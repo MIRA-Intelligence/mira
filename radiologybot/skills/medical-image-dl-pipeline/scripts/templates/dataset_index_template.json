@@ -1,0 +1,30 @@
+{
+    "description": "Auto-generated medical dataset index for MONAI.",
+    "labels": {
+        "0": "background",
+        "1": "disease_target"
+    },
+    "modality": {
+        "0": "CT_or_MRI"
+    },
+    "numTraining": 100,
+    "numTest": 20,
+    "training": [
+        {
+            "image": "./data/imagesTr/patient_001.nii.gz",
+            "label": "./data/labelsTr/patient_001.nii.gz",
+            "fold": 0
+        },
+        {
+            "image": "./data/imagesTr/patient_002.nii.gz",
+            "label": "./data/labelsTr/patient_002.nii.gz",
+            "fold": 1
+        }
+    ],
+    "test": [
+        {
+            "image": "./data/imagesTs/patient_101.nii.gz",
+            "label": "./data/labelsTs/patient_101.nii.gz"
+        }
+    ]
+}

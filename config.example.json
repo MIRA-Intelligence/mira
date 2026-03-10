@@ -1,0 +1,22 @@
+{
+  "agents": {
+    "defaults": {
+      "model": "anthropic/claude-opus-4-5",
+      "provider": "openrouter",
+      "workspace": "~/.radiologybot/workspace"
+    }
+  },
+  "tools": {
+    "restrictToWorkspace": false
+  },
+  "channels": {
+    "telegram": {
+      "enabled": false,
+      "token": "YOUR_TELEGRAM_BOT_TOKEN",
+      "allowFrom": ["*"]
+    }
+  },
+  "gateway": {
+    "port": 18790
+  }
+}
