@@ -4,7 +4,7 @@ Information about the user to help personalize interactions.
 
 ## Basic Information
 
-- **Name**: C. Wang
+- **Name**: LoveMachine
 - **Timezone**: CST (UTC+8)
 - **Language**: Chinese (中文), English
 
