@@ -4,11 +4,17 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
-from radiologybot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from radiologybot.agent.routing import ModelRouter, RoutedProviderManager
+from radiologybot.agent.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
 from radiologybot.agent.tools.registry import ToolRegistry
 from radiologybot.agent.tools.shell import ExecTool
 from radiologybot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -34,6 +40,8 @@ class SubagentManager:
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        provider_factory: Callable[[str], LLMProvider] | None = None,
+        model_router: ModelRouter | None = None,
     ):
         from radiologybot.config.schema import ExecToolConfig
         self.provider = provider
@@ -47,6 +55,12 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.provider_runtime = RoutedProviderManager(
+            default_provider=provider,
+            default_model=self.model,
+            router=model_router,
+            provider_factory=provider_factory,
+        )
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -108,7 +122,7 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
-            
+
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -119,14 +133,18 @@ class SubagentManager:
             max_iterations = 15
             iteration = 0
             final_result: str | None = None
+            active_provider: LLMProvider | None = None
+            active_route = None
 
             while iteration < max_iterations:
                 iteration += 1
 
-                response = await self.provider.chat(
+                if active_provider is None or active_route is None:
+                    active_provider, active_route = await self.provider_runtime.resolve(messages, iteration)
+                response = await active_provider.chat(
                     messages=messages,
                     tools=tools.get_definitions(),
-                    model=self.model,
+                    model=active_route.model,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
@@ -208,7 +226,7 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
-    
+
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
         from radiologybot.agent.context import ContextBuilder
@@ -230,7 +248,7 @@ Stay focused on the assigned task. Your final response will be reported back to 
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
 
         return "\n\n".join(parts)
-    
+
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
         tasks = [self._running_tasks[tid] for tid in self._session_tasks.get(session_key, [])

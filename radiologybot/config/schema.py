@@ -223,6 +223,11 @@ class AgentDefaults(Base):
 
     workspace: str = "~/.radiologybot/workspace"
     model: str = "anthropic/claude-opus-4-5"
+    route_model: str | None = None
+    small_model: str | None = None
+    medium_model: str | None = None
+    large_model: str | None = None
+    route_by_complexity: bool = False
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
