@@ -2,6 +2,7 @@
   "agents": {
     "defaults": {
       "model": "anthropic/claude-opus-4-5",
+      "routeModel": "openai/gpt-4.1-nano",
       "smallModel": "openai/gpt-4.1-mini",
       "mediumModel": "anthropic/claude-sonnet-4-5",
       "largeModel": "anthropic/claude-opus-4-5",

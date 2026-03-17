@@ -223,6 +223,7 @@ class AgentDefaults(Base):
 
     workspace: str = "~/.radiologybot/workspace"
     model: str = "anthropic/claude-opus-4-5"
+    route_model: str | None = None
     small_model: str | None = None
     medium_model: str | None = None
     large_model: str | None = None

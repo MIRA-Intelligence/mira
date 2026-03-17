@@ -133,11 +133,14 @@ class SubagentManager:
             max_iterations = 15
             iteration = 0
             final_result: str | None = None
+            active_provider: LLMProvider | None = None
+            active_route = None
 
             while iteration < max_iterations:
                 iteration += 1
 
-                active_provider, active_route = self.provider_runtime.resolve(messages, iteration)
+                if active_provider is None or active_route is None:
+                    active_provider, active_route = await self.provider_runtime.resolve(messages, iteration)
                 response = await active_provider.chat(
                     messages=messages,
                     tools=tools.get_definitions(),

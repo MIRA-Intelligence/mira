@@ -195,6 +195,22 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _route_hint(
+        tier: str,
+        model: str,
+        score: int | None,
+        source: str,
+        reason: str | None,
+    ) -> str:
+        """Format a visible routing hint for progress output."""
+        details = f", {source}"
+        if reason:
+            details += f", reason={reason[:80]}"
+        if score is None:
+            return f"router -> {tier} ({model}{details})"
+        return f"router -> {tier} ({model}, score={score}{details})"
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -205,11 +221,24 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        active_provider: LLMProvider | None = None
+        active_route = None
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            active_provider, active_route = self.model_runtime.resolve(messages, iteration)
+            if active_provider is None or active_route is None:
+                active_provider, active_route = await self.model_runtime.resolve(messages, iteration)
+            if iteration == 1 and on_progress and self.model_router and self.model_router.enabled:
+                await on_progress(
+                    self._route_hint(
+                        active_route.tier,
+                        active_route.model,
+                        active_route.score,
+                        active_route.source,
+                        active_route.reason,
+                    )
+                )
             response = await active_provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
