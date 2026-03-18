@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from radiologybot.config.schema import Config
+from radiologybot.config.schema import Config, primary_model_candidate
 from radiologybot.providers.base import LLMProvider
 
 
@@ -14,7 +14,9 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
     from radiologybot.providers.openai_codex_provider import OpenAICodexProvider
     from radiologybot.providers.registry import find_by_name
 
-    resolved_model = model or config.agents.defaults.model
+    resolved_model = primary_model_candidate(model, config.agents.defaults.primary_model)
+    if not resolved_model:
+        raise ValueError("No model configured. Set agents.defaults.model in config.json.")
     provider_name = config.get_provider_name(resolved_model)
     provider_config = config.get_provider(resolved_model)
 
