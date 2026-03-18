@@ -44,7 +44,7 @@ Observation → Question → Hypothesis → Prediction → Experiment → Analys
 6. **Analysis** — Evaluate results against predictions:
    - Did the results match the prediction? Quantitatively?
    - If yes: hypothesis is supported (not "proven") — what's the next question?
-   - If no: hypothesis is falsified — what does the discrepancy tell us? Revise the hypothesis.
+   - If no: do not rush to reject the current hypothesis; first review the implementation and design logic for possible bugs or reasoning gaps, then decide whether the hypothesis is truly falsified or the test itself was flawed.
    - Report ALL metrics, including unfavorable ones
    - Include visual/qualitative assessment alongside quantitative metrics
 
@@ -74,12 +74,14 @@ Observation → Question → Hypothesis → Prediction → Experiment → Analys
 ### Rules
 
 1. **Every experiment gets a git commit** — no exceptions
-2. **Commit BEFORE running** the experiment (snapshot the code that will be executed)
+2. **Commit after a successful running** the experiment (snapshot the code that will be executed)
 3. **Commit message format**: `ExpNNN: <brief description of what and why>`
    - Example: `Exp014: phase grid search — test hypothesis that phase multimodality causes optimization failure`
 4. **Tag important milestones**: `git tag exp014-baseline`
 5. **Never commit generated data or large files** — use `.gitignore`
 6. **If an experiment modifies shared code**, commit to a branch first
+7. **Apply new modifications to the existing codebase by default** — do not create a separate new file to reimplement the code from scratch when the change is an evolution of existing functionality
+8. **If the modification becomes large or starts a meaningfully different solution route**, create a new branch before proceeding
 
 ### Commit Checklist
 
