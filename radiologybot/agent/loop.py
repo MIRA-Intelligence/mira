@@ -8,15 +8,21 @@ import re
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
 from radiologybot.agent.context import ContextBuilder
 from radiologybot.agent.memory import MemoryStore
+from radiologybot.agent.routing import ModelRouter, RoutedProviderManager
 from radiologybot.agent.subagent import SubagentManager
 from radiologybot.agent.tools.cron import CronTool
-from radiologybot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from radiologybot.agent.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
 from radiologybot.agent.tools.message import MessageTool
 from radiologybot.agent.tools.registry import ToolRegistry
 from radiologybot.agent.tools.shell import ExecTool
@@ -65,10 +71,14 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        provider_factory: Callable[[str], LLMProvider] | None = None,
+        model_router: ModelRouter | None = None,
     ):
         from radiologybot.config.schema import ExecToolConfig
         self.bus = bus
         self.channels_config = channels_config
+        self.provider_factory = provider_factory
+        self.model_router = model_router
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
@@ -98,6 +108,14 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            provider_factory=provider_factory,
+            model_router=model_router,
+        )
+        self.model_runtime = RoutedProviderManager(
+            default_provider=provider,
+            default_model=self.model,
+            router=model_router,
+            provider_factory=provider_factory,
         )
 
         self._running = False
@@ -177,6 +195,22 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _route_hint(
+        tier: str,
+        model: str,
+        score: int | None,
+        source: str,
+        reason: str | None,
+    ) -> str:
+        """Format a visible routing hint for progress output."""
+        details = f", {source}"
+        if reason:
+            details += f", reason={reason[:80]}"
+        if score is None:
+            return f"router -> {tier} ({model}{details})"
+        return f"router -> {tier} ({model}, score={score}{details})"
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -187,14 +221,28 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        active_provider: LLMProvider | None = None
+        active_route = None
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await self.provider.chat(
+            if active_provider is None or active_route is None:
+                active_provider, active_route = await self.model_runtime.resolve(messages, iteration)
+            if iteration == 1 and on_progress and self.model_router and self.model_router.enabled:
+                await on_progress(
+                    self._route_hint(
+                        active_route.tier,
+                        active_route.model,
+                        active_route.score,
+                        active_route.source,
+                        active_route.reason,
+                    )
+                )
+            response = await active_provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model,
+                model=active_route.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,

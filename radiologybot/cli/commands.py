@@ -29,8 +29,10 @@ from rich.table import Table
 from rich.text import Text
 
 from radiologybot import __logo__, __version__
+from radiologybot.agent.routing import ModelRouter
 from radiologybot.config.paths import get_workspace_path
 from radiologybot.config.schema import Config
+from radiologybot.providers.factory import make_provider
 from radiologybot.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
@@ -213,55 +215,20 @@ def onboard():
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
-    from radiologybot.providers.openai_codex_provider import OpenAICodexProvider
-    from radiologybot.providers.azure_openai_provider import AzureOpenAIProvider
+    try:
+        return make_provider(config)
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1) from exc
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
 
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    from radiologybot.providers.custom_provider import CustomProvider
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
-    # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
-    if provider_name == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.radiologybot/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-        
-        return AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-
-    from radiologybot.providers.litellm_provider import LiteLLMProvider
-    from radiologybot.providers.registry import find_by_name
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.radiologybot/config.json under providers section")
-        raise typer.Exit(1)
-
-    return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
-        extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
-    )
+def _make_provider_for_model(config: Config, model: str):
+    """Create a provider for a routed model."""
+    try:
+        return make_provider(config, model)
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1) from exc
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -315,6 +282,7 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+    model_router = ModelRouter(config.agents.defaults)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
@@ -340,6 +308,8 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        provider_factory=lambda model: _make_provider_for_model(config, model),
+        model_router=model_router,
     )
 
     # Set cron callback (needs agent)
@@ -497,6 +467,7 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
+    model_router = ModelRouter(config.agents.defaults)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_cron_dir() / "jobs.json"
@@ -524,6 +495,8 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        provider_factory=lambda model: _make_provider_for_model(config, model),
+        model_router=model_router,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -869,6 +842,13 @@ def status():
         from radiologybot.providers.registry import PROVIDERS
 
         console.print(f"Model: {config.agents.defaults.model}")
+        if config.agents.defaults.route_by_complexity:
+            console.print("Routing: [green]enabled[/green]")
+            console.print(f"  small: {config.agents.defaults.small_model or '[dim]not set[/dim]'}")
+            console.print(f"  medium: {config.agents.defaults.medium_model or '[dim]not set[/dim]'}")
+            console.print(f"  large: {config.agents.defaults.large_model or '[dim]not set[/dim]'}")
+        else:
+            console.print("Routing: [dim]disabled[/dim]")
 
         # Check API keys from registry
         for spec in PROVIDERS:
