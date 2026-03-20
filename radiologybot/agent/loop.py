@@ -194,12 +194,15 @@ class AgentLoop:
     def _route_hint(
         tier: str,
         model: str,
+        candidates: tuple[str, ...],
         score: int | None,
         source: str,
         reason: str | None,
     ) -> str:
         """Format a visible routing hint for progress output."""
         details = f", {source}"
+        if candidates and model != candidates[0]:
+            details += f", fallback_from={candidates[0]}"
         if reason:
             details += f", reason={reason[:80]}"
         if score is None:
@@ -238,16 +241,6 @@ class AgentLoop:
 
             if active_provider is None or active_route is None:
                 active_provider, active_route = await model_runtime.resolve(messages, iteration)
-            if iteration == 1 and on_progress and self.model_router and self.model_router.enabled:
-                await on_progress(
-                    self._route_hint(
-                        active_route.tier,
-                        active_route.model,
-                        active_route.score,
-                        active_route.source,
-                        active_route.reason,
-                    )
-                )
             response, active_route = await model_runtime.chat(
                 active_route,
                 messages=messages,
@@ -256,6 +249,18 @@ class AgentLoop:
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
             )
+
+            if iteration == 1 and on_progress and self.model_router and self.model_router.enabled:
+                await on_progress(
+                    self._route_hint(
+                        active_route.tier,
+                        active_route.model,
+                        active_route.candidates,
+                        active_route.score,
+                        active_route.source,
+                        active_route.reason,
+                    )
+                )
 
             if response.has_tool_calls:
                 if on_progress:
