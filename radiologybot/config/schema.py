@@ -14,6 +14,35 @@ class Base(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
+ModelSelector = str | list[str]
+_DEFAULT_PRIMARY_MODEL = "anthropic/claude-opus-4-5"
+
+
+def normalize_model_candidates(value: ModelSelector | None) -> list[str]:
+    """Normalize a model selection into a de-duplicated ordered list."""
+    if value is None:
+        return []
+
+    raw_items = [value] if isinstance(value, str) else value
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        model = item.strip()
+        if not model or model in seen:
+            continue
+        seen.add(model)
+        candidates.append(model)
+    return candidates
+
+
+def primary_model_candidate(value: ModelSelector | None, fallback: str | None = None) -> str | None:
+    """Return the first configured model candidate."""
+    candidates = normalize_model_candidates(value)
+    if candidates:
+        return candidates[0]
+    return fallback
+
+
 class WhatsAppConfig(Base):
     """WhatsApp channel configuration."""
 
@@ -222,11 +251,11 @@ class AgentDefaults(Base):
     """Default agent configuration."""
 
     workspace: str = "~/.radiologybot/workspace"
-    model: str = "anthropic/claude-opus-4-5"
-    route_model: str | None = None
-    small_model: str | None = None
-    medium_model: str | None = None
-    large_model: str | None = None
+    model: ModelSelector = _DEFAULT_PRIMARY_MODEL
+    route_model: ModelSelector | None = None
+    small_model: ModelSelector | None = None
+    medium_model: ModelSelector | None = None
+    large_model: ModelSelector | None = None
     route_by_complexity: bool = False
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
@@ -236,6 +265,44 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     memory_window: int = 100
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+
+    @property
+    def default_model_candidates(self) -> list[str]:
+        """Return the ordered default-model candidates."""
+        return normalize_model_candidates(self.model) or [_DEFAULT_PRIMARY_MODEL]
+
+    @property
+    def primary_model(self) -> str:
+        """Return the primary default model."""
+        return self.default_model_candidates[0]
+
+    @property
+    def routing_model_candidates(self) -> list[str]:
+        """Return the ordered routing-model candidates."""
+        return (
+            normalize_model_candidates(self.route_model)
+            or normalize_model_candidates(self.small_model)
+            or self.default_model_candidates
+        )
+
+    @property
+    def primary_routing_model(self) -> str:
+        """Return the primary routing model."""
+        return self.routing_model_candidates[0]
+
+    def tier_model_candidates(self, tier: str) -> list[str]:
+        """Return the ordered candidates for a routing tier."""
+        if tier == "small":
+            return normalize_model_candidates(self.small_model) or self.default_model_candidates
+        if tier == "medium":
+            return normalize_model_candidates(self.medium_model) or self.default_model_candidates
+        if tier == "large":
+            return normalize_model_candidates(self.large_model) or self.default_model_candidates
+        return self.default_model_candidates
+
+    def primary_model_for_tier(self, tier: str) -> str:
+        """Return the primary model for a routing tier."""
+        return self.tier_model_candidates(tier)[0]
 
 
 class AgentsConfig(Base):
@@ -359,7 +426,8 @@ class Config(BaseSettings):
             p = getattr(self.providers, forced, None)
             return (p, forced) if p else (None, None)
 
-        model_lower = (model or self.agents.defaults.model).lower()
+        model_name = primary_model_candidate(model, self.agents.defaults.primary_model) or _DEFAULT_PRIMARY_MODEL
+        model_lower = model_name.lower()
         model_normalized = model_lower.replace("-", "_")
         model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
         normalized_prefix = model_prefix.replace("-", "_")

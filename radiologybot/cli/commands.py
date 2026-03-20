@@ -44,6 +44,15 @@ app = typer.Typer(
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 
+
+def _format_model_selection(value: str | list[str] | None) -> str:
+    """Render model config values for CLI output."""
+    if value is None:
+        return "[dim]not set[/dim]"
+    if isinstance(value, list):
+        return " -> ".join(value) if value else "[dim]not set[/dim]"
+    return value
+
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
@@ -294,7 +303,7 @@ def gateway(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=config.agents.defaults.primary_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -482,7 +491,7 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=config.agents.defaults.primary_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -841,12 +850,12 @@ def status():
     if config_path.exists():
         from radiologybot.providers.registry import PROVIDERS
 
-        console.print(f"Model: {config.agents.defaults.model}")
+        console.print(f"Model: {_format_model_selection(config.agents.defaults.model)}")
         if config.agents.defaults.route_by_complexity:
             console.print("Routing: [green]enabled[/green]")
-            console.print(f"  small: {config.agents.defaults.small_model or '[dim]not set[/dim]'}")
-            console.print(f"  medium: {config.agents.defaults.medium_model or '[dim]not set[/dim]'}")
-            console.print(f"  large: {config.agents.defaults.large_model or '[dim]not set[/dim]'}")
+            console.print(f"  small: {_format_model_selection(config.agents.defaults.small_model)}")
+            console.print(f"  medium: {_format_model_selection(config.agents.defaults.medium_model)}")
+            console.print(f"  large: {_format_model_selection(config.agents.defaults.large_model)}")
         else:
             console.print("Routing: [dim]disabled[/dim]")
 

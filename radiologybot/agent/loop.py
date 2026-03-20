@@ -111,12 +111,7 @@ class AgentLoop:
             provider_factory=provider_factory,
             model_router=model_router,
         )
-        self.model_runtime = RoutedProviderManager(
-            default_provider=provider,
-            default_model=self.model,
-            router=model_router,
-            provider_factory=provider_factory,
-        )
+        self._session_model_runtimes: dict[str, RoutedProviderManager] = {}
 
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -199,21 +194,38 @@ class AgentLoop:
     def _route_hint(
         tier: str,
         model: str,
+        candidates: tuple[str, ...],
         score: int | None,
         source: str,
         reason: str | None,
     ) -> str:
         """Format a visible routing hint for progress output."""
         details = f", {source}"
+        if candidates and model != candidates[0]:
+            details += f", fallback_from={candidates[0]}"
         if reason:
             details += f", reason={reason[:80]}"
         if score is None:
             return f"router -> {tier} ({model}{details})"
         return f"router -> {tier} ({model}, score={score}{details})"
 
+    def _get_model_runtime(self, session_key: str) -> RoutedProviderManager:
+        """Return the session-local model runtime, creating it on demand."""
+        runtime = self._session_model_runtimes.get(session_key)
+        if runtime is None:
+            runtime = RoutedProviderManager(
+                default_provider=self.provider,
+                default_model=self.model,
+                router=self.model_router,
+                provider_factory=self.provider_factory,
+            )
+            self._session_model_runtimes[session_key] = runtime
+        return runtime
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
+        model_runtime: RoutedProviderManager,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
@@ -228,25 +240,27 @@ class AgentLoop:
             iteration += 1
 
             if active_provider is None or active_route is None:
-                active_provider, active_route = await self.model_runtime.resolve(messages, iteration)
+                active_provider, active_route = await model_runtime.resolve(messages, iteration)
+            response, active_route = await model_runtime.chat(
+                active_route,
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                reasoning_effort=self.reasoning_effort,
+            )
+
             if iteration == 1 and on_progress and self.model_router and self.model_router.enabled:
                 await on_progress(
                     self._route_hint(
                         active_route.tier,
                         active_route.model,
+                        active_route.candidates,
                         active_route.score,
                         active_route.source,
                         active_route.reason,
                     )
                 )
-            response = await active_provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=active_route.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                reasoning_effort=self.reasoning_effort,
-            )
 
             if response.has_tool_calls:
                 if on_progress:
@@ -389,13 +403,14 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
+            model_runtime = self._get_model_runtime(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(messages, model_runtime=model_runtime)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -435,6 +450,7 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            self._session_model_runtimes.pop(session.key, None)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -465,6 +481,7 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=self.memory_window)
+        model_runtime = self._get_model_runtime(key)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
@@ -481,7 +498,9 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            model_runtime=model_runtime,
+            on_progress=on_progress or _bus_progress,
         )
 
         if final_content is None:
