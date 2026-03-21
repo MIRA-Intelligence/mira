@@ -94,6 +94,7 @@ def _build_headers(account_id: str, token: str) -> dict[str, str]:
         "Authorization": f"Bearer {token}",
         "chatgpt-account-id": account_id,
         "OpenAI-Beta": "responses=experimental",
+        "x-openai-internal-codex-residency": "us",
         "originator": DEFAULT_ORIGINATOR,
         "User-Agent": "radiologybot (python)",
         "accept": "text/event-stream",
