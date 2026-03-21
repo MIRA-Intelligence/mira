@@ -190,6 +190,18 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
             )
             continue
 
+    # Purge orphaned function_call_outputs whose call_id has no matching
+    # function_call.  This happens when the memory window clips mid-sequence
+    # or the session contains tool calls from a different provider.
+    valid_call_ids = {
+        item["call_id"] for item in input_items if item.get("type") == "function_call"
+    }
+    input_items = [
+        item
+        for item in input_items
+        if item.get("type") != "function_call_output" or item.get("call_id") in valid_call_ids
+    ]
+
     return system_prompt, input_items
 
 
