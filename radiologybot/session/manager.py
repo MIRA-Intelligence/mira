@@ -49,17 +49,42 @@ class Session:
         sliced = unconsolidated[-max_messages:]
 
         # Drop leading non-user messages to avoid orphaned tool_result blocks
+        found_user = False
         for i, m in enumerate(sliced):
             if m.get("role") == "user":
                 sliced = sliced[i:]
+                found_user = True
                 break
+        if not found_user:
+            return []
 
         out: list[dict[str, Any]] = []
+        pending_tool_calls: set[str] = set()
         for m in sliced:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
             for k in ("tool_calls", "tool_call_id", "name"):
                 if k in m:
                     entry[k] = m[k]
+
+            if entry["role"] == "assistant":
+                pending_tool_calls = {
+                    tc.get("id")
+                    for tc in entry.get("tool_calls", [])
+                    if isinstance(tc, dict) and tc.get("id")
+                }
+                out.append(entry)
+                continue
+
+            if entry["role"] == "tool":
+                tool_call_id = entry.get("tool_call_id")
+                if not tool_call_id or tool_call_id not in pending_tool_calls:
+                    continue
+                pending_tool_calls.discard(tool_call_id)
+                out.append(entry)
+                continue
+
+            if entry["role"] == "user":
+                pending_tool_calls.clear()
             out.append(entry)
         return out
 
