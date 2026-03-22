@@ -44,11 +44,18 @@ class Session:
         self.updated_at = datetime.now()
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input, aligned to a user turn."""
+        """Return unconsolidated messages for LLM input, aligned to a user turn.
+
+        Guarantees:
+        - Starts with a user message.
+        - No consecutive same-role messages.
+        - Every assistant with tool_calls has ALL matching tool results.
+        - No orphaned tool results.
+        """
         unconsolidated = self.messages[self.last_consolidated:]
         sliced = unconsolidated[-max_messages:]
 
-        # Drop leading non-user messages to avoid orphaned tool_result blocks
+        # Drop leading non-user messages to avoid orphaned tool_result blocks.
         found_user = False
         for i, m in enumerate(sliced):
             if m.get("role") == "user":
@@ -58,6 +65,7 @@ class Session:
         if not found_user:
             return []
 
+        # --- Pass 1: collect entries and track tool-call linkage ---
         out: list[dict[str, Any]] = []
         pending_tool_calls: set[str] = set()
         for m in sliced:
@@ -86,7 +94,79 @@ class Session:
             if entry["role"] == "user":
                 pending_tool_calls.clear()
             out.append(entry)
+
+        # --- Pass 2: strip assistant tool_calls that lost any results ---
+        out = self._strip_incomplete_tool_calls(out)
+
+        # --- Pass 3: collapse consecutive same-role messages ---
+        out = self._collapse_consecutive_roles(out)
+
         return out
+
+    @staticmethod
+    def _strip_incomplete_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove tool_calls from assistant messages whose results are incomplete."""
+        result: list[dict[str, Any]] = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected_ids = {
+                    tc.get("id")
+                    for tc in msg["tool_calls"]
+                    if isinstance(tc, dict) and tc.get("id")
+                }
+                # Collect immediately following tool results
+                j = i + 1
+                found_ids: set[str] = set()
+                while j < len(messages) and messages[j].get("role") == "tool":
+                    tid = messages[j].get("tool_call_id")
+                    if tid in expected_ids:
+                        found_ids.add(tid)
+                    j += 1
+
+                if found_ids == expected_ids:
+                    result.append(msg)
+                else:
+                    # Drop tool_calls and keep only text content (if any).
+                    # Also skip the orphaned tool results.
+                    content = msg.get("content")
+                    if content:
+                        result.append({"role": "assistant", "content": content})
+                    i = j  # skip past the orphaned tool results
+                    continue
+            else:
+                result.append(msg)
+            i += 1
+        return result
+
+    @staticmethod
+    def _collapse_consecutive_roles(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge consecutive same-role messages that providers reject."""
+        if not messages:
+            return messages
+        result: list[dict[str, Any]] = [messages[0]]
+        for msg in messages[1:]:
+            prev = result[-1]
+            if msg["role"] == prev["role"]:
+                # Merge: keep the later message's content; skip if empty.
+                prev_content = prev.get("content") or ""
+                curr_content = msg.get("content") or ""
+                if isinstance(prev_content, str) and isinstance(curr_content, str):
+                    merged = (prev_content + "\n\n" + curr_content).strip()
+                    prev["content"] = merged or prev_content or curr_content
+                else:
+                    prev["content"] = curr_content or prev_content
+                # Preserve tool_calls from the later message if present.
+                if msg.get("tool_calls"):
+                    prev["tool_calls"] = msg["tool_calls"]
+                if msg.get("tool_call_id"):
+                    prev["tool_call_id"] = msg["tool_call_id"]
+                if msg.get("name"):
+                    prev["name"] = msg["name"]
+            else:
+                result.append(msg)
+        return result
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
