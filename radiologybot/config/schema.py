@@ -230,6 +230,16 @@ class QQConfig(Base):
 
 
 
+class WebChannelConfig(Base):
+    """Web (WebSocket + HTTP) channel configuration."""
+
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 18790
+    allow_from: list[str] = Field(default_factory=lambda: ["*"])
+    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+
+
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
@@ -245,6 +255,7 @@ class ChannelsConfig(Base):
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     matrix: MatrixConfig = Field(default_factory=MatrixConfig)
+    web: WebChannelConfig = Field(default_factory=WebChannelConfig)
 
 
 class AgentDefaults(Base):
