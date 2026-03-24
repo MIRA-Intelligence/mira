@@ -46,6 +46,66 @@ class WebChannel(BaseChannel):
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
+        self._migrate_global_to_project()
+
+    # ── migration ──────────────────────────────────────────────────
+
+    def _migrate_global_to_project(self) -> None:
+        """One-time migration: move global sessions/memory into per-project dirs.
+
+        Scans workspace_root/sessions/ for files named web_PRJ-XXXX.jsonl and
+        moves them into PRJ-XXXX/sessions/.  Similarly moves global memory/ into
+        the first project that exists (as a best-effort fallback).
+        """
+        root = self.projects_root
+        global_sessions = root / "sessions"
+        global_memory = root / "memory"
+
+        if global_sessions.is_dir():
+            for f in list(global_sessions.iterdir()):
+                if not f.name.endswith(".jsonl"):
+                    continue
+                stem = f.stem  # e.g. "web_PRJ-0001"
+                project_id = stem.replace("web_", "", 1)  # "PRJ-0001"
+                proj_dir = root / project_id
+                if not proj_dir.is_dir():
+                    continue
+                dest_dir = proj_dir / "sessions"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = dest_dir / f.name
+                if not dest.exists():
+                    try:
+                        shutil.move(str(f), str(dest))
+                        logger.info("Migrated session {} → {}", f.name, dest)
+                    except OSError as e:
+                        logger.warning("Failed to migrate session {}: {}", f.name, e)
+            if not any(global_sessions.iterdir()):
+                try:
+                    global_sessions.rmdir()
+                except OSError:
+                    pass
+
+        if global_memory.is_dir():
+            projects = [
+                d for d in sorted(root.iterdir())
+                if d.is_dir() and d.name.startswith("PRJ-")
+            ]
+            if len(projects) == 1:
+                dest_dir = projects[0] / "memory"
+                if not dest_dir.exists():
+                    try:
+                        shutil.move(str(global_memory), str(dest_dir))
+                        logger.info("Migrated global memory → {}", dest_dir)
+                    except OSError as e:
+                        logger.warning("Failed to migrate memory: {}", e)
+            elif not projects:
+                pass
+            else:
+                logger.info(
+                    "Multiple projects exist; skipping global memory migration. "
+                    "Manually move {} into the correct project.",
+                    global_memory,
+                )
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -280,6 +340,8 @@ class WebChannel(BaseChannel):
             logger.warning("Failed to read {}: {}", plan_path, exc)
             return web.json_response({"error": str(exc)}, status=500)
 
+    _NON_PROJECT_DIRS = {"skills", "memory", "sessions", "media", "cron", "logs"}
+
     async def _handle_list_projects(self, _request: web.Request) -> web.Response:
         """List project directories under projects_root with optional task_plan data."""
         if not self.projects_root.is_dir():
@@ -288,6 +350,8 @@ class WebChannel(BaseChannel):
         projects: list[dict[str, Any]] = []
         for d in sorted(self.projects_root.iterdir()):
             if not d.is_dir() or d.name.startswith("."):
+                continue
+            if d.name in self._NON_PROJECT_DIRS:
                 continue
             info: dict[str, Any] = {"id": d.name}
             plan_file = d / PLAN_FILENAME

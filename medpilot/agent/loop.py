@@ -95,6 +95,7 @@ class AgentLoop:
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
+        self._project_sessions: dict[str, SessionManager] = {}
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -423,21 +424,29 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
+        meta = msg.metadata or {}
+        project_dir = meta.get("project_dir")
+        if project_dir:
+            sessions_mgr = self._get_project_sessions(project_dir)
+        else:
+            sessions_mgr = self.sessions
+
         key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
+        session = sessions_mgr.get_or_create(key)
 
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
             self._consolidating.add(session.key)
+            _mw = Path(project_dir) if project_dir else self.workspace
             try:
                 async with lock:
                     snapshot = session.messages[session.last_consolidated:]
                     if snapshot:
                         temp = Session(key=session.key)
                         temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
+                        if not await self._consolidate_memory(temp, archive_all=True, workspace_override=_mw):
                             return OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
                                 content="Memory archival failed, session not cleared. Please try again.",
@@ -452,8 +461,8 @@ class AgentLoop:
                 self._consolidating.discard(session.key)
 
             session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
+            sessions_mgr.save(session)
+            sessions_mgr.invalidate(session.key)
             self._session_model_runtimes.pop(session.key, None)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
@@ -461,15 +470,18 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 medpilot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
+        memory_workspace = Path(project_dir) if project_dir else self.workspace
+
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
             self._consolidating.add(session.key)
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
+            _mw = memory_workspace
 
             async def _consolidate_and_unlock():
                 try:
                     async with lock:
-                        await self._consolidate_memory(session)
+                        await self._consolidate_memory(session, workspace_override=_mw)
                 finally:
                     self._consolidating.discard(session.key)
                     _task = asyncio.current_task()
@@ -486,10 +498,10 @@ class AgentLoop:
 
         history = session.get_history(max_messages=self.memory_window)
         model_runtime = self._get_model_runtime(key)
-        meta = msg.metadata or {}
-        project_dir = meta.get("project_dir")
         extra_system = meta.get("_ui_system_instructions")
-        initial_messages = self.context.build_messages(
+
+        ctx = ContextBuilder(memory_workspace) if project_dir else self.context
+        initial_messages = ctx.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
@@ -516,7 +528,7 @@ class AgentLoop:
             final_content = "I've completed processing but have no response to give."
 
         self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
+        sessions_mgr.save(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -563,9 +575,18 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
+    def _get_project_sessions(self, project_dir: str) -> SessionManager:
+        """Return a per-project SessionManager, creating one if needed."""
+        if project_dir not in self._project_sessions:
+            self._project_sessions[project_dir] = SessionManager(Path(project_dir))
+        return self._project_sessions[project_dir]
+
+    async def _consolidate_memory(
+        self, session, archive_all: bool = False, workspace_override: Path | None = None,
+    ) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
+        ws = workspace_override or self.workspace
+        return await MemoryStore(ws).consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )
