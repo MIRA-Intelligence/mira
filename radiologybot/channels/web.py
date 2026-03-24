@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,8 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/api/sessions", self._handle_sessions)
         self._app.router.add_get("/api/plan", self._handle_plan)
         self._app.router.add_post("/api/config", self._handle_config)
+        self._app.router.add_get("/api/projects", self._handle_list_projects)
+        self._app.router.add_delete("/api/projects", self._handle_delete_project)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -164,7 +167,7 @@ class WebChannel(BaseChannel):
         elif origin in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
 
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp
 
@@ -275,4 +278,49 @@ class WebChannel(BaseChannel):
             return web.json_response(data)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to read {}: {}", plan_path, exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def _handle_list_projects(self, _request: web.Request) -> web.Response:
+        """List project directories under projects_root with optional task_plan data."""
+        if not self.projects_root.is_dir():
+            return web.json_response({"projects": []})
+
+        projects: list[dict[str, Any]] = []
+        for d in sorted(self.projects_root.iterdir()):
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            info: dict[str, Any] = {"id": d.name}
+            plan_file = d / PLAN_FILENAME
+            if plan_file.is_file():
+                try:
+                    plan = json.loads(plan_file.read_text(encoding="utf-8"))
+                    info["title"] = plan.get("title", "")
+                    info["status"] = plan.get("status", "in_progress")
+                    info["core_question"] = plan.get("core_question", "")
+                    info["started_at"] = plan.get("started_at", "")
+                    info["has_plan"] = True
+                except (json.JSONDecodeError, OSError):
+                    info["has_plan"] = False
+            else:
+                info["has_plan"] = False
+            projects.append(info)
+
+        return web.json_response({"projects": projects})
+
+    async def _handle_delete_project(self, request: web.Request) -> web.Response:
+        """Delete a project directory from disk."""
+        session_id = request.query.get("session_id")
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        project_dir = self.projects_root / session_id
+        if not project_dir.is_dir():
+            return web.json_response({"deleted": False, "reason": "not found"})
+
+        try:
+            shutil.rmtree(project_dir)
+            logger.info("Deleted project directory: {}", project_dir)
+            return web.json_response({"deleted": True})
+        except OSError as exc:
+            logger.warning("Failed to delete {}: {}", project_dir, exc)
             return web.json_response({"error": str(exc)}, status=500)

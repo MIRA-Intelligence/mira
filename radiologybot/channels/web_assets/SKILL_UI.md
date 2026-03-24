@@ -1,7 +1,7 @@
-# Task Plan — SciAgentUI Experiment-Centric Schema
+# Task Plan — SciAgentUI 3-Stage Schema (Research → Experiment → Result)
 
 Maintain a `task_plan.json` in your **Project Directory** (from Runtime Context).
-The dashboard reads this file to display structured experiment progress.
+The dashboard reads this file to display structured progress across three stages.
 
 Write the file using:
 ```
@@ -19,13 +19,32 @@ Always write the **full** JSON (not a patch).
   "status": "in_progress",
   "started_at": "2026-03-24T12:00:00Z",
   "current_experiment": "Exp003",
+  "research": {
+    "references": [
+      {
+        "id": "R1",
+        "title": "Physics-Informed Deep Learning for qMRI",
+        "authors": "Ma et al.",
+        "year": "2024",
+        "venue": "MRM",
+        "url": "https://doi.org/...",
+        "summary": "Proposes physics-driven loss for T1/T2 mapping.",
+        "relevance": "Core prior-design reference for our approach"
+      }
+    ],
+    "notes": [
+      "Signal model: S(TE,TR) = M0*(1-exp(-TR/T1))*exp(-TE/T2)",
+      "Existing methods assume Gaussian noise — may break for low SNR"
+    ],
+    "survey": "A brief literature overview paragraph..."
+  },
   "experiments": [
     {
       "id": "Exp001",
       "title": "Pixel MLP baseline",
       "status": "completed",
       "question": "Is pixel-wise mapping without image priors feasible?",
-      "hypothesis": "PixelMLP with parameter embedding can achieve >0.85 SSIM on synthetic data",
+      "hypothesis": "PixelMLP can achieve >0.85 SSIM on synthetic data",
       "prediction": "SSIM > 0.85 for T1/T2/PD maps",
       "method": "Train PixelMLP (52K params) on 20 subjects, 500 epochs",
       "results": {
@@ -38,25 +57,9 @@ Always write the **full** JSON (not a patch).
       "commit": "055b86e"
     },
     {
-      "id": "Exp002",
-      "title": "PiUNet baseline with spatial priors",
-      "status": "completed",
-      "question": "How much do spatial priors (U-Net) improve over pixel-wise?",
-      "hypothesis": "PiUNet will outperform PixelMLP especially on T2",
-      "prediction": "T2 SSIM > 0.90, mean SSIM > 0.94",
-      "results": {
-        "metrics": { "mean_ssim": 0.953, "t2_ssim": 0.924 }
-      },
-      "conclusion": "Spatial priors help T2 most (+5.2%).",
-      "commit": "abc1234"
-    },
-    {
       "id": "Exp003",
       "title": "Domain gap evaluation",
       "status": "running",
-      "question": "How large is the synthetic-to-real domain gap?",
-      "hypothesis": "Domain gap will be larger for pixel-wise model",
-      "prediction": "Real SSIM drops >15% from synthetic SSIM",
       "progress": {
         "epoch": 290,
         "total_epochs": 500,
@@ -67,23 +70,60 @@ Always write the **full** JSON (not a patch).
   ],
   "knowledge": [
     "Zero-init fixes sigmoid dead zone for T2 output head (Exp005b)",
-    "Forward consistency is ineffective — physics equations too imprecise (Exp008-010)",
-    "Per-sample normalization causes 55% of domain gap (Exp015)"
-  ]
+    "Forward consistency is ineffective — physics equations too imprecise (Exp008-010)"
+  ],
+  "result": {
+    "summary": "Physics-informed U-Net achieves 0.96 SSIM on real data...",
+    "output_path": "results/final_report.pdf",
+    "output_type": "paper",
+    "sections": [
+      {
+        "title": "Abstract",
+        "content": "We propose PDPE-Net..."
+      },
+      {
+        "title": "Conclusion",
+        "content": "Our approach improves T2 mapping accuracy by 12%..."
+      }
+    ]
+  }
 }
 ```
 
-## Required top-level fields
+## Top-level fields
+
+| Field | Type | Required | Stage |
+|-------|------|----------|-------|
+| `title` | `string` | YES | — |
+| `core_question` | `string` | YES | — |
+| `status` | `string` (`in_progress` / `completed` / `failed`) | YES | — |
+| `started_at` | `string` (ISO 8601) | YES | — |
+| `current_experiment` | `string` (id of active experiment) | NO | Experiment |
+| `research` | `object` | NO | Research |
+| `experiments` | `array` | YES | Experiment |
+| `knowledge` | `string[]` (accumulated discoveries) | NO | Experiment |
+| `result` | `object` | NO | Result |
+
+## Research fields
 
 | Field | Type | Required |
 |-------|------|----------|
-| `title` | `string` | YES |
-| `core_question` | `string` | YES |
-| `status` | `string` (`in_progress` / `completed` / `failed`) | YES |
-| `started_at` | `string` (ISO 8601) | YES |
-| `current_experiment` | `string` (id of the active experiment) | YES |
-| `experiments` | `array` | YES |
-| `knowledge` | `string[]` (accumulated discoveries) | NO |
+| `references` | `array` of reference objects | NO |
+| `notes` | `string[]` | NO |
+| `survey` | `string` (literature overview) | NO |
+
+### Reference object
+
+| Field | Type |
+|-------|------|
+| `id` | `string` (e.g. `R1`, `R2`) |
+| `title` | `string` |
+| `authors` | `string` |
+| `year` | `string` |
+| `venue` | `string` |
+| `url` | `string` |
+| `summary` | `string` |
+| `relevance` | `string` |
 
 ## Experiment fields
 
@@ -98,26 +138,26 @@ Always write the **full** JSON (not a patch).
 | `method` | `string` | NO |
 | `results` | `object` (`metrics`, `findings`, `artifacts`) | NO |
 | `conclusion` | `string` | NO |
-| `next` | `string` (what question this raises) | NO |
-| `commit` | `string` (git commit hash) | NO |
-| `progress` | `object` (for running experiments) | NO |
-| `parent` | `string` (parent experiment id, for branches) | NO |
+| `next` | `string` | NO |
+| `commit` | `string` | NO |
+| `progress` | `object` (`epoch`, `total_epochs`, `current_metric`, `current_value`) | NO |
+| `parent` | `string` (parent experiment id) | NO |
 
-## Progress fields (for running experiments)
+## Result fields
 
-| Field | Type |
-|-------|------|
-| `epoch` | `integer` |
-| `total_epochs` | `integer` |
-| `current_metric` | `string` |
-| `current_value` | `number` |
+| Field | Type | Required |
+|-------|------|----------|
+| `summary` | `string` (final summary) | NO |
+| `output_path` | `string` (file path to deliverable) | NO |
+| `output_type` | `string` (`paper` / `report` / `analysis` / `code`) | NO |
+| `sections` | `array` of `{title, content}` | NO |
 
 ## Rules
 
+- Populate `research` early — add references and notes during the research phase
 - Only **one experiment** should be `running` at a time
-- Each experiment follows the scientific method: question → hypothesis → prediction → experiment → analysis
+- Each experiment follows: question → hypothesis → prediction → experiment → analysis
 - Update `current_experiment` when starting a new experiment
-- Add to `knowledge[]` when you discover something important that applies across experiments
-- Add `results` to an experiment when it completes
-- Include `conclusion` and `next` to explain what was learned and what comes next
-- Use `parent` to indicate branching (e.g., `Exp005b` has `parent: "Exp005"`)
+- Add to `knowledge[]` when you discover something broadly applicable
+- Populate `result` when generating final deliverables
+- The UI shows 3 clickable stages: **Research → Experiment → Result**

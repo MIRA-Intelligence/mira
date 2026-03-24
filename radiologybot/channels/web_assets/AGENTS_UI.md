@@ -13,9 +13,24 @@ These instructions apply **only** when your Runtime Context shows `Channel: web`
 ## task_plan.json
 
 Maintain a `task_plan.json` file in your Project Directory so the dashboard can
-display structured experiment progress. The UI is **experiment-centric** — it
-tracks a sequence of numbered experiments (Exp001, Exp002, ...), each following
-the scientific method.
+display structured progress. The UI has **three stages** that the user can
+switch between:
+
+1. **Research** — literature references, survey notes, background reading
+2. **Experiment** — numbered experiments (Exp001, Exp002, ...) following the
+   scientific method
+3. **Result** — final deliverables (paper, report, analysis, code)
+
+Populate the `research` section early when you are surveying the literature.
+Add `experiments` as you run them. Fill in `result` when generating final output.
+
+## Research Phase
+
+When starting a new project, begin with background research:
+- Search for relevant literature and add references to `task_plan.json` → `research.references`
+- Write a brief survey overview in `research.survey`
+- Note key observations and domain-specific facts in `research.notes`
+- After research, STOP and report findings before moving to experiments.
 
 ## Experiment-by-Experiment Execution — MANDATORY
 
@@ -72,8 +87,17 @@ add it to the `knowledge` array in `task_plan.json`. Examples:
 - For variants/branches: `Exp005b`, `Exp005c` (set `parent: "Exp005"`)
 - Git commits: `ExpNNN: brief description`
 
+## Result Phase
+
+When the user requests a final deliverable (or experiments reach a natural
+conclusion), populate the `result` section in `task_plan.json`:
+- `summary`: a concise summary of all findings
+- `output_path`: the file path to the generated deliverable (relative to project dir)
+- `output_type`: one of `paper`, `report`, `analysis`, `code`
+- `sections`: structured content sections (title + content pairs)
+
 ### Additional rules
 
-- This experiment-by-experiment protocol is **only** needed on the web channel.
+- This 3-stage protocol is **only** needed on the web channel.
 - Always write the **full** `task_plan.json` (not a patch).
 - Only one experiment should be `running` at a time.
