@@ -1,0 +1,37 @@
+codecov:
+  require_ci_to_pass: true
+
+coverage:
+  precision: 2
+  round: down
+  range: "40...90"
+
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        target: 80%
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false
+
+ignore:
+  - "radiologybot/cli/**"
+  - "radiologybot/channels/dingtalk.py"
+  - "radiologybot/channels/discord.py"
+  - "radiologybot/channels/email.py"
+  - "radiologybot/channels/feishu.py"
+  - "radiologybot/channels/matrix.py"
+  - "radiologybot/channels/mochat.py"
+  - "radiologybot/channels/qq.py"
+  - "radiologybot/channels/slack.py"
+  - "radiologybot/channels/telegram.py"
+  - "radiologybot/channels/whatsapp.py"
+  - "radiologybot/heartbeat/**"
+  - "radiologybot/providers/transcription.py"
+  - "radiologybot/providers/custom_provider.py"
