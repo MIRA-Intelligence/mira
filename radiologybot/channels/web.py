@@ -17,6 +17,17 @@ from radiologybot.channels.base import BaseChannel
 from radiologybot.config.schema import WebChannelConfig
 
 PLAN_FILENAME = "task_plan.json"
+_ASSETS_DIR = Path(__file__).parent / "web_assets"
+
+
+def _load_ui_instructions() -> str:
+    """Load AGENTS_UI.md + SKILL_UI.md and return as a single system-prompt block."""
+    parts: list[str] = []
+    for name in ("AGENTS_UI.md", "SKILL_UI.md"):
+        fp = _ASSETS_DIR / name
+        if fp.is_file():
+            parts.append(fp.read_text(encoding="utf-8"))
+    return "\n\n---\n\n".join(parts)
 
 
 class WebChannel(BaseChannel):
@@ -28,6 +39,8 @@ class WebChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: WebChannelConfig = config
         self.workspace: Path | None = workspace
+        self.projects_root: Path = Path("~/.sciagent/workspace").expanduser()
+        self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
@@ -72,6 +85,7 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/api/status", self._handle_status)
         self._app.router.add_get("/api/sessions", self._handle_sessions)
         self._app.router.add_get("/api/plan", self._handle_plan)
+        self._app.router.add_post("/api/config", self._handle_config)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -188,12 +202,19 @@ class WebChannel(BaseChannel):
 
                 self._clients[session_id] = ws
 
+                project_dir = str(self.projects_root / session_id)
+                metadata: dict[str, Any] = {
+                    "source": "web",
+                    "project_dir": project_dir,
+                }
+                if self._ui_instructions:
+                    metadata["_ui_system_instructions"] = self._ui_instructions
                 await self._handle_message(
                     sender_id=user_id,
                     chat_id=session_id,
                     content=content,
                     media=media,
-                    metadata={"source": "web"},
+                    metadata=metadata,
                     session_key=f"web:{session_id}",
                 )
 
@@ -212,6 +233,7 @@ class WebChannel(BaseChannel):
             "running": self._running,
             "connected_clients": len(self._clients),
             "uptime_host": f"{self.config.host}:{self.config.port}",
+            "projects_root": str(self.projects_root),
         })
 
     async def _handle_sessions(self, _request: web.Request) -> web.Response:
@@ -221,16 +243,29 @@ class WebChannel(BaseChannel):
         ]
         return web.json_response({"sessions": sessions})
 
+    async def _handle_config(self, request: web.Request) -> web.Response:
+        """Allow the UI to configure the projects root path."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        if "projects_root" in body:
+            new_root = Path(body["projects_root"]).expanduser().resolve()
+            self.projects_root = new_root
+            logger.info("Projects root updated to {}", new_root)
+
+        return web.json_response({
+            "projects_root": str(self.projects_root),
+        })
+
     async def _handle_plan(self, request: web.Request) -> web.Response:
         """Serve task_plan.json, scoped to a project when session_id is given."""
-        if not self.workspace:
-            return web.json_response({"error": "workspace not configured"}, status=500)
-
         session_id = request.query.get("session_id")
         if session_id:
-            plan_path = self.workspace / "projects" / session_id / PLAN_FILENAME
+            plan_path = self.projects_root / session_id / PLAN_FILENAME
         else:
-            plan_path = self.workspace / PLAN_FILENAME
+            return web.json_response(None)
 
         if not plan_path.is_file():
             return web.json_response(None)

@@ -172,16 +172,3 @@ Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegr
 When the user asks for a recurring/periodic task, update `HEARTBEAT.md` instead of creating a one-time cron reminder.
 
 ---
-
-## Web Dashboard — Progress Tracking
-
-When your Runtime Context shows **Channel: web**, you are connected to the SciAgentUI dashboard.
-In this mode, maintain a `task_plan.json` file so the UI can display structured progress.
-
-- Your Runtime Context includes a **Project Directory** (e.g. `projects/PRJ-0001`).
-  All project files — including `task_plan.json` — MUST be written under this directory.
-  Example: `write_file("projects/PRJ-0001/task_plan.json", ...)`
-- Create the project directory first if it does not exist.
-- Read the `task_plan` skill (`skills/task_plan/SKILL.md`) for the schema and rules.
-- Create `task_plan.json` when you form a plan; update it as you complete steps.
-- This is **only** needed on the web channel — skip it for Telegram, Slack, etc.
