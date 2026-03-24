@@ -68,8 +68,20 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
     return chunks
 
 
+# Bootstrap files resolved at runtime by ContextBuilder (fallback to built-in).
+# They are NOT copied to workspace on init/start — users create them only when
+# they want to override or append (.local.md) to the built-in templates.
+_RUNTIME_BOOTSTRAP = {"AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"}
+
+
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
-    """Sync bundled templates to workspace. Only creates missing files."""
+    """Sync bundled templates to workspace. Only creates missing files.
+
+    Bootstrap files (AGENTS.md, SOUL.md, …) are resolved at runtime via
+    ContextBuilder with fallback to built-in templates, so they are NOT
+    copied here.  Users can still create them in the workspace to override
+    or create ``<NAME>.local.md`` to append.
+    """
     from importlib.resources import files as pkg_files
     try:
         tpl = pkg_files("radiologybot") / "templates"
@@ -88,7 +100,7 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         added.append(str(dest.relative_to(workspace)))
 
     for item in tpl.iterdir():
-        if item.name.endswith(".md"):
+        if item.name.endswith(".md") and item.name not in _RUNTIME_BOOTSTRAP:
             _write(item, workspace / item.name)
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
     _write(None, workspace / "memory" / "HISTORY.md")

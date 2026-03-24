@@ -112,15 +112,48 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 lines.append(f"Project Directory: projects/{chat_id}")
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
+    @staticmethod
+    def _load_builtin_template(filename: str) -> str | None:
+        """Load a built-in template from the radiologybot package."""
+        from importlib.resources import files as pkg_files
+
+        try:
+            tpl_file = pkg_files("radiologybot") / "templates" / filename
+            if tpl_file.is_file():
+                return tpl_file.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        return None
+
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """Load bootstrap files with override / append / fallback resolution.
+
+        Per file (e.g. AGENTS.md):
+          1. workspace/AGENTS.md exists  →  use it              (override)
+          2. else                        →  built-in template   (fallback)
+          3. workspace/AGENTS.local.md   →  append to base      (append)
+        """
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+            stem = filename.rsplit(".", 1)[0]  # "AGENTS"
+
+            ws_file = self.workspace / filename
+            if ws_file.exists():
+                content = ws_file.read_text(encoding="utf-8")
+            else:
+                content = self._load_builtin_template(filename) or ""
+
+            if not content.strip():
+                continue
+
+            local_file = self.workspace / f"{stem}.local.md"
+            if local_file.exists():
+                extra = local_file.read_text(encoding="utf-8")
+                if extra.strip():
+                    content = content.rstrip() + "\n\n" + extra
+
+            parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
 
