@@ -35,7 +35,38 @@ class WebChannel(BaseChannel):
 
     # ── lifecycle ────────────────────────────────────────────────────
 
+    def _kill_stale_listener(self) -> None:
+        """Kill any leftover process occupying our port before binding."""
+        import os
+        import signal
+        import subprocess
+
+        my_pid = os.getpid()
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{self.config.port}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pids = {
+                int(p) for p in result.stdout.split() if p.strip()
+            } - {my_pid}
+        except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+            return
+
+        for pid in pids:
+            try:
+                logger.warning("Killing stale process {} on port {}", pid, self.config.port)
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        if pids:
+            import time
+            time.sleep(0.5)
+
     async def start(self) -> None:
+        self._kill_stale_listener()
+
         self._app = web.Application(middlewares=[self._cors_middleware])
         self._app.router.add_get("/ws", self._ws_handler)
         self._app.router.add_get("/api/status", self._handle_status)
@@ -45,7 +76,8 @@ class WebChannel(BaseChannel):
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         self._site = web.TCPSite(
-            self._runner, self.config.host, self.config.port
+            self._runner, self.config.host, self.config.port,
+            reuse_address=True,
         )
         await self._site.start()
         self._running = True
@@ -87,6 +119,7 @@ class WebChannel(BaseChannel):
         is_progress = msg.metadata.get("_progress", False)
         payload = {
             "type": "progress" if is_progress else "response",
+            "session_id": msg.chat_id,
             "content": msg.content,
             "media": msg.media,
             "metadata": msg.metadata,
@@ -189,11 +222,16 @@ class WebChannel(BaseChannel):
         return web.json_response({"sessions": sessions})
 
     async def _handle_plan(self, request: web.Request) -> web.Response:
-        """Serve task_plan.json from the workspace root."""
+        """Serve task_plan.json, scoped to a project when session_id is given."""
         if not self.workspace:
             return web.json_response({"error": "workspace not configured"}, status=500)
 
-        plan_path = self.workspace / PLAN_FILENAME
+        session_id = request.query.get("session_id")
+        if session_id:
+            plan_path = self.workspace / "projects" / session_id / PLAN_FILENAME
+        else:
+            plan_path = self.workspace / PLAN_FILENAME
+
         if not plan_path.is_file():
             return web.json_response(None)
 
