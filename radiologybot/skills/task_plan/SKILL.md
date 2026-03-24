@@ -6,8 +6,8 @@ metadata: '{"radiologybot": {"requires": {}}}'
 # Task Plan — Structured Progress Tracking for SciAgentUI
 
 When working through the **web** channel (SciAgentUI dashboard), maintain a `task_plan.json`
-file in the workspace root. The dashboard reads this file to render structured progress
-in the task detail panel.
+file in your **Project Directory** (from Runtime Context). The dashboard reads this file to
+render structured progress in the task detail panel.
 
 ## Lifecycle
 
@@ -16,14 +16,17 @@ in the task detail panel.
 3. **Add results** to a step when it completes (metrics, findings, artifacts)
 4. **Mark completed** when the overall task finishes
 
-Use `write_file("task_plan.json", ...)` — always write the **full** JSON (not a patch).
+Write the file to: `write_file("projects/{Chat ID}/task_plan.json", ...)`
+Always write the **full** JSON (not a patch).
 
-## Schema
+## Schema — EXACT format required
+
+The UI parses this JSON strictly. Use ONLY these fields — do NOT add custom fields.
 
 ```json
 {
   "title": "Project or task title",
-  "pipeline_stage": "experiment",
+  "pipeline_stage": "ideation",
   "status": "in_progress",
   "started_at": "2026-03-22T12:00:00Z",
   "steps": [
@@ -44,11 +47,7 @@ Use `write_file("task_plan.json", ...)` — always write the **full** JSON (not 
     {
       "number": 2,
       "title": "Current step",
-      "status": "running",
-      "results": {
-        "metrics": { "steps_done": "7/10", "wall_time": "5h 50m" },
-        "findings": "Preliminary observation so far..."
-      }
+      "status": "running"
     },
     {
       "number": 3,
@@ -59,30 +58,42 @@ Use `write_file("task_plan.json", ...)` — always write the **full** JSON (not 
 }
 ```
 
-## Field reference
+## Required top-level fields
 
-| Field | Values | Meaning |
-|-------|--------|---------|
-| `pipeline_stage` | `ideation` · `planning` · `experiment` · `writing` | Current high-level research phase |
-| top-level `status` | `in_progress` · `completed` · `failed` | Overall task status |
-| step `status` | `pending` · `running` · `completed` · `failed` | Per-step status |
-| phase `status` | `pending` · `running` · `completed` | Per-phase status |
+| Field | Type | Values | Required |
+|-------|------|--------|----------|
+| `title` | `string` | — | YES |
+| `pipeline_stage` | `string` | `ideation` · `planning` · `experiment` · `writing` | YES |
+| `status` | `string` | `in_progress` · `completed` · `failed` | YES |
+| `started_at` | `string` | ISO 8601 datetime | YES |
+| `steps` | `array` | Array of step objects | YES |
 
-### Results object (per step)
+## Required step fields
+
+| Field | Type | Values | Required |
+|-------|------|--------|----------|
+| `number` | `integer` | Sequential from 1 | YES |
+| `title` | `string` | — | YES |
+| `status` | `string` | `pending` · `running` · `completed` · `failed` | YES |
+| `phases` | `array` | Phase objects (optional) | NO |
+| `results` | `object` | Results object (optional) | NO |
+
+## Results object (per step)
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `metrics` | `object` | Key-value pairs of numeric or string metrics (accuracy, loss, wall_time, etc.) |
-| `findings` | `string` | Brief summary of what was learned — displayed as text in the UI |
-| `artifacts` | `string[]` | Relative paths to output files (plots, CSVs, logs) — shown as links in the UI |
+| `metrics` | `object` | Key-value pairs of numeric or string metrics |
+| `findings` | `string` | Brief summary — displayed as text in the UI |
+| `artifacts` | `string[]` | Relative paths to output files — shown as links |
 
 ## Rules
 
 - Only **one step** should be `running` at a time
-- Steps are numbered sequentially starting from 1
-- Phases are optional — add them only when a step has meaningful sub-tasks
-- **Add `results` when a step completes** — include key metrics, a brief finding, and paths to artifacts
-- You can also add partial results to a `running` step (e.g., intermediate metrics)
+- Steps MUST have `number` (integer), `title`, and `status`
+- Do NOT add extra fields like `id`, `description`, `dependencies`, or `outputs`
+- Phases are optional — add only when a step has meaningful sub-tasks
+- **Add `results` when a step completes** — include key metrics, a brief finding, and artifact paths
+- You can add partial results to a `running` step (e.g., intermediate metrics)
 - Update `pipeline_stage` as the work progresses through research phases:
   - `ideation` — literature review, brainstorming, hypothesis formation
   - `planning` — experimental design, protocol setup
