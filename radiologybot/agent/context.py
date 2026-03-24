@@ -157,6 +157,46 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         return "\n\n".join(parts) if parts else ""
 
+    @staticmethod
+    def _sanitize_tool_pairs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Last-resort guard: strip assistant tool_calls that lack matching tool_results.
+
+        Prevents 400 errors from providers that strictly require every tool_use
+        to be immediately followed by its tool_result.
+        """
+        result: list[dict[str, Any]] = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected = {
+                    tc["id"]
+                    for tc in msg["tool_calls"]
+                    if isinstance(tc, dict) and tc.get("id")
+                }
+                j = i + 1
+                found: set[str] = set()
+                tool_msgs: list[dict[str, Any]] = []
+                while j < len(messages) and messages[j].get("role") == "tool":
+                    tid = messages[j].get("tool_call_id")
+                    if tid in expected:
+                        found.add(tid)
+                        tool_msgs.append(messages[j])
+                    j += 1
+
+                if found == expected and found:
+                    result.append(msg)
+                    result.extend(tool_msgs)
+                else:
+                    content = msg.get("content")
+                    if content:
+                        result.append({"role": "assistant", "content": content})
+                i = j if j > i + 1 else i + 1
+            else:
+                result.append(msg)
+                i += 1
+        return result
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -183,11 +223,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         if extra_system:
             system_prompt += "\n\n---\n\n" + extra_system
 
-        return [
+        return self._sanitize_tool_pairs([
             {"role": "system", "content": system_prompt},
             *history,
             {"role": "user", "content": merged},
-        ]
+        ])
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""

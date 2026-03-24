@@ -39,7 +39,7 @@ class WebChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: WebChannelConfig = config
         self.workspace: Path | None = workspace
-        self.projects_root: Path = Path("~/.sciagent/workspace").expanduser()
+        self.projects_root: Path = Path("~/.radiologybot/workspace").expanduser()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
         self._app: web.Application | None = None

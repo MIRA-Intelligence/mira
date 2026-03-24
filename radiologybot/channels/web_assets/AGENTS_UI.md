@@ -5,55 +5,75 @@ These instructions apply **only** when your Runtime Context shows `Channel: web`
 ## Project Directory
 
 - Your Runtime Context includes a **Project Directory** — an absolute path
-  like `/Users/x/.sciagent/workspace/PRJ-0001`.
+  like `/Users/x/.radiologybot/workspace/PRJ-0001`.
 - All project files — including `task_plan.json` — MUST be written under this directory.
-  Example: `write_file("/Users/x/.sciagent/workspace/PRJ-0001/task_plan.json", ...)`
+  Example: `write_file("/Users/x/.radiologybot/workspace/PRJ-0001/task_plan.json", ...)`
 - Create the project directory first if it does not exist.
 
 ## task_plan.json
 
 Maintain a `task_plan.json` file in your Project Directory so the dashboard can
-display structured progress. Read the schema from `skills/task_plan/SKILL.md` for
-the base format. The UI extends it with:
+display structured experiment progress. The UI is **experiment-centric** — it
+tracks a sequence of numbered experiments (Exp001, Exp002, ...), each following
+the scientific method.
 
-- A `stage` field on every step (one of: `research`, `planning`, `experiment`, `writing`)
-- A top-level `stage_data` object for stage-specific artifacts (see SKILL_UI below)
+## Experiment-by-Experiment Execution — MANDATORY
 
-## Phase-by-Phase Execution — MANDATORY
+You MUST work **one experiment at a time**. Each experiment follows:
 
-You MUST work **one pipeline phase at a time**. The 4-stage pipeline is:
+```
+Question → Hypothesis → Prediction → Experiment → Analysis → Conclusion
+```
 
-  `research → planning → experiment → writing`
+**CRITICAL RULE: After completing each experiment (or after it fails), you MUST
+STOP and return a summary. Do NOT proceed to the next experiment until the user
+explicitly says "continue" or gives further instructions.**
 
-**CRITICAL RULE: After completing each phase, you MUST STOP and return a summary
-to the user. Do NOT proceed to the next phase until the user explicitly says
-"continue" or gives further instructions.**
+### Workflow for each experiment
 
-The workflow for each phase:
+1. **Design**: Formulate a clear question, hypothesis, and prediction.
+   Create/update `task_plan.json` with the new experiment entry (status: `running`).
 
-1. **Start the phase**: Update `task_plan.json` with `pipeline_stage` set to the current phase.
-2. **Do the work for THIS phase ONLY**:
-   - `research`: Literature search, gap analysis, hypothesis formation. Populate `stage_data.research`.
-   - `planning`: Create a detailed execution plan with concrete steps.
-   - `experiment`: Execute ONE experiment step, record metrics and results.
-   - `writing`: Draft ONE section of the output document.
-3. **Update `task_plan.json`** with results, findings, and artifacts for completed steps.
-4. **STOP and report**: Return a concise summary of what was accomplished in this phase.
-   Include key findings, metrics, or decisions. End your response — do NOT make
-   further tool calls or start the next phase.
+2. **Execute**: Implement and run the experiment. Update `progress` in
+   `task_plan.json` if applicable (epoch counts, intermediate metrics).
+
+3. **Analyze**: Evaluate results against predictions. Fill in `results`,
+   `conclusion`, and `next` in `task_plan.json`. Set status to `completed`
+   or `failed`.
+
+4. **Report**: Return a concise summary to the user:
+   - What was the question/hypothesis?
+   - What happened? (key metrics)
+   - What does this mean? (conclusion)
+   - What should we do next? (proposed next experiment)
+   Then **STOP** — do not start the next experiment.
+
 5. **Wait**: The user (or the UI in auto-mode) will tell you when to continue.
 
-Example response at end of research phase:
+### Example response at end of an experiment
 
-> **Research phase complete.**
-> - Found 5 relevant papers on chest X-ray classification
-> - Key finding: DenseNet-121 achieves radiologist-level AUC
-> - Identified gap: limited multi-label classification studies
-> - Ready to proceed to **Planning** phase.
+> **Exp005 completed: Domain Gap Evaluation**
+> - **Question**: How large is the synthetic-to-real domain gap?
+> - **Results**: PixelMLP real SSIM=0.739 (gap=-20%), PiUNet real SSIM=0.756 (gap=-20%)
+> - **Conclusion**: Both models show ~20% domain gap. PiUNet slightly better on real data.
+> - **Proposed next**: Exp006 — Test normalization strategies to reduce domain gap.
 
-## What counts as "one phase"
+### Knowledge accumulation
 
-- **research**: All literature search and analysis for this project. Stop when you have enough background.
-- **planning**: The complete experimental design. Stop when the plan is written.
-- **experiment**: ONE experiment step (e.g., "run baseline model"). Stop after that step completes and results are recorded. The user will tell you to continue to the next experiment step.
-- **writing**: ONE section of the document. Stop after that section is drafted.
+When you discover something important that applies beyond the current experiment,
+add it to the `knowledge` array in `task_plan.json`. Examples:
+- "Zero-init fixes sigmoid dead zone for T2 output head"
+- "Per-sample normalization causes 55% of domain gap"
+- "Forward consistency is ineffective when physics equations are imprecise"
+
+### Experiment naming
+
+- Use sequential IDs: `Exp001`, `Exp002`, `Exp003`, ...
+- For variants/branches: `Exp005b`, `Exp005c` (set `parent: "Exp005"`)
+- Git commits: `ExpNNN: brief description`
+
+### Additional rules
+
+- This experiment-by-experiment protocol is **only** needed on the web channel.
+- Always write the **full** `task_plan.json` (not a patch).
+- Only one experiment should be `running` at a time.
