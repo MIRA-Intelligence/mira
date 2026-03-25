@@ -202,6 +202,9 @@ def onboard():
 
     sync_workspace_templates(workspace)
 
+    from medpilot.utils.env import setup_medpilot_env
+    setup_medpilot_env(workspace)
+
     console.print(f"\n{__logo__} medpilot is ready!")
     console.print("\nNext steps:")
     console.print("  1. Add your API key to [cyan]~/.medpilot/config.json[/cyan]")
@@ -277,6 +280,9 @@ def gateway(
         logging.basicConfig(level=logging.DEBUG)
 
     config = _load_runtime_config(config, workspace)
+
+    from medpilot.utils.env import auto_activate_env
+    auto_activate_env(config.workspace_path)
 
     console.print(f"{__logo__} Starting medpilot gateway on port {port}...")
     sync_workspace_templates(config.workspace_path)
@@ -467,6 +473,10 @@ def agent(
             workspace = os.getcwd()
 
     config = _load_runtime_config(config, workspace)
+    
+    from medpilot.utils.env import auto_activate_env
+    auto_activate_env(config.workspace_path)
+    
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
