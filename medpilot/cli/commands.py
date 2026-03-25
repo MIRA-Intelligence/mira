@@ -202,8 +202,6 @@ def onboard():
 
     sync_workspace_templates(workspace)
 
-    from medpilot.utils.env import setup_medpilot_env
-    setup_medpilot_env(workspace)
 
     console.print(f"\n{__logo__} medpilot is ready!")
     console.print("\nNext steps:")

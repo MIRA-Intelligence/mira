@@ -3,30 +3,6 @@ import sys
 import shutil
 import subprocess
 from pathlib import Path
-import typer
-from rich.console import Console
-
-console = Console()
-
-def setup_medpilot_env(workspace: Path):
-    """Check for and create medpilot virtual environment if missing."""
-    has_conda = shutil.which("conda") is not None
-    
-    if has_conda:
-        res = subprocess.run(["conda", "env", "list"], capture_output=True, text=True)
-        envs = [line.split()[0] for line in res.stdout.splitlines() if line and not line.startswith("#")]
-        if "medpilot" not in envs:
-            if typer.confirm("Conda environment 'medpilot' not found. Do you want to create it? (Recommended for workspace isolation)", default=True):
-                console.print("[cyan]Creating conda environment 'medpilot' (Python 3.11)...[/cyan]")
-                subprocess.run(["conda", "create", "-n", "medpilot", "python=3.11", "pip", "-y"])
-                console.print("[green]✓ Conda environment 'medpilot' created.[/green]")
-    else:
-        venv_path = workspace / "venv"
-        if not venv_path.exists():
-            if typer.confirm("Virtual environment not found. Do you want to create one at ~/.medpilot/venv?", default=True):
-                console.print("[cyan]Creating standard Python venv...[/cyan]")
-                subprocess.run([sys.executable, "-m", "venv", str(venv_path)])
-                console.print("[green]✓ Virtual environment created.[/green]")
 
 def auto_activate_env(workspace: Path):
     """Auto activate the medpilot environment for subprocesses by modifying PATH."""
@@ -55,4 +31,3 @@ def auto_activate_env(workspace: Path):
             if bin_dir not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
                 os.environ["VIRTUAL_ENV"] = str(venv_path)
-
