@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
-from radiologybot.agent.tools.filesystem import _resolve_path
-from radiologybot.agent.tools.shell import ExecTool
+from medpilot.agent.tools.filesystem import _resolve_path
+from medpilot.agent.tools.shell import ExecTool
 
 
 def test_resolve_path_inside_allowed_dir(tmp_path):
@@ -42,7 +42,7 @@ def test_resolve_path_outside_allowed_dir(tmp_path):
 def test_exec_tool_guard_command_safe():
     """Test that safe commands are allowed when restricted to workspace."""
     tool = ExecTool(restrict_to_workspace=True)
-    cwd = "/homes/dxli/Code/RadiologyBot"
+    cwd = "/homes/dxli/Code/MedPilot"
     
     assert tool._guard_command("ls -la", cwd) is None
     assert tool._guard_command("cat src/main.py", cwd) is None
@@ -52,7 +52,7 @@ def test_exec_tool_guard_command_safe():
 def test_exec_tool_guard_command_traversal():
     """Test that path traversal commands are blocked."""
     tool = ExecTool(restrict_to_workspace=True)
-    cwd = "/homes/dxli/Code/RadiologyBot"
+    cwd = "/homes/dxli/Code/MedPilot"
     
     blocked_msg = "Error: Command blocked by safety guard (path traversal detected)"
     
@@ -64,7 +64,7 @@ def test_exec_tool_guard_command_traversal():
 def test_exec_tool_guard_command_absolute_outside_cwd():
     """Test that absolute paths pointing outside cwd are blocked."""
     tool = ExecTool(restrict_to_workspace=True)
-    cwd = "/homes/dxli/Code/RadiologyBot"
+    cwd = "/homes/dxli/Code/MedPilot"
     
     blocked_msg = "Error: Command blocked by safety guard (path outside working dir)"
     
@@ -73,6 +73,6 @@ def test_exec_tool_guard_command_absolute_outside_cwd():
     assert tool._guard_command("cat /homes/dxli/Documents/file.txt", cwd) == blocked_msg
 
     # Note: Using absolute path within cwd should be allowed
-    inside_msg = tool._guard_command("cat /homes/dxli/Code/RadiologyBot/README.md", cwd)
+    inside_msg = tool._guard_command("cat /homes/dxli/Code/MedPilot/README.md", cwd)
     assert inside_msg is None
 

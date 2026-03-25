@@ -1,8 +1,8 @@
 from typing import Any
 
-from radiologybot.agent.routing import ModelRouter, RoutedProviderManager
-from radiologybot.config.schema import AgentDefaults
-from radiologybot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from medpilot.agent.routing import ModelRouter, RoutedProviderManager
+from medpilot.config.schema import AgentDefaults
+from medpilot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
 def _defaults(**overrides) -> AgentDefaults:
