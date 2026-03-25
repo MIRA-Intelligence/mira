@@ -50,9 +50,11 @@ class MemoryStore:
     def __init__(self, workspace: Path):
         from medpilot.config.paths import get_workspace_path
         import hashlib
+        from medpilot.utils.helpers import get_medpilot_dir
+
 
         self.project_workspace = workspace
-        self.memory_dir = ensure_dir(workspace / ".medpilot")
+        self.memory_dir = ensure_dir(get_medpilot_dir(workspace) / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
 

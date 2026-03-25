@@ -17,8 +17,8 @@ def test_memory_path_initialization(tmp_path, monkeypatch):
     assert store.global_memory_file == global_ws / "memory" / "MEMORY.md"
     
     assert store.project_workspace == project_ws
-    assert store.memory_dir == project_ws / ".medpilot"
-    assert store.memory_file == project_ws / ".medpilot" / "MEMORY.md"
+    assert store.memory_dir == project_ws / ".medpilot" / "memory"
+    assert store.memory_file == project_ws / ".medpilot" / "memory" / "MEMORY.md"
     
     # Check that backup is enabled since project != global
     assert store.backup_dir is not None

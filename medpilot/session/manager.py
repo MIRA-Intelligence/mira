@@ -10,7 +10,7 @@ from typing import Any
 from loguru import logger
 
 from medpilot.config.paths import get_legacy_sessions_dir
-from medpilot.utils.helpers import ensure_dir, safe_filename
+from medpilot.utils.helpers import ensure_dir, safe_filename, get_medpilot_dir
 
 
 @dataclass
@@ -79,7 +79,7 @@ class SessionManager:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.sessions_dir = ensure_dir(self.workspace / ".medpilot" / "sessions")
+        self.sessions_dir = ensure_dir(get_medpilot_dir(self.workspace) / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
 

@@ -20,7 +20,10 @@ class ContextBuilder:
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
     def __init__(self, workspace: Path):
+        from medpilot.utils.helpers import get_medpilot_dir
+        
         self.workspace = workspace
+        self.medpilot_dir = get_medpilot_dir(workspace)
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
@@ -72,6 +75,7 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
+        medpilot_path = str(self.medpilot_dir.expanduser().resolve())
         return f"""# medpilot 🐈
 
 You are medpilot, a helpful AI assistant.
@@ -81,9 +85,9 @@ You are medpilot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
-- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+- Long-term memory: {medpilot_path}/memory/MEMORY.md (write important facts here)
+- History log: {medpilot_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+- Custom skills: {medpilot_path}/skills/{{skill-name}}/SKILL.md
 
 {platform_policy}
 
@@ -111,7 +115,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
+            file_path = self.medpilot_dir / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
