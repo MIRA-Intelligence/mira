@@ -8,18 +8,24 @@ from medpilot.agent.tools.base import Tool
 
 
 def _resolve_path(
-    path: str, workspace: Path | None = None, allowed_dir: Path | None = None
+    path: str, workspace: Path | None = None, allowed_dirs: list[Path] | None = None
 ) -> Path:
     """Resolve path against workspace (if relative) and enforce directory restriction."""
     p = Path(path).expanduser()
     if not p.is_absolute() and workspace:
         p = workspace / p
     resolved = p.resolve()
-    if allowed_dir:
-        try:
-            resolved.relative_to(allowed_dir.resolve())
-        except ValueError:
-            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
+    if allowed_dirs:
+        is_allowed = False
+        for d in allowed_dirs:
+            try:
+                resolved.relative_to(d.resolve())
+                is_allowed = True
+                break
+            except ValueError:
+                continue
+        if not is_allowed:
+            raise PermissionError(f"Path {path} is outside allowed directories: {', '.join(str(d) for d in allowed_dirs)}")
     return resolved
 
 
@@ -31,6 +37,12 @@ class ReadFileTool(Tool):
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+
+        # Allow reading from BUILTIN_SKILLS_DIR if allowed_dir is set (sandbox active)
+        self._allowed_dirs = [allowed_dir] if allowed_dir else None
+        if self._allowed_dirs:
+            from medpilot.agent.skills import BUILTIN_SKILLS_DIR
+            self._allowed_dirs.append(BUILTIN_SKILLS_DIR)
 
     @property
     def name(self) -> str:
@@ -50,7 +62,7 @@ class ReadFileTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            file_path = _resolve_path(path, self._workspace, self._allowed_dirs)
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             if not file_path.is_file():
@@ -79,6 +91,7 @@ class WriteFileTool(Tool):
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        self._allowed_dirs = [allowed_dir] if allowed_dir else None
 
     @property
     def name(self) -> str:
@@ -101,7 +114,7 @@ class WriteFileTool(Tool):
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            file_path = _resolve_path(path, self._workspace, self._allowed_dirs)
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {file_path}"
@@ -117,6 +130,7 @@ class EditFileTool(Tool):
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        self._allowed_dirs = [allowed_dir] if allowed_dir else None
 
     @property
     def name(self) -> str:
@@ -140,7 +154,7 @@ class EditFileTool(Tool):
 
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            file_path = _resolve_path(path, self._workspace, self._allowed_dirs)
             if not file_path.exists():
                 return f"Error: File not found: {path}"
 
@@ -199,6 +213,12 @@ class ListDirTool(Tool):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
 
+        # Allow reading from BUILTIN_SKILLS_DIR if allowed_dir is set (sandbox active)
+        self._allowed_dirs = [allowed_dir] if allowed_dir else None
+        if self._allowed_dirs:
+            from medpilot.agent.skills import BUILTIN_SKILLS_DIR
+            self._allowed_dirs.append(BUILTIN_SKILLS_DIR)
+
     @property
     def name(self) -> str:
         return "list_dir"
@@ -217,7 +237,7 @@ class ListDirTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            dir_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            dir_path = _resolve_path(path, self._workspace, self._allowed_dirs)
             if not dir_path.exists():
                 return f"Error: Directory not found: {path}"
             if not dir_path.is_dir():

@@ -1,4 +1,4 @@
-# MedPilot
+# <img src="icon.ico" width="40" height="40" align="top"> MedPilot
 
 An open-source, ultra-lightweight AI assistant tailored specifically for **Medical AI Research**.
 
@@ -17,7 +17,7 @@ MedPilot comes pre-loaded with specialized medical skills:
 
 MedPilot goes beyond standard AI wrappers by implementing a robust, production-ready agent architecture:
 - **Intelligent Model Routing**: Dynamically routes sub-tasks, agent reasoning, and tool calls to the most appropriate AI models based on task complexity and context, ensuring optimal performance and cost-efficiency.
-- **Strict Workspace Sandboxing**: The agent operates within a highly secure, confined workspace directory. Built-in filesystem and shell execution guards actively block path traversals (e.g., `cd ..`, `../`) and unauthorized access to external absolute paths, guaranteeing the safety of the host system codes and data.
+- **Strict Workspace Sandboxing (Read/Write Separation)**: The agent operates within a highly secure, confined workspace directory. Built-in filesystem and shell execution guards actively block path traversals (e.g., `cd ..`, `../`) and unauthorized updates to external paths, guaranteeing the safety of the host system. Crucially, it employs a sophisticated Read/Write separation model—allowing the agent securely to read system-level built-in skills without permitting any unauthorized edits to framework source code.
 
 ## 🚀 Quick Start
 

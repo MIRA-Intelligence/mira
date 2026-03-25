@@ -11,12 +11,12 @@ def test_resolve_path_inside_allowed_dir(tmp_path):
     
     # Test absolute path inside allowed_dir
     inside_path_abs = allowed_dir / "test.txt"
-    resolved_abs = _resolve_path(str(inside_path_abs), workspace=allowed_dir, allowed_dir=allowed_dir)
+    resolved_abs = _resolve_path(str(inside_path_abs), workspace=allowed_dir, allowed_dirs=[allowed_dir])
     assert resolved_abs == inside_path_abs.resolve()
 
     # Test relative path inside workspace
     inside_path_rel = "test2.txt"
-    resolved_rel = _resolve_path(inside_path_rel, workspace=allowed_dir, allowed_dir=allowed_dir)
+    resolved_rel = _resolve_path(inside_path_rel, workspace=allowed_dir, allowed_dirs=[allowed_dir])
     assert resolved_rel == (allowed_dir / "test2.txt").resolve()
 
 
@@ -31,12 +31,12 @@ def test_resolve_path_outside_allowed_dir(tmp_path):
     
     # Absolute path outside
     with pytest.raises(PermissionError, match="is outside allowed directory"):
-        _resolve_path(str(outside_path), workspace=allowed_dir, allowed_dir=allowed_dir)
+        _resolve_path(str(outside_path), workspace=allowed_dir, allowed_dirs=[allowed_dir])
 
     # Relative path that traverses outside
     traversal_path = "../outside_workspace/secret.txt"
     with pytest.raises(PermissionError, match="is outside allowed directory"):
-        _resolve_path(traversal_path, workspace=allowed_dir, allowed_dir=allowed_dir)
+        _resolve_path(traversal_path, workspace=allowed_dir, allowed_dirs=[allowed_dir])
 
 
 def test_exec_tool_guard_command_safe():
