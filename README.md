@@ -99,4 +99,4 @@ Features to deploy MedPilot seamlessly to platforms like Telegram, Discord, Feis
 The foundational CLI framework of MedPilot is built heavily upon the [nanobot](https://github.com/HKUDS/nanobot). We sincerely thank the HKUDS team for their excellent open-source contribution to the community.
 
 ---
-*Developed for researchers, by researchers.*
+*Developed for researchers, by ECNU SKMR Lab.*

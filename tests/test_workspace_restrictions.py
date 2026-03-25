@@ -30,12 +30,12 @@ def test_resolve_path_outside_allowed_dir(tmp_path):
     outside_path = outside_dir / "secret.txt"
     
     # Absolute path outside
-    with pytest.raises(PermissionError, match="is outside allowed directory"):
+    with pytest.raises(PermissionError, match="is outside allowed directories"):
         _resolve_path(str(outside_path), workspace=allowed_dir, allowed_dirs=[allowed_dir])
 
     # Relative path that traverses outside
     traversal_path = "../outside_workspace/secret.txt"
-    with pytest.raises(PermissionError, match="is outside allowed directory"):
+    with pytest.raises(PermissionError, match="is outside allowed directories"):
         _resolve_path(traversal_path, workspace=allowed_dir, allowed_dirs=[allowed_dir])
 
 

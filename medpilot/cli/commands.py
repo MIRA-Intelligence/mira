@@ -210,7 +210,7 @@ def onboard():
     console.print("  1. Add your API key to [cyan]~/.medpilot/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print("  2. Chat: [cyan]medpilot agent -m \"Hello!\"[/cyan]")
-    console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/medpilot#-chat-apps[/dim]")
+    # console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/medpilot#-chat-apps[/dim]")
 
 
 
