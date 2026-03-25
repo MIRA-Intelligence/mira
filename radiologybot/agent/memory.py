@@ -20,7 +20,7 @@ _SAVE_MEMORY_TOOL = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save the memory consolidation result to persistent storage.",
+            "description": "Save the memory consolidation result to the local project storage.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -31,8 +31,8 @@ _SAVE_MEMORY_TOOL = [
                     },
                     "memory_update": {
                         "type": "string",
-                        "description": "Full updated long-term memory as markdown. Include all existing "
-                        "facts plus new ones. Return unchanged if nothing new.",
+                        "description": "Full updated local project memory as markdown. Include all existing "
+                        "project facts plus new ones. Return unchanged if nothing new.",
                     },
                 },
                 "required": ["history_entry", "memory_update"],
@@ -46,25 +46,63 @@ class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
 
     def __init__(self, workspace: Path):
-        self.memory_dir = ensure_dir(workspace / "memory")
-        self.memory_file = self.memory_dir / "MEMORY.md"
-        self.history_file = self.memory_dir / "HISTORY.md"
+        from radiologybot.config.paths import get_workspace_path
+        import hashlib
+
+        self.memory_dir = ensure_dir(workspace /".workspace"/ "memory")
+        self.memory_file = self.memory_dir /".workspace"/ "MEMORY.md"
+        self.history_file = self.memory_dir /".workspace"/ "HISTORY.md"
+
+        # Dual-track memory: track global memory as well
+        self.global_workspace = get_workspace_path(None)
+        self.global_memory_file = self.global_workspace / "memory" / "MEMORY.md"
+
+        # Isolated Project Backup: hash the absolute path to prevent collisions
+        if workspace.resolve() != self.global_workspace.resolve():
+            workspace_hash = hashlib.md5(str(workspace.resolve()).encode()).hexdigest()[:8]
+            backup_folder_name = f"{workspace.name}_{workspace_hash}"
+            self.backup_dir = ensure_dir(self.global_workspace / "project_backups" / backup_folder_name)
+            self.memory_backup_file = self.backup_dir / "MEMORY.md"
+            self.history_backup_file = self.backup_dir / "HISTORY.md"
+        else:
+            self.backup_dir = None
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
             return self.memory_file.read_text(encoding="utf-8")
+        # Fallback to backup if local was accidentally deleted
+        if self.backup_dir and self.memory_backup_file.exists():
+            return self.memory_backup_file.read_text(encoding="utf-8")
+        return ""
+
+    def read_global_term(self) -> str:
+        if self.memory_file != self.global_memory_file and self.global_memory_file.exists():
+            return self.global_memory_file.read_text(encoding="utf-8")
         return ""
 
     def write_long_term(self, content: str) -> None:
         self.memory_file.write_text(content, encoding="utf-8")
+        if self.backup_dir:
+            self.memory_backup_file.write_text(content, encoding="utf-8")
 
     def append_history(self, entry: str) -> None:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
+        if self.backup_dir:
+            with open(self.history_backup_file, "a", encoding="utf-8") as f:
+                f.write(entry.rstrip() + "\n\n")
 
     def get_memory_context(self) -> str:
-        long_term = self.read_long_term()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        global_term = self.read_global_term()
+        local_term = self.read_long_term()
+        
+        parts = []
+        if global_term:
+            parts.append(f"## Global System Memory (Rules & Guidelines)\n{global_term}")
+        if local_term:
+            parts.append(f"## Local Project Memory (Current Case/Context)\n{local_term}")
+            
+        return "\n\n".join(parts) if parts else ""
 
     async def consolidate(
         self,
@@ -102,9 +140,9 @@ class MemoryStore:
             lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
 
         current_memory = self.read_long_term()
-        prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
+        prompt = f"""Process this conversation and call the save_memory tool with your consolidation. Update the local project memory only.
 
-## Current Long-term Memory
+## Current Local Project Memory
 {current_memory or "(empty)"}
 
 ## Conversation to Process

@@ -462,6 +462,10 @@ def agent(
     from radiologybot.config.paths import get_cron_dir
     from radiologybot.cron.service import CronService
 
+    if workspace is None and sys.stdin.isatty():
+        if typer.confirm("Do you want to use the current directory as a project workspace?"):
+            workspace = os.getcwd()
+
     config = _load_runtime_config(config, workspace)
     sync_workspace_templates(config.workspace_path)
 

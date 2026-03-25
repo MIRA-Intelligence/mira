@@ -136,18 +136,26 @@ class ExecTool(Tool):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
         if self.restrict_to_workspace:
-            if re.search(r"(?:^|\s)\.\.(?:$|\s|/|\\)", cmd) or "..\\" in cmd or "../" in cmd:
+            if "..\\" in cmd or "../" in cmd:
                 return "Error: Command blocked by safety guard (path traversal detected)"
 
             cwd_path = Path(cwd).resolve()
+            
+            from radiologybot.config.paths import get_workspace_path
+            global_workspace = get_workspace_path(None).resolve()
 
             for raw in self._extract_absolute_paths(cmd):
                 try:
                     p = Path(raw.strip()).resolve()
                 except Exception:
                     continue
-                if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
-                    return "Error: Command blocked by safety guard (path outside working dir)"
+                if p.is_absolute():
+                    # Allow if it's within the current project workspace OR the global workspace
+                    in_project = (cwd_path in p.parents or p == cwd_path)
+                    in_global = (global_workspace in p.parents or p == global_workspace)
+                    
+                    if not (in_project or in_global):
+                        return f"Error: Command blocked by safety guard (path {raw} is outside Project {cwd_path} and Global {global_workspace} directories)"
 
         return None
 
