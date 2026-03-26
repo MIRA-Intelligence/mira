@@ -23,12 +23,16 @@ class CustomProvider(LLMProvider):
             default_headers={"x-session-affinity": uuid.uuid4().hex},
         )
 
+    _ALLOWED_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
+
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
                    reasoning_effort: str | None = None) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
-            "messages": self._sanitize_empty_content(messages),
+            "messages": self._sanitize_request_messages(
+                self._sanitize_empty_content(messages), self._ALLOWED_KEYS,
+            ),
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,
         }

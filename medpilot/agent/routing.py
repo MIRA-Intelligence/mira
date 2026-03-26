@@ -41,6 +41,7 @@ class RoutedModel:
 
     tier: str
     model: str
+    candidates: tuple[str, ...] = ()
     score: int | None = None
     source: str = "instinct"
     reason: str | None = None
@@ -65,13 +66,19 @@ class ModelRouter:
     @property
     def routing_model(self) -> str:
         """Return the model used only for routing judgment."""
-        return self.defaults.route_model or self.defaults.small_model or self.defaults.model
+        return self.defaults.primary_routing_model
+
+    @property
+    def routing_candidates(self) -> tuple[str, ...]:
+        """Return the candidate routing models used for routing judgment."""
+        return tuple(self.defaults.routing_model_candidates)
 
     def default_route(self, source: str = "default", reason: str | None = None) -> RoutedModel:
         """Return the default-model route."""
         return RoutedModel(
             tier="default",
-            model=self.defaults.model,
+            model=self.defaults.primary_model,
+            candidates=tuple(self.defaults.default_model_candidates),
             score=None,
             source=source,
             reason=reason,
@@ -82,18 +89,24 @@ class ModelRouter:
         messages: list[dict[str, Any]],
         iteration: int,
         provider: LLMProvider,
+        routing_model: str | None = None,
+        allow_default_fallback: bool = True,
     ) -> RoutedModel:
         """Use the small model to make a lightweight routing decision."""
         if not self.enabled:
             return self.default_route()
 
+        selected_routing_model = routing_model or self.routing_model
+
         response = await provider.chat(
             messages=self._build_instinct_messages(messages, iteration),
             tools=_ROUTE_TOOL,
-            model=self.routing_model,
+            model=selected_routing_model,
             max_tokens=120,
             temperature=0,
         )
+        if response.finish_reason == "error":
+            raise RuntimeError(response.content or f"Routing model '{selected_routing_model}' failed")
         if response.has_tool_calls:
             args = response.tool_calls[0].arguments
             tier = args.get("tier")
@@ -101,13 +114,17 @@ class ModelRouter:
                 return RoutedModel(
                     tier=tier,
                     model=self._model_for_tier(tier),
+                    candidates=tuple(self._candidates_for_tier(tier)),
                     source="instinct",
                     reason=args.get("reason"),
                 )
 
+        if not allow_default_fallback:
+            raise RuntimeError(f"Routing model '{selected_routing_model}' returned no valid tier")
+
         logger.warning(
             "Model router instinct judgment failed; falling back to default model '{}'",
-            self.defaults.model,
+            self.defaults.primary_model,
         )
         return self.default_route(source="fallback", reason="instinct_failed")
 
@@ -140,11 +157,10 @@ class ModelRouter:
         return ""
 
     def _model_for_tier(self, tier: str) -> str:
-        if tier == "small":
-            return self.defaults.small_model or self.defaults.model
-        if tier == "medium":
-            return self.defaults.medium_model or self.defaults.model
-        return self.defaults.large_model or self.defaults.model
+        return self.defaults.primary_model_for_tier(tier)
+
+    def _candidates_for_tier(self, tier: str) -> list[str]:
+        return self.defaults.tier_model_candidates(tier)
 
     def _build_instinct_messages(
         self,
@@ -198,6 +214,8 @@ class RoutedProviderManager:
         self._router = router
         self._provider_factory = provider_factory
         self._providers: dict[str, LLMProvider] = {default_model: default_provider}
+        self._successful_models: list[str] = []
+        self._failed_models: set[str] = set()
 
     async def resolve(self, messages: list[dict[str, Any]], iteration: int = 1) -> tuple[LLMProvider, RoutedModel]:
         """Return provider and routed model for the current turn."""
@@ -214,22 +232,143 @@ class RoutedProviderManager:
                 route.reason or "",
             )
         if model == self._default_model or not self._provider_factory:
-            return self._default_provider, RoutedModel(route.tier, model, route.score, route.source, route.reason)
+            return self._default_provider, RoutedModel(
+                route.tier,
+                model,
+                route.candidates,
+                route.score,
+                route.source,
+                route.reason,
+            )
         provider = self._providers.get(model)
         if provider is None:
             provider = self._provider_factory(model)
             self._providers[model] = provider
-        return provider, RoutedModel(route.tier, model, route.score, route.source, route.reason)
+        return provider, RoutedModel(
+            route.tier,
+            model,
+            route.candidates,
+            route.score,
+            route.source,
+            route.reason,
+        )
+
+    async def chat(
+        self,
+        route: RoutedModel,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+    ) -> tuple[LLMResponse, RoutedModel]:
+        """Call the routed model and fall back to configured backups on retryable errors."""
+        candidates = self._ordered_candidate_models(tuple(route.candidates) or (route.model,))
+        last_response: LLMResponse | None = None
+        last_error: Exception | None = None
+
+        for index, model in enumerate(candidates):
+            provider = self._provider_for_model(model)
+            try:
+                response = await provider.chat(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                )
+            except Exception as exc:
+                last_error = exc
+                self._mark_model_failed(model)
+                if index < len(candidates) - 1:
+                    logger.warning(
+                        "Model '{}' raised '{}'; trying fallback model '{}'",
+                        model,
+                        exc,
+                        candidates[index + 1],
+                    )
+                    continue
+                raise
+
+            if response.finish_reason != "error" or not self._should_retry_with_fallback(response.content):
+                if response.finish_reason == "error":
+                    self._mark_model_failed(model)
+                else:
+                    self._mark_model_success(model)
+                return response, RoutedModel(
+                    route.tier,
+                    model,
+                    candidates,
+                    route.score,
+                    route.source,
+                    route.reason,
+                )
+
+            last_response = response
+            self._mark_model_failed(model)
+            if index < len(candidates) - 1:
+                logger.warning(
+                    "Model '{}' failed with retryable error; trying fallback model '{}': {}",
+                    model,
+                    candidates[index + 1],
+                    (response.content or "")[:200],
+                )
+
+        if last_response is not None:
+            return LLMResponse(
+                content=(
+                    f"All candidate models failed for this turn. "
+                    f"Last error from '{candidates[-1]}': {last_response.content or 'unknown error'}"
+                ),
+                finish_reason="error",
+                usage=last_response.usage,
+                reasoning_content=last_response.reasoning_content,
+                thinking_blocks=last_response.thinking_blocks,
+            ), RoutedModel(
+                route.tier,
+                candidates[-1],
+                candidates,
+                route.score,
+                route.source,
+                route.reason,
+            )
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No candidate models available for chat completion")
 
     async def _select_route(self, messages: list[dict[str, Any]], iteration: int) -> RoutedModel:
         if not self._router:
-            return RoutedModel("default", self._default_model, source="default")
-        try:
-            instinct_provider = self._provider_for_model(self._router.routing_model)
-            return await self._router.route(messages, iteration, instinct_provider)
-        except Exception as exc:
-            logger.warning("Model router instinct path failed: {}", exc)
-            return self._router.default_route(source="fallback", reason="instinct_error")
+            return RoutedModel("default", self._default_model, (self._default_model,), source="default")
+
+        last_error: Exception | None = None
+        routing_candidates = self._ordered_candidate_models(self._router.routing_candidates)
+        for index, routing_model in enumerate(routing_candidates):
+            try:
+                instinct_provider = self._provider_for_model(routing_model)
+                route = await self._router.route(
+                    messages,
+                    iteration,
+                    instinct_provider,
+                    routing_model=routing_model,
+                    allow_default_fallback=False,
+                )
+                self._mark_model_success(routing_model)
+                return route
+            except Exception as exc:
+                last_error = exc
+                self._mark_model_failed(routing_model)
+                if index < len(routing_candidates) - 1:
+                    logger.warning(
+                        "Routing model '{}' failed; trying fallback routing model '{}': {}",
+                        routing_model,
+                        routing_candidates[index + 1],
+                        exc,
+                    )
+                    continue
+                logger.warning("Model router instinct path failed: {}", exc)
+
+        return self._router.default_route(source="fallback", reason="instinct_error")
 
     def _provider_for_model(self, model: str) -> LLMProvider:
         if model == self._default_model or not self._provider_factory:
@@ -239,3 +378,79 @@ class RoutedProviderManager:
             provider = self._provider_factory(model)
             self._providers[model] = provider
         return provider
+
+    def _ordered_candidate_models(self, candidates: tuple[str, ...]) -> tuple[str, ...]:
+        """Return session-local candidates ordered by recent success, with failures moved last."""
+        successful = [model for model in self._successful_models if model in candidates]
+        neutral = [
+            model for model in candidates if model not in successful and model not in self._failed_models
+        ]
+        failed = [
+            model for model in candidates if model not in successful and model in self._failed_models
+        ]
+        ordered = tuple(successful + neutral + failed)
+        if ordered != candidates:
+            logger.debug(
+                "Reordered candidate models for session: {} -> {}",
+                list(candidates),
+                list(ordered),
+            )
+        return ordered
+
+    def _mark_model_failed(self, model: str) -> None:
+        """Move a failing model to the back of session preference ordering."""
+        self._failed_models.add(model)
+        self._successful_models = [item for item in self._successful_models if item != model]
+
+    def _mark_model_success(self, model: str) -> None:
+        """Promote a successful model to the front of session preference ordering."""
+        self._failed_models.discard(model)
+        self._successful_models = [item for item in self._successful_models if item != model]
+        self._successful_models.insert(0, model)
+
+    @staticmethod
+    def _should_retry_with_fallback(error_text: str | None) -> bool:
+        """Return True when an error is likely transient or model-specific."""
+        if not error_text:
+            return True
+
+        error = error_text.lower()
+        non_retryable_markers = (
+            "authentication",
+            "unauthorized",
+            "invalid api key",
+            "incorrect api key",
+            "permission",
+            "forbidden",
+            "context length",
+            "maximum context length",
+            "unsupported parameter",
+            "invalid_request_error",
+            "bad request",
+            "tool schema",
+            "does not support tools",
+        )
+        if any(marker in error for marker in non_retryable_markers):
+            return False
+
+        retryable_markers = (
+            "rate limit",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "timeout",
+            "timed out",
+            "overloaded",
+            "overload",
+            "unavailable",
+            "temporar",
+            "capacity",
+            "busy",
+            "connection",
+            "network",
+            "try again",
+            "service unavailable",
+        )
+        return any(marker in error for marker in retryable_markers)

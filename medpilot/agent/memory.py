@@ -117,6 +117,14 @@ class MemoryStore:
             
         return "\n\n".join(parts) if parts else ""
 
+    @staticmethod
+    def _align_boundary_to_user(messages: list[dict], boundary: int) -> int:
+        """Move boundary backward to sit on a user message so the
+        unconsolidated window starts at a clean conversation turn."""
+        while boundary > 0 and messages[boundary].get("role") != "user":
+            boundary -= 1
+        return boundary
+
     async def consolidate(
         self,
         session: Session,
@@ -214,7 +222,14 @@ You MUST analyze the knowledge and separate it:
                 if work_update != current_global:
                     self.write_global_term(work_update)
 
-            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
+            if archive_all:
+                session.last_consolidated = 0
+            else:
+                boundary = len(session.messages) - keep_count
+                # Align boundary to a user message so the unconsolidated
+                # window never starts mid-tool-call-sequence.
+                boundary = self._align_boundary_to_user(session.messages, boundary)
+                session.last_consolidated = boundary
             logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
             return True
         except Exception:

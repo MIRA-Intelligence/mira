@@ -55,14 +55,24 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
-        self.provider_runtime = RoutedProviderManager(
-            default_provider=provider,
-            default_model=self.model,
-            router=model_router,
-            provider_factory=provider_factory,
-        )
+        self.provider_factory = provider_factory
+        self.model_router = model_router
+        self._session_runtimes: dict[str, RoutedProviderManager] = {}
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+
+    def _get_runtime(self, session_key: str) -> RoutedProviderManager:
+        """Return the session-local routed provider runtime for subagents."""
+        runtime = self._session_runtimes.get(session_key)
+        if runtime is None:
+            runtime = RoutedProviderManager(
+                default_provider=self.provider,
+                default_model=self.model,
+                router=self.model_router,
+                provider_factory=self.provider_factory,
+            )
+            self._session_runtimes[session_key] = runtime
+        return runtime
 
     async def spawn(
         self,
@@ -77,8 +87,9 @@ class SubagentManager:
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
+        runtime_key = session_key or f"subagent:{task_id}"
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin, self._get_runtime(runtime_key))
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -102,6 +113,7 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        provider_runtime: RoutedProviderManager,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -140,11 +152,11 @@ class SubagentManager:
                 iteration += 1
 
                 if active_provider is None or active_route is None:
-                    active_provider, active_route = await self.provider_runtime.resolve(messages, iteration)
-                response = await active_provider.chat(
+                    active_provider, active_route = await provider_runtime.resolve(messages, iteration)
+                response, active_route = await provider_runtime.chat(
+                    active_route,
                     messages=messages,
                     tools=tools.get_definitions(),
-                    model=active_route.model,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
@@ -229,11 +241,12 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
+<<<<<<< HEAD:medpilot/agent/subagent.py
         from medpilot.agent.context import ContextBuilder
-        from medpilot.agent.skills import SkillsLoader
 
+        context = ContextBuilder(self.workspace)
         time_ctx = ContextBuilder._build_runtime_context(None, None)
-        parts = [f"""# Subagent
+        parts = [context.build_system_prompt(), f"""# Subagent
 
 {time_ctx}
 
@@ -242,10 +255,6 @@ Stay focused on the assigned task. Your final response will be reported back to 
 
 ## Workspace
 {self.workspace}"""]
-
-        skills_summary = SkillsLoader(self.workspace).build_skills_summary()
-        if skills_summary:
-            parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
 
         return "\n\n".join(parts)
 
