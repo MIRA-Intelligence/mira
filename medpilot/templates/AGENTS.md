@@ -170,3 +170,5 @@ Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegr
 - **Rewrite**: `write_file` to replace all tasks
 
 When the user asks for a recurring/periodic task, update `HEARTBEAT.md` instead of creating a one-time cron reminder.
+
+---

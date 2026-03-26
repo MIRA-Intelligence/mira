@@ -1,0 +1,37 @@
+codecov:
+  require_ci_to_pass: true
+
+coverage:
+  precision: 2
+  round: down
+  range: "40...90"
+
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        target: 80%
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false
+
+ignore:
+  - "medpilot/cli/**"
+  - "medpilot/channels/dingtalk.py"
+  - "medpilot/channels/discord.py"
+  - "medpilot/channels/email.py"
+  - "medpilot/channels/feishu.py"
+  - "medpilot/channels/matrix.py"
+  - "medpilot/channels/mochat.py"
+  - "medpilot/channels/qq.py"
+  - "medpilot/channels/slack.py"
+  - "medpilot/channels/telegram.py"
+  - "medpilot/channels/whatsapp.py"
+  - "medpilot/heartbeat/**"
+  - "medpilot/providers/transcription.py"
+  - "medpilot/providers/custom_provider.py"

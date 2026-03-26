@@ -1,4 +1,4 @@
-from radiologybot.session.manager import Session
+from medpilot.session.manager import Session
 
 
 def test_get_history_returns_empty_when_window_has_no_user() -> None:

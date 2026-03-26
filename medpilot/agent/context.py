@@ -101,26 +101,105 @@ Your workspace is at: {workspace_path}
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
     @staticmethod
-    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+    def _build_runtime_context(
+        channel: str | None, chat_id: str | None, project_dir: str | None = None,
+    ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         tz = time.strftime("%Z") or "UTC"
         lines = [f"Current Time: {now} ({tz})"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+            if project_dir:
+                lines.append(f"Project Directory: {project_dir}")
+            elif channel == "web":
+                lines.append(f"Project Directory: projects/{chat_id}")
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
+    @staticmethod
+    def _load_builtin_template(filename: str) -> str | None:
+        """Load a built-in template from the medpilot package."""
+        from importlib.resources import files as pkg_files
+
+        try:
+            tpl_file = pkg_files("medpilot") / "templates" / filename
+            if tpl_file.is_file():
+                return tpl_file.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        return None
+
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """Load bootstrap files with override / append / fallback resolution.
+
+        Per file (e.g. AGENTS.md):
+          1. workspace/AGENTS.md exists  →  use it              (override)
+          2. else                        →  built-in template   (fallback)
+          3. workspace/AGENTS.local.md   →  append to base      (append)
+        """
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
-            file_path = self.medpilot_dir / filename
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+            stem = filename.rsplit(".", 1)[0]  # "AGENTS"
+
+            ws_file = self.workspace / filename
+            if ws_file.exists():
+                content = ws_file.read_text(encoding="utf-8")
+            else:
+                content = self._load_builtin_template(filename) or ""
+
+            if not content.strip():
+                continue
+
+            local_file = self.workspace / f"{stem}.local.md"
+            if local_file.exists():
+                extra = local_file.read_text(encoding="utf-8")
+                if extra.strip():
+                    content = content.rstrip() + "\n\n" + extra
+
+            parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    @staticmethod
+    def _sanitize_tool_pairs(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Last-resort guard: strip assistant tool_calls that lack matching tool_results.
+
+        Prevents 400 errors from providers that strictly require every tool_use
+        to be immediately followed by its tool_result.
+        """
+        result: list[dict[str, Any]] = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected = {
+                    tc["id"]
+                    for tc in msg["tool_calls"]
+                    if isinstance(tc, dict) and tc.get("id")
+                }
+                j = i + 1
+                found: set[str] = set()
+                tool_msgs: list[dict[str, Any]] = []
+                while j < len(messages) and messages[j].get("role") == "tool":
+                    tid = messages[j].get("tool_call_id")
+                    if tid in expected:
+                        found.add(tid)
+                        tool_msgs.append(messages[j])
+                    j += 1
+
+                if found == expected and found:
+                    result.append(msg)
+                    result.extend(tool_msgs)
+                else:
+                    content = msg.get("content")
+                    if content:
+                        result.append({"role": "assistant", "content": content})
+                i = j if j > i + 1 else i + 1
+            else:
+                result.append(msg)
+                i += 1
+        return result
 
     def build_messages(
         self,
@@ -130,9 +209,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        project_dir: str | None = None,
+        extra_system: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id)
+        runtime_ctx = self._build_runtime_context(channel, chat_id, project_dir)
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
@@ -142,11 +223,15 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
-        return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+        system_prompt = self.build_system_prompt(skill_names)
+        if extra_system:
+            system_prompt += "\n\n---\n\n" + extra_system
+
+        return self._sanitize_tool_pairs([
+            {"role": "system", "content": system_prompt},
             *history,
             {"role": "user", "content": merged},
-        ]
+        ])
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""

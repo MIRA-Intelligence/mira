@@ -150,6 +150,18 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning("Matrix channel not available: {}", e)
 
+        # Web channel
+        if self.config.channels.web.enabled:
+            try:
+                from medpilot.channels.web import WebChannel
+                self.channels["web"] = WebChannel(
+                    self.config.channels.web, self.bus,
+                    workspace=self.config.workspace_path,
+                )
+                logger.info("Web channel enabled")
+            except ImportError as e:
+                logger.warning("Web channel not available: {}", e)
+
         self._validate_allow_from()
 
     def _validate_allow_from(self) -> None:

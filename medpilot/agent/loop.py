@@ -486,11 +486,16 @@ class AgentLoop:
 
         history = session.get_history(max_messages=self.memory_window)
         model_runtime = self._get_model_runtime(key)
+        meta = msg.metadata or {}
+        project_dir = meta.get("project_dir")
+        extra_system = meta.get("_ui_system_instructions")
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            project_dir=project_dir,
+            extra_system=extra_system,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:

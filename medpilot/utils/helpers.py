@@ -31,9 +31,74 @@ def timestamp() -> str:
 
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
 
+
 def safe_filename(name: str) -> str:
     """Replace unsafe path characters with underscores."""
     return _UNSAFE_CHARS.sub("_", name).strip()
+
+
+def get_medpilot_dir(workspace: Path) -> Path:
+    """Return the medpilot state directory for a workspace."""
+    try:
+        from medpilot.config.paths import get_workspace_path
+
+        if workspace.resolve() == get_workspace_path(None).resolve():
+            return workspace
+    except Exception:
+        pass
+    return workspace / ".medpilot" if workspace.name != ".medpilot" else workspace
+
+
+# Bootstrap files resolved at runtime by ContextBuilder (fallback to built-in).
+# They are NOT copied to workspace on init/start — users create them only when
+# they want to override or append (.local.md) to the built-in templates.
+_RUNTIME_BOOTSTRAP = {"AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"}
+
+
+def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
+    """Sync bundled templates to workspace. Only creates missing files.
+
+    Bootstrap files (AGENTS.md, SOUL.md, …) are resolved at runtime via
+    ContextBuilder with fallback to built-in templates, so they are NOT
+    copied here.  Users can still create them in the workspace to override
+    or create ``<NAME>.local.md`` to append.
+    """
+    from importlib.resources import files as pkg_files
+
+    try:
+        tpl = pkg_files("medpilot") / "templates"
+    except Exception:
+        return []
+    if not tpl.is_dir():
+        return []
+
+    added: list[str] = []
+
+    def _write(src, dest: Path) -> None:
+        if dest.exists():
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(src.read_text(encoding="utf-8") if src else "", encoding="utf-8")
+        # Try to make path relative to workspace for cleaner logs
+        try:
+            added.append(str(dest.relative_to(workspace)))
+        except ValueError:
+            added.append(str(dest.name))
+
+    for item in tpl.iterdir():
+        if item.name.endswith(".md") and item.name not in _RUNTIME_BOOTSTRAP:
+            _write(item, workspace / item.name)
+
+    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
+    _write(None, workspace / "memory" / "HISTORY.md")
+    (workspace / "skills").mkdir(exist_ok=True)
+
+    if added and not silent:
+        from rich.console import Console
+
+        for name in added:
+            Console().print(f"  [dim]Created {name}[/dim]")
+    return added
 
 
 def split_message(content: str, max_len: int = 2000) -> list[str]:
@@ -66,53 +131,3 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
         chunks.append(content[:pos])
         content = content[pos:].lstrip()
     return chunks
-
-
-def get_medpilot_dir(workspace: Path) -> Path:
-    """Return the state directory for a workspace."""
-    try:
-        from medpilot.config.paths import get_workspace_path
-        if workspace.resolve() == get_workspace_path(None).resolve():
-            return workspace
-    except Exception:
-        pass
-    return workspace / ".medpilot" if workspace.name != ".medpilot" else workspace
-
-
-def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
-    """Sync bundled templates to the agent state directory. Only creates missing files."""
-    from importlib.resources import files as pkg_files
-    try:
-        tpl = pkg_files("medpilot") / "templates"
-    except Exception:
-        return []
-    if not tpl.is_dir():
-        return []
-
-    added: list[str] = []
-    medpilot_dir = get_medpilot_dir(workspace)
-
-    def _write(src, dest: Path):
-        if dest.exists():
-            return
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(src.read_text(encoding="utf-8") if src else "", encoding="utf-8")
-        # Try to make path relative to workspace for cleaner logs
-        try:
-            added.append(str(dest.relative_to(workspace)))
-        except ValueError:
-            added.append(str(dest.name))
-
-    for item in tpl.iterdir():
-        if item.name.endswith(".md"):
-            _write(item, medpilot_dir / item.name)
-            
-    _write(tpl / "memory" / "MEMORY.md", medpilot_dir / "memory" / "MEMORY.md")
-    _write(None, medpilot_dir / "memory" / "HISTORY.md")
-    (medpilot_dir / "skills").mkdir(parents=True, exist_ok=True)
-
-    if added and not silent:
-        from rich.console import Console
-        for name in added:
-            Console().print(f"  [dim]Created {name}[/dim]")
-    return added
