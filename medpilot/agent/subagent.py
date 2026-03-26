@@ -241,7 +241,6 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
-<<<<<<< HEAD:medpilot/agent/subagent.py
         from medpilot.agent.context import ContextBuilder
 
         context = ContextBuilder(self.workspace)
