@@ -11,6 +11,7 @@ from medpilot.channels.base import BaseChannel
 from medpilot.channels import web as web_channel_mod
 from medpilot.channels.web import PLAN_FILENAME, WebChannel, _load_ui_instructions
 from medpilot.config.schema import WebChannelConfig
+from medpilot.session.manager import SessionManager
 
 
 def _minimal_base_init(self, config, bus) -> None:
@@ -83,6 +84,80 @@ async def test_handle_plan_invalid_json_returns_500(web_channel: WebChannel) -> 
     assert resp.status == 500
     body = json.loads(resp.text)
     assert "error" in body
+
+
+async def test_handle_history_returns_entries(web_channel: WebChannel) -> None:
+    session_id = "PRJ-0001"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    manager = SessionManager(project_dir)
+    session = manager.get_or_create(f"web:{session_id}")
+    session.messages = [
+        {"role": "user", "content": "hello", "timestamp": "2026-03-26T10:00:00"},
+        {
+            "role": "assistant",
+            "content": "Working on it",
+            "timestamp": "2026-03-26T10:00:01",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{\"path\":\"x\"}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "write_file", "content": "ok", "timestamp": "2026-03-26T10:00:02"},
+        {"role": "assistant", "content": "Done", "timestamp": "2026-03-26T10:00:03"},
+    ]
+    manager.save(session)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": session_id}
+    resp = await web_channel._handle_history(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["session_id"] == session_id
+    assert body["entries"] == [
+        {
+            "id": f"history-{session_id}-0-user",
+            "timestamp": "2026-03-26T10:00:00",
+            "content": "hello",
+            "type": "response",
+            "metadata": {"_user": True},
+        },
+        {
+            "id": f"history-{session_id}-1-assistant",
+            "timestamp": "2026-03-26T10:00:01",
+            "content": "Working on it",
+            "type": "response",
+            "metadata": {},
+        },
+        {
+            "id": f"history-{session_id}-1-tool-0",
+            "timestamp": "2026-03-26T10:00:01",
+            "content": "write_file({\"path\":\"x\"})",
+            "type": "tool_call",
+            "metadata": {},
+        },
+        {
+            "id": f"history-{session_id}-3-assistant",
+            "timestamp": "2026-03-26T10:00:03",
+            "content": "Done",
+            "type": "response",
+            "metadata": {},
+        },
+    ]
+
+
+async def test_handle_history_missing_project_returns_empty(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "missing"}
+    resp = await web_channel._handle_history(req)
+
+    assert resp.status == 200
+    assert json.loads(resp.text) == {"session_id": "missing", "entries": []}
 
 
 async def test_handle_config_invalid_json(web_channel: WebChannel) -> None:

@@ -16,6 +16,7 @@ from medpilot.bus.events import OutboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.channels.base import BaseChannel
 from medpilot.config.schema import WebChannelConfig
+from medpilot.session.manager import SessionManager
 
 PLAN_FILENAME = "task_plan.json"
 _ASSETS_DIR = Path(__file__).parent / "web_assets"
@@ -29,6 +30,47 @@ def _load_ui_instructions() -> str:
         if fp.is_file():
             parts.append(fp.read_text(encoding="utf-8"))
     return "\n\n---\n\n".join(parts)
+
+
+def _stringify_history_content(content: Any) -> str:
+    """Flatten session content into a UI-friendly text payload."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif item.get("type") == "image_url":
+                parts.append("[image]")
+        return "\n".join(part for part in parts if part).strip()
+    if content is None:
+        return ""
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, ensure_ascii=False)
+    return str(content)
+
+
+def _format_tool_call(tool_call: dict[str, Any]) -> str:
+    """Render a tool call in the same compact form shown in logs."""
+    fn = tool_call.get("function") if isinstance(tool_call, dict) else None
+    if isinstance(fn, dict):
+        name = fn.get("name") or "tool"
+        args = fn.get("arguments")
+    else:
+        name = tool_call.get("name") or "tool"
+        args = tool_call.get("arguments")
+
+    if isinstance(args, str):
+        args_str = args.strip()
+    elif args is None:
+        args_str = ""
+    else:
+        args_str = json.dumps(args, ensure_ascii=False)
+
+    return f"{name}({args_str})" if args_str else f"{name}()"
 
 
 class WebChannel(BaseChannel):
@@ -145,6 +187,7 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/ws", self._ws_handler)
         self._app.router.add_get("/api/status", self._handle_status)
         self._app.router.add_get("/api/sessions", self._handle_sessions)
+        self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
         self._app.router.add_get("/api/plan", self._handle_plan)
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
@@ -305,6 +348,64 @@ class WebChannel(BaseChannel):
             for sid, ws in self._clients.items()
         ]
         return web.json_response({"sessions": sessions})
+
+    def _load_history_entries(self, session_id: str) -> list[dict[str, Any]]:
+        project_dir = self.projects_root / session_id
+        if not project_dir.is_dir():
+            return []
+
+        session = SessionManager(project_dir).get_or_create(f"web:{session_id}")
+        entries: list[dict[str, Any]] = []
+
+        for idx, msg in enumerate(session.messages):
+            timestamp = msg.get("timestamp") or ""
+            role = msg.get("role")
+
+            if role == "user":
+                content = _stringify_history_content(msg.get("content"))
+                if not content:
+                    continue
+                entries.append({
+                    "id": f"history-{session_id}-{idx}-user",
+                    "timestamp": timestamp,
+                    "content": content,
+                    "type": "response",
+                    "metadata": {"_user": True},
+                })
+                continue
+
+            if role == "assistant":
+                content = _stringify_history_content(msg.get("content"))
+                if content:
+                    entries.append({
+                        "id": f"history-{session_id}-{idx}-assistant",
+                        "timestamp": timestamp,
+                        "content": content,
+                        "type": "response",
+                        "metadata": {},
+                    })
+
+                for tool_idx, tool_call in enumerate(msg.get("tool_calls") or []):
+                    if not isinstance(tool_call, dict):
+                        continue
+                    entries.append({
+                        "id": f"history-{session_id}-{idx}-tool-{tool_idx}",
+                        "timestamp": timestamp,
+                        "content": _format_tool_call(tool_call),
+                        "type": "tool_call",
+                        "metadata": {},
+                    })
+
+        return entries
+
+    async def _handle_history(self, request: web.Request) -> web.Response:
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        return web.json_response({
+            "session_id": session_id,
+            "entries": self._load_history_entries(session_id),
+        })
 
     async def _handle_config(self, request: web.Request) -> web.Response:
         """Allow the UI to configure the projects root path."""
