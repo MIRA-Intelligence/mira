@@ -86,6 +86,46 @@ async def test_handle_plan_invalid_json_returns_500(web_channel: WebChannel) -> 
     assert "error" in body
 
 
+async def test_handle_plan_recovers_completed_experiment_from_outputs(web_channel: WebChannel) -> None:
+    session = "PRJ-0001"
+    project_dir = web_channel.projects_root / session
+    (project_dir / "outputs" / "exp004").mkdir(parents=True)
+    (project_dir / "outputs" / "exp004" / "results.json").write_text(
+        json.dumps({"score": 0.95}),
+        encoding="utf-8",
+    )
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps({
+            "title": "demo",
+            "core_question": "q",
+            "status": "in_progress",
+            "started_at": "2026-03-24T12:00:00Z",
+            "current_experiment": "Exp003",
+            "research": {},
+            "experiments": [
+                {"id": "Exp003", "title": "done", "status": "completed"},
+                {"id": "Exp004", "title": "recover", "status": "pending"},
+                {"id": "Exp005", "title": "next", "status": "pending"},
+            ],
+            "knowledge": [],
+            "result": {},
+        }),
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    resp = await web_channel._handle_plan(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    exp004 = body["experiments"][1]
+    assert exp004["status"] == "completed"
+    assert exp004["results"]["metrics"] == {"score": 0.95}
+    assert exp004["results"]["artifacts"] == ["outputs/exp004/results.json"]
+    assert body["current_experiment"] == "Exp005"
+
+
 async def test_handle_history_returns_entries(web_channel: WebChannel) -> None:
     session_id = "PRJ-0001"
     project_dir = web_channel.projects_root / session_id

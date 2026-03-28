@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,69 @@ def _format_tool_call(tool_call: dict[str, Any]) -> str:
         args_str = json.dumps(args, ensure_ascii=False)
 
     return f"{name}({args_str})" if args_str else f"{name}()"
+
+
+def _load_json_file(path: Path) -> Any | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _collect_output_artifacts(project_dir: Path, exp_id: str) -> list[str]:
+    output_dir = project_dir / "outputs" / exp_id.lower()
+    if not output_dir.is_dir():
+        return []
+    return sorted(
+        str(path.relative_to(project_dir))
+        for path in output_dir.rglob("*")
+        if path.is_file()
+    )
+
+
+def _latest_experiment_commit(project_dir: Path, exp_id: str) -> str | None:
+    if not (project_dir / ".git").is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "log", "--format=%H", "--grep", exp_id, "-i", "-n", "1"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    commit = result.stdout.strip().splitlines()
+    if not commit:
+        return None
+    return commit[0][:7]
+
+
+def _merge_recovered_results(existing: Any, recovered_metrics: Any, artifacts: list[str]) -> dict[str, Any]:
+    results = dict(existing) if isinstance(existing, dict) else {}
+
+    if recovered_metrics is not None and "metrics" not in results:
+        if isinstance(recovered_metrics, dict) and any(
+            key in recovered_metrics for key in ("metrics", "findings", "artifacts")
+        ):
+            for key, value in recovered_metrics.items():
+                results.setdefault(key, value)
+        else:
+            results["metrics"] = recovered_metrics
+
+    existing_artifacts = results.get("artifacts")
+    artifact_list = list(existing_artifacts) if isinstance(existing_artifacts, list) else []
+    merged_artifacts = sorted({*artifact_list, *artifacts})
+    if merged_artifacts:
+        results["artifacts"] = merged_artifacts
+
+    if not results.get("findings") and recovered_metrics is not None:
+        results["findings"] = "Recovered experiment output from existing workspace artifacts."
+
+    return results
 
 
 class WebChannel(BaseChannel):
@@ -250,6 +314,84 @@ class WebChannel(BaseChannel):
         except Exception as e:
             logger.warning("Failed to send to {}: {}", msg.chat_id, e)
 
+    def _reconcile_plan_data(self, project_dir: Path, data: dict[str, Any]) -> bool:
+        experiments = data.get("experiments")
+        if not isinstance(experiments, list):
+            return False
+
+        changed = False
+        for exp in experiments:
+            if not isinstance(exp, dict):
+                continue
+
+            exp_id = exp.get("id")
+            if not isinstance(exp_id, str) or not exp_id:
+                continue
+
+            results_path = project_dir / "outputs" / exp_id.lower() / "results.json"
+            recovered_metrics = _load_json_file(results_path) if results_path.is_file() else None
+            if recovered_metrics is None:
+                continue
+
+            if exp.get("status") != "completed":
+                exp["status"] = "completed"
+                changed = True
+
+            merged_results = _merge_recovered_results(
+                exp.get("results"),
+                recovered_metrics,
+                _collect_output_artifacts(project_dir, exp_id),
+            )
+            if exp.get("results") != merged_results:
+                exp["results"] = merged_results
+                changed = True
+
+            if not exp.get("commit"):
+                commit = _latest_experiment_commit(project_dir, exp_id)
+                if commit:
+                    exp["commit"] = commit
+                    changed = True
+
+            if not exp.get("conclusion"):
+                exp["conclusion"] = "Recovered completed state from existing experiment artifacts."
+                changed = True
+
+        if not any(isinstance(exp, dict) and exp.get("status") == "running" for exp in experiments):
+            pending = next(
+                (exp.get("id") for exp in experiments if isinstance(exp, dict) and exp.get("status") == "pending"),
+                None,
+            )
+            current = data.get("current_experiment")
+            if pending and current != pending:
+                data["current_experiment"] = pending
+                changed = True
+
+        return changed
+
+    def _load_plan_data(self, session_id: str, *, reconcile: bool = True) -> dict[str, Any] | None:
+        project_dir = self.projects_root / session_id
+        plan_path = project_dir / PLAN_FILENAME
+        if not plan_path.is_file():
+            return None
+
+        try:
+            data = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"Failed to read {plan_path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"Unexpected non-object JSON in {plan_path}")
+
+        if reconcile and self._reconcile_plan_data(project_dir, data):
+            try:
+                plan_path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.warning("Failed to write reconciled {}: {}", plan_path, exc)
+
+        return data
+
     # ── CORS middleware ──────────────────────────────────────────────
 
     @web.middleware
@@ -307,6 +449,10 @@ class WebChannel(BaseChannel):
                     continue
 
                 self._clients[session_id] = ws
+                try:
+                    self._load_plan_data(session_id)
+                except ValueError as exc:
+                    logger.warning(str(exc))
 
                 project_dir = str(self.projects_root / session_id)
                 metadata: dict[str, Any] = {
@@ -426,20 +572,17 @@ class WebChannel(BaseChannel):
     async def _handle_plan(self, request: web.Request) -> web.Response:
         """Serve task_plan.json, scoped to a project when session_id is given."""
         session_id = request.query.get("session_id")
-        if session_id:
-            plan_path = self.projects_root / session_id / PLAN_FILENAME
-        else:
-            return web.json_response(None)
-
-        if not plan_path.is_file():
+        if not session_id:
             return web.json_response(None)
 
         try:
-            data = json.loads(plan_path.read_text(encoding="utf-8"))
-            return web.json_response(data)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to read {}: {}", plan_path, exc)
+            data = self._load_plan_data(session_id)
+        except ValueError as exc:
+            logger.warning(str(exc))
             return web.json_response({"error": str(exc)}, status=500)
+        if data is None:
+            return web.json_response(None)
+        return web.json_response(data)
 
     _NON_PROJECT_DIRS = {"skills", "memory", "sessions", "media", "cron", "logs"}
 
