@@ -66,6 +66,11 @@ Always write the **full** JSON (not a patch).
         "current_metric": "val_ssim",
         "current_value": 0.92
       }
+    },
+    {
+      "id": "Exp004",
+      "title": "Normalization ablation",
+      "status": "pending"
     }
   ],
   "knowledge": [
@@ -132,9 +137,9 @@ Always write the **full** JSON (not a patch).
 | `id` | `string` (e.g. `Exp001`, `Exp005b`) | YES |
 | `title` | `string` | YES |
 | `status` | `string` (`pending` / `running` / `completed` / `failed`) | YES |
-| `question` | `string` | YES |
-| `hypothesis` | `string` | YES |
-| `prediction` | `string` | YES |
+| `question` | `string` | NO for `pending`, YES once running/completed |
+| `hypothesis` | `string` | NO for `pending`, YES once running/completed |
+| `prediction` | `string` | NO for `pending`, YES once running/completed |
 | `method` | `string` | NO |
 | `results` | `object` (`metrics`, `findings`, `artifacts`) | NO |
 | `conclusion` | `string` | NO |
@@ -155,8 +160,12 @@ Always write the **full** JSON (not a patch).
 ## Rules
 
 - Populate `research` early — add references and notes during the research phase
+- After research, pre-populate `experiments` with the planned queue using
+  `pending` entries so the UI can show upcoming experiments before execution
 - Only **one experiment** should be `running` at a time
 - Each experiment follows: question → hypothesis → prediction → experiment → analysis
+- When a `pending` experiment begins, update the existing entry instead of
+  appending a duplicate experiment with the same ID
 - Update `current_experiment` when starting a new experiment
 - Add to `knowledge[]` when you discover something broadly applicable
 - Populate `result` when generating final deliverables
