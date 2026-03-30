@@ -20,6 +20,31 @@ def _minimal_base_init(self, config, bus) -> None:
     self._running = False
 
 
+class _FakePart:
+    def __init__(self, name: str, filename: str | None, chunks: list[bytes]) -> None:
+        self.name = name
+        self.filename = filename
+        self._chunks = list(chunks)
+
+    async def read_chunk(self) -> bytes:
+        if self._chunks:
+            return self._chunks.pop(0)
+        return b""
+
+    async def release(self) -> None:
+        self._chunks.clear()
+
+
+class _FakeMultipart:
+    def __init__(self, parts: list[_FakePart]) -> None:
+        self._parts = list(parts)
+
+    async def next(self) -> _FakePart | None:
+        if not self._parts:
+            return None
+        return self._parts.pop(0)
+
+
 @pytest.fixture
 def web_channel(tmp_path: Path) -> WebChannel:
     config = MagicMock(spec=WebChannelConfig)
@@ -227,6 +252,50 @@ async def test_handle_config_unchanged_without_key(web_channel: WebChannel, tmp_
     resp = await web_channel._handle_config(req)
     assert resp.status == 200
     assert json.loads(resp.text)["projects_root"] == str(tmp_path)
+
+
+async def test_handle_upload_project_files_invalid_multipart(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.multipart = AsyncMock(side_effect=RuntimeError("bad form"))
+
+    resp = await web_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "expected multipart/form-data"}
+
+
+async def test_handle_upload_project_files_missing_files(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="metadata", filename="ignored.txt", chunks=[b"abc"]),
+    ]))
+
+    resp = await web_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "no files uploaded"}
+
+
+async def test_handle_upload_project_files_writes_data_files(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="sample.csv", chunks=[b"a,", b"b\n"]),
+        _FakePart(name="files", filename="sample.csv", chunks=[b"c,d\n"]),
+    ]))
+
+    resp = await web_channel._handle_upload_project_files(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["session_id"] == "PRJ-0001"
+    assert body["uploaded"] == [
+        {"name": "sample.csv", "path": "data/sample.csv", "size": 4},
+        {"name": "sample_1.csv", "path": "data/sample_1.csv", "size": 4},
+    ]
+
+    data_dir = web_channel.projects_root / "PRJ-0001" / "data"
+    assert (data_dir / "sample.csv").read_bytes() == b"a,b\n"
+    assert (data_dir / "sample_1.csv").read_bytes() == b"c,d\n"
 
 
 async def test_send_delivers_json_to_open_socket(web_channel: WebChannel) -> None:

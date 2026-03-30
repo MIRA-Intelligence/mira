@@ -113,6 +113,27 @@ def _latest_experiment_commit(project_dir: Path, exp_id: str) -> str | None:
     return commit[0][:7]
 
 
+def _safe_upload_name(filename: str) -> str:
+    """Normalize incoming filenames to a basename-only safe value."""
+    return Path(filename).name.strip().replace("\x00", "")
+
+
+def _next_available_path(base_dir: Path, filename: str) -> Path:
+    """Return a non-colliding destination path inside *base_dir*."""
+    candidate = base_dir / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = Path(filename).stem or "file"
+    suffix = Path(filename).suffix
+    idx = 1
+    while True:
+        alt = base_dir / f"{stem}_{idx}{suffix}"
+        if not alt.exists():
+            return alt
+        idx += 1
+
+
 def _merge_recovered_results(existing: Any, recovered_metrics: Any, artifacts: list[str]) -> dict[str, Any]:
     results = dict(existing) if isinstance(existing, dict) else {}
 
@@ -256,6 +277,7 @@ class WebChannel(BaseChannel):
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
+        self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -632,3 +654,68 @@ class WebChannel(BaseChannel):
         except OSError as exc:
             logger.warning("Failed to delete {}: {}", project_dir, exc)
             return web.json_response({"error": str(exc)}, status=500)
+
+    async def _handle_upload_project_files(self, request: web.Request) -> web.Response:
+        """Upload files into projects_root/<session_id>/data for web clients."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        try:
+            multipart = await request.multipart()
+        except Exception:
+            return web.json_response({"error": "expected multipart/form-data"}, status=400)
+
+        project_dir = self.projects_root / session_id
+        data_dir = project_dir / "data"
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to create upload directory {}: {}", data_dir, exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+        uploaded: list[dict[str, Any]] = []
+
+        while True:
+            part = await multipart.next()
+            if part is None:
+                break
+            if part.name != "files":
+                await part.release()
+                continue
+            if not part.filename:
+                await part.release()
+                continue
+
+            safe_name = _safe_upload_name(part.filename)
+            if not safe_name:
+                await part.release()
+                continue
+
+            target = _next_available_path(data_dir, safe_name)
+            size = 0
+            try:
+                with target.open("wb") as f:
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        size += len(chunk)
+            except OSError as exc:
+                logger.warning("Failed to write uploaded file {}: {}", target, exc)
+                return web.json_response({"error": str(exc)}, status=500)
+
+            uploaded.append({
+                "name": target.name,
+                "path": str(target.relative_to(project_dir)),
+                "size": size,
+            })
+
+        if not uploaded:
+            return web.json_response({"error": "no files uploaded"}, status=400)
+
+        return web.json_response({
+            "session_id": session_id,
+            "uploaded": uploaded,
+        })
