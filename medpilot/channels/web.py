@@ -278,6 +278,7 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
         self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
+        self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -719,3 +720,28 @@ class WebChannel(BaseChannel):
             "session_id": session_id,
             "uploaded": uploaded,
         })
+
+    async def _handle_project_artifact(self, request: web.Request) -> web.Response:
+        """Serve a project file under projects_root/<session_id> by relative path."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        rel_path = request.query.get("path", "").strip()
+        if not rel_path:
+            return web.json_response({"error": "path required"}, status=400)
+
+        project_dir = (self.projects_root / session_id).resolve()
+        if not project_dir.is_dir():
+            return web.json_response({"error": "project not found"}, status=404)
+
+        candidate = (project_dir / rel_path).resolve()
+        try:
+            candidate.relative_to(project_dir)
+        except ValueError:
+            return web.json_response({"error": "invalid artifact path"}, status=400)
+
+        if not candidate.is_file():
+            return web.json_response({"error": "artifact not found"}, status=404)
+
+        return web.FileResponse(candidate)

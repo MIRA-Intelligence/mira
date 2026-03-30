@@ -298,6 +298,37 @@ async def test_handle_upload_project_files_writes_data_files(web_channel: WebCha
     assert (data_dir / "sample_1.csv").read_bytes() == b"c,d\n"
 
 
+async def test_handle_project_artifact_serves_file(web_channel: WebChannel) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0001"
+    artifact = project_dir / "experiments" / "exp005" / "roc_pr_curves.png"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"png")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {"path": "experiments/exp005/roc_pr_curves.png"}
+
+    resp = await web_channel._handle_project_artifact(req)
+    assert isinstance(resp, web.FileResponse)
+    assert resp.status == 200
+    assert Path(resp._path) == artifact
+
+
+async def test_handle_project_artifact_blocks_traversal(web_channel: WebChannel, tmp_path: Path) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0001"
+    project_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x", encoding="utf-8")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {"path": "../outside.txt"}
+
+    resp = await web_channel._handle_project_artifact(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "invalid artifact path"}
+
+
 async def test_send_delivers_json_to_open_socket(web_channel: WebChannel) -> None:
     ws = MagicMock()
     ws.closed = False
