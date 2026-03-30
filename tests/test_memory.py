@@ -119,6 +119,57 @@ async def test_consolidate_no_tool_calls_returns_false(tmp_path) -> None:
     provider.chat = AsyncMock(return_value=LLMResponse(content="nope", tool_calls=[]))
     ok = await store.consolidate(session, provider, "m", memory_window=50)
     assert ok is False
+    assert provider.chat.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_consolidate_retries_and_then_succeeds(tmp_path) -> None:
+    store = MemoryStore(tmp_path)
+    messages = [{"role": "user", "content": "x", "timestamp": "2025-01-01T12:00:00"}] * 30
+    session = Session(key="t:1", messages=messages, last_consolidated=0)
+    provider = MagicMock()
+    provider.chat = AsyncMock(
+        side_effect=[
+            LLMResponse(content="first attempt without tool", tool_calls=[]),
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="1",
+                        name="save_memory",
+                        arguments={
+                            "history_entry": "entry",
+                            "project_memory_update": "project memory",
+                        },
+                    )
+                ],
+            ),
+        ]
+    )
+
+    ok = await store.consolidate(session, provider, "m", memory_window=50)
+    assert ok is True
+    assert provider.chat.await_count == 2
+    assert store.read_long_term() == "project memory"
+
+
+@pytest.mark.asyncio
+async def test_consolidate_json_text_fallback_without_tool_call(tmp_path) -> None:
+    store = MemoryStore(tmp_path)
+    messages = [{"role": "user", "content": "x", "timestamp": "2025-01-01T12:00:00"}] * 30
+    session = Session(key="t:1", messages=messages, last_consolidated=0)
+    provider = MagicMock()
+    provider.chat = AsyncMock(
+        return_value=LLMResponse(
+            content='{"history_entry":"entry","project_memory_update":"from json"}',
+            tool_calls=[],
+        )
+    )
+
+    ok = await store.consolidate(session, provider, "m", memory_window=50)
+    assert ok is True
+    assert provider.chat.await_count == 1
+    assert store.read_long_term() == "from json"
 
 
 @pytest.mark.asyncio
