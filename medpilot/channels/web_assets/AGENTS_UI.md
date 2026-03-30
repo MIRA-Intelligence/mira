@@ -61,8 +61,16 @@ explicitly says "continue" or gives further instructions.**
    `task_plan.json` if applicable (epoch counts, intermediate metrics).
 
 3. **Analyze**: Evaluate results against predictions. Fill in `results`,
-   `conclusion`, and `next` in `task_plan.json`. Set status to `completed`
-   or `failed`.
+   `conclusion`, and `next` in `task_plan.json`.
+   - Use `completed` for any experiment that finished execution and produced an
+     analyzable outcome, even if the result is poor or the hypothesis is
+     rejected.
+   - Use `failed` only when the experiment procedure itself fails (for example:
+     runtime error, corrupted input, environment crash, or unrecoverable tool
+     failure) and the run did not complete normally.
+   - Use `skipped` for experiments intentionally skipped (for example: replaced
+     by a better plan, deemed unnecessary, blocked by scope/time, or user
+     request).
 
 4. **Report**: Return a concise summary to the user:
    - What was the question/hypothesis?
@@ -96,6 +104,22 @@ add it to the `knowledge` array in `task_plan.json`. Examples:
 - Git commits: `ExpNNN: brief description`
 - The `experiments` array should contain the full planned queue, not only
   experiments that have already started.
+- Allowed experiment statuses: `pending`, `running`, `completed`, `failed`,
+  `skipped`.
+
+### Re-planning after a completed batch
+
+When the user asks to re-plan based on completed experiments and current
+`knowledge`:
+- Read all existing experiment outcomes from `task_plan.json` first.
+- Keep historical experiments (especially completed/failed ones) in the array;
+  do not drop prior records.
+- Append a new batch with next sequential IDs (`Exp00X` ...), usually as
+  `pending`, and set `current_experiment` to the first new candidate when
+  appropriate.
+- Set project `status` to `in_progress` when new experiments are proposed.
+- Write the full updated `task_plan.json` before sending the final reply so the
+  dashboard can immediately render the new queue.
 
 ## Result Phase
 
