@@ -18,11 +18,25 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
+    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = BUILTIN_SKILLS_DIR):
         self.workspace = workspace
         from medpilot.utils.helpers import get_medpilot_dir
-        self.workspace_skills = get_medpilot_dir(workspace) / "skills"
-        self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+
+        # Backward compatibility:
+        # - legacy tests/projects place skills under "<workspace>/skills"
+        # - runtime state stores skills under "<workspace>/.medpilot/skills"
+        # Search both, preferring direct workspace path.
+        direct_skills = workspace / "skills"
+        medpilot_skills = get_medpilot_dir(workspace) / "skills"
+        roots: list[Path] = []
+        for root in (direct_skills, medpilot_skills):
+            if all(existing != root for existing in roots):
+                roots.append(root)
+        self.workspace_skills_roots = roots
+        # Preserve old attribute name for compatibility with existing code.
+        self.workspace_skills = roots[0]
+        # None explicitly disables builtin skills.
+        self.builtin_skills = builtin_skills_dir
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
@@ -37,11 +51,15 @@ class SkillsLoader:
         skills = []
 
         # Workspace skills (highest priority)
-        if self.workspace_skills.exists():
-            for skill_dir in self.workspace_skills.iterdir():
+        seen_names: set[str] = set()
+        for root in self.workspace_skills_roots:
+            if not root.exists():
+                continue
+            for skill_dir in root.iterdir():
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists():
+                    if skill_file.exists() and skill_dir.name not in seen_names:
+                        seen_names.add(skill_dir.name)
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
 
         # Built-in skills
@@ -49,7 +67,8 @@ class SkillsLoader:
             for skill_dir in self.builtin_skills.iterdir():
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
+                    if skill_file.exists() and skill_dir.name not in seen_names:
+                        seen_names.add(skill_dir.name)
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
 
         # Filter by requirements
@@ -67,10 +86,11 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        # Check workspace first
-        workspace_skill = self.workspace_skills / name / "SKILL.md"
-        if workspace_skill.exists():
-            return workspace_skill.read_text(encoding="utf-8")
+        # Check workspace roots first
+        for root in self.workspace_skills_roots:
+            workspace_skill = root / name / "SKILL.md"
+            if workspace_skill.exists():
+                return workspace_skill.read_text(encoding="utf-8")
 
         # Check built-in
         if self.builtin_skills:

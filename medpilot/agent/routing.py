@@ -8,7 +8,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from medpilot.config.schema import AgentDefaults
-from medpilot.providers.base import LLMProvider
+from medpilot.providers.base import LLMProvider, LLMResponse
 
 _ROUTE_TOOL = [
     {

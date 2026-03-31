@@ -64,6 +64,9 @@ class MemoryStore:
         self.global_workspace = get_workspace_path(None)
         self.global_memory_dir = ensure_dir(self.global_workspace / "memory")
         self.global_memory_file = self.global_memory_dir / "MEMORY.md"
+        # Avoid leaking global memory into unrelated temporary workspaces.
+        self._allow_global_memory = workspace.resolve().is_relative_to(self.global_workspace.resolve())
+        self._explicit_global_write = False
 
         if workspace.resolve() != self.global_workspace.resolve():
             workspace_hash = hashlib.md5(str(workspace.resolve()).encode()).hexdigest()[:8]
@@ -83,7 +86,11 @@ class MemoryStore:
         return ""
 
     def read_global_term(self) -> str:
-        if self.memory_file != self.global_memory_file and self.global_memory_file.exists():
+        if (
+            (self._allow_global_memory or self._explicit_global_write)
+            and self.memory_file != self.global_memory_file
+            and self.global_memory_file.exists()
+        ):
             return self.global_memory_file.read_text(encoding="utf-8")
         return ""
 
@@ -100,6 +107,7 @@ class MemoryStore:
                 f.write(entry.rstrip() + "\n\n")
 
     def write_global_term(self, content: str) -> None:
+        self._explicit_global_write = True
         if self.memory_file.resolve() != self.global_memory_file.resolve():
             from medpilot.utils.helpers import ensure_dir
             ensure_dir(self.global_memory_file.parent)
@@ -111,13 +119,17 @@ class MemoryStore:
     def get_memory_context(self) -> str:
         global_term = self.read_global_term()
         local_term = self.read_long_term()
-        
+
+        # Backward compatibility for existing prompts/tests.
+        if local_term and not global_term:
+            return f"## Long-term Memory\n{local_term}"
+
         parts = []
         if global_term:
             parts.append(f"## Global System Memory (Rules & Guidelines)\n{global_term}")
         if local_term:
             parts.append(f"## Local Project Memory (Current Case/Context)\n{local_term}")
-            
+
         return "\n\n".join(parts) if parts else ""
 
     @staticmethod
