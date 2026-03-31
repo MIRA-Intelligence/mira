@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -42,6 +43,8 @@ _SAVE_MEMORY_TOOL = [
         },
     }
 ]
+
+_MAX_SAVE_MEMORY_ATTEMPTS = 3
 
 
 class MemoryStore:
@@ -125,6 +128,105 @@ class MemoryStore:
             boundary -= 1
         return boundary
 
+    @staticmethod
+    def _extract_json_dict_from_text(text: str) -> dict[str, Any] | None:
+        """Extract a JSON object from raw LLM text (supports fenced blocks)."""
+        stripped = text.strip()
+        candidates: list[str] = []
+        if stripped:
+            candidates.append(stripped)
+
+        fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)```", stripped, flags=re.IGNORECASE)
+        for block in fenced:
+            block = block.strip()
+            if block:
+                candidates.append(block)
+
+        first_brace = stripped.find("{")
+        last_brace = stripped.rfind("}")
+        if 0 <= first_brace < last_brace:
+            candidates.append(stripped[first_brace:last_brace + 1])
+
+        for cand in candidates:
+            try:
+                parsed = json.loads(cand)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(parsed, list):
+                if parsed and isinstance(parsed[0], dict):
+                    parsed = parsed[0]
+                else:
+                    continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    @staticmethod
+    def _normalize_save_memory_args(payload: Any) -> dict[str, Any] | None:
+        """Normalize provider-specific tool argument formats into a dict payload."""
+        normalized: Any = payload
+        for _ in range(4):
+            if isinstance(normalized, str):
+                try:
+                    normalized = json.loads(normalized)
+                except json.JSONDecodeError:
+                    return None
+                continue
+
+            if isinstance(normalized, list):
+                if normalized and isinstance(normalized[0], dict):
+                    normalized = normalized[0]
+                    continue
+                return None
+
+            if isinstance(normalized, dict):
+                fn = normalized.get("function")
+                if isinstance(fn, dict) and fn.get("name") == "save_memory" and "arguments" in fn:
+                    normalized = fn["arguments"]
+                    continue
+                if normalized.get("name") == "save_memory" and "arguments" in normalized:
+                    normalized = normalized["arguments"]
+                    continue
+                if normalized.get("tool") == "save_memory" and "arguments" in normalized:
+                    normalized = normalized["arguments"]
+                    continue
+                break
+
+            return None
+
+        if not isinstance(normalized, dict):
+            return None
+
+        args = dict(normalized)
+        # Backward compatibility for older test fixtures/providers.
+        if "memory_update" in args and "project_memory_update" not in args:
+            args["project_memory_update"] = args["memory_update"]
+
+        if not any(
+            k in args for k in ("history_entry", "project_memory_update", "workspace_memory_update")
+        ):
+            return None
+        return args
+
+    def _extract_save_memory_args(self, response: Any) -> dict[str, Any] | None:
+        """Get normalized save_memory payload from tool_calls or JSON-text fallback."""
+        for tc in response.tool_calls or []:
+            if getattr(tc, "name", None) != "save_memory":
+                continue
+            args = self._normalize_save_memory_args(getattr(tc, "arguments", None))
+            if args is not None:
+                return args
+
+        if isinstance(response.content, str) and response.content.strip():
+            parsed = self._extract_json_dict_from_text(response.content)
+            if parsed is not None:
+                args = self._normalize_save_memory_args(parsed)
+                if args is not None:
+                    logger.info("Memory consolidation: recovered save_memory payload from JSON text fallback")
+                    return args
+        return None
+
     async def consolidate(
         self,
         session: Session,
@@ -177,32 +279,30 @@ You MUST analyze the knowledge and separate it:
 {chr(10).join(lines)}"""
 
         try:
-            response = await provider.chat(
-                messages=[
-                    {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
-                    {"role": "user", "content": prompt},
-                ],
-                tools=_SAVE_MEMORY_TOOL,
-                model=model,
-            )
-
-            if not response.has_tool_calls:
-                logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
-                return False
-
-            args = response.tool_calls[0].arguments
-            # Some providers return arguments as a JSON string instead of dict
-            if isinstance(args, str):
-                args = json.loads(args)
-            # Some providers return arguments as a list (handle edge case)
-            if isinstance(args, list):
-                if args and isinstance(args[0], dict):
-                    args = args[0]
-                else:
-                    logger.warning("Memory consolidation: unexpected arguments as empty or non-dict list")
-                    return False
-            if not isinstance(args, dict):
-                logger.warning("Memory consolidation: unexpected arguments type {}", type(args).__name__)
+            args: dict[str, Any] | None = None
+            for attempt in range(1, _MAX_SAVE_MEMORY_ATTEMPTS + 1):
+                response = await provider.chat(
+                    messages=[
+                        {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    tools=_SAVE_MEMORY_TOOL,
+                    model=model,
+                )
+                args = self._extract_save_memory_args(response)
+                if args is not None:
+                    break
+                if attempt < _MAX_SAVE_MEMORY_ATTEMPTS:
+                    logger.warning(
+                        "Memory consolidation: save_memory payload missing (attempt {}/{}), retrying",
+                        attempt,
+                        _MAX_SAVE_MEMORY_ATTEMPTS,
+                    )
+            if args is None:
+                logger.warning(
+                    "Memory consolidation: LLM did not provide save_memory payload after {} attempts, skipping",
+                    _MAX_SAVE_MEMORY_ATTEMPTS,
+                )
                 return False
 
             if entry := args.get("history_entry"):

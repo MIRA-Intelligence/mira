@@ -22,7 +22,9 @@ switch between:
 3. **Result** — final deliverables (paper, report, analysis, code)
 
 Populate the `research` section early when you are surveying the literature.
-Add `experiments` as you run them. Fill in `result` when generating final output.
+After research, initialize the `experiments` array with the planned experiment
+sequence so the dashboard can show the queue before execution begins. Fill in
+`result` when generating final output.
 
 ## Research Phase
 
@@ -30,6 +32,10 @@ When starting a new project, begin with background research:
 - Search for relevant literature and add references to `task_plan.json` → `research.references`
 - Write a brief survey overview in `research.survey`
 - Note key observations and domain-specific facts in `research.notes`
+- Before stopping, write the planned experiment queue into `task_plan.json` → `experiments`
+  using `pending` entries (`Exp001`, `Exp002`, ...). Include at least `id`,
+  `title`, and `status`, and add `question` / `hypothesis` / `prediction` early
+  if you already know them.
 - After research, STOP and report findings before moving to experiments.
 
 ## Experiment-by-Experiment Execution — MANDATORY
@@ -47,14 +53,24 @@ explicitly says "continue" or gives further instructions.**
 ### Workflow for each experiment
 
 1. **Design**: Formulate a clear question, hypothesis, and prediction.
-   Create/update `task_plan.json` with the new experiment entry (status: `running`).
+   If the experiment is already listed as `pending`, update that entry in
+   `task_plan.json` and set it to `running`. Otherwise create it with status
+   `running`.
 
 2. **Execute**: Implement and run the experiment. Update `progress` in
    `task_plan.json` if applicable (epoch counts, intermediate metrics).
 
 3. **Analyze**: Evaluate results against predictions. Fill in `results`,
-   `conclusion`, and `next` in `task_plan.json`. Set status to `completed`
-   or `failed`.
+   `conclusion`, and `next` in `task_plan.json`.
+   - Use `completed` for any experiment that finished execution and produced an
+     analyzable outcome, even if the result is poor or the hypothesis is
+     rejected.
+   - Use `failed` only when the experiment procedure itself fails (for example:
+     runtime error, corrupted input, environment crash, or unrecoverable tool
+     failure) and the run did not complete normally.
+   - Use `skipped` for experiments intentionally skipped (for example: replaced
+     by a better plan, deemed unnecessary, blocked by scope/time, or user
+     request).
 
 4. **Report**: Return a concise summary to the user:
    - What was the question/hypothesis?
@@ -86,6 +102,24 @@ add it to the `knowledge` array in `task_plan.json`. Examples:
 - Use sequential IDs: `Exp001`, `Exp002`, `Exp003`, ...
 - For variants/branches: `Exp005b`, `Exp005c` (set `parent: "Exp005"`)
 - Git commits: `ExpNNN: brief description`
+- The `experiments` array should contain the full planned queue, not only
+  experiments that have already started.
+- Allowed experiment statuses: `pending`, `running`, `completed`, `failed`,
+  `skipped`.
+
+### Re-planning after a completed batch
+
+When the user asks to re-plan based on completed experiments and current
+`knowledge`:
+- Read all existing experiment outcomes from `task_plan.json` first.
+- Keep historical experiments (especially completed/failed ones) in the array;
+  do not drop prior records.
+- Append a new batch with next sequential IDs (`Exp00X` ...), usually as
+  `pending`, and set `current_experiment` to the first new candidate when
+  appropriate.
+- Set project `status` to `in_progress` when new experiments are proposed.
+- Write the full updated `task_plan.json` before sending the final reply so the
+  dashboard can immediately render the new queue.
 
 ## Result Phase
 

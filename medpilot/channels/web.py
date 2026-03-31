@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from medpilot.bus.events import OutboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.channels.base import BaseChannel
 from medpilot.config.schema import WebChannelConfig
+from medpilot.session.manager import SessionManager
 
 PLAN_FILENAME = "task_plan.json"
 _ASSETS_DIR = Path(__file__).parent / "web_assets"
@@ -29,6 +31,131 @@ def _load_ui_instructions() -> str:
         if fp.is_file():
             parts.append(fp.read_text(encoding="utf-8"))
     return "\n\n---\n\n".join(parts)
+
+
+def _stringify_history_content(content: Any) -> str:
+    """Flatten session content into a UI-friendly text payload."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif item.get("type") == "image_url":
+                parts.append("[image]")
+        return "\n".join(part for part in parts if part).strip()
+    if content is None:
+        return ""
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, ensure_ascii=False)
+    return str(content)
+
+
+def _format_tool_call(tool_call: dict[str, Any]) -> str:
+    """Render a tool call in the same compact form shown in logs."""
+    fn = tool_call.get("function") if isinstance(tool_call, dict) else None
+    if isinstance(fn, dict):
+        name = fn.get("name") or "tool"
+        args = fn.get("arguments")
+    else:
+        name = tool_call.get("name") or "tool"
+        args = tool_call.get("arguments")
+
+    if isinstance(args, str):
+        args_str = args.strip()
+    elif args is None:
+        args_str = ""
+    else:
+        args_str = json.dumps(args, ensure_ascii=False)
+
+    return f"{name}({args_str})" if args_str else f"{name}()"
+
+
+def _load_json_file(path: Path) -> Any | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _collect_output_artifacts(project_dir: Path, exp_id: str) -> list[str]:
+    output_dir = project_dir / "outputs" / exp_id.lower()
+    if not output_dir.is_dir():
+        return []
+    return sorted(
+        str(path.relative_to(project_dir))
+        for path in output_dir.rglob("*")
+        if path.is_file()
+    )
+
+
+def _latest_experiment_commit(project_dir: Path, exp_id: str) -> str | None:
+    if not (project_dir / ".git").is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "log", "--format=%H", "--grep", exp_id, "-i", "-n", "1"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    commit = result.stdout.strip().splitlines()
+    if not commit:
+        return None
+    return commit[0][:7]
+
+
+def _safe_upload_name(filename: str) -> str:
+    """Normalize incoming filenames to a basename-only safe value."""
+    return Path(filename).name.strip().replace("\x00", "")
+
+
+def _next_available_path(base_dir: Path, filename: str) -> Path:
+    """Return a non-colliding destination path inside *base_dir*."""
+    candidate = base_dir / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = Path(filename).stem or "file"
+    suffix = Path(filename).suffix
+    idx = 1
+    while True:
+        alt = base_dir / f"{stem}_{idx}{suffix}"
+        if not alt.exists():
+            return alt
+        idx += 1
+
+
+def _merge_recovered_results(existing: Any, recovered_metrics: Any, artifacts: list[str]) -> dict[str, Any]:
+    results = dict(existing) if isinstance(existing, dict) else {}
+
+    if recovered_metrics is not None and "metrics" not in results:
+        if isinstance(recovered_metrics, dict) and any(
+            key in recovered_metrics for key in ("metrics", "findings", "artifacts")
+        ):
+            for key, value in recovered_metrics.items():
+                results.setdefault(key, value)
+        else:
+            results["metrics"] = recovered_metrics
+
+    existing_artifacts = results.get("artifacts")
+    artifact_list = list(existing_artifacts) if isinstance(existing_artifacts, list) else []
+    merged_artifacts = sorted({*artifact_list, *artifacts})
+    if merged_artifacts:
+        results["artifacts"] = merged_artifacts
+
+    if not results.get("findings") and recovered_metrics is not None:
+        results["findings"] = "Recovered experiment output from existing workspace artifacts."
+
+    return results
 
 
 class WebChannel(BaseChannel):
@@ -46,6 +173,66 @@ class WebChannel(BaseChannel):
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
+        self._migrate_global_to_project()
+
+    # ── migration ──────────────────────────────────────────────────
+
+    def _migrate_global_to_project(self) -> None:
+        """One-time migration: move global sessions/memory into per-project dirs.
+
+        Scans workspace_root/sessions/ for files named web_PRJ-XXXX.jsonl and
+        moves them into PRJ-XXXX/sessions/.  Similarly moves global memory/ into
+        the first project that exists (as a best-effort fallback).
+        """
+        root = self.projects_root
+        global_sessions = root / "sessions"
+        global_memory = root / "memory"
+
+        if global_sessions.is_dir():
+            for f in list(global_sessions.iterdir()):
+                if not f.name.endswith(".jsonl"):
+                    continue
+                stem = f.stem  # e.g. "web_PRJ-0001"
+                project_id = stem.replace("web_", "", 1)  # "PRJ-0001"
+                proj_dir = root / project_id
+                if not proj_dir.is_dir():
+                    continue
+                dest_dir = proj_dir / "sessions"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = dest_dir / f.name
+                if not dest.exists():
+                    try:
+                        shutil.move(str(f), str(dest))
+                        logger.info("Migrated session {} → {}", f.name, dest)
+                    except OSError as e:
+                        logger.warning("Failed to migrate session {}: {}", f.name, e)
+            if not any(global_sessions.iterdir()):
+                try:
+                    global_sessions.rmdir()
+                except OSError:
+                    pass
+
+        if global_memory.is_dir():
+            projects = [
+                d for d in sorted(root.iterdir())
+                if d.is_dir() and d.name.startswith("PRJ-")
+            ]
+            if len(projects) == 1:
+                dest_dir = projects[0] / "memory"
+                if not dest_dir.exists():
+                    try:
+                        shutil.move(str(global_memory), str(dest_dir))
+                        logger.info("Migrated global memory → {}", dest_dir)
+                    except OSError as e:
+                        logger.warning("Failed to migrate memory: {}", e)
+            elif not projects:
+                pass
+            else:
+                logger.info(
+                    "Multiple projects exist; skipping global memory migration. "
+                    "Manually move {} into the correct project.",
+                    global_memory,
+                )
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -85,10 +272,13 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/ws", self._ws_handler)
         self._app.router.add_get("/api/status", self._handle_status)
         self._app.router.add_get("/api/sessions", self._handle_sessions)
+        self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
         self._app.router.add_get("/api/plan", self._handle_plan)
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
+        self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
+        self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -147,6 +337,84 @@ class WebChannel(BaseChannel):
         except Exception as e:
             logger.warning("Failed to send to {}: {}", msg.chat_id, e)
 
+    def _reconcile_plan_data(self, project_dir: Path, data: dict[str, Any]) -> bool:
+        experiments = data.get("experiments")
+        if not isinstance(experiments, list):
+            return False
+
+        changed = False
+        for exp in experiments:
+            if not isinstance(exp, dict):
+                continue
+
+            exp_id = exp.get("id")
+            if not isinstance(exp_id, str) or not exp_id:
+                continue
+
+            results_path = project_dir / "outputs" / exp_id.lower() / "results.json"
+            recovered_metrics = _load_json_file(results_path) if results_path.is_file() else None
+            if recovered_metrics is None:
+                continue
+
+            if exp.get("status") != "completed":
+                exp["status"] = "completed"
+                changed = True
+
+            merged_results = _merge_recovered_results(
+                exp.get("results"),
+                recovered_metrics,
+                _collect_output_artifacts(project_dir, exp_id),
+            )
+            if exp.get("results") != merged_results:
+                exp["results"] = merged_results
+                changed = True
+
+            if not exp.get("commit"):
+                commit = _latest_experiment_commit(project_dir, exp_id)
+                if commit:
+                    exp["commit"] = commit
+                    changed = True
+
+            if not exp.get("conclusion"):
+                exp["conclusion"] = "Recovered completed state from existing experiment artifacts."
+                changed = True
+
+        if not any(isinstance(exp, dict) and exp.get("status") == "running" for exp in experiments):
+            pending = next(
+                (exp.get("id") for exp in experiments if isinstance(exp, dict) and exp.get("status") == "pending"),
+                None,
+            )
+            current = data.get("current_experiment")
+            if pending and current != pending:
+                data["current_experiment"] = pending
+                changed = True
+
+        return changed
+
+    def _load_plan_data(self, session_id: str, *, reconcile: bool = True) -> dict[str, Any] | None:
+        project_dir = self.projects_root / session_id
+        plan_path = project_dir / PLAN_FILENAME
+        if not plan_path.is_file():
+            return None
+
+        try:
+            data = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"Failed to read {plan_path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"Unexpected non-object JSON in {plan_path}")
+
+        if reconcile and self._reconcile_plan_data(project_dir, data):
+            try:
+                plan_path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.warning("Failed to write reconciled {}: {}", plan_path, exc)
+
+        return data
+
     # ── CORS middleware ──────────────────────────────────────────────
 
     @web.middleware
@@ -204,6 +472,10 @@ class WebChannel(BaseChannel):
                     continue
 
                 self._clients[session_id] = ws
+                try:
+                    self._load_plan_data(session_id)
+                except ValueError as exc:
+                    logger.warning(str(exc))
 
                 project_dir = str(self.projects_root / session_id)
                 metadata: dict[str, Any] = {
@@ -246,6 +518,64 @@ class WebChannel(BaseChannel):
         ]
         return web.json_response({"sessions": sessions})
 
+    def _load_history_entries(self, session_id: str) -> list[dict[str, Any]]:
+        project_dir = self.projects_root / session_id
+        if not project_dir.is_dir():
+            return []
+
+        session = SessionManager(project_dir).get_or_create(f"web:{session_id}")
+        entries: list[dict[str, Any]] = []
+
+        for idx, msg in enumerate(session.messages):
+            timestamp = msg.get("timestamp") or ""
+            role = msg.get("role")
+
+            if role == "user":
+                content = _stringify_history_content(msg.get("content"))
+                if not content:
+                    continue
+                entries.append({
+                    "id": f"history-{session_id}-{idx}-user",
+                    "timestamp": timestamp,
+                    "content": content,
+                    "type": "response",
+                    "metadata": {"_user": True},
+                })
+                continue
+
+            if role == "assistant":
+                content = _stringify_history_content(msg.get("content"))
+                if content:
+                    entries.append({
+                        "id": f"history-{session_id}-{idx}-assistant",
+                        "timestamp": timestamp,
+                        "content": content,
+                        "type": "response",
+                        "metadata": {},
+                    })
+
+                for tool_idx, tool_call in enumerate(msg.get("tool_calls") or []):
+                    if not isinstance(tool_call, dict):
+                        continue
+                    entries.append({
+                        "id": f"history-{session_id}-{idx}-tool-{tool_idx}",
+                        "timestamp": timestamp,
+                        "content": _format_tool_call(tool_call),
+                        "type": "tool_call",
+                        "metadata": {},
+                    })
+
+        return entries
+
+    async def _handle_history(self, request: web.Request) -> web.Response:
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        return web.json_response({
+            "session_id": session_id,
+            "entries": self._load_history_entries(session_id),
+        })
+
     async def _handle_config(self, request: web.Request) -> web.Response:
         """Allow the UI to configure the projects root path."""
         try:
@@ -265,20 +595,19 @@ class WebChannel(BaseChannel):
     async def _handle_plan(self, request: web.Request) -> web.Response:
         """Serve task_plan.json, scoped to a project when session_id is given."""
         session_id = request.query.get("session_id")
-        if session_id:
-            plan_path = self.projects_root / session_id / PLAN_FILENAME
-        else:
-            return web.json_response(None)
-
-        if not plan_path.is_file():
+        if not session_id:
             return web.json_response(None)
 
         try:
-            data = json.loads(plan_path.read_text(encoding="utf-8"))
-            return web.json_response(data)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to read {}: {}", plan_path, exc)
+            data = self._load_plan_data(session_id)
+        except ValueError as exc:
+            logger.warning(str(exc))
             return web.json_response({"error": str(exc)}, status=500)
+        if data is None:
+            return web.json_response(None)
+        return web.json_response(data)
+
+    _NON_PROJECT_DIRS = {"skills", "memory", "sessions", "media", "cron", "logs"}
 
     async def _handle_list_projects(self, _request: web.Request) -> web.Response:
         """List project directories under projects_root with optional task_plan data."""
@@ -288,6 +617,8 @@ class WebChannel(BaseChannel):
         projects: list[dict[str, Any]] = []
         for d in sorted(self.projects_root.iterdir()):
             if not d.is_dir() or d.name.startswith("."):
+                continue
+            if d.name in self._NON_PROJECT_DIRS:
                 continue
             info: dict[str, Any] = {"id": d.name}
             plan_file = d / PLAN_FILENAME
@@ -324,3 +655,93 @@ class WebChannel(BaseChannel):
         except OSError as exc:
             logger.warning("Failed to delete {}: {}", project_dir, exc)
             return web.json_response({"error": str(exc)}, status=500)
+
+    async def _handle_upload_project_files(self, request: web.Request) -> web.Response:
+        """Upload files into projects_root/<session_id>/data for web clients."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        try:
+            multipart = await request.multipart()
+        except Exception:
+            return web.json_response({"error": "expected multipart/form-data"}, status=400)
+
+        project_dir = self.projects_root / session_id
+        data_dir = project_dir / "data"
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to create upload directory {}: {}", data_dir, exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+        uploaded: list[dict[str, Any]] = []
+
+        while True:
+            part = await multipart.next()
+            if part is None:
+                break
+            if part.name != "files":
+                await part.release()
+                continue
+            if not part.filename:
+                await part.release()
+                continue
+
+            safe_name = _safe_upload_name(part.filename)
+            if not safe_name:
+                await part.release()
+                continue
+
+            target = _next_available_path(data_dir, safe_name)
+            size = 0
+            try:
+                with target.open("wb") as f:
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        size += len(chunk)
+            except OSError as exc:
+                logger.warning("Failed to write uploaded file {}: {}", target, exc)
+                return web.json_response({"error": str(exc)}, status=500)
+
+            uploaded.append({
+                "name": target.name,
+                "path": str(target.relative_to(project_dir)),
+                "size": size,
+            })
+
+        if not uploaded:
+            return web.json_response({"error": "no files uploaded"}, status=400)
+
+        return web.json_response({
+            "session_id": session_id,
+            "uploaded": uploaded,
+        })
+
+    async def _handle_project_artifact(self, request: web.Request) -> web.Response:
+        """Serve a project file under projects_root/<session_id> by relative path."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        rel_path = request.query.get("path", "").strip()
+        if not rel_path:
+            return web.json_response({"error": "path required"}, status=400)
+
+        project_dir = (self.projects_root / session_id).resolve()
+        if not project_dir.is_dir():
+            return web.json_response({"error": "project not found"}, status=404)
+
+        candidate = (project_dir / rel_path).resolve()
+        try:
+            candidate.relative_to(project_dir)
+        except ValueError:
+            return web.json_response({"error": "invalid artifact path"}, status=400)
+
+        if not candidate.is_file():
+            return web.json_response({"error": "artifact not found"}, status=404)
+
+        return web.FileResponse(candidate)

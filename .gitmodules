@@ -1,0 +1,4 @@
+[submodule "UI"]
+	path = UI
+	url = git@github.com:Project-MedPilot/MedPilotUI.git
+	branch = dev
