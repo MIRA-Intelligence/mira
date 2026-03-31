@@ -1,5 +1,8 @@
 # <img src="icon.ico" width="40" height="40" align="top"> MedPilot
 
+[![Tests](https://github.com/Project-MedPilot/MedPilot/actions/workflows/tests.yml/badge.svg)](https://github.com/Project-MedPilot/MedPilot/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/Project-MedPilot/MedPilot/graph/badge.svg)](https://codecov.io/gh/Project-MedPilot/MedPilot)
+
 An open-source, ultra-lightweight AI assistant tailored specifically for **Medical AI Research**.
 
 Powered by an underlying micro-agent framework, MedPilot is designed to execute complex medical imaging pipelines, from raw DICOM data processing to deep learning tasks, traditional radiomics, and survival analysis.
