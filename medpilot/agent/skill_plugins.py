@@ -19,6 +19,8 @@ PLUGIN_MANIFEST_FILENAME = "plugin.json"
 _PLUGIN_SOURCE_FILENAME = ".medpilot-plugin-source.json"
 _GLOBAL_STATE_FILENAME = "plugin_state.json"
 _PROJECT_OVERRIDES_FILENAME = "plugin_overrides.json"
+_BUILTIN_PLUGIN_ID = "builtin-skills"
+_BUILTIN_PLUGIN_NAME = "Built-in Skills"
 
 
 class SkillPluginError(ValueError):
@@ -63,6 +65,7 @@ class SkillPluginManager:
         self.plugins_root = ensure_dir(self.global_skills_dir / "plugins")
         self.global_state_path = self.global_skills_dir / _GLOBAL_STATE_FILENAME
         self.project_overrides_path = self.project_skills_dir / _PROJECT_OVERRIDES_FILENAME
+        self.builtin_skills_dir = Path(__file__).parent.parent / "skills"
 
     def _read_json(self, path: Path) -> dict[str, Any]:
         if not path.is_file():
@@ -125,6 +128,76 @@ class SkillPluginManager:
             ),
             key=lambda p: p.name,
         )
+
+    def _build_builtin_manifest(self) -> dict[str, Any] | None:
+        root = self.builtin_skills_dir
+        if not root.is_dir():
+            return None
+
+        skills: list[dict[str, Any]] = []
+        groups_map: dict[str, set[str]] = {}
+        seen: set[str] = set()
+        for skill_file in sorted(root.rglob("SKILL.md")):
+            rel = skill_file.relative_to(root)
+            parts = rel.parts
+            if len(parts) < 2:
+                continue
+            skill_id = parts[-2]
+            if not _is_valid_identifier(skill_id) or skill_id in seen:
+                continue
+            group_id = parts[0] if len(parts) >= 3 else "general"
+            if not _is_valid_identifier(group_id):
+                group_id = "general"
+            seen.add(skill_id)
+            groups_map.setdefault(group_id, set()).add(skill_id)
+            skills.append({
+                "id": skill_id,
+                "name": skill_id,
+                "relative_path": str(rel),
+                "group_ids": [group_id],
+            })
+
+        if not skills:
+            return None
+
+        groups = [
+            {
+                "id": group_id,
+                "name": group_id.replace("-", " ").replace("_", " ").title(),
+                "skill_ids": sorted(skill_ids),
+            }
+            for group_id, skill_ids in sorted(groups_map.items(), key=lambda item: item[0])
+        ]
+        return {
+            "id": _BUILTIN_PLUGIN_ID,
+            "name": _BUILTIN_PLUGIN_NAME,
+            "version": "1.0.0",
+            "description": "Skills bundled with MedPilot.",
+            "install_path": str(root),
+            "groups": groups,
+            "skills": skills,
+        }
+
+    def _iter_plugin_records(self) -> list[tuple[dict[str, Any], Path, dict[str, str]]]:
+        records: list[tuple[dict[str, Any], Path, dict[str, str]]] = []
+        builtin = self._build_builtin_manifest()
+        if builtin is not None:
+            records.append(
+                (
+                    builtin,
+                    self.builtin_skills_dir,
+                    {"type": "builtin", "path": str(self.builtin_skills_dir)},
+                )
+            )
+        for plugin_dir in self._iter_plugin_dirs():
+            try:
+                manifest = self._load_manifest(plugin_dir)
+            except SkillPluginError as exc:
+                logger.warning("Skip invalid skill plugin {}: {}", plugin_dir, exc)
+                continue
+            source = self._read_plugin_source(plugin_dir)
+            records.append((manifest, plugin_dir, source))
+        return records
 
     def _read_plugin_source(self, plugin_dir: Path) -> dict[str, str]:
         source_file = plugin_dir / _PLUGIN_SOURCE_FILENAME
@@ -395,6 +468,8 @@ class SkillPluginManager:
     def uninstall(self, plugin_id: str) -> None:
         if not isinstance(plugin_id, str) or not _is_valid_identifier(plugin_id):
             raise SkillPluginError("Invalid plugin_id")
+        if plugin_id == _BUILTIN_PLUGIN_ID:
+            raise SkillPluginError("Built-in skills cannot be uninstalled")
         plugin_dir = self.plugins_root / plugin_id
         if not plugin_dir.is_dir():
             raise SkillPluginError(f"Plugin not installed: {plugin_id}")
@@ -424,9 +499,8 @@ class SkillPluginManager:
         if target_type in {"group", "skill"}:
             if not isinstance(target_id, str) or not _is_valid_identifier(target_id):
                 raise SkillPluginError("target_id is required for group/skill toggles")
-
-        plugin_dir = self.plugins_root / plugin_id
-        if not plugin_dir.is_dir():
+        available_plugin_ids = {record[0]["id"] for record in self._iter_plugin_records()}
+        if plugin_id not in available_plugin_ids:
             raise SkillPluginError(f"Plugin not installed: {plugin_id}")
 
         state_path = self.global_state_path if scope == "global" else self.project_overrides_path
@@ -450,15 +524,8 @@ class SkillPluginManager:
         project_state = self._read_state(self.project_overrides_path).get("plugins", {})
 
         plugins: list[dict[str, Any]] = []
-        for plugin_dir in self._iter_plugin_dirs():
-            try:
-                manifest = self._load_manifest(plugin_dir)
-            except SkillPluginError as exc:
-                logger.warning("Skip invalid skill plugin {}: {}", plugin_dir, exc)
-                continue
-
+        for manifest, plugin_root, source in self._iter_plugin_records():
             plugin_id = manifest["id"]
-            source = self._read_plugin_source(plugin_dir)
             global_entry = global_state.get(plugin_id, {})
             project_entry = project_state.get(plugin_id, {})
 
@@ -492,7 +559,7 @@ class SkillPluginManager:
             skills: list[dict[str, Any]] = []
             for skill in manifest["skills"]:
                 skill_id = skill["id"]
-                skill_file = plugin_dir / skill["relative_path"]
+                skill_file = plugin_root / skill["relative_path"]
                 global_value = None
                 project_value = None
                 if isinstance(global_entry, dict):
@@ -547,7 +614,16 @@ class SkillPluginManager:
                 discovered.append({
                     "name": name,
                     "path": path,
-                    "source": "plugin",
+                    "source": "builtin" if plugin["id"] == _BUILTIN_PLUGIN_ID else "plugin",
                     "plugin_id": plugin["id"],
                 })
         return discovered
+
+    def get_managed_skill_names(self) -> set[str]:
+        managed: set[str] = set()
+        for plugin in self.list_plugins():
+            for skill in plugin.get("skills", []):
+                skill_id = skill.get("id")
+                if isinstance(skill_id, str):
+                    managed.add(skill_id)
+        return managed

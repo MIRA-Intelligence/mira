@@ -52,10 +52,24 @@ class SkillsLoader:
         except SkillPluginError:
             return []
 
+    def _managed_skill_names(self) -> set[str]:
+        try:
+            return self.plugin_manager.get_managed_skill_names()
+        except SkillPluginError:
+            return set()
+
     def _plugin_skill_path_by_name(self, name: str) -> str | None:
         for entry in self._list_plugin_skills():
             if entry.get("name") == name:
                 return entry.get("path")
+        return None
+
+    def _builtin_skill_path_by_name(self, name: str) -> Path | None:
+        if not self.builtin_skills or not self.builtin_skills.exists():
+            return None
+        for skill_file in self.builtin_skills.rglob("SKILL.md"):
+            if skill_file.parent.name == name:
+                return skill_file
         return None
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
@@ -98,13 +112,16 @@ class SkillsLoader:
             })
 
         # Built-in skills
+        managed_names = self._managed_skill_names()
         if self.builtin_skills and self.builtin_skills.exists():
-            for skill_dir in self.builtin_skills.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and skill_dir.name not in seen_names:
-                        seen_names.add(skill_dir.name)
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
+            for skill_file in self.builtin_skills.rglob("SKILL.md"):
+                if not skill_file.is_file():
+                    continue
+                skill_name = skill_file.parent.name
+                if skill_name in seen_names or skill_name in managed_names:
+                    continue
+                seen_names.add(skill_name)
+                skills.append({"name": skill_name, "path": str(skill_file), "source": "builtin"})
 
         # Filter by requirements
         if filter_unavailable:
@@ -133,11 +150,13 @@ class SkillsLoader:
             if plugin_skill.is_file():
                 return plugin_skill.read_text(encoding="utf-8")
 
+        if name in self._managed_skill_names():
+            return None
+
         # Check built-in
-        if self.builtin_skills:
-            builtin_skill = self.builtin_skills / name / "SKILL.md"
-            if builtin_skill.exists():
-                return builtin_skill.read_text(encoding="utf-8")
+        builtin_skill = self._builtin_skill_path_by_name(name)
+        if builtin_skill:
+            return builtin_skill.read_text(encoding="utf-8")
 
         return None
 

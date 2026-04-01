@@ -366,7 +366,7 @@ async def test_skill_plugin_install_from_directory_and_list(web_channel: WebChan
     list_resp = await web_channel._handle_skill_plugins_list(list_req)
     assert list_resp.status == 200
     list_body = json.loads(list_resp.text)
-    assert [p["id"] for p in list_body["plugins"]] == ["plugin-pack"]
+    assert {p["id"] for p in list_body["plugins"]} >= {"builtin-skills", "plugin-pack"}
 
 
 async def test_skill_plugin_install_from_zip(web_channel: WebChannel, tmp_path: Path) -> None:
@@ -410,14 +410,15 @@ async def test_skill_plugin_toggle_and_uninstall(web_channel: WebChannel, tmp_pa
     toggle_resp = await web_channel._handle_skill_plugins_state(toggle_req)
     assert toggle_resp.status == 200
     toggle_body = json.loads(toggle_resp.text)
-    assert toggle_body["plugins"][0]["enabled"]["effective"] is False
+    plugin_pack = next(item for item in toggle_body["plugins"] if item["id"] == "plugin-pack")
+    assert plugin_pack["enabled"]["effective"] is False
 
     remove_req = MagicMock(spec=web.Request)
     remove_req.match_info = {"session_id": "PRJ-0001", "plugin_id": "plugin-pack"}
     remove_resp = await web_channel._handle_skill_plugins_uninstall(remove_req)
     assert remove_resp.status == 200
     remove_body = json.loads(remove_resp.text)
-    assert remove_body["plugins"] == []
+    assert [item["id"] for item in remove_body["plugins"]] == ["builtin-skills"]
 
 
 async def test_send_delivers_json_to_open_socket(web_channel: WebChannel) -> None:

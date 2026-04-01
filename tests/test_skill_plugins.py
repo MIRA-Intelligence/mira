@@ -43,6 +43,15 @@ def _create_plugin_source(tmp_path: Path, plugin_id: str = "dl-pack") -> Path:
     return plugin_dir
 
 
+def _create_builtin_tree(tmp_path: Path) -> Path:
+    root = tmp_path / "builtin-skills"
+    (root / "research" / "finder").mkdir(parents=True)
+    (root / "research" / "finder" / "SKILL.md").write_text("# finder", encoding="utf-8")
+    (root / "engineering" / "builder").mkdir(parents=True)
+    (root / "engineering" / "builder" / "SKILL.md").write_text("# builder", encoding="utf-8")
+    return root
+
+
 def _patch_global_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     global_workspace = tmp_path / "global-workspace"
     global_workspace.mkdir(parents=True)
@@ -58,8 +67,8 @@ def test_install_and_scope_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
     manager.install_from_directory(plugin_source)
     plugins = manager.list_plugins()
-    assert len(plugins) == 1
-    plugin = plugins[0]
+    assert {item["id"] for item in plugins} >= {"builtin-skills", "dl-pack"}
+    plugin = next(item for item in plugins if item["id"] == "dl-pack")
     assert plugin["id"] == "dl-pack"
     assert plugin["enabled"]["effective"] is True
     assert {s["id"] for s in plugin["skills"]} == {"trainer", "evaluator"}
@@ -70,7 +79,8 @@ def test_install_and_scope_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path:
         target_type="plugin",
         enabled=False,
     )
-    assert manager.list_plugins()[0]["enabled"]["effective"] is False
+    updated_plugins = manager.list_plugins()
+    assert next(item for item in updated_plugins if item["id"] == "dl-pack")["enabled"]["effective"] is False
 
     manager.set_enabled(
         scope="project",
@@ -78,7 +88,8 @@ def test_install_and_scope_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path:
         target_type="plugin",
         enabled=True,
     )
-    assert manager.list_plugins()[0]["enabled"]["effective"] is True
+    updated_plugins = manager.list_plugins()
+    assert next(item for item in updated_plugins if item["id"] == "dl-pack")["enabled"]["effective"] is True
 
     manager.set_enabled(
         scope="project",
@@ -87,8 +98,9 @@ def test_install_and_scope_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path:
         target_id="deep-learning",
         enabled=False,
     )
-    enabled_skills = manager.list_enabled_skills()
-    assert enabled_skills == []
+    enabled_names = {item["name"] for item in manager.list_enabled_skills()}
+    assert "trainer" not in enabled_names
+    assert "evaluator" not in enabled_names
 
 
 def test_install_from_zip_and_reject_traversal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -128,6 +140,28 @@ def test_uninstall_cleans_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     )
 
     manager.uninstall("vision-pack")
-    assert manager.list_plugins() == []
+    remaining = manager.list_plugins()
+    assert [item["id"] for item in remaining] == ["builtin-skills"]
     with pytest.raises(SkillPluginError):
         manager.uninstall("vision-pack")
+
+
+def test_builtin_skill_groups_toggle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _patch_global_workspace(monkeypatch, tmp_path)
+    manager = SkillPluginManager(tmp_path / "project")
+    manager.builtin_skills_dir = _create_builtin_tree(tmp_path)
+
+    plugins = manager.list_plugins()
+    builtin = next(item for item in plugins if item["id"] == "builtin-skills")
+    assert {group["id"] for group in builtin["groups"]} == {"engineering", "research"}
+
+    manager.set_enabled(
+        scope="project",
+        plugin_id="builtin-skills",
+        target_type="group",
+        target_id="research",
+        enabled=False,
+    )
+    enabled_names = {item["name"] for item in manager.list_enabled_skills()}
+    assert "finder" not in enabled_names
+    assert "builder" in enabled_names

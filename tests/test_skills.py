@@ -181,3 +181,33 @@ def test_plugin_skills_follow_scope_toggles(tmp_path: Path, monkeypatch: pytest.
     )
     names_after = {entry["name"] for entry in loader.list_skills(filter_unavailable=False)}
     assert "mlops" not in names_after
+
+
+def test_builtin_skill_groups_follow_scope_toggles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    global_workspace = tmp_path / "global-workspace"
+    global_workspace.mkdir(parents=True)
+    monkeypatch.setattr(skill_plugins_mod, "get_workspace_path", lambda _workspace: global_workspace)
+
+    project_workspace = tmp_path / "project"
+    builtin = tmp_path / "builtin-grouped"
+    _write_skill(builtin / "research", "literature", "---\ndescription: L\n---\n")
+    _write_skill(builtin / "engineering", "planner", "---\ndescription: P\n---\n")
+
+    manager = SkillPluginManager(project_workspace)
+    manager.builtin_skills_dir = builtin
+    loader = SkillsLoader(project_workspace, builtin_skills_dir=builtin, plugin_manager=manager)
+
+    names = {entry["name"] for entry in loader.list_skills(filter_unavailable=False)}
+    assert {"literature", "planner"}.issubset(names)
+
+    manager.set_enabled(
+        scope="project",
+        plugin_id="builtin-skills",
+        target_type="group",
+        target_id="research",
+        enabled=False,
+    )
+
+    names_after = {entry["name"] for entry in loader.list_skills(filter_unavailable=False)}
+    assert "literature" not in names_after
+    assert "planner" in names_after
