@@ -43,6 +43,7 @@ _SAVE_MEMORY_TOOL = [
         },
     }
 ]
+_SAVE_MEMORY_TOOL_CHOICE = {"type": "function", "function": {"name": "save_memory"}}
 
 _MAX_SAVE_MEMORY_ATTEMPTS = 3
 
@@ -299,6 +300,7 @@ You MUST analyze the knowledge and separate it:
                         {"role": "user", "content": prompt},
                     ],
                     tools=_SAVE_MEMORY_TOOL,
+                    tool_choice=_SAVE_MEMORY_TOOL_CHOICE,
                     model=model,
                 )
                 args = self._extract_save_memory_args(response)
@@ -317,22 +319,29 @@ You MUST analyze the knowledge and separate it:
                 )
                 return False
 
+            wrote_history = False
+            wrote_project = False
+            wrote_workspace = False
+
             if entry := args.get("history_entry"):
                 if not isinstance(entry, str):
                     entry = json.dumps(entry, ensure_ascii=False)
                 self.append_history(entry)
+                wrote_history = True
             
             if proj_update := args.get("project_memory_update"):
                 if not isinstance(proj_update, str):
                     proj_update = json.dumps(proj_update, ensure_ascii=False)
                 if proj_update != current_local:
                     self.write_long_term(proj_update)
+                    wrote_project = True
                     
             if work_update := args.get("workspace_memory_update"):
                 if not isinstance(work_update, str):
                     work_update = json.dumps(work_update, ensure_ascii=False)
                 if work_update != current_global:
                     self.write_global_term(work_update)
+                    wrote_workspace = True
 
             if archive_all:
                 session.last_consolidated = 0
@@ -342,6 +351,12 @@ You MUST analyze the knowledge and separate it:
                 # window never starts mid-tool-call-sequence.
                 boundary = self._align_boundary_to_user(session.messages, boundary)
                 session.last_consolidated = boundary
+            logger.info(
+                "Memory consolidation writes: history={}, project={}, workspace={}",
+                wrote_history,
+                wrote_project,
+                wrote_workspace,
+            )
             logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
             return True
         except Exception:

@@ -85,6 +85,7 @@ class AzureOpenAIProvider(LLMProvider):
         deployment_name: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
@@ -106,7 +107,7 @@ class AzureOpenAIProvider(LLMProvider):
 
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice if tool_choice is not None else "auto"
 
         return payload
 
@@ -114,6 +115,7 @@ class AzureOpenAIProvider(LLMProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
@@ -137,7 +139,7 @@ class AzureOpenAIProvider(LLMProvider):
         url = self._build_chat_url(deployment_name)
         headers = self._build_headers()
         payload = self._prepare_request_payload(
-            deployment_name, messages, tools, max_tokens, temperature, reasoning_effort
+            deployment_name, messages, tools, tool_choice, max_tokens, temperature, reasoning_effort
         )
 
         try:

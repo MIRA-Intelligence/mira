@@ -106,6 +106,7 @@ class LLMProvider(ABC):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
@@ -117,6 +118,7 @@ class LLMProvider(ABC):
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
+            tool_choice: Optional tool selection policy (provider-specific).
             model: Model identifier (provider-specific).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.

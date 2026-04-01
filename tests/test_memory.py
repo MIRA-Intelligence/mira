@@ -78,6 +78,8 @@ async def test_consolidate_archive_all_updates_memory_and_resets_marker(tmp_path
     assert "new memory" == store.read_long_term()
     assert "[2025-01-01 12:00] summary" in store.history_file.read_text(encoding="utf-8")
     provider.chat.assert_awaited_once()
+    kwargs = provider.chat.await_args.kwargs
+    assert kwargs["tool_choice"] == {"type": "function", "function": {"name": "save_memory"}}
 
 
 @pytest.mark.asyncio

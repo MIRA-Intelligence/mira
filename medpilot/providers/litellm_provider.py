@@ -210,6 +210,7 @@ class LiteLLMProvider(LLMProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
@@ -267,7 +268,7 @@ class LiteLLMProvider(LLMProvider):
         
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = tool_choice if tool_choice is not None else "auto"
 
         try:
             response = await acompletion(**kwargs)
