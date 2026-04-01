@@ -102,6 +102,31 @@ def test_install_and_scope_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert "trainer" not in enabled_names
     assert "evaluator" not in enabled_names
 
+    # Skill-level override makes group gating ineffective for that skill.
+    manager.set_enabled(
+        scope="project",
+        plugin_id="dl-pack",
+        target_type="skill",
+        target_id="trainer",
+        enabled=True,
+    )
+    enabled_names = {item["name"] for item in manager.list_enabled_skills()}
+    assert "trainer" in enabled_names
+    plugin = next(item for item in manager.list_plugins() if item["id"] == "dl-pack")
+    group = next(item for item in plugin["groups"] if item["id"] == "deep-learning")
+    assert group["customized"]["project"] is True
+
+    # Clicking group again should restore group-level control (clear skill overrides).
+    manager.set_enabled(
+        scope="project",
+        plugin_id="dl-pack",
+        target_type="group",
+        target_id="deep-learning",
+        enabled=False,
+    )
+    enabled_names = {item["name"] for item in manager.list_enabled_skills()}
+    assert "trainer" not in enabled_names
+
 
 def test_install_from_zip_and_reject_traversal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _patch_global_workspace(monkeypatch, tmp_path)

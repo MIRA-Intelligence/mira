@@ -39,10 +39,19 @@ def _safe_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _is_explicit(state_entry: Any, category: str, key: str) -> bool:
+    if not isinstance(state_entry, dict):
+        return False
+    collection = state_entry.get(category)
+    return isinstance(collection, dict) and key in collection and isinstance(collection[key], bool)
+
+
 def _effective_scope_state(
     global_value: bool | None,
     project_value: bool | None,
     *,
+    global_explicit: bool = False,
+    project_explicit: bool = False,
     default: bool = True,
 ) -> dict[str, bool | None]:
     global_enabled = default if global_value is None else global_value
@@ -51,6 +60,8 @@ def _effective_scope_state(
         "global": global_enabled,
         "project": project_value,
         "effective": effective_enabled,
+        "global_explicit": global_explicit,
+        "project_explicit": project_explicit,
     }
 
 
@@ -499,9 +510,24 @@ class SkillPluginManager:
         if target_type in {"group", "skill"}:
             if not isinstance(target_id, str) or not _is_valid_identifier(target_id):
                 raise SkillPluginError("target_id is required for group/skill toggles")
-        available_plugin_ids = {record[0]["id"] for record in self._iter_plugin_records()}
-        if plugin_id not in available_plugin_ids:
+        manifests_by_id = {record[0]["id"]: record[0] for record in self._iter_plugin_records()}
+        if plugin_id not in manifests_by_id:
             raise SkillPluginError(f"Plugin not installed: {plugin_id}")
+        manifest = manifests_by_id[plugin_id]
+        group_to_skills = {
+            group["id"]: set(group.get("skill_ids", []))
+            for group in manifest.get("groups", [])
+            if isinstance(group, dict) and isinstance(group.get("id"), str)
+        }
+        all_skills = {
+            skill.get("id")
+            for skill in manifest.get("skills", [])
+            if isinstance(skill, dict) and isinstance(skill.get("id"), str)
+        }
+        if target_type == "group" and target_id not in group_to_skills:
+            raise SkillPluginError(f"Unknown group for plugin {plugin_id}: {target_id}")
+        if target_type == "skill" and target_id not in all_skills:
+            raise SkillPluginError(f"Unknown skill for plugin {plugin_id}: {target_id}")
 
         state_path = self.global_state_path if scope == "global" else self.project_overrides_path
         state = self._read_state(state_path)
@@ -513,6 +539,11 @@ class SkillPluginManager:
         elif target_type == "group":
             groups = plugin_state.setdefault("groups", {})
             groups[target_id] = enabled
+            # Reapplying a group clears per-skill overrides in this scope
+            # so group control becomes effective again.
+            skills = plugin_state.setdefault("skills", {})
+            for skill_id in group_to_skills.get(target_id, set()):
+                skills.pop(skill_id, None)
         else:
             skills = plugin_state.setdefault("skills", {})
             skills[target_id] = enabled
@@ -532,10 +563,14 @@ class SkillPluginManager:
             plugin_enabled = _effective_scope_state(
                 _safe_bool(global_entry.get("enabled")) if isinstance(global_entry, dict) else None,
                 _safe_bool(project_entry.get("enabled")) if isinstance(project_entry, dict) else None,
+                global_explicit=isinstance(global_entry, dict) and isinstance(global_entry.get("enabled"), bool),
+                project_explicit=isinstance(project_entry, dict) and isinstance(project_entry.get("enabled"), bool),
             )
 
             groups: list[dict[str, Any]] = []
             group_effective: dict[str, bool] = {}
+            group_customized_global: dict[str, bool] = {}
+            group_customized_project: dict[str, bool] = {}
             for group in manifest["groups"]:
                 group_id = group["id"]
                 global_value = None
@@ -546,6 +581,8 @@ class SkillPluginManager:
                     project_value = _safe_bool((project_entry.get("groups") or {}).get(group_id))
                 group_enabled = _effective_scope_state(global_value, project_value)
                 group_effective[group_id] = bool(group_enabled["effective"])
+                group_customized_global[group_id] = False
+                group_customized_project[group_id] = False
                 groups.append({
                     "id": group_id,
                     "name": group["name"],
@@ -566,8 +603,25 @@ class SkillPluginManager:
                     global_value = _safe_bool((global_entry.get("skills") or {}).get(skill_id))
                 if isinstance(project_entry, dict):
                     project_value = _safe_bool((project_entry.get("skills") or {}).get(skill_id))
-                skill_enabled = _effective_scope_state(global_value, project_value)
-                group_gate = all(group_effective.get(group_id, True) for group_id in skill["group_ids"])
+                global_explicit = _is_explicit(global_entry, "skills", skill_id)
+                project_explicit = _is_explicit(project_entry, "skills", skill_id)
+                skill_enabled = _effective_scope_state(
+                    global_value,
+                    project_value,
+                    global_explicit=global_explicit,
+                    project_explicit=project_explicit,
+                )
+                for group_id in skill["group_ids"]:
+                    if global_explicit:
+                        group_customized_global[group_id] = True
+                    if project_explicit:
+                        group_customized_project[group_id] = True
+                # If a skill has explicit scope overrides, it is no longer gated by group state
+                # until the group is explicitly set again.
+                if global_explicit or project_explicit:
+                    group_gate = True
+                else:
+                    group_gate = all(group_effective.get(group_id, True) for group_id in skill["group_ids"])
                 effective_enabled = (
                     bool(plugin_enabled["effective"])
                     and bool(skill_enabled["effective"])
@@ -595,6 +649,12 @@ class SkillPluginManager:
                 "groups": groups,
                 "skills": skills,
             })
+            for group in plugins[-1]["groups"]:
+                group_id = group["id"]
+                group["customized"] = {
+                    "global": group_customized_global.get(group_id, False),
+                    "project": group_customized_project.get(group_id, False),
+                }
         return plugins
 
     def list_enabled_skills(self) -> list[dict[str, str]]:
