@@ -28,6 +28,7 @@ class OpenAICodexProvider(LLMProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
@@ -48,7 +49,6 @@ class OpenAICodexProvider(LLMProvider):
             "text": {"verbosity": "medium"},
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": _prompt_cache_key(messages),
-            "tool_choice": "auto",
             "parallel_tool_calls": True,
         }
 
@@ -57,6 +57,7 @@ class OpenAICodexProvider(LLMProvider):
 
         if tools:
             body["tools"] = _convert_tools(tools)
+            body["tool_choice"] = tool_choice if tool_choice is not None else "auto"
 
         url = DEFAULT_CODEX_URL
 
