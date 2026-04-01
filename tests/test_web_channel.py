@@ -1,4 +1,5 @@
 import json
+import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,6 +13,7 @@ from medpilot.channels import web as web_channel_mod
 from medpilot.channels.web import PLAN_FILENAME, WebChannel, _load_ui_instructions
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
+from medpilot.agent import skill_plugins as skill_plugins_mod
 
 
 def _minimal_base_init(self, config, bus) -> None:
@@ -45,10 +47,28 @@ class _FakeMultipart:
         return self._parts.pop(0)
 
 
+def _create_plugin_source(base: Path, plugin_id: str = "plugin-pack") -> Path:
+    src = base / "plugin-src"
+    (src / "skills" / "writer").mkdir(parents=True, exist_ok=True)
+    (src / "skills" / "writer" / "SKILL.md").write_text("# Writer Skill", encoding="utf-8")
+    (src / "plugin.json").write_text(
+        json.dumps({
+            "id": plugin_id,
+            "version": "0.1.0",
+            "skills": [{"id": "writer", "path": "skills/writer"}],
+        }),
+        encoding="utf-8",
+    )
+    return src
+
+
 @pytest.fixture
-def web_channel(tmp_path: Path) -> WebChannel:
+def web_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebChannel:
     config = MagicMock(spec=WebChannelConfig)
     bus = MagicMock(spec=MessageBus)
+    global_workspace = tmp_path / "global-workspace"
+    global_workspace.mkdir(parents=True)
+    monkeypatch.setattr(skill_plugins_mod, "get_workspace_path", lambda _workspace: global_workspace)
     with patch.object(BaseChannel, "__init__", _minimal_base_init):
         with patch.object(web_channel_mod, "_load_ui_instructions", return_value=""):
             ch = WebChannel(config, bus)
@@ -327,6 +347,77 @@ async def test_handle_project_artifact_blocks_traversal(web_channel: WebChannel,
     resp = await web_channel._handle_project_artifact(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "invalid artifact path"}
+
+
+async def test_skill_plugin_install_from_directory_and_list(web_channel: WebChannel, tmp_path: Path) -> None:
+    src = _create_plugin_source(tmp_path)
+    install_req = MagicMock(spec=web.Request)
+    install_req.match_info = {"session_id": "PRJ-0001"}
+    install_req.headers = {"Content-Type": "application/json"}
+    install_req.json = AsyncMock(return_value={"path": str(src)})
+
+    install_resp = await web_channel._handle_skill_plugins_install(install_req)
+    assert install_resp.status == 200
+    body = json.loads(install_resp.text)
+    assert body["installed"]["id"] == "plugin-pack"
+
+    list_req = MagicMock(spec=web.Request)
+    list_req.match_info = {"session_id": "PRJ-0001"}
+    list_resp = await web_channel._handle_skill_plugins_list(list_req)
+    assert list_resp.status == 200
+    list_body = json.loads(list_resp.text)
+    assert [p["id"] for p in list_body["plugins"]] == ["plugin-pack"]
+
+
+async def test_skill_plugin_install_from_zip(web_channel: WebChannel, tmp_path: Path) -> None:
+    src = _create_plugin_source(tmp_path, plugin_id="zip-pack")
+    zip_path = tmp_path / "zip-pack.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for item in src.rglob("*"):
+            if item.is_file():
+                zf.write(item, item.relative_to(src))
+
+    zip_bytes = zip_path.read_bytes()
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.headers = {"Content-Type": "multipart/form-data; boundary=fake"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="zip", filename="zip-pack.zip", chunks=[zip_bytes]),
+    ]))
+
+    resp = await web_channel._handle_skill_plugins_install(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["installed"]["id"] == "zip-pack"
+
+
+async def test_skill_plugin_toggle_and_uninstall(web_channel: WebChannel, tmp_path: Path) -> None:
+    src = _create_plugin_source(tmp_path)
+    install_req = MagicMock(spec=web.Request)
+    install_req.match_info = {"session_id": "PRJ-0001"}
+    install_req.headers = {"Content-Type": "application/json"}
+    install_req.json = AsyncMock(return_value={"path": str(src)})
+    await web_channel._handle_skill_plugins_install(install_req)
+
+    toggle_req = MagicMock(spec=web.Request)
+    toggle_req.match_info = {"session_id": "PRJ-0001"}
+    toggle_req.json = AsyncMock(return_value={
+        "scope": "global",
+        "target_type": "plugin",
+        "plugin_id": "plugin-pack",
+        "enabled": False,
+    })
+    toggle_resp = await web_channel._handle_skill_plugins_state(toggle_req)
+    assert toggle_resp.status == 200
+    toggle_body = json.loads(toggle_resp.text)
+    assert toggle_body["plugins"][0]["enabled"]["effective"] is False
+
+    remove_req = MagicMock(spec=web.Request)
+    remove_req.match_info = {"session_id": "PRJ-0001", "plugin_id": "plugin-pack"}
+    remove_resp = await web_channel._handle_skill_plugins_uninstall(remove_req)
+    assert remove_resp.status == 200
+    remove_body = json.loads(remove_resp.text)
+    assert remove_body["plugins"] == []
 
 
 async def test_send_delivers_json_to_open_socket(web_channel: WebChannel) -> None:
