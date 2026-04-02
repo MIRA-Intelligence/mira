@@ -6,6 +6,7 @@ import asyncio
 import json
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from loguru import logger
 
 from medpilot.bus.events import OutboundMessage
 from medpilot.bus.queue import MessageBus
+from medpilot.agent.skill_plugins import SkillPluginError, SkillPluginManager
 from medpilot.channels.base import BaseChannel
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
@@ -279,6 +281,10 @@ class WebChannel(BaseChannel):
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
         self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
         self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
+        self._app.router.add_get("/api/projects/{session_id}/skill-plugins", self._handle_skill_plugins_list)
+        self._app.router.add_post("/api/projects/{session_id}/skill-plugins/install", self._handle_skill_plugins_install)
+        self._app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
+        self._app.router.add_delete("/api/projects/{session_id}/skill-plugins/{plugin_id}", self._handle_skill_plugins_uninstall)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -745,3 +751,122 @@ class WebChannel(BaseChannel):
             return web.json_response({"error": "artifact not found"}, status=404)
 
         return web.FileResponse(candidate)
+
+    def _skill_plugin_manager(self, session_id: str) -> SkillPluginManager:
+        project_dir = self.projects_root / session_id
+        project_dir.mkdir(parents=True, exist_ok=True)
+        return SkillPluginManager(project_dir)
+
+    async def _handle_skill_plugins_list(self, request: web.Request) -> web.Response:
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        manager = self._skill_plugin_manager(session_id)
+        return web.json_response({"plugins": manager.list_plugins()})
+
+    async def _handle_skill_plugins_install(self, request: web.Request) -> web.Response:
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        manager = self._skill_plugin_manager(session_id)
+
+        content_type = request.headers.get("Content-Type", "").lower()
+        try:
+            if content_type.startswith("multipart/form-data"):
+                multipart = await request.multipart()
+                zip_path: Path | None = None
+                zip_name: str | None = None
+                while True:
+                    part = await multipart.next()
+                    if part is None:
+                        break
+                    if part.name != "zip":
+                        await part.release()
+                        continue
+                    if not part.filename:
+                        await part.release()
+                        continue
+                    zip_name = part.filename
+                    with tempfile.NamedTemporaryFile(
+                        prefix="skill-plugin-",
+                        suffix=".zip",
+                        delete=False,
+                    ) as tmp:
+                        while True:
+                            chunk = await part.read_chunk()
+                            if not chunk:
+                                break
+                            tmp.write(chunk)
+                        zip_path = Path(tmp.name)
+                if zip_path is None:
+                    return web.json_response({"error": "zip file field 'zip' is required"}, status=400)
+                try:
+                    installed = manager.install_from_zip(zip_path, archive_name_hint=zip_name)
+                finally:
+                    try:
+                        zip_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            else:
+                try:
+                    body = await request.json()
+                except (json.JSONDecodeError, TypeError):
+                    return web.json_response({"error": "invalid JSON"}, status=400)
+                source_path = body.get("path") if isinstance(body, dict) else None
+                if not isinstance(source_path, str) or not source_path.strip():
+                    return web.json_response({"error": "directory path is required"}, status=400)
+                installed = manager.install_from_directory(Path(source_path))
+        except SkillPluginError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        return web.json_response({
+            "installed": installed,
+            "plugins": manager.list_plugins(),
+        })
+
+    async def _handle_skill_plugins_state(self, request: web.Request) -> web.Response:
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        scope = body.get("scope")
+        target_type = body.get("target_type")
+        plugin_id = body.get("plugin_id")
+        enabled = body.get("enabled")
+        target_id = body.get("target_id")
+        if not isinstance(enabled, bool):
+            return web.json_response({"error": "enabled must be a boolean"}, status=400)
+
+        manager = self._skill_plugin_manager(session_id)
+        try:
+            manager.set_enabled(
+                scope=scope,
+                plugin_id=plugin_id,
+                target_type=target_type,
+                enabled=enabled,
+                target_id=target_id,
+            )
+        except SkillPluginError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        return web.json_response({"plugins": manager.list_plugins()})
+
+    async def _handle_skill_plugins_uninstall(self, request: web.Request) -> web.Response:
+        session_id = request.match_info.get("session_id", "").strip()
+        plugin_id = request.match_info.get("plugin_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        if not plugin_id:
+            return web.json_response({"error": "plugin_id required"}, status=400)
+
+        manager = self._skill_plugin_manager(session_id)
+        try:
+            manager.uninstall(plugin_id)
+        except SkillPluginError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        return web.json_response({"uninstalled": plugin_id, "plugins": manager.list_plugins()})

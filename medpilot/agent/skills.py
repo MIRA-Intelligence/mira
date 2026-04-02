@@ -6,6 +6,8 @@ import re
 import shutil
 from pathlib import Path
 
+from medpilot.agent.skill_plugins import SkillPluginError, SkillPluginManager
+
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
@@ -18,7 +20,12 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = BUILTIN_SKILLS_DIR):
+    def __init__(
+        self,
+        workspace: Path,
+        builtin_skills_dir: Path | None = BUILTIN_SKILLS_DIR,
+        plugin_manager: SkillPluginManager | None = None,
+    ):
         self.workspace = workspace
         from medpilot.utils.helpers import get_medpilot_dir
 
@@ -37,6 +44,33 @@ class SkillsLoader:
         self.workspace_skills = roots[0]
         # None explicitly disables builtin skills.
         self.builtin_skills = builtin_skills_dir
+        self.plugin_manager = plugin_manager or SkillPluginManager(workspace)
+
+    def _list_plugin_skills(self) -> list[dict[str, str]]:
+        try:
+            return self.plugin_manager.list_enabled_skills()
+        except SkillPluginError:
+            return []
+
+    def _managed_skill_names(self) -> set[str]:
+        try:
+            return self.plugin_manager.get_managed_skill_names()
+        except SkillPluginError:
+            return set()
+
+    def _plugin_skill_path_by_name(self, name: str) -> str | None:
+        for entry in self._list_plugin_skills():
+            if entry.get("name") == name:
+                return entry.get("path")
+        return None
+
+    def _builtin_skill_path_by_name(self, name: str) -> Path | None:
+        if not self.builtin_skills or not self.builtin_skills.exists():
+            return None
+        for skill_file in self.builtin_skills.rglob("SKILL.md"):
+            if skill_file.parent.name == name:
+                return skill_file
+        return None
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
@@ -62,14 +96,32 @@ class SkillsLoader:
                         seen_names.add(skill_dir.name)
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
 
+        # Plugin skills (global install + scope toggles)
+        for plugin_skill in self._list_plugin_skills():
+            name = plugin_skill.get("name")
+            path = plugin_skill.get("path")
+            if not isinstance(name, str) or not isinstance(path, str):
+                continue
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            skills.append({
+                "name": name,
+                "path": path,
+                "source": "plugin",
+            })
+
         # Built-in skills
+        managed_names = self._managed_skill_names()
         if self.builtin_skills and self.builtin_skills.exists():
-            for skill_dir in self.builtin_skills.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and skill_dir.name not in seen_names:
-                        seen_names.add(skill_dir.name)
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
+            for skill_file in self.builtin_skills.rglob("SKILL.md"):
+                if not skill_file.is_file():
+                    continue
+                skill_name = skill_file.parent.name
+                if skill_name in seen_names or skill_name in managed_names:
+                    continue
+                seen_names.add(skill_name)
+                skills.append({"name": skill_name, "path": str(skill_file), "source": "builtin"})
 
         # Filter by requirements
         if filter_unavailable:
@@ -92,11 +144,19 @@ class SkillsLoader:
             if workspace_skill.exists():
                 return workspace_skill.read_text(encoding="utf-8")
 
+        plugin_path = self._plugin_skill_path_by_name(name)
+        if plugin_path:
+            plugin_skill = Path(plugin_path)
+            if plugin_skill.is_file():
+                return plugin_skill.read_text(encoding="utf-8")
+
+        if name in self._managed_skill_names():
+            return None
+
         # Check built-in
-        if self.builtin_skills:
-            builtin_skill = self.builtin_skills / name / "SKILL.md"
-            if builtin_skill.exists():
-                return builtin_skill.read_text(encoding="utf-8")
+        builtin_skill = self._builtin_skill_path_by_name(name)
+        if builtin_skill:
+            return builtin_skill.read_text(encoding="utf-8")
 
         return None
 
