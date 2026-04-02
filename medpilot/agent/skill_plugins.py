@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -252,6 +253,128 @@ class SkillPluginManager:
                 })
         return discovered
 
+    def _normalize_identifier(self, raw: str, fallback: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", raw.strip().lower())
+        normalized = normalized.strip("-._")
+        if not normalized:
+            normalized = fallback
+        if not normalized[0].isalnum():
+            normalized = f"{fallback}-{normalized}".strip("-._")
+        return normalized
+
+    def _read_skill_name_from_frontmatter(self, skill_file: Path) -> str | None:
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if not content.startswith("---"):
+            return None
+        match = re.match(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", content, re.DOTALL)
+        if not match:
+            return None
+        for line in match.group(1).splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            if key.strip().lower() != "name":
+                continue
+            name = value.strip().strip("\"'")
+            return name or None
+        return None
+
+    def _infer_manifest_payload(
+        self,
+        plugin_dir: Path,
+        *,
+        plugin_id_hint: str,
+        plugin_name_hint: str,
+    ) -> dict[str, Any]:
+        skill_files = sorted([p for p in plugin_dir.rglob("SKILL.md") if p.is_file()])
+        if not skill_files:
+            raise SkillPluginError(f"No SKILL.md found in package: {plugin_dir}")
+
+        plugin_id = self._normalize_identifier(plugin_id_hint, "skill-plugin")
+        if not _is_valid_identifier(plugin_id):
+            raise SkillPluginError(f"Unable to derive valid plugin id from: {plugin_id_hint}")
+
+        skills: list[dict[str, Any]] = []
+        groups: dict[str, set[str]] = {}
+        used_ids: set[str] = set()
+
+        for skill_file in skill_files:
+            rel_actual = skill_file.relative_to(plugin_dir)
+            parts = rel_actual.parts
+            if len(parts) < 2:
+                continue
+
+            skill_dir_rel = skill_file.parent.relative_to(plugin_dir)
+            skill_folder = parts[-2]
+            # Group pattern: <group_folder>/<skill_folder>/SKILL.md
+            # We also accept an optional wrapper prefix in zip paths by using
+            # the last 3 path segments.
+            if len(parts) >= 3:
+                group_id = self._normalize_identifier(parts[-3], "group")
+            else:
+                group_id = None
+
+            display_name = self._read_skill_name_from_frontmatter(skill_file) or skill_folder
+            skill_id = self._normalize_identifier(display_name, "skill")
+            if skill_id in used_ids:
+                skill_id = self._normalize_identifier("-".join(skill_dir_rel.parts), skill_id)
+            suffix = 2
+            while skill_id in used_ids:
+                skill_id = f"{skill_id}-{suffix}"
+                suffix += 1
+            used_ids.add(skill_id)
+
+            skill_entry: dict[str, Any] = {
+                "id": skill_id,
+                "path": str(skill_dir_rel),
+                "name": display_name,
+            }
+            if group_id and _is_valid_identifier(group_id):
+                skill_entry["groups"] = [group_id]
+                groups.setdefault(group_id, set()).add(skill_id)
+            skills.append(skill_entry)
+
+        if not skills:
+            raise SkillPluginError(f"No valid SKILL.md entries found in package: {plugin_dir}")
+
+        payload: dict[str, Any] = {
+            "id": plugin_id,
+            "name": plugin_name_hint or plugin_id,
+            "version": "0.1.0",
+            "description": "Auto-generated manifest from local skill package.",
+            "skills": skills,
+        }
+        if groups:
+            payload["groups"] = [
+                {
+                    "id": gid,
+                    "name": gid.replace("-", " ").replace("_", " ").title(),
+                    "skills": sorted(skill_ids),
+                }
+                for gid, skill_ids in sorted(groups.items(), key=lambda item: item[0])
+            ]
+        return payload
+
+    def _ensure_manifest_for_install(
+        self,
+        source_dir: Path,
+        *,
+        plugin_id_hint: str,
+        plugin_name_hint: str,
+    ) -> dict[str, Any]:
+        manifest_file = source_dir / PLUGIN_MANIFEST_FILENAME
+        if not manifest_file.is_file():
+            payload = self._infer_manifest_payload(
+                source_dir,
+                plugin_id_hint=plugin_id_hint,
+                plugin_name_hint=plugin_name_hint,
+            )
+            self._write_json(manifest_file, payload)
+        return self._load_manifest(source_dir)
+
     def _validate_skill_path(self, plugin_dir: Path, raw_path: str) -> str:
         base = plugin_dir.resolve()
         candidate = (plugin_dir / raw_path).resolve()
@@ -264,6 +387,19 @@ class SkillPluginManager:
         if candidate.name != "SKILL.md" or not candidate.is_file():
             raise SkillPluginError(f"Skill path missing SKILL.md: {raw_path}")
         return str(candidate.relative_to(plugin_dir))
+
+    def _infer_group_from_relative_path(self, relative_path: str) -> str | None:
+        parts = Path(relative_path).parts
+        if len(parts) < 3:
+            return None
+        # <group>/<skill>/SKILL.md or <wrapper>/<group>/<skill>/SKILL.md
+        candidate = parts[-3]
+        if candidate.lower() == "skills":
+            return None
+        group_id = self._normalize_identifier(candidate, "group")
+        if not _is_valid_identifier(group_id):
+            return None
+        return group_id
 
     def _load_manifest(self, plugin_dir: Path) -> dict[str, Any]:
         manifest_file = plugin_dir / PLUGIN_MANIFEST_FILENAME
@@ -385,6 +521,26 @@ class SkillPluginManager:
                 "skill_ids": sorted(set(group_skills)),
             })
 
+        # Backward compatibility: if old manifests omitted `groups`,
+        # infer from skill path layout for grouped packages.
+        if not groups:
+            inferred_groups: dict[str, set[str]] = {}
+            for skill in skills:
+                if skill["group_ids"]:
+                    continue
+                inferred_group = self._infer_group_from_relative_path(skill["relative_path"])
+                if inferred_group is None:
+                    continue
+                skill["group_ids"] = [inferred_group]
+                inferred_groups.setdefault(inferred_group, set()).add(skill["id"])
+            for group_id, skill_ids in sorted(inferred_groups.items(), key=lambda item: item[0]):
+                seen_group_ids.add(group_id)
+                groups.append({
+                    "id": group_id,
+                    "name": group_id.replace("-", " ").replace("_", " ").title(),
+                    "skill_ids": sorted(skill_ids),
+                })
+
         for skill in skills:
             for group_id in skill["group_ids"]:
                 if group_id not in seen_group_ids:
@@ -416,9 +572,13 @@ class SkillPluginManager:
         )
         if len(candidates) == 1:
             return candidates[0]
-        if not candidates:
-            raise SkillPluginError(f"Zip archive missing {PLUGIN_MANIFEST_FILENAME}")
-        raise SkillPluginError("Zip archive contains multiple plugin roots")
+        if candidates:
+            raise SkillPluginError("Zip archive contains multiple plugin roots")
+
+        # Manifest is optional for local skill packages: infer directly from SKILL.md layout.
+        if any(item.name == "SKILL.md" for item in extracted_dir.rglob("SKILL.md")):
+            return extracted_dir
+        raise SkillPluginError("Zip archive contains no SKILL.md files")
 
     def _safe_extract_zip(self, archive_path: Path, target_dir: Path) -> None:
         with zipfile.ZipFile(archive_path, "r") as zf:
@@ -434,8 +594,14 @@ class SkillPluginManager:
         *,
         source_type: str,
         source_path: str,
+        plugin_id_hint: str,
+        plugin_name_hint: str,
     ) -> dict[str, Any]:
-        manifest = self._load_manifest(source_dir)
+        manifest = self._ensure_manifest_for_install(
+            source_dir,
+            plugin_id_hint=plugin_id_hint,
+            plugin_name_hint=plugin_name_hint,
+        )
         plugin_id = manifest["id"]
         destination = self.plugins_root / plugin_id
         staging = self.plugins_root / f".tmp-{plugin_id}-{int(time.time() * 1000)}"
@@ -460,12 +626,15 @@ class SkillPluginManager:
             resolved,
             source_type="directory",
             source_path=str(resolved),
+            plugin_id_hint=resolved.name,
+            plugin_name_hint=resolved.name.replace("-", " ").replace("_", " ").title(),
         )
 
-    def install_from_zip(self, archive_path: Path) -> dict[str, Any]:
+    def install_from_zip(self, archive_path: Path, archive_name_hint: str | None = None) -> dict[str, Any]:
         resolved = archive_path.expanduser().resolve()
         if not resolved.is_file():
             raise SkillPluginError(f"Plugin zip file not found: {resolved}")
+        hint_stem = Path(archive_name_hint).stem if isinstance(archive_name_hint, str) and archive_name_hint.strip() else resolved.stem
         with tempfile.TemporaryDirectory(prefix="skill-plugin-", dir=self.plugins_root) as tmp:
             tmp_dir = Path(tmp)
             self._safe_extract_zip(resolved, tmp_dir)
@@ -474,6 +643,8 @@ class SkillPluginManager:
                 plugin_root,
                 source_type="zip",
                 source_path=str(resolved),
+                plugin_id_hint=hint_stem,
+                plugin_name_hint=hint_stem.replace("-", " ").replace("_", " ").title(),
             )
 
     def uninstall(self, plugin_id: str) -> None:
@@ -510,6 +681,8 @@ class SkillPluginManager:
         if target_type in {"group", "skill"}:
             if not isinstance(target_id, str) or not _is_valid_identifier(target_id):
                 raise SkillPluginError("target_id is required for group/skill toggles")
+        if plugin_id == _BUILTIN_PLUGIN_ID and target_type == "plugin":
+            raise SkillPluginError("Built-in skills do not support plugin-level toggles")
         manifests_by_id = {record[0]["id"]: record[0] for record in self._iter_plugin_records()}
         if plugin_id not in manifests_by_id:
             raise SkillPluginError(f"Plugin not installed: {plugin_id}")
@@ -560,12 +733,21 @@ class SkillPluginManager:
             global_entry = global_state.get(plugin_id, {})
             project_entry = project_state.get(plugin_id, {})
 
-            plugin_enabled = _effective_scope_state(
-                _safe_bool(global_entry.get("enabled")) if isinstance(global_entry, dict) else None,
-                _safe_bool(project_entry.get("enabled")) if isinstance(project_entry, dict) else None,
-                global_explicit=isinstance(global_entry, dict) and isinstance(global_entry.get("enabled"), bool),
-                project_explicit=isinstance(project_entry, dict) and isinstance(project_entry.get("enabled"), bool),
-            )
+            if plugin_id == _BUILTIN_PLUGIN_ID:
+                plugin_enabled = _effective_scope_state(
+                    True,
+                    None,
+                    global_explicit=False,
+                    project_explicit=False,
+                    default=True,
+                )
+            else:
+                plugin_enabled = _effective_scope_state(
+                    _safe_bool(global_entry.get("enabled")) if isinstance(global_entry, dict) else None,
+                    _safe_bool(project_entry.get("enabled")) if isinstance(project_entry, dict) else None,
+                    global_explicit=isinstance(global_entry, dict) and isinstance(global_entry.get("enabled"), bool),
+                    project_explicit=isinstance(project_entry, dict) and isinstance(project_entry.get("enabled"), bool),
+                )
 
             groups: list[dict[str, Any]] = []
             group_effective: dict[str, bool] = {}
@@ -616,8 +798,7 @@ class SkillPluginManager:
                         group_customized_global[group_id] = True
                     if project_explicit:
                         group_customized_project[group_id] = True
-                # If a skill has explicit scope overrides, it is no longer gated by group state
-                # until the group is explicitly set again.
+                # Per-skill explicit overrides bypass group gate until group is reapplied.
                 if global_explicit or project_explicit:
                     group_gate = True
                 else:

@@ -775,6 +775,7 @@ class WebChannel(BaseChannel):
             if content_type.startswith("multipart/form-data"):
                 multipart = await request.multipart()
                 zip_path: Path | None = None
+                zip_name: str | None = None
                 while True:
                     part = await multipart.next()
                     if part is None:
@@ -785,6 +786,7 @@ class WebChannel(BaseChannel):
                     if not part.filename:
                         await part.release()
                         continue
+                    zip_name = part.filename
                     with tempfile.NamedTemporaryFile(
                         prefix="skill-plugin-",
                         suffix=".zip",
@@ -799,7 +801,7 @@ class WebChannel(BaseChannel):
                 if zip_path is None:
                     return web.json_response({"error": "zip file field 'zip' is required"}, status=400)
                 try:
-                    installed = manager.install_from_zip(zip_path)
+                    installed = manager.install_from_zip(zip_path, archive_name_hint=zip_name)
                 finally:
                     try:
                         zip_path.unlink(missing_ok=True)

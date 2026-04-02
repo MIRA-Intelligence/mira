@@ -391,6 +391,32 @@ async def test_skill_plugin_install_from_zip(web_channel: WebChannel, tmp_path: 
     assert body["installed"]["id"] == "zip-pack"
 
 
+async def test_skill_plugin_install_from_zip_without_manifest(web_channel: WebChannel, tmp_path: Path) -> None:
+    src = tmp_path / "no-manifest-pack"
+    (src / "research" / "finder").mkdir(parents=True, exist_ok=True)
+    (src / "research" / "finder" / "SKILL.md").write_text(
+        "---\nname: Finder\n---\n\n# skill",
+        encoding="utf-8",
+    )
+    zip_path = tmp_path / "no-manifest-pack.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for item in src.rglob("*"):
+            if item.is_file():
+                zf.write(item, item.relative_to(src))
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.headers = {"Content-Type": "multipart/form-data; boundary=fake"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="zip", filename="no-manifest-pack.zip", chunks=[zip_path.read_bytes()]),
+    ]))
+
+    resp = await web_channel._handle_skill_plugins_install(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["installed"]["id"] == "no-manifest-pack"
+
+
 async def test_skill_plugin_toggle_and_uninstall(web_channel: WebChannel, tmp_path: Path) -> None:
     src = _create_plugin_source(tmp_path)
     install_req = MagicMock(spec=web.Request)
