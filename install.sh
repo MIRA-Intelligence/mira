@@ -14,12 +14,12 @@ echo "-----------------------------"
 DEFAULT_BRANCH="main"
 INSTALL_BRANCH="${MEDPILOT_BRANCH:-}"
 
-if [ -z "$INSTALL_BRANCH" ]; then
-    read -p "Which git branch should be installed? [${DEFAULT_BRANCH}] " -r || true
-    INSTALL_BRANCH="${REPLY:-$DEFAULT_BRANCH}"
-fi
-
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ -z "$INSTALL_BRANCH" ] && [ -t 0 ]; then
+        read -p "Which git branch should be installed? [${DEFAULT_BRANCH}] " -r || true
+        INSTALL_BRANCH="${REPLY:-$DEFAULT_BRANCH}"
+    fi
+
     CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
     if [ -n "$INSTALL_BRANCH" ] && [ "$CURRENT_BRANCH" != "$INSTALL_BRANCH" ]; then
         echo -e "${CYAN}Switching to branch '${INSTALL_BRANCH}'...${RESET}"
