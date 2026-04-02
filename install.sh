@@ -11,6 +11,32 @@ RESET="\033[0m"
 echo "Welcome to MedPilot Installer"
 echo "-----------------------------"
 
+DEFAULT_BRANCH="main"
+INSTALL_BRANCH="${MEDPILOT_BRANCH:-}"
+
+if [ -z "$INSTALL_BRANCH" ]; then
+    read -p "Which git branch should be installed? [${DEFAULT_BRANCH}] " -r || true
+    INSTALL_BRANCH="${REPLY:-$DEFAULT_BRANCH}"
+fi
+
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+    if [ -n "$INSTALL_BRANCH" ] && [ "$CURRENT_BRANCH" != "$INSTALL_BRANCH" ]; then
+        echo -e "${CYAN}Switching to branch '${INSTALL_BRANCH}'...${RESET}"
+        git fetch origin "$INSTALL_BRANCH" >/dev/null 2>&1 || true
+        if git show-ref --verify --quiet "refs/heads/${INSTALL_BRANCH}"; then
+            git checkout "$INSTALL_BRANCH"
+        elif git show-ref --verify --quiet "refs/remotes/origin/${INSTALL_BRANCH}"; then
+            git checkout -b "$INSTALL_BRANCH" --track "origin/$INSTALL_BRANCH"
+        else
+            echo -e "${RED}Error: Branch '${INSTALL_BRANCH}' not found locally or on origin.${RESET}"
+            exit 1
+        fi
+    fi
+else
+    echo -e "${YELLOW}Warning: Not in a git repository. Branch selection skipped.${RESET}"
+fi
+
 if ! command -v conda &> /dev/null; then
     echo -e "${YELLOW}Warning: conda is not installed. It is highly recommended to run MedPilot in an isolated conda environment.${RESET}"
     read -p "Do you want to create a standard Python virtual environment instead? [Y/n] " -r || true
