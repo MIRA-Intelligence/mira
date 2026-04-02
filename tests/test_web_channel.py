@@ -429,15 +429,17 @@ async def test_skill_plugin_toggle_and_uninstall(web_channel: WebChannel, tmp_pa
     toggle_req.match_info = {"session_id": "PRJ-0001"}
     toggle_req.json = AsyncMock(return_value={
         "scope": "global",
-        "target_type": "plugin",
+        "target_type": "skill",
         "plugin_id": "plugin-pack",
+        "target_id": "writer",
         "enabled": False,
     })
     toggle_resp = await web_channel._handle_skill_plugins_state(toggle_req)
     assert toggle_resp.status == 200
     toggle_body = json.loads(toggle_resp.text)
     plugin_pack = next(item for item in toggle_body["plugins"] if item["id"] == "plugin-pack")
-    assert plugin_pack["enabled"]["effective"] is False
+    writer = next(item for item in plugin_pack["skills"] if item["id"] == "writer")
+    assert writer["enabled"]["effective"] is False
 
     remove_req = MagicMock(spec=web.Request)
     remove_req.match_info = {"session_id": "PRJ-0001", "plugin_id": "plugin-pack"}

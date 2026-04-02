@@ -674,15 +674,12 @@ class SkillPluginManager:
     ) -> None:
         if scope not in {"global", "project"}:
             raise SkillPluginError("scope must be 'global' or 'project'")
-        if target_type not in {"plugin", "group", "skill"}:
-            raise SkillPluginError("target_type must be 'plugin', 'group', or 'skill'")
+        if target_type not in {"group", "skill"}:
+            raise SkillPluginError("target_type must be 'group' or 'skill'")
         if not isinstance(plugin_id, str) or not _is_valid_identifier(plugin_id):
             raise SkillPluginError("Invalid plugin_id")
-        if target_type in {"group", "skill"}:
-            if not isinstance(target_id, str) or not _is_valid_identifier(target_id):
-                raise SkillPluginError("target_id is required for group/skill toggles")
-        if plugin_id == _BUILTIN_PLUGIN_ID and target_type == "plugin":
-            raise SkillPluginError("Built-in skills do not support plugin-level toggles")
+        if not isinstance(target_id, str) or not _is_valid_identifier(target_id):
+            raise SkillPluginError("target_id is required for group/skill toggles")
         manifests_by_id = {record[0]["id"]: record[0] for record in self._iter_plugin_records()}
         if plugin_id not in manifests_by_id:
             raise SkillPluginError(f"Plugin not installed: {plugin_id}")
@@ -707,9 +704,7 @@ class SkillPluginManager:
         plugins = state.setdefault("plugins", {})
         plugin_state = plugins.setdefault(plugin_id, {"enabled": None, "groups": {}, "skills": {}})
 
-        if target_type == "plugin":
-            plugin_state["enabled"] = enabled
-        elif target_type == "group":
+        if target_type == "group":
             groups = plugin_state.setdefault("groups", {})
             groups[target_id] = enabled
             # Reapplying a group clears per-skill overrides in this scope
@@ -733,21 +728,14 @@ class SkillPluginManager:
             global_entry = global_state.get(plugin_id, {})
             project_entry = project_state.get(plugin_id, {})
 
-            if plugin_id == _BUILTIN_PLUGIN_ID:
-                plugin_enabled = _effective_scope_state(
-                    True,
-                    None,
-                    global_explicit=False,
-                    project_explicit=False,
-                    default=True,
-                )
-            else:
-                plugin_enabled = _effective_scope_state(
-                    _safe_bool(global_entry.get("enabled")) if isinstance(global_entry, dict) else None,
-                    _safe_bool(project_entry.get("enabled")) if isinstance(project_entry, dict) else None,
-                    global_explicit=isinstance(global_entry, dict) and isinstance(global_entry.get("enabled"), bool),
-                    project_explicit=isinstance(project_entry, dict) and isinstance(project_entry.get("enabled"), bool),
-                )
+            # Plugin-level toggles are deprecated; keep plugin gate always enabled.
+            plugin_enabled = _effective_scope_state(
+                True,
+                None,
+                global_explicit=False,
+                project_explicit=False,
+                default=True,
+            )
 
             groups: list[dict[str, Any]] = []
             group_effective: dict[str, bool] = {}

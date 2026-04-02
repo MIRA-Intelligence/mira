@@ -73,23 +73,13 @@ def test_install_and_scope_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert plugin["enabled"]["effective"] is True
     assert {s["id"] for s in plugin["skills"]} == {"trainer", "evaluator"}
 
-    manager.set_enabled(
-        scope="global",
-        plugin_id="dl-pack",
-        target_type="plugin",
-        enabled=False,
-    )
-    updated_plugins = manager.list_plugins()
-    assert next(item for item in updated_plugins if item["id"] == "dl-pack")["enabled"]["effective"] is False
-
-    manager.set_enabled(
-        scope="project",
-        plugin_id="dl-pack",
-        target_type="plugin",
-        enabled=True,
-    )
-    updated_plugins = manager.list_plugins()
-    assert next(item for item in updated_plugins if item["id"] == "dl-pack")["enabled"]["effective"] is True
+    with pytest.raises(SkillPluginError):
+        manager.set_enabled(
+            scope="global",
+            plugin_id="dl-pack",
+            target_type="plugin",
+            enabled=False,
+        )
 
     manager.set_enabled(
         scope="project",

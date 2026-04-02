@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,6 +9,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from medpilot.agent.context import ContextBuilder
+from medpilot.agent.skill_plugins import SkillPluginManager
+from medpilot.agent.skills import SkillsLoader
+from medpilot.agent import skill_plugins as skill_plugins_mod
 
 TAG = ContextBuilder._RUNTIME_CONTEXT_TAG
 
@@ -381,3 +385,50 @@ class TestBuildUserContent:
         f.write_text("hello", encoding="utf-8")
         cb = ContextBuilder(tmp_path)
         assert cb._build_user_content("t", [str(f)]) == "t"
+
+
+def test_build_system_prompt_hides_disabled_plugin_skill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    global_workspace = tmp_path / "global-workspace"
+    global_workspace.mkdir(parents=True)
+    monkeypatch.setattr(skill_plugins_mod, "get_workspace_path", lambda _workspace: global_workspace)
+
+    project_workspace = tmp_path / "project"
+    plugin_source = tmp_path / "plugin-src"
+    skill_dir = plugin_source / "skills" / "hidden-skill"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\ndescription: Hidden Skill\n---\n\n# hidden",
+        encoding="utf-8",
+    )
+    (plugin_source / "plugin.json").write_text(
+        json.dumps({
+            "id": "hidden-pack",
+            "version": "0.1.0",
+            "skills": [{"id": "hidden-skill", "path": "skills/hidden-skill"}],
+        }),
+        encoding="utf-8",
+    )
+
+    manager = SkillPluginManager(project_workspace)
+    manager.install_from_directory(plugin_source)
+
+    cb = ContextBuilder(project_workspace)
+    cb.skills = SkillsLoader(project_workspace, builtin_skills_dir=None, plugin_manager=manager)
+
+    visible_prompt = cb.build_system_prompt()
+    assert "<name>hidden-skill</name>" in visible_prompt
+    assert cb.skills.load_skill("hidden-skill") is not None
+
+    manager.set_enabled(
+        scope="project",
+        plugin_id="hidden-pack",
+        target_type="skill",
+        target_id="hidden-skill",
+        enabled=False,
+    )
+    hidden_prompt = cb.build_system_prompt()
+    assert "<name>hidden-skill</name>" not in hidden_prompt
+    assert cb.skills.load_skill("hidden-skill") is None
