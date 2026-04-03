@@ -28,10 +28,9 @@ Before writing code, verify if the task is well-defined from an engineering pers
 
 ### The Cycle
 
-
-
+```
 Requirement Analysis → Constraint Check → Solution Design → Implementation → Benchmarking → Optimization
-
+```
 
 
 ### Step-by-Step Requirements

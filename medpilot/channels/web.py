@@ -509,6 +509,33 @@ class WebChannel(BaseChannel):
                     metadata=metadata,
                     session_key=f"web:{session_id}",
                 )
+            elif msg_type == "set_mode":
+                session_id = data.get("session_id", session_id)
+                user_id = data.get("user_id", session_id or "anonymous")
+                run_mode = _normalize_run_mode(data.get("mode"))
+
+                if session_id is None:
+                    await ws.send_json(
+                        {"type": "error", "content": "session_id required"}
+                    )
+                    continue
+
+                self._clients[session_id] = ws
+                project_dir = str(self.projects_root / session_id)
+                metadata = {
+                    "source": "web",
+                    "project_dir": project_dir,
+                    "run_mode": run_mode,
+                    "_control": "set_mode",
+                }
+                await self._handle_message(
+                    sender_id=user_id,
+                    chat_id=session_id,
+                    content="__set_mode__",
+                    media=[],
+                    metadata=metadata,
+                    session_key=f"web:{session_id}",
+                )
 
         # Client disconnected
         if session_id and self._clients.get(session_id) is ws:

@@ -125,6 +125,7 @@ class AgentLoop:
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._session_run_modes: dict[str, str] = {}  # session_key -> manual|auto
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
@@ -220,6 +221,23 @@ class AgentLoop:
             if mode in {"manual", "auto"}:
                 return mode
         return "manual"
+
+    @staticmethod
+    def _parse_run_mode(value: object) -> str | None:
+        """Parse run mode, returning None when absent/invalid."""
+        if isinstance(value, str):
+            mode = value.strip().lower()
+            if mode in {"manual", "auto"}:
+                return mode
+        return None
+
+    def _resolve_session_run_mode(self, session_key: str, inbound_value: object) -> str:
+        """Resolve effective mode for a session, updating cache if explicitly provided."""
+        explicit = self._parse_run_mode(inbound_value)
+        if explicit:
+            self._session_run_modes[session_key] = explicit
+            return explicit
+        return self._session_run_modes.get(session_key, "manual")
 
     @staticmethod
     def _looks_like_user_input_request(text: str | None) -> bool:
@@ -476,7 +494,10 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
 
-            if msg.content.strip().lower() == "/stop":
+            control = (msg.metadata or {}).get("_control")
+            if control == "set_mode":
+                await self._handle_set_mode(msg)
+            elif msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
@@ -497,6 +518,20 @@ class AgentLoop:
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
+
+    async def _handle_set_mode(self, msg: InboundMessage) -> None:
+        """Update session run mode immediately without entering normal dispatch."""
+        mode = self._normalize_run_mode((msg.metadata or {}).get("run_mode"))
+        self._session_run_modes[msg.session_key] = mode
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=f"Run mode switched to {mode}.",
+            metadata={
+                "_control": "set_mode_ack",
+                "run_mode": mode,
+            },
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -567,13 +602,13 @@ class AgentLoop:
 
         meta = msg.metadata or {}
         project_dir = meta.get("project_dir")
-        run_mode = self._normalize_run_mode(meta.get("run_mode"))
+        key = session_key or msg.session_key
+        run_mode = self._resolve_session_run_mode(key, meta.get("run_mode"))
         if project_dir:
             sessions_mgr = self._get_project_sessions(project_dir)
         else:
             sessions_mgr = self.sessions
 
-        key = session_key or msg.session_key
         session = sessions_mgr.get_or_create(key)
 
         # Slash commands
@@ -669,13 +704,17 @@ class AgentLoop:
         )
 
         auto_round = 0
-        while self._should_continue_auto_web(
-            channel=msg.channel,
-            run_mode=run_mode,
-            project_dir=project_dir,
-            final_content=final_content,
-            auto_round=auto_round,
-        ):
+        while True:
+            current_mode = self._session_run_modes.get(key, run_mode)
+            if not self._should_continue_auto_web(
+                channel=msg.channel,
+                run_mode=current_mode,
+                project_dir=project_dir,
+                final_content=final_content,
+                auto_round=auto_round,
+            ):
+                break
+            run_mode = current_mode
             auto_round += 1
             await progress_cb(
                 f"auto-run round {auto_round}: continuing to next pending experiment"

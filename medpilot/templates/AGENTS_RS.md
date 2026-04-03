@@ -15,23 +15,21 @@ Before proposing any new experiment or method, you must critically evaluate the 
 ### Required Behavior
 
 1. **Demand Deep Context**
-   - Do not accept superficial descriptions like "the model performs poorly." Demand to know *where* it fails: specific anatomical structures, specific acquisition parameters (e.g., low SNR, high motion), or specific topological errors.
+   - Do not accept superficial descriptions like "the model performs poorly." Demand to know *where* it fails. e.g., specific anatomical structures, specific acquisition parameters, or specific topological errors.
    - If the user provides insufficient observational data, ask targeted questions to extract the physics or anatomy of the failure mode.
 
 2. **Critical Review of Consensus**
-   - Explicitly identify the "standard assumption" being used right now, and state why it might be fundamentally flawed for this specific medical imaging problem.
+   - Explicitly identify the "standard assumption" being used right now, and state why it might be fundamentally flawed for this specific research problem.
 
 3. **Ban "Engineering Urges"**
    - **Strictly Prohibited:** Proposing "use a larger Transformer", "add more layers", or "try a different optimizer" as a scientific hypothesis.
-   - **Required:** Hypotheses must be grounded in mathematical topology, imaging physics (e.g., MRI k-space artifacts, CT beam hardening), or anatomical priors.
+   - **Required:** Hypotheses must be grounded in scientific knowledge, such as mathematical topology, imaging physics (e.g., MRI k-space artifacts, CT beam hardening), or anatomical priors.
 
 ### The Cycle
 
-
-
-Observation → Critical Review → Hypothesis (Mechanism) → Falsifiable Prediction → Experiment → Deep Analysis
-
-
+```
+Observation → Critical Review → Hypothesis (Scientific Mechanism) → Falsifiable Prediction → Experiment → Deep Analysis
+```
 
 ### Step-by-Step Requirements
 
@@ -60,9 +58,9 @@ Observation → Critical Review → Hypothesis (Mechanism) → Falsifiable Predi
 ### Rules
 1. **Every controlled experiment gets a git commit.**
 2. **Commit after a successful running** the experiment.
-3. **Commit message format**: `SciNNN: <brief description of hypothesis tested>`
-   - Example: `Sci014: test phase-continuity hypothesis using custom topological penalty`
-4. **Tag critical discoveries**: `git tag sci014-falsified-mse`
+3. **Commit message format**: `ExpNNN: <brief description of hypothesis tested>`
+   - Example: `Exp014: test phase-continuity hypothesis using custom topological penalty`
+4. **Tag critical discoveries**: `git tag exp014-falsified-mse`
 5. **Never commit generated data** — use `.gitignore`.
 6. **Branch for distinct theoretical approaches.**
 
@@ -72,19 +70,17 @@ Observation → Critical Review → Hypothesis (Mechanism) → Falsifiable Predi
 
 Every experiment recorded in MEMORY.md must include:
 
-
-
-SciNNN: <Title> (commit: <hash>)
-Observation: What specific anomaly/pattern triggered this investigation?
-Assumptions Challenged: What standard consensus are we questioning?
-Hypothesis (Mechanism): What is the underlying physical/mathematical reason for the observation?
-Prediction: What exact behavior will prove/disprove this?
-Experiment Design: How are we isolating the variable?
-Expected Phenomenon: What results aligned with the hypothesis?
-Anomalies: What unexpected behaviors occurred during this test? (Crucial for next steps)
-Conclusion: Is the mechanism supported or falsified? What is the real root cause?
-
-
+```
+ExpNNN: <Title> (commit: <hash>)
+- **Observation**: What specific anomaly/pattern triggered this investigation?
+- **Assumptions Challenged**: What standard consensus are we questioning?
+- **Hypothesis (Mechanism)**: What is the underlying physical/mathematical reason for the observation?
+- **Prediction**: What exact behavior will prove/disprove this?
+- **Experiment Design**: How are we isolating the variable?
+- **Expected Phenomenon**: What results aligned with the hypothesis?
+- **Anomalies**: What unexpected behaviors occurred during this test? (Crucial for next steps)
+- **Conclusion**: Is the mechanism supported or falsified? What is the real root cause?
+```
 
 ---
 
