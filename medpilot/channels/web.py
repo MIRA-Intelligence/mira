@@ -35,6 +35,15 @@ def _load_ui_instructions() -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _normalize_run_mode(value: Any) -> str:
+    """Normalize UI run mode with a conservative fallback."""
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode in {"manual", "auto"}:
+            return mode
+    return "manual"
+
+
 def _stringify_history_content(content: Any) -> str:
     """Flatten session content into a UI-friendly text payload."""
     if isinstance(content, str):
@@ -470,6 +479,7 @@ class WebChannel(BaseChannel):
                 user_id = data.get("user_id", session_id or "anonymous")
                 content = data.get("content", "")
                 media = data.get("media", [])
+                run_mode = _normalize_run_mode(data.get("mode"))
 
                 if session_id is None:
                     await ws.send_json(
@@ -487,6 +497,7 @@ class WebChannel(BaseChannel):
                 metadata: dict[str, Any] = {
                     "source": "web",
                     "project_dir": project_dir,
+                    "run_mode": run_mode,
                 }
                 if self._ui_instructions:
                     metadata["_ui_system_instructions"] = self._ui_instructions

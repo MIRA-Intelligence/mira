@@ -51,6 +51,8 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
+    _AUTO_MAX_ROUNDS = 20
+    _AUTO_CONTINUE_MARKER = "[AUTO-CONTINUE-INTERNAL]"
 
     def __init__(
         self,
@@ -209,6 +211,145 @@ class AgentLoop:
         if score is None:
             return f"router -> {tier} ({model}{details})"
         return f"router -> {tier} ({model}, score={score}{details})"
+
+    @staticmethod
+    def _normalize_run_mode(value: object) -> str:
+        """Normalize UI run mode with a conservative fallback."""
+        if isinstance(value, str):
+            mode = value.strip().lower()
+            if mode in {"manual", "auto"}:
+                return mode
+        return "manual"
+
+    @staticmethod
+    def _looks_like_user_input_request(text: str | None) -> bool:
+        """Heuristic: detect when assistant explicitly needs user input."""
+        if not text:
+            return False
+        lowered = text.lower()
+        keywords = (
+            "please provide",
+            "please confirm",
+            "please choose",
+            "could you",
+            "can you provide",
+            "which option",
+            "clarify",
+            "need your input",
+            "what would you like to do next",
+            "需要你",
+            "请提供",
+            "请确认",
+            "请选择",
+            "是否继续",
+            "是否开始",
+            "是否要我",
+            "要我现在",
+        )
+        return any(k in lowered for k in keywords)
+
+    @staticmethod
+    def _looks_like_failure_response(text: str | None) -> bool:
+        """Heuristic: detect blocking errors where auto should stop.
+
+        IMPORTANT: Do not treat ordinary experiment outcomes like "hypothesis failed"
+        as blocking failures. We only stop on explicit runtime/system blockage.
+        """
+        if not text:
+            return False
+        lowered = text.lower()
+        hard_signals = (
+            "traceback (most recent call last)",
+            "sorry, i encountered an error",
+            "memory archival failed",
+            "command timed out",
+            "exit code:",
+            "permission denied",
+            "no such file or directory",
+            "module not found",
+            "failed to connect",
+            "failed to load",
+            "tool call failed",
+            "unrecoverable",
+            "blocked by",
+            "无法继续",
+            "出现错误",
+            "运行时错误",
+        )
+        if any(k in lowered for k in hard_signals):
+            return True
+        if lowered.startswith("error:") or "\nerror:" in lowered:
+            return True
+        return False
+
+    @staticmethod
+    def _load_task_plan(project_dir: str | None) -> dict | None:
+        """Load web task_plan.json if available."""
+        if not project_dir:
+            return None
+        plan_path = Path(project_dir) / "task_plan.json"
+        if not plan_path.is_file():
+            return None
+        try:
+            payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _plan_has_pending_work(plan: dict | None) -> bool:
+        """Return whether task_plan still has pending/running experiments."""
+        if not plan:
+            return False
+        experiments = plan.get("experiments")
+        if not isinstance(experiments, list):
+            return False
+        return any(
+            isinstance(exp, dict) and exp.get("status") in {"pending", "running"}
+            for exp in experiments
+        )
+
+    def _build_auto_continue_message(
+        self,
+        channel: str,
+        chat_id: str,
+        project_dir: str | None,
+        run_mode: str,
+    ) -> str:
+        """Build the synthetic internal continue message for server-side auto mode."""
+        runtime_ctx = ContextBuilder._build_runtime_context(
+            channel,
+            chat_id,
+            project_dir,
+            run_mode=run_mode,
+        )
+        return (
+            f"{runtime_ctx}\n\n{self._AUTO_CONTINUE_MARKER}\n"
+            "Continue automatically to the next pending experiment or stage. "
+            "Do not stop for confirmation unless user input is strictly required."
+        )
+
+    def _should_continue_auto_web(
+        self,
+        *,
+        channel: str,
+        run_mode: str,
+        project_dir: str | None,
+        final_content: str | None,
+        auto_round: int,
+    ) -> bool:
+        """Decide whether to schedule another internal auto-run cycle."""
+        if channel != "web" or run_mode != "auto":
+            return False
+        if auto_round >= self._AUTO_MAX_ROUNDS:
+            logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
+            return False
+        if self._looks_like_failure_response(final_content):
+            return False
+        if self._looks_like_user_input_request(final_content):
+            return False
+        plan = self._load_task_plan(project_dir)
+        return self._plan_has_pending_work(plan)
 
     def _get_model_runtime(self, session_key: str) -> RoutedProviderManager:
         """Return the session-local model runtime, creating it on demand."""
@@ -426,6 +567,7 @@ class AgentLoop:
 
         meta = msg.metadata or {}
         project_dir = meta.get("project_dir")
+        run_mode = self._normalize_run_mode(meta.get("run_mode"))
         if project_dir:
             sessions_mgr = self._get_project_sessions(project_dir)
         else:
@@ -507,6 +649,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
+            run_mode=run_mode,
             extra_system=extra_system,
         )
 
@@ -518,11 +661,39 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        progress_cb = on_progress or _bus_progress
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             model_runtime=model_runtime,
-            on_progress=on_progress or _bus_progress,
+            on_progress=progress_cb,
         )
+
+        auto_round = 0
+        while self._should_continue_auto_web(
+            channel=msg.channel,
+            run_mode=run_mode,
+            project_dir=project_dir,
+            final_content=final_content,
+            auto_round=auto_round,
+        ):
+            auto_round += 1
+            await progress_cb(
+                f"auto-run round {auto_round}: continuing to next pending experiment"
+            )
+            all_msgs.append({
+                "role": "user",
+                "content": self._build_auto_continue_message(
+                    msg.channel,
+                    msg.chat_id,
+                    project_dir,
+                    run_mode,
+                ),
+            })
+            final_content, _, all_msgs = await self._run_agent_loop(
+                all_msgs,
+                model_runtime=model_runtime,
+                on_progress=progress_cb,
+            )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -558,6 +729,11 @@ class AgentLoop:
                         entry["content"] = parts[1]
                     else:
                         continue
+                if (
+                    isinstance(entry.get("content"), str)
+                    and self._AUTO_CONTINUE_MARKER in entry["content"]
+                ):
+                    continue
                 if isinstance(content, list):
                     filtered = []
                     for c in content:

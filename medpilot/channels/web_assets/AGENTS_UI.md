@@ -1,6 +1,7 @@
 # MedPilot — Web Dashboard Instructions
 
 These instructions apply **only** when your Runtime Context shows `Channel: web`.
+Runtime Context also includes `Run Mode` (`manual` or `auto`) provided by the UI.
 
 ## Project Directory
 
@@ -36,7 +37,8 @@ When starting a new project, begin with background research:
   using `pending` entries (`Exp001`, `Exp002`, ...). Include at least `id`,
   `title`, and `status`, and add `question` / `hypothesis` / `prediction` early
   if you already know them.
-- After research, STOP and report findings before moving to experiments.
+- In `manual` mode: after research, STOP and report findings before moving to experiments.
+- In `auto` mode: continue directly into the next pending experiment without waiting.
 
 ## Experiment-by-Experiment Execution — MANDATORY
 
@@ -46,9 +48,13 @@ You MUST work **one experiment at a time**. Each experiment follows:
 Question → Hypothesis → Prediction → Experiment → Analysis → Conclusion
 ```
 
-**CRITICAL RULE: After completing each experiment (or after it fails), you MUST
-STOP and return a summary. Do NOT proceed to the next experiment until the user
-explicitly says "continue" or gives further instructions.**
+**CRITICAL RULE (mode-dependent):**
+- In `manual` mode: after completing each experiment (or after it fails), you MUST
+  STOP and return a summary. Do NOT proceed until the user explicitly says
+  "continue" or gives further instructions.
+- In `auto` mode: continue to the next pending experiment automatically. Only stop
+  early when user input is strictly required, the project is blocked by an error,
+  or there are no pending/running experiments left.
 
 ### Workflow for each experiment
 
@@ -77,9 +83,12 @@ explicitly says "continue" or gives further instructions.**
    - What happened? (key metrics)
    - What does this mean? (conclusion)
    - What should we do next? (proposed next experiment)
-   Then **STOP** — do not start the next experiment.
+   - In `manual` mode: then **STOP** and wait for user confirmation.
+   - In `auto` mode: do **NOT** stop here; proceed to the next pending experiment automatically.
 
-5. **Wait**: The user (or the UI in auto-mode) will tell you when to continue.
+5. **Wait/Continue**:
+   - `manual`: wait for user confirmation.
+   - `auto`: continue automatically to the next pending experiment.
 
 ### Example response at end of an experiment
 
