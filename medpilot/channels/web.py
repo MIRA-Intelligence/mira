@@ -416,11 +416,24 @@ class WebChannel(BaseChannel):
         logger.info("Web channel stopped")
 
     async def send(self, msg: OutboundMessage) -> None:
+        metadata = msg.metadata or {}
+        if metadata.get("_audit_only"):
+            action = metadata.get("_audit_event")
+            details = metadata.get("_audit_details")
+            if isinstance(action, str) and action:
+                self._audit(
+                    source="agent",
+                    action=action,
+                    session_id=msg.chat_id,
+                    details=details if isinstance(details, dict) else {},
+                )
+            return
+
         ws = self._clients.get(msg.chat_id)
-        is_progress = msg.metadata.get("_progress", False)
+        is_progress = metadata.get("_progress", False)
         common_details = {
             "type": "progress" if is_progress else "response",
-            "tool_hint": bool(msg.metadata.get("_tool_hint", False)),
+            "tool_hint": bool(metadata.get("_tool_hint", False)),
             "content_preview": self._preview(msg.content),
         }
         if ws is None or ws.closed:
@@ -438,7 +451,7 @@ class WebChannel(BaseChannel):
             "session_id": msg.chat_id,
             "content": msg.content,
             "media": msg.media,
-            "metadata": msg.metadata,
+            "metadata": metadata,
         }
 
         try:

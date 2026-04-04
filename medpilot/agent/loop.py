@@ -8,7 +8,7 @@ import re
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -194,6 +194,49 @@ class AgentLoop:
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    @staticmethod
+    def _extract_read_file_path(arguments: object) -> str | None:
+        """Extract read_file path argument from model tool-call payload."""
+        payload = arguments[0] if isinstance(arguments, list) and arguments else arguments
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("path")
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _extract_skill_name_from_path(path: str) -> str | None:
+        """Return skill name when path targets a skills/**/SKILL.md file."""
+        normalized = path.strip().replace("\\", "/")
+        if not normalized.lower().endswith("/skill.md"):
+            return None
+
+        parts = [part for part in normalized.split("/") if part]
+        if len(parts) < 2 or parts[-1].lower() != "skill.md":
+            return None
+        return parts[-2]
+
+    @classmethod
+    def _build_skill_invoked_event(
+        cls,
+        *,
+        tool_name: str,
+        arguments: object,
+    ) -> dict[str, Any] | None:
+        """Build audit payload when agent reads a skill file."""
+        if tool_name != "read_file":
+            return None
+        path = cls._extract_read_file_path(arguments)
+        if not path:
+            return None
+        skill_name = cls._extract_skill_name_from_path(path)
+        if not skill_name:
+            return None
+        return {
+            "tool": tool_name,
+            "skill_name": skill_name,
+            "path": path,
+        }
 
     @staticmethod
     def _route_hint(
@@ -414,6 +457,7 @@ class AgentLoop:
         initial_messages: list[dict],
         model_runtime: RoutedProviderManager,
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -477,6 +521,13 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                    if audit_hook:
+                        skill_event = self._build_skill_invoked_event(
+                            tool_name=tool_call.name,
+                            arguments=tool_call.arguments,
+                        )
+                        if skill_event:
+                            await audit_hook(skill_event)
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
@@ -727,10 +778,26 @@ class AgentLoop:
             ))
 
         progress_cb = on_progress or _bus_progress
+        audit_cb = None
+        if msg.channel == "web":
+            async def _web_audit(details: dict[str, Any]) -> None:
+                metadata = dict(msg.metadata or {})
+                metadata["_audit_only"] = True
+                metadata["_audit_event"] = "skill_invoked"
+                metadata["_audit_details"] = details
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="",
+                    metadata=metadata,
+                ))
+
+            audit_cb = _web_audit
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             model_runtime=model_runtime,
             on_progress=progress_cb,
+            audit_hook=audit_cb,
         )
 
         auto_round = 0
@@ -762,6 +829,7 @@ class AgentLoop:
                 all_msgs,
                 model_runtime=model_runtime,
                 on_progress=progress_cb,
+                audit_hook=audit_cb,
             )
 
         if final_content is None:

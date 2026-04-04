@@ -558,6 +558,36 @@ async def test_send_writes_project_audit_entry(web_channel: WebChannel) -> None:
     assert entry["details"]["tool_hint"] is True
 
 
+async def test_send_audit_only_skill_event_writes_project_log(web_channel: WebChannel) -> None:
+    session_id = "sid-skill-log"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    msg = OutboundMessage(
+        channel="web",
+        chat_id=session_id,
+        content="",
+        metadata={
+            "_audit_only": True,
+            "_audit_event": "skill_invoked",
+            "_audit_details": {
+                "tool": "read_file",
+                "skill_name": "scientific-method",
+                "path": "/tmp/skills/research/scientific-method/SKILL.md",
+            },
+        },
+    )
+    await web_channel.send(msg)
+
+    project_log = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    assert project_log.is_file()
+    entry = json.loads(project_log.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert entry["source"] == "agent"
+    assert entry["action"] == "skill_invoked"
+    assert entry["details"]["tool"] == "read_file"
+    assert entry["details"]["skill_name"] == "scientific-method"
+
+
 async def test_send_no_client_noop(web_channel: WebChannel) -> None:
     msg = OutboundMessage(channel="web", chat_id="missing", content="x")
     await web_channel.send(msg)
