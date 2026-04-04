@@ -44,6 +44,15 @@ def _normalize_run_mode(value: Any) -> str:
     return "manual"
 
 
+def _normalize_agent_profile(value: Any) -> str:
+    """Normalize UI agent profile with a conservative fallback."""
+    if isinstance(value, str):
+        profile = value.strip().lower()
+        if profile in {"engineer", "default", "research"}:
+            return profile
+    return "default"
+
+
 def _stringify_history_content(content: Any) -> str:
     """Flatten session content into a UI-friendly text payload."""
     if isinstance(content, str):
@@ -480,6 +489,7 @@ class WebChannel(BaseChannel):
                 content = data.get("content", "")
                 media = data.get("media", [])
                 run_mode = _normalize_run_mode(data.get("mode"))
+                agent_profile = _normalize_agent_profile(data.get("agent_profile"))
 
                 if session_id is None:
                     await ws.send_json(
@@ -498,6 +508,7 @@ class WebChannel(BaseChannel):
                     "source": "web",
                     "project_dir": project_dir,
                     "run_mode": run_mode,
+                    "agent_profile": agent_profile,
                 }
                 if self._ui_instructions:
                     metadata["_ui_system_instructions"] = self._ui_instructions

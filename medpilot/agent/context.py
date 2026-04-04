@@ -27,11 +27,15 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        agents_filename: str = "AGENTS.md",
+    ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
-        bootstrap = self._load_bootstrap_files()
+        bootstrap = self._load_bootstrap_files(agents_filename=agents_filename)
         if bootstrap:
             parts.append(bootstrap)
 
@@ -134,7 +138,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             pass
         return None
 
-    def _load_bootstrap_files(self) -> str:
+    def _load_bootstrap_files(self, agents_filename: str = "AGENTS.md") -> str:
         """Load bootstrap files with override / append / fallback resolution.
 
         Per file (e.g. AGENTS.md):
@@ -145,13 +149,14 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
-            stem = filename.rsplit(".", 1)[0]  # "AGENTS"
+            effective_name = agents_filename if filename == "AGENTS.md" else filename
+            stem = effective_name.rsplit(".", 1)[0]
 
-            ws_file = self.workspace / filename
+            ws_file = self.workspace / effective_name
             if ws_file.exists():
                 content = ws_file.read_text(encoding="utf-8")
             else:
-                content = self._load_builtin_template(filename) or ""
+                content = self._load_builtin_template(effective_name) or ""
 
             if not content.strip():
                 continue
@@ -162,7 +167,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 if extra.strip():
                     content = content.rstrip() + "\n\n" + extra
 
-            parts.append(f"## {filename}\n\n{content}")
+            parts.append(f"## {effective_name}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
 
@@ -216,6 +221,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         chat_id: str | None = None,
         project_dir: str | None = None,
         run_mode: str | None = None,
+        agents_filename: str = "AGENTS.md",
         extra_system: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
@@ -229,7 +235,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
-        system_prompt = self.build_system_prompt(skill_names)
+        system_prompt = self.build_system_prompt(skill_names, agents_filename=agents_filename)
         if extra_system:
             system_prompt += "\n\n---\n\n" + extra_system
 

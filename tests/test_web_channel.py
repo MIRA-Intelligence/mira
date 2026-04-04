@@ -10,7 +10,12 @@ from medpilot.bus.events import OutboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.channels.base import BaseChannel
 from medpilot.channels import web as web_channel_mod
-from medpilot.channels.web import PLAN_FILENAME, WebChannel, _load_ui_instructions
+from medpilot.channels.web import (
+    PLAN_FILENAME,
+    WebChannel,
+    _load_ui_instructions,
+    _normalize_agent_profile,
+)
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
 from medpilot.agent import skill_plugins as skill_plugins_mod
@@ -87,6 +92,17 @@ def test_load_ui_instructions_skips_missing_files(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(web_channel_mod, "_ASSETS_DIR", tmp_path)
     (tmp_path / "AGENTS_UI.md").write_text("only", encoding="utf-8")
     assert _load_ui_instructions() == "only"
+
+
+def test_normalize_agent_profile_accepts_known_values() -> None:
+    assert _normalize_agent_profile("engineer") == "engineer"
+    assert _normalize_agent_profile("default") == "default"
+    assert _normalize_agent_profile("research") == "research"
+
+
+def test_normalize_agent_profile_falls_back_to_default() -> None:
+    assert _normalize_agent_profile("unknown") == "default"
+    assert _normalize_agent_profile(None) == "default"
 
 
 async def test_handle_plan_no_session_id(web_channel: WebChannel) -> None:

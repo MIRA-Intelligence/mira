@@ -126,6 +126,7 @@ class AgentLoop:
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._session_run_modes: dict[str, str] = {}  # session_key -> manual|auto
+        self._session_agent_profiles: dict[str, str] = {}  # session_key -> engineer|default|research
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
@@ -231,6 +232,15 @@ class AgentLoop:
                 return mode
         return None
 
+    @staticmethod
+    def _parse_agent_profile(value: object) -> str | None:
+        """Parse agent profile, returning None when absent/invalid."""
+        if isinstance(value, str):
+            profile = value.strip().lower()
+            if profile in {"engineer", "default", "research"}:
+                return profile
+        return None
+
     def _resolve_session_run_mode(self, session_key: str, inbound_value: object) -> str:
         """Resolve effective mode for a session, updating cache if explicitly provided."""
         explicit = self._parse_run_mode(inbound_value)
@@ -238,6 +248,23 @@ class AgentLoop:
             self._session_run_modes[session_key] = explicit
             return explicit
         return self._session_run_modes.get(session_key, "manual")
+
+    def _resolve_session_agent_profile(self, session_key: str, inbound_value: object) -> str:
+        """Resolve effective agent profile, updating cache if explicitly provided."""
+        explicit = self._parse_agent_profile(inbound_value)
+        if explicit:
+            self._session_agent_profiles[session_key] = explicit
+            return explicit
+        return self._session_agent_profiles.get(session_key, "default")
+
+    @staticmethod
+    def _agent_profile_to_agents_filename(profile: str) -> str:
+        """Map profile to its AGENTS bootstrap file."""
+        if profile == "engineer":
+            return "AGENTS_EG.md"
+        if profile == "research":
+            return "AGENTS_RS.md"
+        return "AGENTS.md"
 
     @staticmethod
     def _looks_like_user_input_request(text: str | None) -> bool:
@@ -604,6 +631,8 @@ class AgentLoop:
         project_dir = meta.get("project_dir")
         key = session_key or msg.session_key
         run_mode = self._resolve_session_run_mode(key, meta.get("run_mode"))
+        agent_profile = self._resolve_session_agent_profile(key, meta.get("agent_profile"))
+        agents_filename = self._agent_profile_to_agents_filename(agent_profile)
         if project_dir:
             sessions_mgr = self._get_project_sessions(project_dir)
         else:
@@ -685,6 +714,7 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
             run_mode=run_mode,
+            agents_filename=agents_filename,
             extra_system=extra_system,
         )
 
