@@ -94,6 +94,20 @@ MedPilot provides a comprehensive CLI for managing your sessions and configurati
 - **`medpilot gateway`**
   Launch the background gateway service. This enables external API endpoints and multi-channel traffic. 
 
+### Local Engine Service CLI
+
+For desktop/local deployment workflows, use `medpilot-agent`:
+
+```bash
+medpilot-agent install-service
+medpilot-agent start
+medpilot-agent status
+medpilot-agent logs
+medpilot-agent doctor
+medpilot-agent stop
+medpilot-agent uninstall-service
+```
+
 ## 🔗 Release Compatibility Mapping
 
 MedPilot tracks UI/Agent release compatibility in `compatibility.json`.
@@ -105,7 +119,6 @@ MedPilot tracks UI/Agent release compatibility in `compatibility.json`.
 - `min_agent_for_ui`: minimum compatible agent patch version
 
 Validate updates locally before opening a PR:
-
 ```bash
 python scripts/validate_compatibility.py --file compatibility.json
 ```
