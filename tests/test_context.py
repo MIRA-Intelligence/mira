@@ -252,6 +252,16 @@ class TestLoadBootstrapFiles:
         cb = ContextBuilder(tmp_path)
         assert cb._load_bootstrap_files() == ""
 
+    def test_switches_agents_template_file(
+        self, mock_builtin: MagicMock, tmp_path: Path,
+    ) -> None:
+        mock_builtin.side_effect = lambda fn: f"BUILTIN-{fn}"
+        cb = ContextBuilder(tmp_path)
+        out = cb._load_bootstrap_files(agents_filename="AGENTS_EG.md")
+        assert "## AGENTS_EG.md" in out
+        assert "BUILTIN-AGENTS_EG.md" in out
+        assert "## AGENTS.md" not in out
+
 
 @patch("medpilot.agent.context.SkillsLoader")
 @patch("medpilot.agent.context.MemoryStore")
@@ -303,6 +313,20 @@ class TestBuildMessages:
             ]
             out = cb.build_messages(history, "q")
         assert out[1] == {"role": "assistant", "content": "k"}
+
+    def test_agents_filename_forwarded_to_system_prompt(
+        self, _mock_mem: MagicMock, _mock_skills: MagicMock, tmp_path: Path,
+    ) -> None:
+        with (
+            patch.object(ContextBuilder, "build_system_prompt", return_value="SYS") as mock_sp,
+            patch("medpilot.agent.context.datetime") as m_dt,
+            patch("medpilot.agent.context.time.strftime", return_value="UTC"),
+        ):
+            m_dt.now.return_value.strftime.return_value = "T"
+            cb = ContextBuilder(tmp_path)
+            cb.build_messages([], "hello", agents_filename="AGENTS_RS.md")
+        _, kwargs = mock_sp.call_args
+        assert kwargs["agents_filename"] == "AGENTS_RS.md"
 
 
 @patch("medpilot.agent.context.SkillsLoader")

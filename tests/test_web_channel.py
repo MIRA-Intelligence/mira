@@ -10,7 +10,12 @@ from medpilot.bus.events import OutboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.channels.base import BaseChannel
 from medpilot.channels import web as web_channel_mod
-from medpilot.channels.web import PLAN_FILENAME, WebChannel, _load_ui_instructions
+from medpilot.channels.web import (
+    PLAN_FILENAME,
+    WebChannel,
+    _load_ui_instructions,
+    _normalize_agent_profile,
+)
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
 from medpilot.agent import skill_plugins as skill_plugins_mod
@@ -87,6 +92,44 @@ def test_load_ui_instructions_skips_missing_files(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(web_channel_mod, "_ASSETS_DIR", tmp_path)
     (tmp_path / "AGENTS_UI.md").write_text("only", encoding="utf-8")
     assert _load_ui_instructions() == "only"
+
+
+def test_normalize_agent_profile_accepts_known_values() -> None:
+    assert _normalize_agent_profile("engineer") == "engineer"
+    assert _normalize_agent_profile("default") == "default"
+    assert _normalize_agent_profile("research") == "research"
+
+
+def test_normalize_agent_profile_falls_back_to_default() -> None:
+    assert _normalize_agent_profile("unknown") == "default"
+    assert _normalize_agent_profile(None) == "default"
+
+
+def test_audit_writes_global_and_project_logs(web_channel: WebChannel) -> None:
+    session_id = "PRJ-LOG"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    web_channel._audit(
+        source="ui",
+        action="ws_message_received",
+        session_id=session_id,
+        project_dir=project_dir,
+        details={"content_preview": "hello"},
+    )
+
+    global_log = web_channel.projects_root / "logs" / "project_actions.jsonl"
+    project_log = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    assert global_log.is_file()
+    assert project_log.is_file()
+
+    global_entry = json.loads(global_log.read_text(encoding="utf-8").strip().splitlines()[-1])
+    project_entry = json.loads(project_log.read_text(encoding="utf-8").strip().splitlines()[-1])
+
+    assert global_entry["session_id"] == session_id
+    assert global_entry["source"] == "ui"
+    assert global_entry["action"] == "ws_message_received"
+    assert project_entry == global_entry
 
 
 async def test_handle_plan_no_session_id(web_channel: WebChannel) -> None:
@@ -486,6 +529,63 @@ async def test_send_progress_type(web_channel: WebChannel) -> None:
     )
     await web_channel.send(msg)
     assert ws.send_json.await_args.args[0]["type"] == "progress"
+
+
+async def test_send_writes_project_audit_entry(web_channel: WebChannel) -> None:
+    session_id = "sid-log"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    ws = MagicMock()
+    ws.closed = False
+    ws.send_json = AsyncMock()
+    web_channel._clients[session_id] = ws
+
+    msg = OutboundMessage(
+        channel="web",
+        chat_id=session_id,
+        content="running exp",
+        metadata={"_progress": True, "_tool_hint": True},
+    )
+    await web_channel.send(msg)
+
+    project_log = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    assert project_log.is_file()
+    entry = json.loads(project_log.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert entry["source"] == "agent"
+    assert entry["action"] == "ws_outbound_sent"
+    assert entry["details"]["type"] == "progress"
+    assert entry["details"]["tool_hint"] is True
+
+
+async def test_send_audit_only_skill_event_writes_project_log(web_channel: WebChannel) -> None:
+    session_id = "sid-skill-log"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    msg = OutboundMessage(
+        channel="web",
+        chat_id=session_id,
+        content="",
+        metadata={
+            "_audit_only": True,
+            "_audit_event": "skill_invoked",
+            "_audit_details": {
+                "tool": "read_file",
+                "skill_name": "scientific-method",
+                "path": "/tmp/skills/research/scientific-method/SKILL.md",
+            },
+        },
+    )
+    await web_channel.send(msg)
+
+    project_log = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    assert project_log.is_file()
+    entry = json.loads(project_log.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert entry["source"] == "agent"
+    assert entry["action"] == "skill_invoked"
+    assert entry["details"]["tool"] == "read_file"
+    assert entry["details"]["skill_name"] == "scientific-method"
 
 
 async def test_send_no_client_noop(web_channel: WebChannel) -> None:
