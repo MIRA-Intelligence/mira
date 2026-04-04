@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
+import plistlib
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +26,8 @@ console = Console()
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_INSTALLED = 2
+LAUNCHD_LABEL = "com.projectmedpilot.agent"
+DEFAULT_PORT = 46321
 
 
 def _now_iso() -> str:
@@ -38,6 +43,7 @@ class AgentPaths:
     runtime_dir: Path
     state_file: Path
     log_file: Path
+    launchd_plist: Path
 
     @classmethod
     def default(cls) -> "AgentPaths":
@@ -50,6 +56,7 @@ class AgentPaths:
             runtime_dir=root / "runtime",
             state_file=root / "runtime" / "agent-service-state.json",
             log_file=root / "logs" / "agent-service.log",
+            launchd_plist=Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
         )
 
     def ensure(self) -> None:
@@ -70,7 +77,7 @@ class LocalServiceManager:
             "running": False,
             "service_mode": "local-skeleton",
             "platform": platform.system().lower(),
-            "port": 46321,
+            "port": DEFAULT_PORT,
             "installed_at": None,
             "last_started_at": None,
             "last_stopped_at": None,
@@ -161,8 +168,129 @@ class LocalServiceManager:
         )
 
 
+class LaunchdServiceManager(LocalServiceManager):
+    """macOS launchd-backed lifecycle manager."""
+
+    @property
+    def _domain(self) -> str:
+        return f"gui/{os.getuid()}"
+
+    @property
+    def _service_target(self) -> str:
+        return f"{self._domain}/{LAUNCHD_LABEL}"
+
+    def _run_launchctl(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["launchctl", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _write_plist(self, port: int) -> None:
+        self.paths.launchd_plist.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "Label": LAUNCHD_LABEL,
+            "ProgramArguments": [
+                sys.executable,
+                "-m",
+                "medpilot.cli.commands",
+                "gateway",
+                "--port",
+                str(port),
+            ],
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "StandardOutPath": str(self.paths.log_file),
+            "StandardErrorPath": str(self.paths.log_file),
+            "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
+        }
+        with self.paths.launchd_plist.open("wb") as fp:
+            plistlib.dump(payload, fp)
+
+    def install_service(self) -> tuple[int, str]:
+        code, msg = super().install_service()
+        if code != EXIT_OK:
+            return code, msg
+        state = self.load_state()
+        self._write_plist(int(state.get("port", DEFAULT_PORT)))
+        bootstrap = self._run_launchctl("bootstrap", self._domain, str(self.paths.launchd_plist))
+        # launchd returns non-zero when already loaded; try cleanup then retry once.
+        if bootstrap.returncode != 0:
+            self._run_launchctl("bootout", self._service_target)
+            bootstrap = self._run_launchctl("bootstrap", self._domain, str(self.paths.launchd_plist))
+            if bootstrap.returncode != 0:
+                return EXIT_ERROR, bootstrap.stderr.strip() or "failed to bootstrap launchd service"
+        state["service_mode"] = "launchd"
+        self.save_state(state)
+        return EXIT_OK, f"launchd service installed ({self.paths.launchd_plist})"
+
+    def uninstall_service(self) -> tuple[int, str]:
+        self._run_launchctl("bootout", self._service_target)
+        try:
+            self.paths.launchd_plist.unlink(missing_ok=True)
+        except OSError as exc:
+            return EXIT_ERROR, f"failed to remove plist: {exc}"
+        return super().uninstall_service()
+
+    def start(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_launchctl("kickstart", "-k", self._service_target)
+        if result.returncode != 0:
+            return EXIT_ERROR, result.stderr.strip() or "failed to start launchd service"
+        state["running"] = True
+        state["last_started_at"] = _now_iso()
+        self.save_state(state)
+        return EXIT_OK, "launchd service started"
+
+    def stop(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_launchctl("stop", LAUNCHD_LABEL)
+        if result.returncode != 0:
+            return EXIT_ERROR, result.stderr.strip() or "failed to stop launchd service"
+        state["running"] = False
+        state["last_stopped_at"] = _now_iso()
+        self.save_state(state)
+        return EXIT_OK, "launchd service stopped"
+
+    def status(self) -> tuple[int, dict[str, Any]]:
+        base_code, payload = super().status()
+        result = self._run_launchctl("print", self._service_target)
+        payload["running"] = result.returncode == 0
+        payload["service_mode"] = "launchd"
+        payload["launchd_label"] = LAUNCHD_LABEL
+        payload["launchd_plist"] = str(self.paths.launchd_plist)
+        if result.returncode != 0 and payload.get("installed"):
+            payload["last_launchctl_error"] = result.stderr.strip()
+        return base_code, payload
+
+    def doctor(self) -> tuple[int, dict[str, Any]]:
+        code, payload = super().doctor()
+        checks = payload.get("checks", {})
+        if isinstance(checks, dict):
+            checks["launchd_plist_present"] = self.paths.launchd_plist.exists()
+            launchctl = self._run_launchctl("print", self._service_target)
+            checks["launchctl_query_ok"] = launchctl.returncode in {0, 113}
+            payload["checks"] = checks
+            payload["healthy"] = all(bool(v) for v in checks.values())
+        payload["launchd_plist"] = str(self.paths.launchd_plist)
+        return (EXIT_OK if payload.get("healthy") else EXIT_ERROR), payload
+
+
 def _manager() -> LocalServiceManager:
-    return LocalServiceManager(AgentPaths.default())
+    mode = os.environ.get("MEDPILOT_AGENT_SERVICE_MODE", "auto").strip().lower()
+    paths = AgentPaths.default()
+    if mode == "launchd":
+        return LaunchdServiceManager(paths)
+    if mode == "local":
+        return LocalServiceManager(paths)
+    if platform.system().lower() == "darwin":
+        return LaunchdServiceManager(paths)
+    return LocalServiceManager(paths)
 
 
 @app.command("install-service")
