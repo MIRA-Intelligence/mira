@@ -94,6 +94,20 @@ MedPilot provides a comprehensive CLI for managing your sessions and configurati
 - **`medpilot gateway`**
   Launch the background gateway service. This enables external API endpoints and multi-channel traffic. 
 
+### Local Engine Service CLI
+
+For desktop/local deployment workflows, use `medpilot-agent`:
+
+```bash
+medpilot-agent install-service
+medpilot-agent start
+medpilot-agent status
+medpilot-agent logs
+medpilot-agent doctor
+medpilot-agent stop
+medpilot-agent uninstall-service
+```
+
 ## 💬 Multi-Channel Deployment (Coming Soon)
 Features to deploy MedPilot seamlessly to platforms like Telegram, Discord, Feishu, or Slack to assist your research team in real-time are in active development.
 

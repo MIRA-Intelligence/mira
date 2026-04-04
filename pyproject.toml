@@ -65,6 +65,7 @@ dev = [
 
 [project.scripts]
 medpilot = "medpilot.cli.commands:app"
+medpilot-agent = "medpilot.cli.agent_service:app"
 
 [build-system]
 requires = ["hatchling"]
