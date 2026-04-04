@@ -6,11 +6,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 
+from medpilot import __version__
+from medpilot.agent import skill_plugins as skill_plugins_mod
 from medpilot.bus.events import OutboundMessage
 from medpilot.bus.queue import MessageBus
-from medpilot.channels.base import BaseChannel
 from medpilot.channels import web as web_channel_mod
+from medpilot.channels.base import BaseChannel
 from medpilot.channels.web import (
+    _API_CONTRACT_VERSION,
     PLAN_FILENAME,
     WebChannel,
     _load_ui_instructions,
@@ -18,7 +21,6 @@ from medpilot.channels.web import (
 )
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
-from medpilot.agent import skill_plugins as skill_plugins_mod
 
 
 def _minimal_base_init(self, config, bus) -> None:
@@ -103,6 +105,36 @@ def test_normalize_agent_profile_accepts_known_values() -> None:
 def test_normalize_agent_profile_falls_back_to_default() -> None:
     assert _normalize_agent_profile("unknown") == "default"
     assert _normalize_agent_profile(None) == "default"
+
+
+async def test_handle_health_returns_machine_readable_payload(web_channel: WebChannel) -> None:
+    web_channel._running = True
+    web_channel._clients = {"s1": MagicMock(closed=False)}
+
+    req = MagicMock(spec=web.Request)
+    resp = await web_channel._handle_health(req)
+
+    assert resp.status == 200
+    assert json.loads(resp.text) == {
+        "status": "ok",
+        "service": "medpilot-gateway",
+        "channel": "web",
+        "running": True,
+        "connected_clients": 1,
+    }
+
+
+async def test_handle_version_returns_contract_payload(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    resp = await web_channel._handle_version(req)
+    body = json.loads(resp.text)
+
+    assert resp.status == 200
+    assert body["service"] == "medpilot-gateway"
+    assert body["agent_version"] == __version__
+    assert body["api_contract"] == _API_CONTRACT_VERSION
+    assert isinstance(body["uptime_seconds"], int)
+    assert body["uptime_seconds"] >= 0
 
 
 def test_audit_writes_global_and_project_logs(web_channel: WebChannel) -> None:
