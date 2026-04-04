@@ -108,6 +108,21 @@ medpilot-agent stop
 medpilot-agent uninstall-service
 ```
 
+## 🔗 Release Compatibility Mapping
+
+MedPilot tracks UI/Agent release compatibility in `compatibility.json`.
+
+- `release_train`: release window in `YYYY.MM` format
+- `ui`: supported UI minor range (e.g. `0.1.x`)
+- `agent`: supported agent minor range (e.g. `0.1.x`)
+- `api_contract`: API contract version (e.g. `v1`)
+- `min_agent_for_ui`: minimum compatible agent patch version
+
+Validate updates locally before opening a PR:
+```bash
+python scripts/validate_compatibility.py --file compatibility.json
+```
+
 ## 💬 Multi-Channel Deployment (Coming Soon)
 Features to deploy MedPilot seamlessly to platforms like Telegram, Discord, Feishu, or Slack to assist your research team in real-time are in active development.
 

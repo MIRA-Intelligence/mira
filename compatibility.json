@@ -1,0 +1,7 @@
+{
+  "release_train": "2026.04",
+  "ui": "0.1.x",
+  "agent": "0.1.x",
+  "api_contract": "v1",
+  "min_agent_for_ui": "0.1.4"
+}
