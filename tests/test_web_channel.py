@@ -105,6 +105,33 @@ def test_normalize_agent_profile_falls_back_to_default() -> None:
     assert _normalize_agent_profile(None) == "default"
 
 
+def test_audit_writes_global_and_project_logs(web_channel: WebChannel) -> None:
+    session_id = "PRJ-LOG"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    web_channel._audit(
+        source="ui",
+        action="ws_message_received",
+        session_id=session_id,
+        project_dir=project_dir,
+        details={"content_preview": "hello"},
+    )
+
+    global_log = web_channel.projects_root / "logs" / "project_actions.jsonl"
+    project_log = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    assert global_log.is_file()
+    assert project_log.is_file()
+
+    global_entry = json.loads(global_log.read_text(encoding="utf-8").strip().splitlines()[-1])
+    project_entry = json.loads(project_log.read_text(encoding="utf-8").strip().splitlines()[-1])
+
+    assert global_entry["session_id"] == session_id
+    assert global_entry["source"] == "ui"
+    assert global_entry["action"] == "ws_message_received"
+    assert project_entry == global_entry
+
+
 async def test_handle_plan_no_session_id(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.query = {}
@@ -502,6 +529,33 @@ async def test_send_progress_type(web_channel: WebChannel) -> None:
     )
     await web_channel.send(msg)
     assert ws.send_json.await_args.args[0]["type"] == "progress"
+
+
+async def test_send_writes_project_audit_entry(web_channel: WebChannel) -> None:
+    session_id = "sid-log"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    ws = MagicMock()
+    ws.closed = False
+    ws.send_json = AsyncMock()
+    web_channel._clients[session_id] = ws
+
+    msg = OutboundMessage(
+        channel="web",
+        chat_id=session_id,
+        content="running exp",
+        metadata={"_progress": True, "_tool_hint": True},
+    )
+    await web_channel.send(msg)
+
+    project_log = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    assert project_log.is_file()
+    entry = json.loads(project_log.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert entry["source"] == "agent"
+    assert entry["action"] == "ws_outbound_sent"
+    assert entry["details"]["type"] == "progress"
+    assert entry["details"]["tool_hint"] is True
 
 
 async def test_send_no_client_noop(web_channel: WebChannel) -> None:

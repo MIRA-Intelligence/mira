@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,8 @@ from medpilot.session.manager import SessionManager
 
 PLAN_FILENAME = "task_plan.json"
 _ASSETS_DIR = Path(__file__).parent / "web_assets"
+_PROJECT_AUDIT_REL_PATH = Path(".medpilot") / "logs" / "actions.jsonl"
+_GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
 
 
 def _load_ui_instructions() -> str:
@@ -195,6 +198,77 @@ class WebChannel(BaseChannel):
         self._site: web.TCPSite | None = None
         self._migrate_global_to_project()
 
+    @staticmethod
+    def _preview(value: Any, *, limit: int = 300) -> str:
+        """Render a compact, log-friendly preview for arbitrary values."""
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                text = str(value)
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "...(truncated)"
+
+    @staticmethod
+    def _sanitize_details(details: dict[str, Any] | None) -> dict[str, Any]:
+        """Keep audit details JSON-serializable and compact."""
+        if not details:
+            return {}
+        safe: dict[str, Any] = {}
+        for key, value in details.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                safe[key] = value if not isinstance(value, str) else WebChannel._preview(value, limit=500)
+            else:
+                safe[key] = WebChannel._preview(value, limit=500)
+        return safe
+
+    @staticmethod
+    def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
+        """Append one JSON line to path, creating parent dirs as needed."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _audit(
+        self,
+        *,
+        source: str,
+        action: str,
+        session_id: str | None = None,
+        project_dir: Path | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Write action audit logs to global and per-project log streams."""
+        entry: dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "source": source,
+            "action": action,
+            "session_id": session_id,
+            "details": self._sanitize_details(details),
+        }
+        if project_dir is not None:
+            entry["project_dir"] = str(project_dir)
+        elif session_id:
+            entry["project_dir"] = str(self.projects_root / session_id)
+
+        try:
+            global_log = self.projects_root / "logs" / _GLOBAL_AUDIT_FILENAME
+            self._append_jsonl(global_log, entry)
+        except OSError as exc:
+            logger.warning("Failed to append global audit log: {}", exc)
+
+        target = project_dir
+        if target is None and session_id:
+            target = self.projects_root / session_id
+        if target and target.is_dir():
+            try:
+                self._append_jsonl(target / _PROJECT_AUDIT_REL_PATH, entry)
+            except OSError as exc:
+                logger.warning("Failed to append project audit log for {}: {}", session_id, exc)
+
     # ── migration ──────────────────────────────────────────────────
 
     def _migrate_global_to_project(self) -> None:
@@ -343,11 +417,22 @@ class WebChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         ws = self._clients.get(msg.chat_id)
+        is_progress = msg.metadata.get("_progress", False)
+        common_details = {
+            "type": "progress" if is_progress else "response",
+            "tool_hint": bool(msg.metadata.get("_tool_hint", False)),
+            "content_preview": self._preview(msg.content),
+        }
         if ws is None or ws.closed:
+            self._audit(
+                source="agent",
+                action="ws_outbound_dropped",
+                session_id=msg.chat_id,
+                details={**common_details, "reason": "no_active_client"},
+            )
             logger.debug("No active WebSocket for chat_id={}", msg.chat_id)
             return
 
-        is_progress = msg.metadata.get("_progress", False)
         payload = {
             "type": "progress" if is_progress else "response",
             "session_id": msg.chat_id,
@@ -358,7 +443,19 @@ class WebChannel(BaseChannel):
 
         try:
             await ws.send_json(payload)
+            self._audit(
+                source="agent",
+                action="ws_outbound_sent",
+                session_id=msg.chat_id,
+                details=common_details,
+            )
         except Exception as e:
+            self._audit(
+                source="agent",
+                action="ws_outbound_failed",
+                session_id=msg.chat_id,
+                details={**common_details, "error": self._preview(str(e), limit=400)},
+            )
             logger.warning("Failed to send to {}: {}", msg.chat_id, e)
 
     def _reconcile_plan_data(self, project_dir: Path, data: dict[str, Any]) -> bool:
@@ -504,6 +601,19 @@ class WebChannel(BaseChannel):
                     logger.warning(str(exc))
 
                 project_dir = str(self.projects_root / session_id)
+                self._audit(
+                    source="ui",
+                    action="ws_message_received",
+                    session_id=session_id,
+                    project_dir=Path(project_dir),
+                    details={
+                        "user_id": user_id,
+                        "run_mode": run_mode,
+                        "agent_profile": agent_profile,
+                        "content_preview": self._preview(content),
+                        "media_count": len(media) if isinstance(media, list) else 0,
+                    },
+                )
                 metadata: dict[str, Any] = {
                     "source": "web",
                     "project_dir": project_dir,
@@ -533,6 +643,16 @@ class WebChannel(BaseChannel):
 
                 self._clients[session_id] = ws
                 project_dir = str(self.projects_root / session_id)
+                self._audit(
+                    source="ui",
+                    action="ws_set_mode_received",
+                    session_id=session_id,
+                    project_dir=Path(project_dir),
+                    details={
+                        "user_id": user_id,
+                        "run_mode": run_mode,
+                    },
+                )
                 metadata = {
                     "source": "web",
                     "project_dir": project_dir,
@@ -641,6 +761,11 @@ class WebChannel(BaseChannel):
         if "projects_root" in body:
             new_root = Path(body["projects_root"]).expanduser().resolve()
             self.projects_root = new_root
+            self._audit(
+                source="ui",
+                action="api_projects_root_updated",
+                details={"projects_root": str(new_root)},
+            )
             logger.info("Projects root updated to {}", new_root)
 
         return web.json_response({
@@ -701,13 +826,36 @@ class WebChannel(BaseChannel):
 
         project_dir = self.projects_root / session_id
         if not project_dir.is_dir():
+            self._audit(
+                source="ui",
+                action="api_delete_project_missing",
+                session_id=session_id,
+                details={"reason": "not found"},
+            )
             return web.json_response({"deleted": False, "reason": "not found"})
 
         try:
+            self._audit(
+                source="ui",
+                action="api_delete_project_requested",
+                session_id=session_id,
+                project_dir=project_dir,
+            )
             shutil.rmtree(project_dir)
+            self._audit(
+                source="ui",
+                action="api_delete_project_completed",
+                session_id=session_id,
+            )
             logger.info("Deleted project directory: {}", project_dir)
             return web.json_response({"deleted": True})
         except OSError as exc:
+            self._audit(
+                source="ui",
+                action="api_delete_project_failed",
+                session_id=session_id,
+                details={"error": self._preview(str(exc), limit=400)},
+            )
             logger.warning("Failed to delete {}: {}", project_dir, exc)
             return web.json_response({"error": str(exc)}, status=500)
 
@@ -770,6 +918,17 @@ class WebChannel(BaseChannel):
 
         if not uploaded:
             return web.json_response({"error": "no files uploaded"}, status=400)
+
+        self._audit(
+            source="ui",
+            action="api_project_files_uploaded",
+            session_id=session_id,
+            project_dir=project_dir,
+            details={
+                "count": len(uploaded),
+                "files": [item.get("path", "") for item in uploaded],
+            },
+        )
 
         return web.json_response({
             "session_id": session_id,
