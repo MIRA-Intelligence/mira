@@ -15,9 +15,10 @@ from typing import Any
 from aiohttp import web
 from loguru import logger
 
+from medpilot import __version__
+from medpilot.agent.skill_plugins import SkillPluginError, SkillPluginManager
 from medpilot.bus.events import OutboundMessage
 from medpilot.bus.queue import MessageBus
-from medpilot.agent.skill_plugins import SkillPluginError, SkillPluginManager
 from medpilot.channels.base import BaseChannel
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
@@ -26,6 +27,7 @@ PLAN_FILENAME = "task_plan.json"
 _ASSETS_DIR = Path(__file__).parent / "web_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".medpilot") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
+_API_CONTRACT_VERSION = "v1"
 
 
 def _load_ui_instructions() -> str:
@@ -191,6 +193,7 @@ class WebChannel(BaseChannel):
         self.config: WebChannelConfig = config
         self.workspace: Path | None = workspace
         self.projects_root: Path = Path("~/.medpilot/workspace").expanduser()
+        self._boot_ts: float = time.monotonic()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
         self._app: web.Application | None = None
@@ -364,6 +367,10 @@ class WebChannel(BaseChannel):
 
         self._app = web.Application(middlewares=[self._cors_middleware])
         self._app.router.add_get("/ws", self._ws_handler)
+        self._app.router.add_get("/health", self._handle_health)
+        self._app.router.add_get("/version", self._handle_version)
+        self._app.router.add_get("/api/health", self._handle_health)
+        self._app.router.add_get("/api/version", self._handle_version)
         self._app.router.add_get("/api/status", self._handle_status)
         self._app.router.add_get("/api/sessions", self._handle_sessions)
         self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
@@ -689,6 +696,23 @@ class WebChannel(BaseChannel):
         return ws
 
     # ── REST endpoints ───────────────────────────────────────────────
+
+    async def _handle_health(self, _request: web.Request) -> web.Response:
+        return web.json_response({
+            "status": "ok",
+            "service": "medpilot-gateway",
+            "channel": self.name,
+            "running": self._running,
+            "connected_clients": len(self._clients),
+        })
+
+    async def _handle_version(self, _request: web.Request) -> web.Response:
+        return web.json_response({
+            "service": "medpilot-gateway",
+            "agent_version": __version__,
+            "api_contract": _API_CONTRACT_VERSION,
+            "uptime_seconds": int(max(time.monotonic() - self._boot_ts, 0)),
+        })
 
     async def _handle_status(self, _request: web.Request) -> web.Response:
         return web.json_response({
