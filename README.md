@@ -104,6 +104,7 @@ medpilot-agent start
 medpilot-agent status
 medpilot-agent logs
 medpilot-agent doctor
+medpilot-agent upgrade --package medpilot-ai
 medpilot-agent stop
 medpilot-agent uninstall-service
 ```

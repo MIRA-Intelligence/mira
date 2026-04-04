@@ -8,8 +8,11 @@ import platform
 import plistlib
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +47,7 @@ class AgentPaths:
     state_file: Path
     log_file: Path
     launchd_plist: Path
+    backups_dir: Path
 
     @classmethod
     def default(cls) -> "AgentPaths":
@@ -57,10 +61,11 @@ class AgentPaths:
             state_file=root / "runtime" / "agent-service-state.json",
             log_file=root / "logs" / "agent-service.log",
             launchd_plist=Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
+            backups_dir=root / "runtime" / "backups",
         )
 
     def ensure(self) -> None:
-        for path in (self.config_dir, self.data_dir, self.logs_dir, self.runtime_dir):
+        for path in (self.config_dir, self.data_dir, self.logs_dir, self.runtime_dir, self.backups_dir):
             path.mkdir(parents=True, exist_ok=True)
         self.log_file.touch(exist_ok=True)
 
@@ -293,6 +298,34 @@ def _manager() -> LocalServiceManager:
     return LocalServiceManager(paths)
 
 
+def _current_version(package: str) -> str | None:
+    try:
+        return importlib_metadata.version(package)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _pip_upgrade(package_spec: str) -> tuple[int, str]:
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", package_spec],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return EXIT_OK, result.stdout.strip() or f"upgraded {package_spec}"
+    return EXIT_ERROR, result.stderr.strip() or f"failed to upgrade {package_spec}"
+
+
+def _health_check(port: int, timeout_s: float = 3.0) -> bool:
+    url = f"http://127.0.0.1:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return False
+
+
 @app.command("install-service")
 def install_service() -> None:
     code, message = _manager().install_service()
@@ -340,6 +373,66 @@ def doctor() -> None:
     code, payload = _manager().doctor()
     console.print_json(data=payload)
     raise typer.Exit(code)
+
+
+@app.command()
+def upgrade(
+    package: str = typer.Option("medpilot-ai", "--package", help="Package name to upgrade."),
+) -> None:
+    manager = _manager()
+    status_code, status_payload = manager.status()
+    if status_code != EXIT_OK:
+        console.print("Unable to inspect current service status.")
+        raise typer.Exit(EXIT_ERROR)
+
+    installed = bool(status_payload.get("installed"))
+    if not installed:
+        console.print("Service is not installed. Run `medpilot-agent install-service` first.")
+        raise typer.Exit(EXIT_NOT_INSTALLED)
+
+    port = int(status_payload.get("port", DEFAULT_PORT))
+    prev_version = _current_version(package)
+    backup_file = manager.paths.backups_dir / f"upgrade-backup-{_now_iso().replace(':', '-')}.json"
+    manager.paths.ensure()
+    if manager.paths.state_file.exists():
+        backup_file.write_text(manager.paths.state_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+    stop_code, stop_msg = manager.stop()
+    if stop_code not in {EXIT_OK, EXIT_NOT_INSTALLED}:
+        console.print(f"Failed to stop service before upgrade: {stop_msg}")
+        raise typer.Exit(EXIT_ERROR)
+
+    up_code, up_msg = _pip_upgrade(package)
+    if up_code != EXIT_OK:
+        console.print(f"Upgrade failed: {up_msg}")
+        if prev_version:
+            rollback_code, rollback_msg = _pip_upgrade(f"{package}=={prev_version}")
+            if rollback_code != EXIT_OK:
+                console.print(f"Rollback package install failed: {rollback_msg}")
+                raise typer.Exit(EXIT_ERROR)
+            console.print(f"Rolled back package to {package}=={prev_version}")
+        manager.start()
+        raise typer.Exit(EXIT_ERROR)
+
+    start_code, start_msg = manager.start()
+    if start_code != EXIT_OK:
+        console.print(f"Upgrade applied but service failed to start: {start_msg}")
+        if prev_version:
+            _pip_upgrade(f"{package}=={prev_version}")
+            manager.start()
+        raise typer.Exit(EXIT_ERROR)
+
+    if not _health_check(port):
+        console.print("Service started but health check failed; attempting rollback.")
+        manager.stop()
+        if prev_version:
+            _pip_upgrade(f"{package}=={prev_version}")
+            manager.start()
+        raise typer.Exit(EXIT_ERROR)
+
+    new_version = _current_version(package)
+    console.print(f"Upgrade successful: {prev_version or 'unknown'} -> {new_version or 'unknown'}")
+    raise typer.Exit(EXIT_OK)
 
 
 if __name__ == "__main__":
