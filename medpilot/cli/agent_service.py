@@ -10,6 +10,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
@@ -30,7 +31,12 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_INSTALLED = 2
 LAUNCHD_LABEL = "com.projectmedpilot.agent"
+SYSTEMD_UNIT_NAME = "medpilot-agent.service"
+WINDOWS_SERVICE_NAME = "MedPilotAgent"
 DEFAULT_PORT = 46321
+LOG_ROTATE_BYTES = 1_000_000
+LOG_ROTATE_FILES = 3
+DIAGNOSTICS_LOG_TAIL_LINES = 200
 
 
 def _now_iso() -> str:
@@ -47,6 +53,7 @@ class AgentPaths:
     state_file: Path
     log_file: Path
     launchd_plist: Path
+    systemd_unit: Path
     backups_dir: Path
 
     @classmethod
@@ -61,6 +68,7 @@ class AgentPaths:
             state_file=root / "runtime" / "agent-service-state.json",
             log_file=root / "logs" / "agent-service.log",
             launchd_plist=Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
+            systemd_unit=Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME,
             backups_dir=root / "runtime" / "backups",
         )
 
@@ -75,6 +83,33 @@ class LocalServiceManager:
 
     def __init__(self, paths: AgentPaths) -> None:
         self.paths = paths
+
+    def _rotate_log_if_needed(self) -> None:
+        if not self.paths.log_file.exists():
+            return
+        if self.paths.log_file.stat().st_size < LOG_ROTATE_BYTES:
+            return
+
+        for idx in range(LOG_ROTATE_FILES - 1, 0, -1):
+            src = self.paths.log_file.with_name(f"{self.paths.log_file.name}.{idx}")
+            dst = self.paths.log_file.with_name(f"{self.paths.log_file.name}.{idx + 1}")
+            if src.exists():
+                src.replace(dst)
+        self.paths.log_file.replace(self.paths.log_file.with_name(f"{self.paths.log_file.name}.1"))
+        self.paths.log_file.touch(exist_ok=True)
+
+    def _append_log(self, event: str, **details: Any) -> None:
+        self.paths.ensure()
+        self._rotate_log_if_needed()
+        payload = {
+            "timestamp": _now_iso(),
+            "event": event,
+            "service_mode": self._default_state().get("service_mode"),
+            "platform": platform.system().lower(),
+            **details,
+        }
+        with self.paths.log_file.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def _default_state(self) -> dict[str, Any]:
         return {
@@ -113,6 +148,7 @@ class LocalServiceManager:
         state["installed"] = True
         state["installed_at"] = state.get("installed_at") or _now_iso()
         self.save_state(state)
+        self._append_log("install_service", installed=True)
         return EXIT_OK, "service metadata installed"
 
     def uninstall_service(self) -> tuple[int, str]:
@@ -121,24 +157,29 @@ class LocalServiceManager:
         state["running"] = False
         state["last_stopped_at"] = _now_iso()
         self.save_state(state)
+        self._append_log("uninstall_service", installed=False)
         return EXIT_OK, "service metadata removed"
 
     def start(self) -> tuple[int, str]:
         state = self.load_state()
         if not state.get("installed"):
+            self._append_log("start_service_failed", reason="not_installed")
             return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
         state["running"] = True
         state["last_started_at"] = _now_iso()
         self.save_state(state)
+        self._append_log("start_service", running=True)
         return EXIT_OK, "service marked as running"
 
     def stop(self) -> tuple[int, str]:
         state = self.load_state()
         if not state.get("installed"):
+            self._append_log("stop_service_failed", reason="not_installed")
             return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
         state["running"] = False
         state["last_stopped_at"] = _now_iso()
         self.save_state(state)
+        self._append_log("stop_service", running=False)
         return EXIT_OK, "service marked as stopped"
 
     def status(self) -> tuple[int, dict[str, Any]]:
@@ -158,6 +199,7 @@ class LocalServiceManager:
 
     def doctor(self) -> tuple[int, dict[str, Any]]:
         self.paths.ensure()
+        status_code, status_payload = self.status()
         checks = {
             "python_executable": bool(sys.executable),
             "config_dir_writable": self.paths.config_dir.exists(),
@@ -165,12 +207,207 @@ class LocalServiceManager:
             "logs_dir_writable": self.paths.logs_dir.exists(),
             "runtime_dir_writable": self.paths.runtime_dir.exists(),
             "state_file_present": self.paths.state_file.exists(),
+            "log_file_present": self.paths.log_file.exists(),
         }
         ok = all(v for v in checks.values())
         return (
             EXIT_OK if ok else EXIT_ERROR,
-            {"healthy": ok, "checks": checks, "log_file": str(self.paths.log_file)},
+            {
+                "healthy": ok,
+                "checks": checks,
+                "log_file": str(self.paths.log_file),
+                "status": status_payload if status_code == EXIT_OK else {},
+                "agent_package_version": _current_version("medpilot-ai"),
+            },
         )
+
+    def export_diagnostics(self) -> tuple[int, str]:
+        self.paths.ensure()
+        self.paths.backups_dir.mkdir(parents=True, exist_ok=True)
+        diagnostics_dir = self.paths.runtime_dir / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        bundle = diagnostics_dir / f"diagnostics-{_now_iso().replace(':', '-')}.zip"
+
+        _, doctor_payload = self.doctor()
+        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("doctor.json", json.dumps(doctor_payload, ensure_ascii=False, indent=2) + "\n")
+            if self.paths.state_file.exists():
+                zf.write(self.paths.state_file, arcname="agent-service-state.json")
+            if self.paths.log_file.exists():
+                lines = self.paths.log_file.read_text(encoding="utf-8").splitlines()
+                tail = "\n".join(lines[-DIAGNOSTICS_LOG_TAIL_LINES:]) + ("\n" if lines else "")
+                zf.writestr("agent-service.log.tail", tail)
+        self._append_log("diagnostics_exported", bundle=str(bundle))
+        return EXIT_OK, str(bundle)
+
+
+class SystemdUserServiceManager(LocalServiceManager):
+    """Linux systemd --user manager."""
+
+    def _run_systemctl(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["systemctl", "--user", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _write_unit(self, port: int) -> None:
+        self.paths.systemd_unit.parent.mkdir(parents=True, exist_ok=True)
+        content = f"""[Unit]
+Description=MedPilot Local Agent Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={sys.executable} -m medpilot.cli.commands gateway --port {port}
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:{self.paths.log_file}
+StandardError=append:{self.paths.log_file}
+
+[Install]
+WantedBy=default.target
+"""
+        self.paths.systemd_unit.write_text(content, encoding="utf-8")
+
+    def install_service(self) -> tuple[int, str]:
+        code, msg = super().install_service()
+        if code != EXIT_OK:
+            return code, msg
+        state = self.load_state()
+        self._write_unit(int(state.get("port", DEFAULT_PORT)))
+        self._run_systemctl("daemon-reload")
+        enable = self._run_systemctl("enable", SYSTEMD_UNIT_NAME)
+        if enable.returncode != 0:
+            return EXIT_ERROR, enable.stderr.strip() or "failed to enable systemd user service"
+        state["service_mode"] = "systemd-user"
+        self.save_state(state)
+        self._append_log("systemd_install_service", unit=str(self.paths.systemd_unit))
+        return EXIT_OK, f"systemd user service installed ({self.paths.systemd_unit})"
+
+    def uninstall_service(self) -> tuple[int, str]:
+        self._run_systemctl("disable", "--now", SYSTEMD_UNIT_NAME)
+        try:
+            self.paths.systemd_unit.unlink(missing_ok=True)
+        except OSError as exc:
+            return EXIT_ERROR, f"failed to remove unit file: {exc}"
+        self._run_systemctl("daemon-reload")
+        code, msg = super().uninstall_service()
+        self._append_log("systemd_uninstall_service", unit=str(self.paths.systemd_unit))
+        return code, msg
+
+    def start(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_systemctl("start", SYSTEMD_UNIT_NAME)
+        if result.returncode != 0:
+            self._append_log("systemd_start_failed", error=result.stderr.strip())
+            return EXIT_ERROR, result.stderr.strip() or "failed to start systemd user service"
+        state["running"] = True
+        state["last_started_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("systemd_start_service", running=True)
+        return EXIT_OK, "systemd user service started"
+
+    def stop(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_systemctl("stop", SYSTEMD_UNIT_NAME)
+        if result.returncode != 0:
+            self._append_log("systemd_stop_failed", error=result.stderr.strip())
+            return EXIT_ERROR, result.stderr.strip() or "failed to stop systemd user service"
+        state["running"] = False
+        state["last_stopped_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("systemd_stop_service", running=False)
+        return EXIT_OK, "systemd user service stopped"
+
+    def status(self) -> tuple[int, dict[str, Any]]:
+        base_code, payload = super().status()
+        result = self._run_systemctl("is-active", SYSTEMD_UNIT_NAME)
+        payload["running"] = result.returncode == 0 and result.stdout.strip() == "active"
+        payload["service_mode"] = "systemd-user"
+        payload["systemd_unit"] = str(self.paths.systemd_unit)
+        if result.returncode != 0 and payload.get("installed"):
+            payload["last_systemd_error"] = result.stderr.strip()
+        return base_code, payload
+
+
+class WindowsServiceManager(LocalServiceManager):
+    """Windows Service manager."""
+
+    def _run_sc(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sc", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def install_service(self) -> tuple[int, str]:
+        code, msg = super().install_service()
+        if code != EXIT_OK:
+            return code, msg
+        state = self.load_state()
+        bin_path = f"\"{sys.executable}\" -m medpilot.cli.commands gateway --port {int(state.get('port', DEFAULT_PORT))}"
+        create = self._run_sc("create", WINDOWS_SERVICE_NAME, "binPath=", bin_path, "start=", "auto")
+        if create.returncode != 0:
+            return EXIT_ERROR, create.stderr.strip() or "failed to create Windows service"
+        state["service_mode"] = "windows-service"
+        self.save_state(state)
+        self._append_log("windows_install_service", service=WINDOWS_SERVICE_NAME)
+        return EXIT_OK, f"Windows service installed ({WINDOWS_SERVICE_NAME})"
+
+    def uninstall_service(self) -> tuple[int, str]:
+        self._run_sc("stop", WINDOWS_SERVICE_NAME)
+        delete = self._run_sc("delete", WINDOWS_SERVICE_NAME)
+        if delete.returncode != 0:
+            return EXIT_ERROR, delete.stderr.strip() or "failed to delete Windows service"
+        code, msg = super().uninstall_service()
+        self._append_log("windows_uninstall_service", service=WINDOWS_SERVICE_NAME)
+        return code, msg
+
+    def start(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_sc("start", WINDOWS_SERVICE_NAME)
+        if result.returncode != 0:
+            self._append_log("windows_start_failed", error=result.stderr.strip())
+            return EXIT_ERROR, result.stderr.strip() or "failed to start Windows service"
+        state["running"] = True
+        state["last_started_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("windows_start_service", running=True)
+        return EXIT_OK, "Windows service started"
+
+    def stop(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_sc("stop", WINDOWS_SERVICE_NAME)
+        if result.returncode != 0:
+            self._append_log("windows_stop_failed", error=result.stderr.strip())
+            return EXIT_ERROR, result.stderr.strip() or "failed to stop Windows service"
+        state["running"] = False
+        state["last_stopped_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("windows_stop_service", running=False)
+        return EXIT_OK, "Windows service stopped"
+
+    def status(self) -> tuple[int, dict[str, Any]]:
+        base_code, payload = super().status()
+        result = self._run_sc("query", WINDOWS_SERVICE_NAME)
+        payload["running"] = "RUNNING" in result.stdout.upper()
+        payload["service_mode"] = "windows-service"
+        payload["windows_service"] = WINDOWS_SERVICE_NAME
+        if result.returncode != 0 and payload.get("installed"):
+            payload["last_sc_error"] = result.stderr.strip()
+        return base_code, payload
 
 
 class LaunchdServiceManager(LocalServiceManager):
@@ -228,6 +465,7 @@ class LaunchdServiceManager(LocalServiceManager):
                 return EXIT_ERROR, bootstrap.stderr.strip() or "failed to bootstrap launchd service"
         state["service_mode"] = "launchd"
         self.save_state(state)
+        self._append_log("launchd_install_service", plist=str(self.paths.launchd_plist))
         return EXIT_OK, f"launchd service installed ({self.paths.launchd_plist})"
 
     def uninstall_service(self) -> tuple[int, str]:
@@ -236,7 +474,9 @@ class LaunchdServiceManager(LocalServiceManager):
             self.paths.launchd_plist.unlink(missing_ok=True)
         except OSError as exc:
             return EXIT_ERROR, f"failed to remove plist: {exc}"
-        return super().uninstall_service()
+        code, msg = super().uninstall_service()
+        self._append_log("launchd_uninstall_service", plist=str(self.paths.launchd_plist))
+        return code, msg
 
     def start(self) -> tuple[int, str]:
         state = self.load_state()
@@ -244,10 +484,12 @@ class LaunchdServiceManager(LocalServiceManager):
             return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
         result = self._run_launchctl("kickstart", "-k", self._service_target)
         if result.returncode != 0:
+            self._append_log("launchd_start_failed", error=result.stderr.strip())
             return EXIT_ERROR, result.stderr.strip() or "failed to start launchd service"
         state["running"] = True
         state["last_started_at"] = _now_iso()
         self.save_state(state)
+        self._append_log("launchd_start_service", running=True)
         return EXIT_OK, "launchd service started"
 
     def stop(self) -> tuple[int, str]:
@@ -256,10 +498,12 @@ class LaunchdServiceManager(LocalServiceManager):
             return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
         result = self._run_launchctl("stop", LAUNCHD_LABEL)
         if result.returncode != 0:
+            self._append_log("launchd_stop_failed", error=result.stderr.strip())
             return EXIT_ERROR, result.stderr.strip() or "failed to stop launchd service"
         state["running"] = False
         state["last_stopped_at"] = _now_iso()
         self.save_state(state)
+        self._append_log("launchd_stop_service", running=False)
         return EXIT_OK, "launchd service stopped"
 
     def status(self) -> tuple[int, dict[str, Any]]:
@@ -291,10 +535,19 @@ def _manager() -> LocalServiceManager:
     paths = AgentPaths.default()
     if mode == "launchd":
         return LaunchdServiceManager(paths)
+    if mode == "systemd":
+        return SystemdUserServiceManager(paths)
+    if mode == "windows":
+        return WindowsServiceManager(paths)
     if mode == "local":
         return LocalServiceManager(paths)
-    if platform.system().lower() == "darwin":
+    platform_name = platform.system().lower()
+    if platform_name == "darwin":
         return LaunchdServiceManager(paths)
+    if platform_name == "linux":
+        return SystemdUserServiceManager(paths)
+    if platform_name == "windows":
+        return WindowsServiceManager(paths)
     return LocalServiceManager(paths)
 
 
@@ -369,8 +622,16 @@ def logs() -> None:
 
 
 @app.command()
-def doctor() -> None:
-    code, payload = _manager().doctor()
+def doctor(
+    export: bool = typer.Option(False, "--export", help="Export diagnostics bundle."),
+) -> None:
+    manager = _manager()
+    code, payload = manager.doctor()
+    if export:
+        export_code, bundle_path = manager.export_diagnostics()
+        payload["diagnostics_bundle"] = bundle_path
+        if export_code != EXIT_OK:
+            code = EXIT_ERROR
     console.print_json(data=payload)
     raise typer.Exit(code)
 
