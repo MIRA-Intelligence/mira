@@ -104,6 +104,7 @@ medpilot-agent start
 medpilot-agent status
 medpilot-agent logs
 medpilot-agent doctor
+medpilot-agent doctor --export
 medpilot-agent upgrade --package medpilot-ai
 medpilot-agent stop
 medpilot-agent uninstall-service
@@ -114,6 +115,11 @@ On macOS, `install-service` registers a user LaunchAgent at:
 ```bash
 ~/Library/LaunchAgents/com.projectmedpilot.agent.plist
 ```
+
+Local engine logs and diagnostics:
+
+- Logs: `~/.medpilot/logs/agent-service.log` (+ rotated files)
+- Diagnostics bundles: `~/.medpilot/runtime/diagnostics/`
 
 ## 💬 Multi-Channel Deployment (Coming Soon)
 Features to deploy MedPilot seamlessly to platforms like Telegram, Discord, Feishu, or Slack to assist your research team in real-time are in active development.
