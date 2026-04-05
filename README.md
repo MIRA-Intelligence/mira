@@ -116,6 +116,12 @@ On macOS, `install-service` registers a user LaunchAgent at:
 ~/Library/LaunchAgents/com.projectmedpilot.agent.plist
 ```
 
+On Linux, `install-service` registers a user systemd unit:
+
+```bash
+~/.config/systemd/user/medpilot-agent.service
+```
+
 Local engine logs and diagnostics:
 
 - Logs: `~/.medpilot/logs/agent-service.log` (+ rotated files)
