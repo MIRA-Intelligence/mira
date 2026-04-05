@@ -1,0 +1,103 @@
+name: Release Train
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent_tag:
+        description: "Agent tag in MedPilot (e.g. v0.2.0)"
+        required: true
+        type: string
+      ui_tag:
+        description: "UI tag in MedPilotUI (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-tags:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify agent tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/Project-MedPilot/MedPilot/git/ref/tags/${{ inputs.agent_tag }} >/dev/null
+
+      - name: Verify UI tag exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/Project-MedPilot/MedPilotUI/git/ref/tags/${{ inputs.ui_tag }} >/dev/null
+
+  smoke:
+    needs: verify-tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout agent tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.agent_tag }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install MedPilot
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Start gateway
+        run: |
+          nohup medpilot gateway --port 18790 > gateway.log 2>&1 &
+
+      - name: Wait for gateway health
+        run: |
+          for i in {1..20}; do
+            if curl -sf http://127.0.0.1:18790/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Gateway failed to become healthy"
+          exit 1
+
+      - name: Run release-train smoke checks
+        run: |
+          python scripts/release_train_smoke.py --base-url http://127.0.0.1:18790 > smoke-report.json
+
+      - name: Upload smoke artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-train-smoke-${{ inputs.agent_tag }}-${{ inputs.ui_tag }}
+          path: |
+            smoke-report.json
+            gateway.log
+
+  summary:
+    needs: [verify-tags, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build release summary
+        run: |
+          cat <<EOF > release-train-summary.md
+          ## Release Train Candidate
+
+          - Agent tag: \`${{ inputs.agent_tag }}\`
+          - UI tag: \`${{ inputs.ui_tag }}\`
+          - Smoke: passed
+
+          Smoke validates:
+          - Desktop -> Local engine contract checks (\`/health\`, \`/version\`)
+          - Desktop -> Cloud-style API contract check (\`/api/status\`)
+          - Web -> Cloud-style API contract check (\`/api/status\`)
+          EOF
+
+      - name: Upload summary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-train-summary-${{ inputs.agent_tag }}-${{ inputs.ui_tag }}
+          path: release-train-summary.md

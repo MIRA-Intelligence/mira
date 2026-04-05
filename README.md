@@ -129,6 +129,9 @@ Tagging `v*` triggers `.github/workflows/agent-release.yml` to:
 - publish `medpilot-ai` package artifacts (wheel/sdist)
 - build standalone `medpilot-agent` executables with checksums
 
+Use `.github/workflows/release-train.yml` (`workflow_dispatch`) to validate an
+`agent_tag + ui_tag` pair and run smoke checks before announcing a combined release.
+
 ## 💬 Multi-Channel Deployment (Coming Soon)
 Features to deploy MedPilot seamlessly to platforms like Telegram, Discord, Feishu, or Slack to assist your research team in real-time are in active development.
 
