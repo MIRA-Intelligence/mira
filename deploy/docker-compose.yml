@@ -1,0 +1,27 @@
+services:
+  medpilot-agent:
+    image: ghcr.io/project-medpilot/medpilot-agent:${MEDPILOT_AGENT_TAG:-latest}
+    container_name: medpilot-agent
+    restart: unless-stopped
+    command: ["medpilot", "gateway", "--port", "18790"]
+    ports:
+      - "${MEDPILOT_AGENT_PORT:-18790}:18790"
+    volumes:
+      - medpilot_data:/root/.medpilot
+    environment:
+      - MEDPILOT_CONFIG_PATH=/root/.medpilot/config.json
+
+  medpilot-ui:
+    image: ghcr.io/project-medpilot/medpilot-ui:${MEDPILOT_UI_TAG:-latest}
+    container_name: medpilot-ui
+    restart: unless-stopped
+    depends_on:
+      - medpilot-agent
+    ports:
+      - "${MEDPILOT_UI_PORT:-8080}:80"
+    environment:
+      - VITE_API_URL=${MEDPILOT_API_URL:-http://localhost:18790/api}
+      - VITE_WS_URL=${MEDPILOT_WS_URL:-ws://localhost:18790/ws}
+
+volumes:
+  medpilot_data:
