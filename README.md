@@ -116,6 +116,18 @@ On macOS, `install-service` registers a user LaunchAgent at:
 ~/Library/LaunchAgents/com.projectmedpilot.agent.plist
 ```
 
+On Linux, `install-service` registers a user systemd unit:
+
+```bash
+~/.config/systemd/user/medpilot-agent.service
+```
+
+On Windows, `install-service` registers service name:
+
+```bash
+MedPilotAgent
+```
+
 Local engine logs and diagnostics:
 
 - Logs: `~/.medpilot/logs/agent-service.log` (+ rotated files)
@@ -128,6 +140,20 @@ Tagging `v*` triggers `.github/workflows/agent-release.yml` to:
 - build/test the project on Linux/macOS/Windows
 - publish `medpilot-ai` package artifacts (wheel/sdist)
 - build standalone `medpilot-agent` executables with checksums
+
+Use `.github/workflows/release-train.yml` (`workflow_dispatch`) to validate an
+`agent_tag + ui_tag` pair and run smoke checks before announcing a combined release.
+
+## 🏗️ Optional Self-hosted Path
+
+Self-hosted Docker templates are under `deploy/`:
+
+- `deploy/docker-compose.yml`
+- `deploy/.env.example`
+
+Operator guide:
+
+- `docs/self-hosted-docker.md`
 
 ## 💬 Multi-Channel Deployment (Coming Soon)
 Features to deploy MedPilot seamlessly to platforms like Telegram, Discord, Feishu, or Slack to assist your research team in real-time are in active development.
