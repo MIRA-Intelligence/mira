@@ -121,6 +121,14 @@ Local engine logs and diagnostics:
 - Logs: `~/.medpilot/logs/agent-service.log` (+ rotated files)
 - Diagnostics bundles: `~/.medpilot/runtime/diagnostics/`
 
+## 📦 Agent Release Pipeline
+
+Tagging `v*` triggers `.github/workflows/agent-release.yml` to:
+
+- build/test the project on Linux/macOS/Windows
+- publish `medpilot-ai` package artifacts (wheel/sdist)
+- build standalone `medpilot-agent` executables with checksums
+
 ## 💬 Multi-Channel Deployment (Coming Soon)
 Features to deploy MedPilot seamlessly to platforms like Telegram, Discord, Feishu, or Slack to assist your research team in real-time are in active development.
 
