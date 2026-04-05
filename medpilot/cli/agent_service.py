@@ -31,6 +31,8 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_INSTALLED = 2
 LAUNCHD_LABEL = "com.projectmedpilot.agent"
+SYSTEMD_UNIT_NAME = "medpilot-agent.service"
+WINDOWS_SERVICE_NAME = "MedPilotAgent"
 DEFAULT_PORT = 46321
 LOG_ROTATE_BYTES = 1_000_000
 LOG_ROTATE_FILES = 3
@@ -51,6 +53,7 @@ class AgentPaths:
     state_file: Path
     log_file: Path
     launchd_plist: Path
+    systemd_unit: Path
     backups_dir: Path
 
     @classmethod
@@ -65,6 +68,7 @@ class AgentPaths:
             state_file=root / "runtime" / "agent-service-state.json",
             log_file=root / "logs" / "agent-service.log",
             launchd_plist=Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
+            systemd_unit=Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME,
             backups_dir=root / "runtime" / "backups",
         )
 
@@ -237,6 +241,175 @@ class LocalServiceManager:
         return EXIT_OK, str(bundle)
 
 
+class SystemdUserServiceManager(LocalServiceManager):
+    """Linux systemd --user manager."""
+
+    def _run_systemctl(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["systemctl", "--user", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _write_unit(self, port: int) -> None:
+        self.paths.systemd_unit.parent.mkdir(parents=True, exist_ok=True)
+        content = f"""[Unit]
+Description=MedPilot Local Agent Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={sys.executable} -m medpilot.cli.commands gateway --port {port}
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:{self.paths.log_file}
+StandardError=append:{self.paths.log_file}
+
+[Install]
+WantedBy=default.target
+"""
+        self.paths.systemd_unit.write_text(content, encoding="utf-8")
+
+    def install_service(self) -> tuple[int, str]:
+        code, msg = super().install_service()
+        if code != EXIT_OK:
+            return code, msg
+        state = self.load_state()
+        self._write_unit(int(state.get("port", DEFAULT_PORT)))
+        self._run_systemctl("daemon-reload")
+        enable = self._run_systemctl("enable", SYSTEMD_UNIT_NAME)
+        if enable.returncode != 0:
+            return EXIT_ERROR, enable.stderr.strip() or "failed to enable systemd user service"
+        state["service_mode"] = "systemd-user"
+        self.save_state(state)
+        self._append_log("systemd_install_service", unit=str(self.paths.systemd_unit))
+        return EXIT_OK, f"systemd user service installed ({self.paths.systemd_unit})"
+
+    def uninstall_service(self) -> tuple[int, str]:
+        self._run_systemctl("disable", "--now", SYSTEMD_UNIT_NAME)
+        try:
+            self.paths.systemd_unit.unlink(missing_ok=True)
+        except OSError as exc:
+            return EXIT_ERROR, f"failed to remove unit file: {exc}"
+        self._run_systemctl("daemon-reload")
+        code, msg = super().uninstall_service()
+        self._append_log("systemd_uninstall_service", unit=str(self.paths.systemd_unit))
+        return code, msg
+
+    def start(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_systemctl("start", SYSTEMD_UNIT_NAME)
+        if result.returncode != 0:
+            self._append_log("systemd_start_failed", error=result.stderr.strip())
+            return EXIT_ERROR, result.stderr.strip() or "failed to start systemd user service"
+        state["running"] = True
+        state["last_started_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("systemd_start_service", running=True)
+        return EXIT_OK, "systemd user service started"
+
+    def stop(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_systemctl("stop", SYSTEMD_UNIT_NAME)
+        if result.returncode != 0:
+            self._append_log("systemd_stop_failed", error=result.stderr.strip())
+            return EXIT_ERROR, result.stderr.strip() or "failed to stop systemd user service"
+        state["running"] = False
+        state["last_stopped_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("systemd_stop_service", running=False)
+        return EXIT_OK, "systemd user service stopped"
+
+    def status(self) -> tuple[int, dict[str, Any]]:
+        base_code, payload = super().status()
+        result = self._run_systemctl("is-active", SYSTEMD_UNIT_NAME)
+        payload["running"] = result.returncode == 0 and result.stdout.strip() == "active"
+        payload["service_mode"] = "systemd-user"
+        payload["systemd_unit"] = str(self.paths.systemd_unit)
+        if result.returncode != 0 and payload.get("installed"):
+            payload["last_systemd_error"] = result.stderr.strip()
+        return base_code, payload
+
+
+class WindowsServiceManager(LocalServiceManager):
+    """Windows Service manager."""
+
+    def _run_sc(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sc", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def install_service(self) -> tuple[int, str]:
+        code, msg = super().install_service()
+        if code != EXIT_OK:
+            return code, msg
+        state = self.load_state()
+        bin_path = f"\"{sys.executable}\" -m medpilot.cli.commands gateway --port {int(state.get('port', DEFAULT_PORT))}"
+        create = self._run_sc("create", WINDOWS_SERVICE_NAME, "binPath=", bin_path, "start=", "auto")
+        if create.returncode != 0:
+            return EXIT_ERROR, create.stderr.strip() or "failed to create Windows service"
+        state["service_mode"] = "windows-service"
+        self.save_state(state)
+        self._append_log("windows_install_service", service=WINDOWS_SERVICE_NAME)
+        return EXIT_OK, f"Windows service installed ({WINDOWS_SERVICE_NAME})"
+
+    def uninstall_service(self) -> tuple[int, str]:
+        self._run_sc("stop", WINDOWS_SERVICE_NAME)
+        delete = self._run_sc("delete", WINDOWS_SERVICE_NAME)
+        if delete.returncode != 0:
+            return EXIT_ERROR, delete.stderr.strip() or "failed to delete Windows service"
+        code, msg = super().uninstall_service()
+        self._append_log("windows_uninstall_service", service=WINDOWS_SERVICE_NAME)
+        return code, msg
+
+    def start(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_sc("start", WINDOWS_SERVICE_NAME)
+        if result.returncode != 0:
+            self._append_log("windows_start_failed", error=result.stderr.strip())
+            return EXIT_ERROR, result.stderr.strip() or "failed to start Windows service"
+        state["running"] = True
+        state["last_started_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("windows_start_service", running=True)
+        return EXIT_OK, "Windows service started"
+
+    def stop(self) -> tuple[int, str]:
+        state = self.load_state()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_sc("stop", WINDOWS_SERVICE_NAME)
+        if result.returncode != 0:
+            self._append_log("windows_stop_failed", error=result.stderr.strip())
+            return EXIT_ERROR, result.stderr.strip() or "failed to stop Windows service"
+        state["running"] = False
+        state["last_stopped_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("windows_stop_service", running=False)
+        return EXIT_OK, "Windows service stopped"
+
+    def status(self) -> tuple[int, dict[str, Any]]:
+        base_code, payload = super().status()
+        result = self._run_sc("query", WINDOWS_SERVICE_NAME)
+        payload["running"] = "RUNNING" in result.stdout.upper()
+        payload["service_mode"] = "windows-service"
+        payload["windows_service"] = WINDOWS_SERVICE_NAME
+        if result.returncode != 0 and payload.get("installed"):
+            payload["last_sc_error"] = result.stderr.strip()
+        return base_code, payload
+
+
 class LaunchdServiceManager(LocalServiceManager):
     """macOS launchd-backed lifecycle manager."""
 
@@ -362,10 +535,19 @@ def _manager() -> LocalServiceManager:
     paths = AgentPaths.default()
     if mode == "launchd":
         return LaunchdServiceManager(paths)
+    if mode == "systemd":
+        return SystemdUserServiceManager(paths)
+    if mode == "windows":
+        return WindowsServiceManager(paths)
     if mode == "local":
         return LocalServiceManager(paths)
-    if platform.system().lower() == "darwin":
+    platform_name = platform.system().lower()
+    if platform_name == "darwin":
         return LaunchdServiceManager(paths)
+    if platform_name == "linux":
+        return SystemdUserServiceManager(paths)
+    if platform_name == "windows":
+        return WindowsServiceManager(paths)
     return LocalServiceManager(paths)
 
 
