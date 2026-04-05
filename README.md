@@ -122,6 +122,12 @@ On Linux, `install-service` registers a user systemd unit:
 ~/.config/systemd/user/medpilot-agent.service
 ```
 
+On Windows, `install-service` registers service name:
+
+```bash
+MedPilotAgent
+```
+
 Local engine logs and diagnostics:
 
 - Logs: `~/.medpilot/logs/agent-service.log` (+ rotated files)
