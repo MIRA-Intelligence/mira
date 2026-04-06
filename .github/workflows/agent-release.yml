@@ -82,7 +82,11 @@ jobs:
   publish-pypi:
     needs: build-and-test
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') && secrets.PYPI_API_TOKEN != ''
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Download linux artifacts
         uses: actions/download-artifact@v4
@@ -90,10 +94,19 @@ jobs:
           name: medpilot-agent-ubuntu-latest
           path: pypi-artifacts
 
+      - name: Keep only package files
+        shell: bash
+        run: |
+          mkdir -p pypi-packages
+          cp pypi-artifacts/*.whl pypi-packages/ || true
+          cp pypi-artifacts/*.tar.gz pypi-packages/ || true
+          ls -al pypi-packages
+          test -n "$(ls -A pypi-packages)"
+
       - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: pypi-artifacts
+          packages-dir: pypi-packages
 
   publish-release:
     needs: build-and-test

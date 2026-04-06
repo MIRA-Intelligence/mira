@@ -9,9 +9,9 @@ import re
 import sys
 from pathlib import Path
 
-RELEASE_TRAIN_RE = re.compile(r"^\d{4}\.(0[1-9]|1[0-2])$")
-VERSION_RANGE_RE = re.compile(r"^\d+\.\d+\.x$")
-SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+RELEASE_TRAIN_RE = re.compile(r"^\d{4}\.(0[1-9]|1[0-2])(?:rc\d+)?$")
+VERSION_SPEC_RE = re.compile(r"^(?:\d+\.\d+\.x|\d+\.\d+\.\d+(?:rc\d+)?)$")
+SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:rc\d+)?$")
 API_CONTRACT_RE = re.compile(r"^v\d+$")
 
 REQUIRED_KEYS = {
@@ -36,15 +36,15 @@ def _validate_data(payload: dict[str, object]) -> list[str]:
 
     release_train = payload.get("release_train")
     if not isinstance(release_train, str) or not RELEASE_TRAIN_RE.fullmatch(release_train):
-        errors.append("release_train must match YYYY.MM (e.g. 2026.04).")
+        errors.append("release_train must match YYYY.MM or YYYY.MMrcN (e.g. 2026.04, 2026.04rc1).")
 
     ui = payload.get("ui")
-    if not isinstance(ui, str) or not VERSION_RANGE_RE.fullmatch(ui):
-        errors.append("ui must match major.minor.x (e.g. 2.3.x).")
+    if not isinstance(ui, str) or not VERSION_SPEC_RE.fullmatch(ui):
+        errors.append("ui must match major.minor.x or major.minor.patchrcN (e.g. 2.3.x, 2.3.0rc1).")
 
     agent = payload.get("agent")
-    if not isinstance(agent, str) or not VERSION_RANGE_RE.fullmatch(agent):
-        errors.append("agent must match major.minor.x (e.g. 1.6.x).")
+    if not isinstance(agent, str) or not VERSION_SPEC_RE.fullmatch(agent):
+        errors.append("agent must match major.minor.x or major.minor.patchrcN (e.g. 1.6.x, 1.6.0rc1).")
 
     api_contract = payload.get("api_contract")
     if not isinstance(api_contract, str) or not API_CONTRACT_RE.fullmatch(api_contract):
@@ -52,7 +52,7 @@ def _validate_data(payload: dict[str, object]) -> list[str]:
 
     min_agent = payload.get("min_agent_for_ui")
     if not isinstance(min_agent, str) or not SEMVER_RE.fullmatch(min_agent):
-        errors.append("min_agent_for_ui must match semantic version major.minor.patch.")
+        errors.append("min_agent_for_ui must match semantic version major.minor.patch or major.minor.patchrcN.")
 
     return errors
 
