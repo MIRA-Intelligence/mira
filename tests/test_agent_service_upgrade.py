@@ -17,7 +17,7 @@ def test_upgrade_success_flow(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_service_mod, "_pip_upgrade", lambda _spec: (0, "ok"))
     monkeypatch.setattr(agent_service_mod, "_health_check", lambda _port: True)
 
-    result = runner.invoke(agent_service_mod.app, ["upgrade", "--package", "medpilot-ai"])
+    result = runner.invoke(agent_service_mod.app, ["upgrade", "--package", "medpilot"])
 
     assert result.exit_code == 0
     assert "Upgrade successful" in result.stdout
@@ -46,9 +46,9 @@ def test_upgrade_failure_rolls_back(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_service_mod, "_pip_upgrade", fake_pip_upgrade)
     monkeypatch.setattr(agent_service_mod, "_health_check", lambda _port: True)
 
-    result = runner.invoke(agent_service_mod.app, ["upgrade", "--package", "medpilot-ai"])
+    result = runner.invoke(agent_service_mod.app, ["upgrade", "--package", "medpilot"])
 
     assert result.exit_code == 1
     assert "Rolled back package" in result.stdout
-    assert calls[0] == "medpilot-ai"
-    assert calls[1] == "medpilot-ai==0.1.0"
+    assert calls[0] == "medpilot"
+    assert calls[1] == "medpilot==0.1.0"

@@ -217,7 +217,7 @@ class LocalServiceManager:
                 "checks": checks,
                 "log_file": str(self.paths.log_file),
                 "status": status_payload if status_code == EXIT_OK else {},
-                "agent_package_version": _current_version("medpilot-ai"),
+                "agent_package_version": _current_version("medpilot"),
             },
         )
 
@@ -638,7 +638,7 @@ def doctor(
 
 @app.command()
 def upgrade(
-    package: str = typer.Option("medpilot-ai", "--package", help="Package name to upgrade."),
+    package: str = typer.Option("medpilot", "--package", help="Package name to upgrade."),
 ) -> None:
     manager = _manager()
     status_code, status_payload = manager.status()

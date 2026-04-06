@@ -14,7 +14,6 @@ try:
     from nio import (
         AsyncClient,
         AsyncClientConfig,
-        ContentRepositoryConfigError,
         DownloadError,
         InviteEvent,
         JoinError,
@@ -33,7 +32,7 @@ try:
     from nio.exceptions import EncryptionError
 except ImportError as e:
     raise ImportError(
-        "Matrix dependencies not installed. Run: pip install medpilot-ai[matrix]"
+        "Matrix dependencies not installed. Run: pip install medpilot[matrix]"
     ) from e
 
 from medpilot.bus.events import OutboundMessage

@@ -105,7 +105,7 @@ medpilot-agent status
 medpilot-agent logs
 medpilot-agent doctor
 medpilot-agent doctor --export
-medpilot-agent upgrade --package medpilot-ai
+medpilot-agent upgrade --package medpilot
 medpilot-agent stop
 medpilot-agent uninstall-service
 ```
@@ -154,7 +154,7 @@ python scripts/validate_compatibility.py --file compatibility.json
 Tagging `v*` triggers `.github/workflows/agent-release.yml` to:
 
 - build/test the project on Linux/macOS/Windows
-- publish `medpilot-ai` package artifacts (wheel/sdist)
+- publish `medpilot` package artifacts (wheel/sdist)
 - build standalone `medpilot-agent` executables with checksums
 
 Use `.github/workflows/release-train.yml` (`workflow_dispatch`) to validate an

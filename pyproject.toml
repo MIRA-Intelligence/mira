@@ -1,7 +1,8 @@
 [project]
-name = "medpilot-ai"
-version = "0.2.0"
+name = "medpilot"
+dynamic = ["version"]
 description = "A lightweight personal AI assistant framework"
+readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
@@ -68,8 +69,16 @@ medpilot = "medpilot.cli.commands:app"
 medpilot-agent = "medpilot.cli.agent_service:app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+(?:rc\\d+)?)$"
+fallback_version = "0.0.0"
+local_scheme = "no-local-version"
 
 [tool.hatch.build.targets.wheel]
 packages = ["medpilot"]

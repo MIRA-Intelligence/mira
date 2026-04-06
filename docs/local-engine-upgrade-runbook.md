@@ -15,7 +15,7 @@ medpilot-agent doctor
 ## Standard Upgrade Flow
 
 ```bash
-medpilot-agent upgrade --package medpilot-ai
+medpilot-agent upgrade --package medpilot
 ```
 
 The command performs:
@@ -38,7 +38,7 @@ If automated rollback fails, run:
 
 ```bash
 medpilot-agent stop
-python -m pip install --upgrade medpilot-ai==<previous_version>
+python -m pip install --upgrade medpilot==<previous_version>
 medpilot-agent start
 medpilot-agent status
 medpilot-agent doctor
