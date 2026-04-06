@@ -1,15 +1,17 @@
-import os
-import sys
-import subprocess
 import shutil
-import pytest
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="installer shell tests are not reliable on Windows runners")
 def test_install_sh_no_conda(tmp_path):
     """Test the shell script behavior when Conda is missing."""
     install_script = Path("install.sh").absolute()
     bash_exe = shutil.which("bash") or "/bin/bash"
-    
+
     # Create a wrapper script to manipulate PATH and inputs
     wrapper_path = tmp_path / "run_install.sh"
     with open(wrapper_path, "w") as f:
@@ -23,7 +25,7 @@ function pip() {{ echo "Simulated pip $@"; }}
 export -f python
 export -f pip
 
-# Run installer and provide "n" to standard python virtual environment, 
+# Run installer and provide "n" to standard python virtual environment,
 # but wait, the script reads from terminal (read -p). We can provide input via stdin.
 # Actually, the read -p reads from stdin unless -u is specified.
 "{bash_exe}" "{install_script}" << 'INPUT'
@@ -31,16 +33,17 @@ n
 INPUT
 ''')
     wrapper_path.chmod(0o755)
-    
+
     result = subprocess.run(["bash", str(wrapper_path)], capture_output=True, text=True)
     assert "Warning: conda is not installed" in result.stdout
     assert "Simulated pip install -e ." in result.stdout
 
+@pytest.mark.skipif(sys.platform == "win32", reason="installer shell tests are not reliable on Windows runners")
 def test_install_sh_with_conda(tmp_path):
     """Test the shell script behavior when Conda is present."""
     install_script = Path("install.sh").absolute()
     bash_exe = shutil.which("bash") or "/bin/bash"
-    
+
     wrapper_path = tmp_path / "run_install.sh"
     with open(wrapper_path, "w") as f:
         f.write(f'''#!/usr/bin/env bash
@@ -66,7 +69,7 @@ base
 INPUT
 ''')
     wrapper_path.chmod(0o755)
-    
+
     result = subprocess.run(["bash", str(wrapper_path)], capture_output=True, text=True)
     assert "Conda is installed." in result.stdout
     assert "Available conda environments:" in result.stdout

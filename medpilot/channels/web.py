@@ -111,7 +111,7 @@ def _collect_output_artifacts(project_dir: Path, exp_id: str) -> list[str]:
     if not output_dir.is_dir():
         return []
     return sorted(
-        str(path.relative_to(project_dir))
+        path.relative_to(project_dir).as_posix()
         for path in output_dir.rglob("*")
         if path.is_file()
     )
@@ -949,7 +949,7 @@ class WebChannel(BaseChannel):
 
             uploaded.append({
                 "name": target.name,
-                "path": str(target.relative_to(project_dir)),
+                "path": target.relative_to(project_dir).as_posix(),
                 "size": size,
             })
 

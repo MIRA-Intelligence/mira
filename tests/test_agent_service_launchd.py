@@ -1,5 +1,8 @@
 import plistlib
+import sys
 from types import SimpleNamespace
+
+import pytest
 
 from medpilot.cli.agent_service import (
     EXIT_OK,
@@ -13,6 +16,7 @@ def _fake_completed(returncode=0, stdout="", stderr=""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="launchd tests are macOS-specific")
 def test_launchd_install_writes_plist_and_bootstraps(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     calls = []
@@ -35,6 +39,7 @@ def test_launchd_install_writes_plist_and_bootstraps(monkeypatch, tmp_path):
     assert any(cmd[1] == "bootstrap" for cmd in calls)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="launchd tests are macOS-specific")
 def test_launchd_status_includes_launchd_metadata(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
 
