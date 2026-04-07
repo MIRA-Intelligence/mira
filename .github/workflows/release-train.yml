@@ -18,16 +18,22 @@ permissions:
 jobs:
   verify-tags:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_TRAIN_GH_TOKEN || github.token }}
     steps:
+      - name: Ensure cross-repo token can access MedPilotUI
+        run: |
+          if ! gh api repos/Project-MedPilot/MedPilotUI >/dev/null 2>&1; then
+            echo "::error::Current GH token cannot access Project-MedPilot/MedPilotUI."
+            echo "Configure RELEASE_TRAIN_GH_TOKEN with access to both repos: classic PATs need repo (or public_repo for public-only repos), and fine-grained PATs need repository Contents: Read, then rerun."
+            exit 1
+          fi
+
       - name: Verify agent tag exists
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           gh api repos/Project-MedPilot/MedPilot/git/ref/tags/${{ inputs.agent_tag }} >/dev/null
 
       - name: Verify UI tag exists
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           gh api repos/Project-MedPilot/MedPilotUI/git/ref/tags/${{ inputs.ui_tag }} >/dev/null
 
@@ -50,9 +56,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Build CI gateway config
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from medpilot.config.schema import Config
+
+          cfg = Config()
+          cfg.agents.defaults.model = "custom/default"
+          cfg.agents.defaults.provider = "custom"
+          cfg.providers.custom.api_key = "no-key"
+          cfg.providers.custom.api_base = "http://127.0.0.1:8000/v1"
+          cfg.channels.web.enabled = True
+          cfg.channels.web.host = "127.0.0.1"
+          cfg.channels.web.port = 18790
+          cfg.channels.web.allow_from = ["*"]
+          cfg.channels.web.cors_origins = ["*"]
+
+          out = Path("release-train-config.json")
+          out.write_text(json.dumps(cfg.model_dump(by_alias=True), indent=2), encoding="utf-8")
+          print(f"Wrote {out}")
+          PY
+
       - name: Start gateway
         run: |
-          nohup medpilot gateway --port 18790 > gateway.log 2>&1 &
+          nohup medpilot gateway --config release-train-config.json > gateway.log 2>&1 &
 
       - name: Wait for gateway health
         run: |
@@ -63,6 +92,8 @@ jobs:
             sleep 2
           done
           echo "Gateway failed to become healthy"
+          echo "------ gateway.log (tail) ------"
+          tail -n 200 gateway.log || true
           exit 1
 
       - name: Run release-train smoke checks
