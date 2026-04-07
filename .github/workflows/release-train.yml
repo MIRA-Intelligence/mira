@@ -56,9 +56,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Build CI gateway config
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from medpilot.config.schema import Config
+
+          cfg = Config()
+          cfg.agents.defaults.primary_model = "custom/default"
+          cfg.providers.custom.api_key = "no-key"
+          cfg.providers.custom.api_base = "http://127.0.0.1:8000/v1"
+
+          out = Path("release-train-config.json")
+          out.write_text(json.dumps(cfg.model_dump(by_alias=True), indent=2), encoding="utf-8")
+          print(f"Wrote {out}")
+          PY
+
       - name: Start gateway
         run: |
-          nohup medpilot gateway --port 18790 > gateway.log 2>&1 &
+          nohup medpilot gateway --config release-train-config.json --port 18790 > gateway.log 2>&1 &
 
       - name: Wait for gateway health
         run: |
@@ -69,6 +86,8 @@ jobs:
             sleep 2
           done
           echo "Gateway failed to become healthy"
+          echo "------ gateway.log (tail) ------"
+          tail -n 200 gateway.log || true
           exit 1
 
       - name: Run release-train smoke checks
