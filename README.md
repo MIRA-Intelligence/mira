@@ -174,6 +174,11 @@ Operator guide:
 ## 💬 Multi-Channel Deployment (Coming Soon)
 Features to deploy MedPilot seamlessly to platforms like Telegram, Discord, Feishu, or Slack to assist your research team in real-time are in active development.
 
+## 🤝 Contributing / CLA
+
+All external contributions require acceptance of the Contributor License Agreement.
+See `CLA.md` for details. By submitting a PR, you confirm acceptance of this CLA.
+
 ## 🙏 Acknowledgments
 
 The foundational CLI framework of MedPilot is built heavily upon the [nanobot](https://github.com/HKUDS/nanobot). We sincerely thank the HKUDS team for their excellent open-source contribution to the community.

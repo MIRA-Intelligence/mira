@@ -2,6 +2,11 @@
 
 - Closes #<issue-id> (or Implements Project-MedPilot/MedPilot#<issue-id> for cross-repo PRs)
 
+## CLA Acknowledgement
+
+- [ ] I have read `CLA.md` and agree to the Contributor License Agreement.
+- [ ] I confirm I have the right to submit this contribution.
+
 ## What Changed
 
 - [ ] Backend/API behavior

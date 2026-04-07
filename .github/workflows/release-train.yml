@@ -18,16 +18,22 @@ permissions:
 jobs:
   verify-tags:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_TRAIN_GH_TOKEN || github.token }}
     steps:
+      - name: Ensure cross-repo token is configured
+        if: ${{ secrets.RELEASE_TRAIN_GH_TOKEN == '' }}
+        run: |
+          echo "::error::Missing secret RELEASE_TRAIN_GH_TOKEN."
+          echo "This workflow checks tags across private repos (MedPilot + MedPilotUI)."
+          echo "Create RELEASE_TRAIN_GH_TOKEN with repo:read access to both repos, then rerun."
+          exit 1
+
       - name: Verify agent tag exists
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           gh api repos/Project-MedPilot/MedPilot/git/ref/tags/${{ inputs.agent_tag }} >/dev/null
 
       - name: Verify UI tag exists
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           gh api repos/Project-MedPilot/MedPilotUI/git/ref/tags/${{ inputs.ui_tag }} >/dev/null
 
