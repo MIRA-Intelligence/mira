@@ -21,13 +21,13 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.RELEASE_TRAIN_GH_TOKEN || github.token }}
     steps:
-      - name: Ensure cross-repo token is configured
-        if: ${{ secrets.RELEASE_TRAIN_GH_TOKEN == '' }}
+      - name: Ensure cross-repo token can access MedPilotUI
         run: |
-          echo "::error::Missing secret RELEASE_TRAIN_GH_TOKEN."
-          echo "This workflow checks tags across private repos (MedPilot + MedPilotUI)."
-          echo "Create RELEASE_TRAIN_GH_TOKEN with repo:read access to both repos, then rerun."
-          exit 1
+          if ! gh api repos/Project-MedPilot/MedPilotUI >/dev/null 2>&1; then
+            echo "::error::Current GH token cannot access Project-MedPilot/MedPilotUI."
+            echo "Configure RELEASE_TRAIN_GH_TOKEN with repo:read access to both repos, then rerun."
+            exit 1
+          fi
 
       - name: Verify agent tag exists
         run: |
