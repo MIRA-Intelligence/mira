@@ -349,6 +349,59 @@ async def test_handle_config_unchanged_without_key(web_channel: WebChannel, tmp_
     assert json.loads(resp.text)["projects_root"] == str(tmp_path)
 
 
+async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebChannel) -> None:
+    (web_channel.projects_root / "PRJ-0001").mkdir(parents=True)
+    (web_channel.projects_root / "PRJ-0002").mkdir(parents=True)
+    (web_channel.projects_root / "skills").mkdir(parents=True)
+    (web_channel.projects_root / "random-folder").mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    resp = await web_channel._handle_list_projects(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    ids = [item["id"] for item in body["projects"]]
+    assert ids == ["PRJ-0001", "PRJ-0002"]
+    assert [item["display_name"] for item in body["projects"]] == ["PRJ-0001", "PRJ-0002"]
+    assert all(item["has_meta"] for item in body["projects"])
+
+    meta_file = web_channel.projects_root / "PRJ-0001" / ".medpilot" / "project.json"
+    assert meta_file.is_file()
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["id"] == "PRJ-0001"
+    assert meta["display_name"] == "PRJ-0001"
+
+
+async def test_handle_project_meta_updates_display_name(web_channel: WebChannel) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0001"
+    project_dir.mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.json = AsyncMock(return_value={"display_name": "Lung CT baseline"})
+    resp = await web_channel._handle_project_meta(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["display_name"] == "Lung CT baseline"
+
+    meta_file = project_dir / ".medpilot" / "project.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["display_name"] == "Lung CT baseline"
+
+
+async def test_cors_allows_patch_method(web_channel: WebChannel) -> None:
+    web_channel.config.cors_origins = ["*"]
+    req = MagicMock(spec=web.Request)
+    req.method = "OPTIONS"
+    req.headers = {"Origin": "http://localhost:5173"}
+
+    resp = await web_channel._cors_middleware(req, AsyncMock())
+    assert resp.status == 204
+    assert resp.headers["Access-Control-Allow-Methods"] == "GET, POST, PATCH, DELETE, OPTIONS"
+    assert resp.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+
+
 async def test_handle_upload_project_files_invalid_multipart(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}

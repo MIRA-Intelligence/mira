@@ -24,6 +24,10 @@ from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
 
 PLAN_FILENAME = "task_plan.json"
+PROJECT_DIR_PREFIX = "PRJ"
+PROJECT_META_DIRNAME = ".medpilot"
+PROJECT_META_FILENAME = "project.json"
+PROJECT_META_SCHEMA_VERSION = 1
 _ASSETS_DIR = Path(__file__).parent / "web_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".medpilot") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
@@ -377,6 +381,7 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/api/plan", self._handle_plan)
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
+        self._app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
         self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
         self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
@@ -576,7 +581,7 @@ class WebChannel(BaseChannel):
         elif origin in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
 
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp
 
@@ -824,20 +829,81 @@ class WebChannel(BaseChannel):
             return web.json_response(None)
         return web.json_response(data)
 
-    _NON_PROJECT_DIRS = {"skills", "memory", "sessions", "media", "cron", "logs"}
+    def _project_meta_path(self, project_dir: Path) -> Path:
+        return project_dir / PROJECT_META_DIRNAME / PROJECT_META_FILENAME
+
+    def _is_project_dir(self, project_dir: Path) -> bool:
+        return project_dir.is_dir() and project_dir.name.startswith(PROJECT_DIR_PREFIX)
+
+    def _load_project_meta(self, project_dir: Path) -> dict[str, Any]:
+        meta_path = self._project_meta_path(project_dir)
+        if not meta_path.is_file():
+            return {}
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+        return {}
+
+    def _default_project_meta(self, project_id: str) -> dict[str, Any]:
+        now = f"{datetime.utcnow().isoformat()}Z"
+        return {
+            "id": project_id,
+            "display_name": project_id,
+            "created_at": now,
+            "updated_at": now,
+            "schema_version": PROJECT_META_SCHEMA_VERSION,
+        }
+
+    def _write_project_meta(self, project_dir: Path, meta: dict[str, Any]) -> None:
+        meta_path = self._project_meta_path(project_dir)
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _ensure_project_meta(self, project_dir: Path) -> dict[str, Any]:
+        project_id = project_dir.name
+        current = self._load_project_meta(project_dir)
+        baseline = self._default_project_meta(project_id)
+        meta = {**baseline, **current}
+
+        display_name = meta.get("display_name")
+        if not isinstance(display_name, str) or not display_name.strip():
+            meta["display_name"] = project_id
+        else:
+            meta["display_name"] = display_name.strip()
+
+        if meta.get("id") != project_id:
+            meta["id"] = project_id
+
+        if not isinstance(meta.get("schema_version"), int):
+            meta["schema_version"] = PROJECT_META_SCHEMA_VERSION
+
+        if not isinstance(meta.get("created_at"), str) or not meta["created_at"]:
+            meta["created_at"] = baseline["created_at"]
+        if not isinstance(meta.get("updated_at"), str) or not meta["updated_at"]:
+            meta["updated_at"] = baseline["updated_at"]
+
+        self._write_project_meta(project_dir, meta)
+        return meta
 
     async def _handle_list_projects(self, _request: web.Request) -> web.Response:
-        """List project directories under projects_root with optional task_plan data."""
+        """List PRJ-* project directories under projects_root with optional task_plan data."""
         if not self.projects_root.is_dir():
             return web.json_response({"projects": []})
 
         projects: list[dict[str, Any]] = []
         for d in sorted(self.projects_root.iterdir()):
-            if not d.is_dir() or d.name.startswith("."):
+            if not self._is_project_dir(d):
                 continue
-            if d.name in self._NON_PROJECT_DIRS:
-                continue
-            info: dict[str, Any] = {"id": d.name}
+
+            meta = self._ensure_project_meta(d)
+            info: dict[str, Any] = {
+                "id": d.name,
+                "display_name": str(meta.get("display_name", d.name)),
+                "has_meta": True,
+            }
             plan_file = d / PLAN_FILENAME
             if plan_file.is_file():
                 try:
@@ -854,6 +920,39 @@ class WebChannel(BaseChannel):
             projects.append(info)
 
         return web.json_response({"projects": projects})
+
+    async def _handle_project_meta(self, request: web.Request) -> web.Response:
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        project_dir = self.projects_root / session_id
+        if not self._is_project_dir(project_dir):
+            return web.json_response({"error": "project not found"}, status=404)
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        display_name = body.get("display_name")
+        if not isinstance(display_name, str):
+            return web.json_response({"error": "display_name must be a string"}, status=400)
+
+        trimmed = display_name.strip() or session_id
+        meta = self._ensure_project_meta(project_dir)
+        meta["display_name"] = trimmed
+        meta["updated_at"] = f"{datetime.utcnow().isoformat()}Z"
+        self._write_project_meta(project_dir, meta)
+
+        self._audit(
+            source="ui",
+            action="api_project_meta_updated",
+            session_id=session_id,
+            project_dir=project_dir,
+            details={"display_name": trimmed},
+        )
+        return web.json_response({"id": session_id, "display_name": trimmed, "meta": meta})
 
     async def _handle_delete_project(self, request: web.Request) -> web.Response:
         """Delete a project directory from disk."""
