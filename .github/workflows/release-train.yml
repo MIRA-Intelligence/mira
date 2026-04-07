@@ -69,6 +69,7 @@ jobs:
           cfg.providers.custom.api_key = "no-key"
           cfg.providers.custom.api_base = "http://127.0.0.1:8000/v1"
           cfg.channels.web.enabled = True
+          cfg.channels.web.host = "127.0.0.1"
           cfg.channels.web.port = 18790
           cfg.channels.web.allow_from = ["*"]
           cfg.channels.web.cors_origins = ["*"]
