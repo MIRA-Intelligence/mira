@@ -64,9 +64,14 @@ jobs:
           from medpilot.config.schema import Config
 
           cfg = Config()
-          cfg.agents.defaults.primary_model = "custom/default"
+          cfg.agents.defaults.model = "custom/default"
+          cfg.agents.defaults.provider = "custom"
           cfg.providers.custom.api_key = "no-key"
           cfg.providers.custom.api_base = "http://127.0.0.1:8000/v1"
+          cfg.channels.web.enabled = True
+          cfg.channels.web.port = 18790
+          cfg.channels.web.allow_from = ["*"]
+          cfg.channels.web.cors_origins = ["*"]
 
           out = Path("release-train-config.json")
           out.write_text(json.dumps(cfg.model_dump(by_alias=True), indent=2), encoding="utf-8")
@@ -75,7 +80,7 @@ jobs:
 
       - name: Start gateway
         run: |
-          nohup medpilot gateway --config release-train-config.json --port 18790 > gateway.log 2>&1 &
+          nohup medpilot gateway --config release-train-config.json > gateway.log 2>&1 &
 
       - name: Wait for gateway health
         run: |
