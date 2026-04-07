@@ -25,7 +25,7 @@ jobs:
         run: |
           if ! gh api repos/Project-MedPilot/MedPilotUI >/dev/null 2>&1; then
             echo "::error::Current GH token cannot access Project-MedPilot/MedPilotUI."
-            echo "Configure RELEASE_TRAIN_GH_TOKEN with repo:read access to both repos, then rerun."
+            echo "Configure RELEASE_TRAIN_GH_TOKEN with access to both repos: classic PATs need repo (or public_repo for public-only repos), and fine-grained PATs need repository Contents: Read, then rerun."
             exit 1
           fi
 
