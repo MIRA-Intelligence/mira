@@ -25,6 +25,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     cfg = loader.load_config(tmp_path / "missing.json")
     assert isinstance(cfg, Config)
     assert cfg.gateway.port == 18790
+    assert cfg.agents.defaults.auto_max_rounds == 30
 
 
 def test_load_config_invalid_json_prints_warning(tmp_path: Path, capsys) -> None:

@@ -85,6 +85,7 @@ def _make_loop(tmp_path: Path) -> AgentLoop:
     loop._session_agent_profiles = {}
     loop._project_sessions = {}
     loop._TOOL_RESULT_MAX_CHARS = 20
+    loop.auto_max_rounds = 30
     return loop
 
 

@@ -51,7 +51,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
-    _AUTO_MAX_ROUNDS = 20
+    _DEFAULT_AUTO_MAX_ROUNDS = 30
     _AUTO_CONTINUE_MARKER = "[AUTO-CONTINUE-INTERNAL]"
 
     def __init__(
@@ -64,6 +64,7 @@ class AgentLoop:
         temperature: float = 0.1,
         max_tokens: int = 4096,
         memory_window: int = 100,
+        auto_max_rounds: int = _DEFAULT_AUTO_MAX_ROUNDS,
         reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
@@ -88,6 +89,7 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.memory_window = memory_window
+        self.auto_max_rounds = auto_max_rounds
         self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
@@ -429,8 +431,8 @@ class AgentLoop:
         """Decide whether to schedule another internal auto-run cycle."""
         if channel != "web" or run_mode != "auto":
             return False
-        if auto_round >= self._AUTO_MAX_ROUNDS:
-            logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
+        if auto_round >= self.auto_max_rounds:
+            logger.warning("Auto mode max rounds ({}) reached", self.auto_max_rounds)
             return False
         if self._looks_like_failure_response(final_content):
             return False
