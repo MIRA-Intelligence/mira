@@ -53,6 +53,24 @@ def _normalize_run_mode(value: Any) -> str:
     return "manual"
 
 
+def _parse_auto_max_rounds(value: Any) -> int | None:
+    """Parse optional per-session auto round cap from UI payload."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return None
+        return parsed if parsed >= 1 else None
+    return None
+
+
 def _normalize_agent_profile(value: Any) -> str:
     """Normalize UI agent profile with a conservative fallback."""
     if isinstance(value, str):
@@ -611,6 +629,7 @@ class WebChannel(BaseChannel):
                 content = data.get("content", "")
                 media = data.get("media", [])
                 run_mode = _normalize_run_mode(data.get("mode"))
+                auto_max_rounds = _parse_auto_max_rounds(data.get("auto_max_rounds"))
                 agent_profile = _normalize_agent_profile(data.get("agent_profile"))
 
                 if session_id is None:
@@ -634,6 +653,7 @@ class WebChannel(BaseChannel):
                     details={
                         "user_id": user_id,
                         "run_mode": run_mode,
+                        "auto_max_rounds": auto_max_rounds,
                         "agent_profile": agent_profile,
                         "content_preview": self._preview(content),
                         "media_count": len(media) if isinstance(media, list) else 0,
@@ -645,6 +665,8 @@ class WebChannel(BaseChannel):
                     "run_mode": run_mode,
                     "agent_profile": agent_profile,
                 }
+                if auto_max_rounds is not None:
+                    metadata["auto_max_rounds"] = auto_max_rounds
                 if self._ui_instructions:
                     metadata["_ui_system_instructions"] = self._ui_instructions
                 await self._handle_message(

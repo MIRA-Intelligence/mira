@@ -128,6 +128,7 @@ class AgentLoop:
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._session_run_modes: dict[str, str] = {}  # session_key -> manual|auto
+        self._session_auto_max_rounds: dict[str, int] = {}  # session_key -> per-session auto round cap
         self._session_agent_profiles: dict[str, str] = {}  # session_key -> engineer|default|research
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
@@ -286,6 +287,24 @@ class AgentLoop:
                 return profile
         return None
 
+    @staticmethod
+    def _parse_auto_max_rounds(value: object) -> int | None:
+        """Parse auto max rounds, returning None when absent/invalid."""
+        if isinstance(value, bool):  # bool is int-like in Python; reject explicitly
+            return None
+        if isinstance(value, int):
+            return value if value >= 1 else None
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            try:
+                parsed = int(raw)
+            except ValueError:
+                return None
+            return parsed if parsed >= 1 else None
+        return None
+
     def _resolve_session_run_mode(self, session_key: str, inbound_value: object) -> str:
         """Resolve effective mode for a session, updating cache if explicitly provided."""
         explicit = self._parse_run_mode(inbound_value)
@@ -293,6 +312,14 @@ class AgentLoop:
             self._session_run_modes[session_key] = explicit
             return explicit
         return self._session_run_modes.get(session_key, "manual")
+
+    def _resolve_session_auto_max_rounds(self, session_key: str, inbound_value: object) -> int:
+        """Resolve effective auto round cap, updating cache if explicitly provided."""
+        explicit = self._parse_auto_max_rounds(inbound_value)
+        if explicit is not None:
+            self._session_auto_max_rounds[session_key] = explicit
+            return explicit
+        return self._session_auto_max_rounds.get(session_key, self.auto_max_rounds)
 
     def _resolve_session_agent_profile(self, session_key: str, inbound_value: object) -> str:
         """Resolve effective agent profile, updating cache if explicitly provided."""
@@ -424,6 +451,7 @@ class AgentLoop:
         *,
         channel: str,
         run_mode: str,
+        auto_max_rounds: int,
         project_dir: str | None,
         final_content: str | None,
         auto_round: int,
@@ -431,8 +459,8 @@ class AgentLoop:
         """Decide whether to schedule another internal auto-run cycle."""
         if channel != "web" or run_mode != "auto":
             return False
-        if auto_round >= self.auto_max_rounds:
-            logger.warning("Auto mode max rounds ({}) reached", self.auto_max_rounds)
+        if auto_round >= auto_max_rounds:
+            logger.warning("Auto mode max rounds ({}) reached", auto_max_rounds)
             return False
         if self._looks_like_failure_response(final_content):
             return False
@@ -684,6 +712,7 @@ class AgentLoop:
         project_dir = meta.get("project_dir")
         key = session_key or msg.session_key
         run_mode = self._resolve_session_run_mode(key, meta.get("run_mode"))
+        auto_max_rounds = self._resolve_session_auto_max_rounds(key, meta.get("auto_max_rounds"))
         agent_profile = self._resolve_session_agent_profile(key, meta.get("agent_profile"))
         agents_filename = self._agent_profile_to_agents_filename(agent_profile)
         if project_dir:
@@ -805,9 +834,11 @@ class AgentLoop:
         auto_round = 0
         while True:
             current_mode = self._session_run_modes.get(key, run_mode)
+            current_auto_max_rounds = self._session_auto_max_rounds.get(key, auto_max_rounds)
             if not self._should_continue_auto_web(
                 channel=msg.channel,
                 run_mode=current_mode,
+                auto_max_rounds=current_auto_max_rounds,
                 project_dir=project_dir,
                 final_content=final_content,
                 auto_round=auto_round,

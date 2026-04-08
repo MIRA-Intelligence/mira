@@ -19,6 +19,7 @@ from medpilot.channels.web import (
     _format_tool_call,
     _load_ui_instructions,
     _normalize_agent_profile,
+    _parse_auto_max_rounds,
     _normalize_run_mode,
     _safe_upload_name,
     _stringify_history_content,
@@ -702,6 +703,8 @@ async def test_send_send_json_failure_swallowed(web_channel: WebChannel) -> None
 def test_web_helpers_cover_normalization_and_formatting() -> None:
     assert _normalize_run_mode(" AUTO ") == "auto"
     assert _normalize_run_mode("unknown") == "manual"
+    assert _parse_auto_max_rounds(" 42 ") == 42
+    assert _parse_auto_max_rounds("0") is None
     assert _normalize_agent_profile(" ENGINEER ") == "engineer"
     assert _normalize_agent_profile("bad") == "default"
     assert _safe_upload_name("../x.txt") == "x.txt"
@@ -787,6 +790,7 @@ async def test_ws_handler_message_and_set_mode_dispatch(
                     "session_id": "PRJ-4001",
                     "user_id": "u1",
                     "mode": "AUTO",
+                    "auto_max_rounds": 55,
                     "agent_profile": "engineer",
                     "content": "hello",
                     "media": ["a.png"],
@@ -820,6 +824,7 @@ async def test_ws_handler_message_and_set_mode_dispatch(
 
     assert len(handled) == 2
     assert handled[0]["metadata"]["run_mode"] == "auto"
+    assert handled[0]["metadata"]["auto_max_rounds"] == 55
     assert handled[0]["metadata"]["agent_profile"] == "engineer"
     assert "_ui_system_instructions" in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"

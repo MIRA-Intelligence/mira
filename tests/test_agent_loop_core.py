@@ -82,6 +82,7 @@ def _make_loop(tmp_path: Path) -> AgentLoop:
     loop.tools.register(_EchoTool())
     loop.model_router = SimpleNamespace(enabled=True)
     loop._session_run_modes = {}
+    loop._session_auto_max_rounds = {}
     loop._session_agent_profiles = {}
     loop._project_sessions = {}
     loop._TOOL_RESULT_MAX_CHARS = 20
@@ -121,6 +122,10 @@ def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
     assert loop._parse_run_mode("bad") is None
     assert loop._parse_agent_profile("RESEARCH") == "research"
     assert loop._parse_agent_profile("other") is None
+    assert loop._parse_auto_max_rounds("31") == 31
+    assert loop._parse_auto_max_rounds(0) is None
+    assert loop._resolve_session_auto_max_rounds("k", "45") == 45
+    assert loop._resolve_session_auto_max_rounds("k", None) == 45
     assert loop._resolve_session_run_mode("k", "auto") == "auto"
     assert loop._resolve_session_run_mode("k", None) == "auto"
     assert loop._resolve_session_agent_profile("k", "engineer") == "engineer"
@@ -148,6 +153,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert loop._should_continue_auto_web(
         channel="web",
         run_mode="auto",
+        auto_max_rounds=30,
         project_dir=str(project),
         final_content="all good",
         auto_round=0,
@@ -155,6 +161,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert loop._should_continue_auto_web(
         channel="cli",
         run_mode="auto",
+        auto_max_rounds=30,
         project_dir=str(project),
         final_content="all good",
         auto_round=0,
@@ -162,6 +169,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert loop._should_continue_auto_web(
         channel="web",
         run_mode="auto",
+        auto_max_rounds=30,
         project_dir=str(project),
         final_content="please confirm",
         auto_round=0,
