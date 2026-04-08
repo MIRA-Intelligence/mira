@@ -192,10 +192,17 @@ class WebChannel(BaseChannel):
 
     name = "web"
 
-    def __init__(self, config: WebChannelConfig, bus: MessageBus, workspace: Path | None = None):
+    def __init__(
+        self,
+        config: WebChannelConfig,
+        bus: MessageBus,
+        workspace: Path | None = None,
+        restrict_to_workspace: bool = True,
+    ):
         super().__init__(config, bus)
         self.config: WebChannelConfig = config
         self.workspace: Path | None = workspace
+        self.restrict_to_workspace: bool = restrict_to_workspace
         self.projects_root: Path = Path("~/.medpilot/workspace").expanduser()
         self._boot_ts: float = time.monotonic()
         self._ui_instructions: str = _load_ui_instructions()
@@ -381,6 +388,7 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/api/plan", self._handle_plan)
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
+        self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
         self._app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
         self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
@@ -812,6 +820,91 @@ class WebChannel(BaseChannel):
 
         return web.json_response({
             "projects_root": str(self.projects_root),
+        })
+
+    def _workspace_root_for_access(self) -> Path:
+        """Return the root path used for workspace access checks."""
+        return self.projects_root.expanduser().resolve()
+
+    def _resolve_probe_path(self, raw_path: str) -> tuple[Path | None, str | None]:
+        """Resolve a UI-provided data path using agent-like workspace rules."""
+        path_text = raw_path.strip()
+        if not path_text:
+            return None, "path required"
+
+        root = self._workspace_root_for_access()
+        candidate = Path(path_text).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError as exc:
+            return None, f"invalid path: {exc}"
+
+        if self.restrict_to_workspace:
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                return None, f"path is outside workspace: {root}"
+        return resolved, None
+
+    async def _handle_validate_data_path(self, request: web.Request) -> web.Response:
+        """Validate whether a server-side data path is visible to the agent."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+
+        raw_path = body.get("path") if isinstance(body, dict) else None
+        if not isinstance(raw_path, str):
+            return web.json_response({"ok": False, "error": "path must be a string"})
+
+        resolved, err = self._resolve_probe_path(raw_path)
+        if err or resolved is None:
+            return web.json_response({"ok": False, "error": err or "invalid path"})
+
+        if not resolved.exists():
+            return web.json_response({
+                "ok": False,
+                "error": "path not found",
+                "resolved_path": str(resolved),
+            })
+
+        if resolved.is_file():
+            try:
+                with resolved.open("rb"):
+                    pass
+            except OSError as exc:
+                return web.json_response({
+                    "ok": False,
+                    "error": f"file is not readable: {exc}",
+                    "resolved_path": str(resolved),
+                })
+            return web.json_response({
+                "ok": True,
+                "kind": "file",
+                "resolved_path": str(resolved),
+            })
+
+        if resolved.is_dir():
+            try:
+                next(resolved.iterdir(), None)
+            except OSError as exc:
+                return web.json_response({
+                    "ok": False,
+                    "error": f"directory is not readable: {exc}",
+                    "resolved_path": str(resolved),
+                })
+            return web.json_response({
+                "ok": True,
+                "kind": "directory",
+                "resolved_path": str(resolved),
+            })
+
+        return web.json_response({
+            "ok": False,
+            "error": "path is neither a regular file nor directory",
+            "resolved_path": str(resolved),
         })
 
     async def _handle_plan(self, request: web.Request) -> web.Response:

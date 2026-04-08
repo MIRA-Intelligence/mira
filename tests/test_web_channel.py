@@ -353,6 +353,61 @@ async def test_handle_config_unchanged_without_key(web_channel: WebChannel, tmp_
     assert json.loads(resp.text)["projects_root"] == str(tmp_path)
 
 
+async def test_handle_validate_data_path_requires_valid_json(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(side_effect=json.JSONDecodeError("msg", "", 0))
+    resp = await web_channel._handle_validate_data_path(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "invalid JSON"}
+
+
+async def test_handle_validate_data_path_success_and_missing(web_channel: WebChannel) -> None:
+    datasets = web_channel.projects_root / "datasets"
+    datasets.mkdir(parents=True)
+
+    req_ok = MagicMock(spec=web.Request)
+    req_ok.json = AsyncMock(return_value={"path": "datasets"})
+    ok_resp = await web_channel._handle_validate_data_path(req_ok)
+    ok_body = json.loads(ok_resp.text)
+    assert ok_resp.status == 200
+    assert ok_body["ok"] is True
+    assert ok_body["kind"] == "directory"
+
+    req_missing = MagicMock(spec=web.Request)
+    req_missing.json = AsyncMock(return_value={"path": "datasets/missing"})
+    missing_resp = await web_channel._handle_validate_data_path(req_missing)
+    missing_body = json.loads(missing_resp.text)
+    assert missing_resp.status == 200
+    assert missing_body["ok"] is False
+    assert missing_body["error"] == "path not found"
+
+
+async def test_handle_validate_data_path_enforces_workspace_boundary(web_channel: WebChannel, tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-datasets"
+    outside.mkdir(parents=True, exist_ok=True)
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"path": str(outside)})
+    resp = await web_channel._handle_validate_data_path(req)
+    body = json.loads(resp.text)
+    assert resp.status == 200
+    assert body["ok"] is False
+    assert "outside workspace" in body["error"]
+
+
+async def test_handle_validate_data_path_allows_outside_when_unrestricted(web_channel: WebChannel, tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-open-datasets"
+    outside.mkdir(parents=True, exist_ok=True)
+    web_channel.restrict_to_workspace = False
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"path": str(outside)})
+    resp = await web_channel._handle_validate_data_path(req)
+    body = json.loads(resp.text)
+    assert resp.status == 200
+    assert body["ok"] is True
+    assert body["kind"] == "directory"
+
+
 async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebChannel) -> None:
     (web_channel.projects_root / "PRJ-0001").mkdir(parents=True)
     (web_channel.projects_root / "PRJ-0002").mkdir(parents=True)
