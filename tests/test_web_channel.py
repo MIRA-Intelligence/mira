@@ -16,8 +16,12 @@ from medpilot.channels.web import (
     _API_CONTRACT_VERSION,
     PLAN_FILENAME,
     WebChannel,
+    _format_tool_call,
     _load_ui_instructions,
     _normalize_agent_profile,
+    _normalize_run_mode,
+    _safe_upload_name,
+    _stringify_history_content,
 )
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
@@ -693,3 +697,187 @@ async def test_send_send_json_failure_swallowed(web_channel: WebChannel) -> None
     ws.send_json = AsyncMock(side_effect=RuntimeError("broken"))
     web_channel._clients["err"] = ws
     await web_channel.send(OutboundMessage(channel="web", chat_id="err", content="x"))
+
+
+def test_web_helpers_cover_normalization_and_formatting() -> None:
+    assert _normalize_run_mode(" AUTO ") == "auto"
+    assert _normalize_run_mode("unknown") == "manual"
+    assert _normalize_agent_profile(" ENGINEER ") == "engineer"
+    assert _normalize_agent_profile("bad") == "default"
+    assert _safe_upload_name("../x.txt") == "x.txt"
+    assert _stringify_history_content([{"type": "text", "text": "A"}, {"type": "image_url"}]) == "A\n[image]"
+    assert _stringify_history_content({"k": 1}) == '{"k": 1}'
+    assert _format_tool_call({"function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}}) == 'read_file({"path":"a"})'
+
+
+def test_reconcile_plan_data_without_experiments_returns_false(web_channel: WebChannel, tmp_path: Path) -> None:
+    assert web_channel._reconcile_plan_data(tmp_path, {"title": "demo"}) is False
+
+
+def test_load_plan_data_errors_and_reconcile_write_warning(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = web_channel.projects_root / "PRJ-3001"
+    project.mkdir(parents=True)
+    plan = project / PLAN_FILENAME
+    plan.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unexpected non-object JSON"):
+        web_channel._load_plan_data("PRJ-3001")
+
+    plan.write_text(json.dumps({"experiments": []}), encoding="utf-8")
+    monkeypatch.setattr(web_channel, "_reconcile_plan_data", lambda *a, **k: True)
+    monkeypatch.setattr(Path, "write_text", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    data = web_channel._load_plan_data("PRJ-3001")
+    assert data == {"experiments": []}
+
+
+class _FakeWsMessage:
+    def __init__(self, msg_type, data: str):
+        self.type = msg_type
+        self.data = data
+
+
+class _FakeWs:
+    def __init__(self, messages: list[_FakeWsMessage]) -> None:
+        self._messages = list(messages)
+        self.closed = False
+        self.sent = []
+
+    async def prepare(self, request) -> None:
+        return None
+
+    def __aiter__(self):
+        async def _gen():
+            for item in self._messages:
+                yield item
+        return _gen()
+
+    async def send_json(self, payload) -> None:
+        self.sent.append(payload)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_ws_handler_invalid_json_and_missing_session_id(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = _FakeWs(
+        [
+            _FakeWsMessage(web.WSMsgType.TEXT, "{"),
+            _FakeWsMessage(web.WSMsgType.TEXT, json.dumps({"type": "message", "content": "x"})),
+        ]
+    )
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+    assert ws.sent[0]["content"] == "Invalid JSON"
+    assert ws.sent[1]["content"] == "session_id required"
+
+
+async def test_ws_handler_message_and_set_mode_dispatch(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    messages = [
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "message",
+                    "session_id": "PRJ-4001",
+                    "user_id": "u1",
+                    "mode": "AUTO",
+                    "agent_profile": "engineer",
+                    "content": "hello",
+                    "media": ["a.png"],
+                }
+            ),
+        ),
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "set_mode",
+                    "session_id": "PRJ-4001",
+                    "user_id": "u1",
+                    "mode": "manual",
+                }
+            ),
+        ),
+    ]
+    ws = _FakeWs(messages)
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    web_channel._ui_instructions = "UI instruction"
+    handled = []
+
+    async def _handle_message(**kwargs):
+        handled.append(kwargs)
+
+    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    monkeypatch.setattr(web_channel, "_load_plan_data", lambda *_a, **_k: None)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    assert len(handled) == 2
+    assert handled[0]["metadata"]["run_mode"] == "auto"
+    assert handled[0]["metadata"]["agent_profile"] == "engineer"
+    assert "_ui_system_instructions" in handled[0]["metadata"]
+    assert handled[1]["metadata"]["_control"] == "set_mode"
+
+
+async def test_handle_status_and_sessions_endpoints(web_channel: WebChannel) -> None:
+    ws = MagicMock()
+    ws.closed = False
+    web_channel._clients = {"PRJ-5001": ws}
+    web_channel.config.host = "127.0.0.1"
+    web_channel.config.port = 18790
+    req = MagicMock(spec=web.Request)
+
+    status = await web_channel._handle_status(req)
+    status_body = json.loads(status.text)
+    assert status_body["channel"] == "web"
+    assert status_body["connected_clients"] == 1
+
+    sessions = await web_channel._handle_sessions(req)
+    sessions_body = json.loads(sessions.text)
+    assert sessions_body == {"sessions": [{"session_id": "PRJ-5001", "connected": True}]}
+
+
+async def test_handle_history_requires_session_id(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": ""}
+    resp = await web_channel._handle_history(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "session_id required"}
+
+
+async def test_handle_delete_project_paths(web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch) -> None:
+    req_missing = MagicMock(spec=web.Request)
+    req_missing.query = {}
+    missing_id = await web_channel._handle_delete_project(req_missing)
+    assert missing_id.status == 400
+
+    req_not_found = MagicMock(spec=web.Request)
+    req_not_found.query = {"session_id": "PRJ-NOPE"}
+    not_found = await web_channel._handle_delete_project(req_not_found)
+    assert json.loads(not_found.text)["deleted"] is False
+
+    project = web_channel.projects_root / "PRJ-DEL"
+    project.mkdir(parents=True)
+    req_ok = MagicMock(spec=web.Request)
+    req_ok.query = {"session_id": "PRJ-DEL"}
+    ok = await web_channel._handle_delete_project(req_ok)
+    assert json.loads(ok.text) == {"deleted": True}
+
+    project2 = web_channel.projects_root / "PRJ-ERR"
+    project2.mkdir(parents=True)
+    req_err = MagicMock(spec=web.Request)
+    req_err.query = {"session_id": "PRJ-ERR"}
+
+    def _boom(_):
+        raise OSError("cannot delete")
+
+    monkeypatch.setattr(web_channel_mod.shutil, "rmtree", _boom)
+    err = await web_channel._handle_delete_project(req_err)
+    assert err.status == 500
+    assert "cannot delete" in json.loads(err.text)["error"]
