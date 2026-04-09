@@ -157,6 +157,7 @@ class ChannelManager:
                 self.channels["web"] = WebChannel(
                     self.config.channels.web, self.bus,
                     workspace=self.config.workspace_path,
+                    restrict_to_workspace=self.config.tools.restrict_to_workspace,
                 )
                 logger.info("Web channel enabled")
             except ImportError as e:
