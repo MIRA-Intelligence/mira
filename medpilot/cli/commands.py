@@ -1,6 +1,7 @@
 """CLI commands for medpilot."""
 
 import asyncio
+import json
 import os
 import select
 import signal
@@ -43,6 +44,16 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+
+
+class SafeFileHistory(FileHistory):
+    """FileHistory that sanitizes surrogate characters on write."""
+
+    def store_string(self, string: str) -> None:
+        safe = string.encode("utf-8", errors="surrogateescape").decode(
+            "utf-8", errors="replace"
+        )
+        super().store_string(safe)
 
 
 def _format_model_selection(value: str | list[str] | None) -> str:
@@ -116,20 +127,54 @@ def _init_prompt_session() -> None:
     history_file.parent.mkdir(parents=True, exist_ok=True)
 
     _PROMPT_SESSION = PromptSession(
-        history=FileHistory(str(history_file)),
+        history=SafeFileHistory(str(history_file)),
         enable_open_in_editor=False,
         multiline=False,   # Enter submits (single line mode)
     )
 
 
-def _print_agent_response(response: str, render_markdown: bool) -> None:
+def _print_agent_response(
+    response: str,
+    render_markdown: bool,
+    metadata: dict | None = None,
+) -> None:
     """Render assistant response with consistent terminal styling."""
     content = response or ""
-    body = Markdown(content) if render_markdown else Text(content)
+    body = _response_renderable(content, render_markdown, metadata=metadata)
     console.print()
     console.print(f"[cyan]{__logo__} medpilot[/cyan]")
     console.print(body)
     console.print()
+
+
+def _response_renderable(
+    response: str,
+    render_markdown: bool,
+    metadata: dict | None = None,
+):
+    if metadata and metadata.get("render_as") == "text":
+        return Text(response or "")
+    return Markdown(response or "") if render_markdown else Text(response or "")
+
+
+def _print_cli_progress_line(content: str, thinking_spinner=None) -> None:
+    if thinking_spinner is not None:
+        with thinking_spinner.pause():
+            console.print(f"  [dim]↳ {content}[/dim]")
+        return
+    console.print(f"  [dim]↳ {content}[/dim]")
+
+
+async def _print_interactive_line(content: str) -> None:
+    console.print(content)
+
+
+async def _print_interactive_progress_line(content: str, thinking_spinner=None) -> None:
+    if thinking_spinner is not None:
+        with thinking_spinner.pause():
+            await _print_interactive_line(f"  [dim]↳ {content}[/dim]")
+        return
+    await _print_interactive_line(f"  [dim]↳ {content}[/dim]")
 
 
 def _is_exit_command(command: str) -> bool:
@@ -178,46 +223,159 @@ def main(
 # ============================================================================
 
 
+def _load_workspace_template(name: str) -> str:
+    from importlib.resources import files as pkg_files
+
+    try:
+        path = (pkg_files("medpilot") / "templates" / name)
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return ""
+
+
+def _ensure_workspace_bootstrap(workspace: Path) -> list[str]:
+    created: list[str] = []
+    bootstrap = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "HEARTBEAT.md")
+    for name in bootstrap:
+        target = workspace / name
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(_load_workspace_template(name), encoding="utf-8")
+            created.append(name)
+    memory_dir = workspace / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("MEMORY.md", "HISTORY.md", "history.jsonl"):
+        target = memory_dir / name
+        if target.exists():
+            continue
+        text = _load_workspace_template(f"memory/{name}") if name == "MEMORY.md" else ""
+        target.write_text(text, encoding="utf-8")
+        created.append(f"memory/{name}")
+    return created
+
+
 @app.command()
-def onboard():
+def onboard(
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    wizard: bool = typer.Option(False, "--wizard", help="Run interactive onboarding wizard"),
+):
     """Initialize medpilot configuration and workspace."""
-    from medpilot.config.loader import get_config_path, load_config, save_config
+    from medpilot.cli.onboard import run_onboard
+    from medpilot.config.loader import get_config_path, load_config, save_config, set_config_path
     from medpilot.config.schema import Config
 
-    config_path = get_config_path()
+    config_path = Path(config).expanduser().resolve() if config else get_config_path()
+    if config:
+        set_config_path(config_path)
 
-    if config_path.exists():
-        console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
-        console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
-        console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
-        if typer.confirm("Overwrite?"):
-            config = Config()
-            save_config(config)
-            console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
-        else:
-            config = load_config()
-            save_config(config)
-            console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+    if wizard:
+        initial = load_config(config_path) if config_path.exists() else Config()
+        if workspace:
+            initial.agents.defaults.workspace = workspace
+        result = run_onboard(initial)
+        if not result.should_save:
+            console.print("[yellow]No changes were saved.[/yellow]")
+            return
+        cfg = result.config
+        if workspace:
+            cfg.agents.defaults.workspace = workspace
+        # Merge discovered/default channel fields without overwriting existing user values.
+        from medpilot.channels.registry import discover_all
+
+        defaults = cfg.model_dump(by_alias=True)
+        channels_data = defaults.get("channels")
+        if isinstance(channels_data, dict):
+            for name, cls in discover_all().items():
+                try:
+                    section_defaults = cls.default_config()
+                except Exception:
+                    continue
+                if isinstance(section_defaults, dict):
+                    channels_data.setdefault(name, {})
+                    if isinstance(channels_data[name], dict):
+                        channels_data[name] = _merge_missing_defaults(channels_data[name], section_defaults)
+        cfg = Config.model_validate(defaults)
+        save_config(cfg, config_path)
+        console.print(f"[green]✓[/green] Saved config at {config_path.resolve()}")
     else:
-        save_config(Config())
-        console.print(f"[green]✓[/green] Created config at {config_path}")
+        if config_path.exists():
+            console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
+            console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
+            console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
+            if typer.confirm("Overwrite?"):
+                cfg = Config()
+                save_config(cfg, config_path)
+                console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
+            else:
+                cfg = load_config(config_path)
+                # Merge discovered/default channel fields without overwriting existing user values.
+                from medpilot.channels.registry import discover_all
+
+                defaults = cfg.model_dump(by_alias=True)
+                channels_data = defaults.get("channels")
+                if isinstance(channels_data, dict):
+                    for name, cls in discover_all().items():
+                        try:
+                            section_defaults = cls.default_config()
+                        except Exception:
+                            continue
+                        if isinstance(section_defaults, dict):
+                            channels_data.setdefault(name, {})
+                            if isinstance(channels_data[name], dict):
+                                channels_data[name] = _merge_missing_defaults(
+                                    channels_data[name], section_defaults
+                                )
+                cfg = Config.model_validate(defaults)
+                save_config(cfg, config_path)
+                console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+        else:
+            cfg = Config()
+            save_config(cfg, config_path)
+            console.print(f"[green]✓[/green] Created config at {config_path}")
+
+    cfg = load_config(config_path)
+    if workspace:
+        cfg.agents.defaults.workspace = workspace
+        save_config(cfg, config_path)
 
     # Create workspace
-    workspace = get_workspace_path()
+    workspace_path = get_workspace_path(cfg.workspace_path)
 
-    if not workspace.exists():
-        workspace.mkdir(parents=True, exist_ok=True)
-        console.print(f"[green]✓[/green] Created workspace at {workspace}")
+    if not workspace_path.exists():
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        console.print(f"[green]✓[/green] Created workspace at {workspace_path}")
 
-    sync_workspace_templates(workspace)
+    created = _ensure_workspace_bootstrap(workspace_path)
+    sync_workspace_templates(workspace_path)
+    for name in created:
+        console.print(f"  [dim]Created {name}[/dim]")
 
 
     console.print(f"\n{__logo__} medpilot is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.medpilot/config.json[/cyan]")
+    console.print(f"  1. Add your API key to [cyan]{config_path.resolve()}[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
-    console.print("  2. Chat: [cyan]medpilot agent -m \"Hello!\"[/cyan]")
+    config_hint = f" --config {config_path.resolve()}" if config else ""
+    console.print(f"  2. Chat: [cyan]medpilot agent -m \"Hello!\"{config_hint}[/cyan]")
+    console.print(f"  3. Gateway: [cyan]medpilot gateway{config_hint}[/cyan]")
     # console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/medpilot#-chat-apps[/dim]")
+
+
+def _merge_missing_defaults(existing: object, defaults: object) -> object:
+    """Recursively fill missing values from defaults without overwriting existing values."""
+    if not isinstance(existing, dict) or not isinstance(defaults, dict):
+        return existing
+
+    merged = dict(existing)
+    for key, value in defaults.items():
+        if key not in merged:
+            merged[key] = value
+        else:
+            merged[key] = _merge_missing_defaults(merged[key], value)
+    return merged
 
 
 
@@ -241,6 +399,27 @@ def _make_provider_for_model(config: Config, model: str):
         raise typer.Exit(1) from exc
 
 
+def _workspace_cron_store(config: Config) -> Path:
+    return config.workspace_path / "cron" / "jobs.json"
+
+
+def _migrate_cron_store(config: Config) -> None:
+    from medpilot.config.paths import get_cron_dir
+
+    workspace_store = _workspace_cron_store(config)
+    legacy_store = get_cron_dir() / "jobs.json"
+    if workspace_store.exists() or not legacy_store.exists():
+        return
+    workspace_store.parent.mkdir(parents=True, exist_ok=True)
+    legacy_store.replace(workspace_store)
+
+
+def _as_text_response(response: object) -> str:
+    if hasattr(response, "content"):
+        return str(getattr(response, "content", "") or "")
+    return str(response or "")
+
+
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
     """Load config and optionally override the active workspace."""
     from medpilot.config.loader import load_config, set_config_path
@@ -255,6 +434,14 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
         console.print(f"[dim]Using config: {config_path}[/dim]")
 
     loaded = load_config(config_path)
+    if config_path and config_path.exists():
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            legacy_window = ((payload.get("agents") or {}).get("defaults") or {}).get("memoryWindow")
+            if legacy_window is not None:
+                console.print("[yellow]Notice: agents.defaults.memoryWindow is no longer used.[/yellow]")
+        except Exception:
+            pass
     if workspace:
         loaded.agents.defaults.workspace = workspace
     return loaded
@@ -267,7 +454,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 
 @app.command()
 def gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    port: int | None = typer.Option(None, "--port", "-p", help="Gateway port"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
@@ -276,7 +463,6 @@ def gateway(
     from medpilot.agent.loop import AgentLoop
     from medpilot.bus.queue import MessageBus
     from medpilot.channels.manager import ChannelManager
-    from medpilot.config.paths import get_cron_dir
     from medpilot.cron.service import CronService
     from medpilot.cron.types import CronJob
     from medpilot.heartbeat.service import HeartbeatService
@@ -291,15 +477,17 @@ def gateway(
     from medpilot.utils.env import auto_activate_env
     auto_activate_env(config.workspace_path)
 
-    console.print(f"{__logo__} Starting medpilot gateway on port {port}...")
+    gateway_port = port if port is not None else config.gateway.port
+    console.print(f"{__logo__} Starting medpilot gateway on port {gateway_port}...")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
     model_router = ModelRouter(config.agents.defaults)
+    default_tz = config.agents.defaults.timezone
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
-    cron_store_path = get_cron_dir() / "jobs.json"
+    cron_store_path = _workspace_cron_store(config)
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
@@ -311,12 +499,13 @@ def gateway(
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
+        memory_window=int(getattr(config.agents.defaults, "memory_window", 100)),
         reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
+        timezone=default_tz,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
@@ -348,6 +537,7 @@ def gateway(
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
             )
+            response = _as_text_response(response)
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
@@ -355,6 +545,18 @@ def gateway(
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
             return response
+
+        try:
+            from medpilot.utils.evaluator import evaluate_response
+
+            await evaluate_response(
+                response=response,
+                task_context=reminder_note,
+                provider_arg=provider,
+                model=agent.model,
+            )
+        except Exception:
+            pass
 
         if job.payload.deliver and job.payload.to and response:
             from medpilot.bus.events import OutboundMessage
@@ -451,6 +653,61 @@ def gateway(
     asyncio.run(run())
 
 
+@app.command()
+def serve(
+    host: str | None = typer.Option(None, "--host", help="API host"),
+    port: int | None = typer.Option(None, "--port", "-p", help="API port"),
+    timeout: float | None = typer.Option(None, "--timeout", help="Request timeout (seconds)"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Start OpenAI-compatible API server."""
+    from aiohttp import web
+
+    from medpilot.agent.loop import AgentLoop
+    from medpilot.api.server import create_app
+    from medpilot.bus.queue import MessageBus
+    from medpilot.session.manager import SessionManager
+
+    cfg = _load_runtime_config(config, workspace)
+    sync_workspace_templates(cfg.workspace_path)
+
+    provider = _make_provider(cfg)
+    model_router = ModelRouter(cfg.agents.defaults)
+    default_tz = cfg.agents.defaults.timezone
+    agent_loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=cfg.workspace_path,
+        model=cfg.agents.defaults.primary_model,
+        temperature=cfg.agents.defaults.temperature,
+        max_tokens=cfg.agents.defaults.max_tokens,
+        max_iterations=cfg.agents.defaults.max_tool_iterations,
+        memory_window=int(getattr(cfg.agents.defaults, "memory_window", 100)),
+        reasoning_effort=cfg.agents.defaults.reasoning_effort,
+        brave_api_key=cfg.tools.web.search.api_key or None,
+        web_proxy=cfg.tools.web.proxy or None,
+        exec_config=cfg.tools.exec,
+        timezone=default_tz,
+        restrict_to_workspace=cfg.tools.restrict_to_workspace,
+        session_manager=SessionManager(cfg.workspace_path),
+        mcp_servers=cfg.tools.mcp_servers,
+        channels_config=cfg.channels,
+        provider_factory=lambda model: _make_provider_for_model(cfg, model),
+        model_router=model_router,
+    )
+
+    api_host = host if host is not None else cfg.api.host
+    api_port = port if port is not None else cfg.api.port
+    request_timeout = timeout if timeout is not None else cfg.api.timeout
+    api_app = create_app(
+        agent_loop=agent_loop,
+        model_name=cfg.agents.defaults.primary_model,
+        request_timeout=request_timeout,
+    )
+    web.run_app(api_app, host=api_host, port=api_port, print=None)
+
+
 
 
 # ============================================================================
@@ -472,7 +729,6 @@ def agent(
 
     from medpilot.agent.loop import AgentLoop
     from medpilot.bus.queue import MessageBus
-    from medpilot.config.paths import get_cron_dir
     from medpilot.cron.service import CronService
 
     if workspace is None and sys.stdin.isatty():
@@ -489,9 +745,10 @@ def agent(
     bus = MessageBus()
     provider = _make_provider(config)
     model_router = ModelRouter(config.agents.defaults)
+    default_tz = config.agents.defaults.timezone
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
-    cron_store_path = get_cron_dir() / "jobs.json"
+    cron_store_path = _workspace_cron_store(config)
     cron = CronService(cron_store_path)
 
     if logs:
@@ -507,12 +764,13 @@ def agent(
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
+        memory_window=int(getattr(config.agents.defaults, "memory_window", 100)),
         reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         cron_service=cron,
+        timezone=default_tz,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
@@ -541,7 +799,14 @@ def agent(
         async def run_once():
             with _thinking_ctx():
                 response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
+            if hasattr(response, "content"):
+                _print_agent_response(
+                    getattr(response, "content", ""),
+                    render_markdown=markdown,
+                    metadata=getattr(response, "metadata", {}) or {},
+                )
+            else:
+                _print_agent_response(str(response), render_markdown=markdown, metadata={})
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -661,94 +926,33 @@ app.add_typer(channels_app, name="channels")
 
 
 @channels_app.command("status")
-def channels_status():
+def channels_status(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
     """Show channel status."""
-    from medpilot.config.loader import load_config
+    from medpilot.channels.registry import discover_all
+    from medpilot.config.loader import load_config, set_config_path
 
-    config = load_config()
+    if config:
+        set_config_path(Path(config).expanduser().resolve())
+    cfg = load_config()
 
+    # Plugin-oriented status output for compatibility tests.
     table = Table(title="Channel Status")
     table.add_column("Channel", style="cyan")
     table.add_column("Enabled", style="green")
     table.add_column("Configuration", style="yellow")
 
-    # WhatsApp
-    wa = config.channels.whatsapp
-    table.add_row(
-        "WhatsApp",
-        "✓" if wa.enabled else "✗",
-        wa.bridge_url
-    )
+    names: set[str] = set(discover_all().keys())
+    names.update(getattr(cfg.channels, "model_extra", {}).keys())
+    names.update(("telegram", "whatsapp", "discord", "feishu", "mochat", "dingtalk", "email", "slack", "qq", "matrix", "web"))
 
-    dc = config.channels.discord
-    table.add_row(
-        "Discord",
-        "✓" if dc.enabled else "✗",
-        dc.gateway_url
-    )
-
-    # Feishu
-    fs = config.channels.feishu
-    fs_config = f"app_id: {fs.app_id[:10]}..." if fs.app_id else "[dim]not configured[/dim]"
-    table.add_row(
-        "Feishu",
-        "✓" if fs.enabled else "✗",
-        fs_config
-    )
-
-    # Mochat
-    mc = config.channels.mochat
-    mc_base = mc.base_url or "[dim]not configured[/dim]"
-    table.add_row(
-        "Mochat",
-        "✓" if mc.enabled else "✗",
-        mc_base
-    )
-
-    # Telegram
-    tg = config.channels.telegram
-    tg_config = f"token: {tg.token[:10]}..." if tg.token else "[dim]not configured[/dim]"
-    table.add_row(
-        "Telegram",
-        "✓" if tg.enabled else "✗",
-        tg_config
-    )
-
-    # Slack
-    slack = config.channels.slack
-    slack_config = "socket" if slack.app_token and slack.bot_token else "[dim]not configured[/dim]"
-    table.add_row(
-        "Slack",
-        "✓" if slack.enabled else "✗",
-        slack_config
-    )
-
-    # DingTalk
-    dt = config.channels.dingtalk
-    dt_config = f"client_id: {dt.client_id[:10]}..." if dt.client_id else "[dim]not configured[/dim]"
-    table.add_row(
-        "DingTalk",
-        "✓" if dt.enabled else "✗",
-        dt_config
-    )
-
-    # QQ
-    qq = config.channels.qq
-    qq_config = f"app_id: {qq.app_id[:10]}..." if qq.app_id else "[dim]not configured[/dim]"
-    table.add_row(
-        "QQ",
-        "✓" if qq.enabled else "✗",
-        qq_config
-    )
-
-    # Email
-    em = config.channels.email
-    em_config = em.imap_host if em.imap_host else "[dim]not configured[/dim]"
-    table.add_row(
-        "Email",
-        "✓" if em.enabled else "✗",
-        em_config
-    )
+    for name in sorted(names):
+        section = getattr(cfg.channels, name, None)
+        if section is None:
+            section = (getattr(cfg.channels, "model_extra", None) or {}).get(name, {})
+        enabled = bool(getattr(section, "enabled", False) if not isinstance(section, dict) else section.get("enabled", False))
+        table.add_row(name, "✓" if enabled else "✗", "")
 
     console.print(table)
 
@@ -814,30 +1018,44 @@ def _get_bridge_dir() -> Path:
 
 
 @channels_app.command("login")
-def channels_login():
-    """Link device via QR code."""
-    import subprocess
+def channels_login(
+    channel: str = typer.Argument(..., help="Channel name"),
+    force: bool = typer.Option(False, "--force", help="Force re-login"),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Login for a specific channel (plugin-aware)."""
+    import asyncio
 
-    from medpilot.config.loader import load_config
-    from medpilot.config.paths import get_runtime_subdir
+    from medpilot.bus.queue import MessageBus
+    from medpilot.channels.registry import discover_all
+    from medpilot.config.loader import load_config, set_config_path
 
-    config = load_config()
-    bridge_dir = _get_bridge_dir()
+    if config:
+        set_config_path(Path(config).expanduser().resolve())
+    cfg = load_config()
+    cls = discover_all().get(channel)
+    if not cls:
+        console.print(f"[red]Unknown channel: {channel}[/red]")
+        raise typer.Exit(1)
 
-    console.print(f"{__logo__} Starting bridge...")
-    console.print("Scan the QR code to connect.\n")
-
-    env = {**os.environ}
-    if config.channels.whatsapp.bridge_token:
-        env["BRIDGE_TOKEN"] = config.channels.whatsapp.bridge_token
-    env["AUTH_DIR"] = str(get_runtime_subdir("whatsapp-auth"))
-
-    try:
-        subprocess.run(["npm", "start"], cwd=bridge_dir, check=True, env=env)
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Bridge failed: {e}[/red]")
-    except FileNotFoundError:
-        console.print("[red]npm not found. Please install Node.js.[/red]")
+    section = getattr(cfg.channels, channel, None)
+    if section is None:
+        section = (getattr(cfg.channels, "model_extra", None) or {}).get(channel, {"enabled": True})
+    bus = MessageBus()
+    kwargs: dict[str, object] = {}
+    if channel in {"telegram", "feishu"}:
+        kwargs["groq_api_key"] = getattr(cfg.providers.groq, "api_key", "")
+    if channel == "web":
+        kwargs["workspace"] = cfg.workspace_path
+    inst = cls(section, bus, **kwargs)
+    if not hasattr(inst, "login"):
+        console.print(f"[red]Channel '{channel}' does not support login[/red]")
+        raise typer.Exit(1)
+    ok = asyncio.run(inst.login(force=force))
+    if ok:
+        console.print(f"[green]✓[/green] {channel} login succeeded")
+    else:
+        raise typer.Exit(1)
 
 
 # ============================================================================

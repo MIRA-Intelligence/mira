@@ -1,6 +1,6 @@
 [project]
 name = "medpilot"
-dynamic = ["version"]
+version = "0.0.0"
 description = "A lightweight personal AI assistant framework"
 readme = "README.md"
 requires-python = ">=3.11"

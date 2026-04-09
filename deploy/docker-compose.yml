@@ -1,7 +1,66 @@
+x-common-config: &common-config
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  volumes:
+    - ~/.medpilot:/home/medpilot/.medpilot
+  cap_drop:
+    - ALL
+  cap_add:
+    - SYS_ADMIN
+  security_opt:
+    - apparmor=unconfined
+    - seccomp=unconfined
+
 services:
+  # Local build/run stack (uses repository Dockerfile)
+  medpilot-gateway:
+    container_name: medpilot-gateway
+    <<: *common-config
+    command: ["gateway"]
+    restart: unless-stopped
+    ports:
+      - 18790:18790
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  medpilot-api:
+    container_name: medpilot-api
+    <<: *common-config
+    command:
+      ["serve", "--host", "0.0.0.0", "-w", "/home/medpilot/.medpilot/api-workspace"]
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:8900:8900
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  medpilot-cli:
+    <<: *common-config
+    profiles:
+      - cli
+    command: ["status"]
+    stdin_open: true
+    tty: true
+
+  # Optional self-hosted release stack
   medpilot-agent:
     image: ghcr.io/project-medpilot/medpilot-agent:${MEDPILOT_AGENT_TAG:-latest}
     container_name: medpilot-agent
+    profiles:
+      - self-hosted
     restart: unless-stopped
     command: ["medpilot", "gateway", "--port", "18790"]
     ports:
@@ -14,6 +73,8 @@ services:
   medpilot-ui:
     image: ghcr.io/project-medpilot/medpilot-ui:${MEDPILOT_UI_TAG:-latest}
     container_name: medpilot-ui
+    profiles:
+      - self-hosted
     restart: unless-stopped
     depends_on:
       - medpilot-agent

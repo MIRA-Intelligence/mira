@@ -11,6 +11,7 @@ from typing import Any
 from medpilot.agent.memory import MemoryStore
 from medpilot.agent.skills import SkillsLoader
 from medpilot.utils.helpers import detect_image_mime
+from medpilot.utils.prompt_templates import render_template
 
 
 class ContextBuilder:
@@ -18,6 +19,7 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
+    _MAX_RECENT_HISTORY = 50
 
     def __init__(self, workspace: Path):
         from medpilot.utils.helpers import get_medpilot_dir
@@ -31,9 +33,10 @@ class ContextBuilder:
         self,
         skill_names: list[str] | None = None,
         agents_filename: str = "AGENTS.md",
+        channel: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity()]
+        parts = [self._get_identity(channel=channel)]
 
         bootstrap = self._load_bootstrap_files(agents_filename=agents_filename)
         if bootstrap:
@@ -51,18 +54,17 @@ class ContextBuilder:
 
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
-            parts.append(f"""# Skills
+            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary).strip())
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
-
-{skills_summary}""")
+        recent_history = self._build_recent_history_section()
+        if recent_history:
+            parts.append(recent_history)
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self) -> str:
+    def _get_identity(self, channel: str | None = None) -> str:
         """Get the core identity section."""
-        workspace_path = str(self.workspace.expanduser().resolve())
+        workspace_path = str(self.medpilot_dir.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
@@ -79,30 +81,32 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
-        medpilot_path = str(self.medpilot_dir.expanduser().resolve())
-        return f"""# medpilot 🐈
+        return render_template(
+            "agent/identity.md",
+            runtime=runtime,
+            workspace_path=workspace_path,
+            platform_policy=platform_policy.strip(),
+            channel=channel,
+        ).strip()
 
-You are medpilot, a helpful AI assistant.
-
-## Runtime
-{runtime}
-
-## Workspace
-Your workspace is at: {workspace_path}
-- Long-term memory: {medpilot_path}/memory/MEMORY.md (write important facts here)
-- History log: {medpilot_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
-- Custom skills: {medpilot_path}/skills/{{skill-name}}/SKILL.md
-
-{platform_policy}
-
-## medpilot Guidelines
-- State intent before tool calls, but NEVER predict or claim results before receiving them.
-- Before modifying a file, read it first. Do not assume files or directories exist.
-- After writing or editing a file, re-read it if accuracy matters.
-- If a tool call fails, analyze the error before retrying with a different approach.
-- Ask for clarification when the request is ambiguous.
-
-Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
+    def _build_recent_history_section(self) -> str:
+        """Build unprocessed history section for prompt cache continuity."""
+        since_cursor = self.memory.get_last_dream_cursor()
+        entries = self.memory.read_unprocessed_history(since_cursor=since_cursor)
+        if not entries:
+            return ""
+        tail = entries[-self._MAX_RECENT_HISTORY:]
+        lines = ["# Recent History"]
+        for row in tail:
+            ts = str(row.get("timestamp", "")).strip()
+            content = str(row.get("content", "")).strip()
+            if not content:
+                continue
+            if ts:
+                lines.append(f"[{ts}] {content}")
+            else:
+                lines.append(content)
+        return "\n".join(lines) if len(lines) > 1 else ""
 
     @staticmethod
     def _build_runtime_context(
@@ -223,26 +227,40 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         run_mode: str | None = None,
         agents_filename: str = "AGENTS.md",
         extra_system: str | None = None,
+        current_role: str = "user",
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, project_dir, run_mode)
         user_content = self._build_user_content(current_message, media)
 
-        # Merge runtime context and user content into a single user message
-        # to avoid consecutive same-role messages that some providers reject.
         if isinstance(user_content, str):
             merged = f"{runtime_ctx}\n\n{user_content}"
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
-        system_prompt = self.build_system_prompt(skill_names, agents_filename=agents_filename)
+        history_copy = [dict(m) for m in history]
+        if current_role == "assistant" and history_copy and history_copy[-1].get("role") == "assistant":
+            prev = dict(history_copy[-1])
+            prev_content = prev.get("content") or ""
+            if isinstance(prev_content, str):
+                prev["content"] = f"{prev_content}\n\n{current_message}".strip()
+            else:
+                prev["content"] = current_message
+            history_copy[-1] = prev
+            current_role = "user"
+
+        system_prompt = self.build_system_prompt(
+            skill_names,
+            agents_filename=agents_filename,
+            channel=channel,
+        )
         if extra_system:
             system_prompt += "\n\n---\n\n" + extra_system
 
         return self._sanitize_tool_pairs([
             {"role": "system", "content": system_prompt},
-            *history,
-            {"role": "user", "content": merged},
+            *history_copy,
+            {"role": current_role, "content": merged},
         ])
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:

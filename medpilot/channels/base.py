@@ -18,6 +18,12 @@ class BaseChannel(ABC):
     """
 
     name: str = "base"
+    display_name: str = "Base"
+
+    @classmethod
+    def default_config(cls) -> dict[str, Any]:
+        """Return a minimal default config payload for compatibility."""
+        return {"enabled": False}
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -57,6 +63,22 @@ class BaseChannel(ABC):
             msg: The message to send.
         """
         pass
+
+    async def send_delta(
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Default delta sender falls back to regular send()."""
+        await self.send(
+            OutboundMessage(
+                channel=self.name,
+                chat_id=str(chat_id),
+                content=delta,
+                metadata=metadata or {"_stream_delta": True},
+            )
+        )
 
     def is_allowed(self, sender_id: str) -> bool:
         """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""

@@ -44,15 +44,26 @@ class SkillsLoader:
         self.workspace_skills = roots[0]
         # None explicitly disables builtin skills.
         self.builtin_skills = builtin_skills_dir
-        self.plugin_manager = plugin_manager or SkillPluginManager(workspace)
+        # Test/compat behavior: when caller injects a custom builtin dir, avoid
+        # auto-discovering global/plugin skills unless explicitly requested.
+        if plugin_manager is not None:
+            self.plugin_manager = plugin_manager
+        elif builtin_skills_dir is BUILTIN_SKILLS_DIR:
+            self.plugin_manager = SkillPluginManager(workspace)
+        else:
+            self.plugin_manager = None
 
     def _list_plugin_skills(self) -> list[dict[str, str]]:
+        if self.plugin_manager is None:
+            return []
         try:
             return self.plugin_manager.list_enabled_skills()
         except SkillPluginError:
             return []
 
     def _managed_skill_names(self) -> set[str]:
+        if self.plugin_manager is None:
+            return set()
         try:
             return self.plugin_manager.get_managed_skill_names()
         except SkillPluginError:

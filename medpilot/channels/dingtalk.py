@@ -5,6 +5,8 @@ import json
 import mimetypes
 import os
 import time
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -57,8 +59,31 @@ class NanobotDingTalkHandler(CallbackHandler):
             content = ""
             if chatbot_msg.text:
                 content = chatbot_msg.text.content.strip()
+            elif chatbot_msg.extensions.get("content", {}).get("recognition"):
+                content = chatbot_msg.extensions["content"]["recognition"].strip()
             if not content:
                 content = message.data.get("text", {}).get("content", "").strip()
+
+            file_paths: list[str] = []
+            if chatbot_msg.message_type == "file":
+                download_code = (
+                    message.data.get("content", {}).get("downloadCode")
+                    or message.data.get("downloadCode")
+                )
+                fname = (
+                    message.data.get("content", {}).get("fileName")
+                    or message.data.get("fileName")
+                    or "file"
+                )
+                if download_code:
+                    sender_uid = chatbot_msg.sender_staff_id or chatbot_msg.sender_id or "unknown"
+                    fp = await self.channel._download_dingtalk_file(download_code, fname, sender_uid)
+                    if fp:
+                        file_paths.append(fp)
+                        content = content or "[File]"
+            if file_paths:
+                file_list = "\n".join("- " + p for p in file_paths)
+                content = content + "\n\nReceived files:\n" + file_list
 
             if not content:
                 logger.warning(
@@ -98,6 +123,9 @@ class NanobotDingTalkHandler(CallbackHandler):
             logger.error("Error processing DingTalk message: {}", e)
             # Return OK to avoid retry loop from DingTalk server
             return AckMessage.STATUS_OK, "Error"
+
+
+MedPilotDingTalkHandler = NanobotDingTalkHandler
 
 
 class DingTalkChannel(BaseChannel):
@@ -302,6 +330,59 @@ class DingTalkChannel(BaseChannel):
             logger.error("DingTalk media upload error type={} err={}", media_type, e)
             return None
 
+    @staticmethod
+    def _normalize_upload_payload(
+        filename: str,
+        data: bytes,
+        content_type: str | None,
+    ) -> tuple[bytes, str, str | None]:
+        """Normalize payload for upload (zip HTML attachments)."""
+        lower = filename.lower()
+        if content_type == "text/html" or lower.endswith((".html", ".htm")):
+            base = Path(filename).stem or "file"
+            html_name = f"{base}.html"
+            zip_name = f"{base}.zip"
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(html_name, data)
+            return buf.getvalue(), zip_name, "application/zip"
+        return data, filename, content_type
+
+    async def _download_dingtalk_file(
+        self,
+        download_code: str,
+        filename: str,
+        sender_id: str,
+    ) -> str | None:
+        """Download DingTalk attachment by downloadCode and persist locally."""
+        from medpilot.config.paths import get_media_dir
+
+        token = await self._get_access_token()
+        if not token or not self._http:
+            return None
+        try:
+            url = "https://api.dingtalk.com/v1.0/robot/messageFiles/download"
+            headers = {"x-acs-dingtalk-access-token": token}
+            payload = {"downloadCode": download_code, "robotCode": self.config.client_id}
+            resp = await self._http.post(url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                return None
+            body = resp.json()
+            download_url = body.get("downloadUrl")
+            if not download_url:
+                return None
+            file_resp = await self._http.get(download_url)
+            if file_resp.status_code >= 400:
+                return None
+            media_dir = get_media_dir("dingtalk") / sender_id
+            media_dir.mkdir(parents=True, exist_ok=True)
+            out = media_dir / filename
+            out.write_bytes(file_resp.content)
+            return str(out)
+        except Exception as e:
+            logger.error("Error downloading DingTalk file: {}", e)
+            return None
+
     async def _send_batch_message(
         self,
         token: str,
@@ -382,6 +463,7 @@ class DingTalkChannel(BaseChannel):
             return False
 
         filename = filename or self._guess_filename(media_ref, upload_type)
+        data, filename, content_type = self._normalize_upload_payload(filename, data, content_type)
         file_type = Path(filename).suffix.lower().lstrip(".")
         if not file_type:
             guessed = mimetypes.guess_extension(content_type or "")

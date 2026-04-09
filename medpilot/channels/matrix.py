@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import mimetypes
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeAlias
 
@@ -37,6 +39,7 @@ except ImportError as e:
 
 from medpilot.bus.events import OutboundMessage
 from medpilot.channels.base import BaseChannel
+from medpilot.config.schema import MatrixConfig as _SchemaMatrixConfig
 from medpilot.config.paths import get_data_dir, get_media_dir
 from medpilot.utils.helpers import safe_filename
 
@@ -94,6 +97,19 @@ MATRIX_HTML_CLEANER = nh3.Cleaner(
 )
 
 
+class MatrixConfig(_SchemaMatrixConfig):
+    """Compatibility export for tests and channel plugin interfaces."""
+
+
+@dataclass
+class _StreamBuf:
+    """Per-room streaming accumulator."""
+
+    text: str = ""
+    event_id: str | None = None
+    last_edit: float = 0.0
+
+
 def _render_markdown_html(text: str) -> str | None:
     """Render markdown to sanitized HTML; returns None for plain text."""
     try:
@@ -110,12 +126,26 @@ def _render_markdown_html(text: str) -> str | None:
     return formatted
 
 
-def _build_matrix_text_content(text: str) -> dict[str, object]:
-    """Build Matrix m.text payload with optional HTML formatted_body."""
+def _build_matrix_text_content(
+    text: str,
+    event_id: str | None = None,
+    relates_to: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """Build Matrix m.text payload with optional HTML and edit metadata."""
     content: dict[str, object] = {"msgtype": "m.text", "body": text, "m.mentions": {}}
     if html := _render_markdown_html(text):
         content["format"] = MATRIX_HTML_FORMAT
         content["formatted_body"] = html
+    if relates_to:
+        content["m.relates_to"] = relates_to
+    if event_id:
+        new_content = dict(content)
+        content = {
+            **content,
+            "body": text,
+            "m.new_content": new_content,
+            "m.relates_to": {"rel_type": "m.replace", "event_id": event_id},
+        }
     return content
 
 
@@ -145,6 +175,8 @@ class MatrixChannel(BaseChannel):
     """Matrix (Element) channel using long-polling sync."""
 
     name = "matrix"
+    _STREAM_EDIT_INTERVAL = 2
+    monotonic_time = time.monotonic
 
     def __init__(self, config: Any, bus, *, restrict_to_workspace: bool = False,
                  workspace: Path | None = None):
@@ -156,6 +188,7 @@ class MatrixChannel(BaseChannel):
         self._workspace = workspace.expanduser().resolve() if workspace else None
         self._server_upload_limit_bytes: int | None = None
         self._server_upload_limit_checked = False
+        self._stream_bufs: dict[str, _StreamBuf] = {}
 
     async def start(self) -> None:
         """Start Matrix client and begin sync loop."""
@@ -261,14 +294,14 @@ class MatrixChannel(BaseChannel):
         room = getattr(self.client, "rooms", {}).get(room_id)
         return bool(getattr(room, "encrypted", False))
 
-    async def _send_room_content(self, room_id: str, content: dict[str, Any]) -> None:
+    async def _send_room_content(self, room_id: str, content: dict[str, Any]) -> Any:
         """Send m.room.message with E2EE options."""
         if not self.client:
             return
         kwargs: dict[str, Any] = {"room_id": room_id, "message_type": "m.room.message", "content": content}
         if self.config.e2ee_enabled:
             kwargs["ignore_unverified_devices"] = True
-        await self.client.room_send(**kwargs)
+        return await self.client.room_send(**kwargs)
 
     async def _resolve_server_upload_limit_bytes(self) -> int | None:
         """Query homeserver upload limit once per channel lifecycle."""
@@ -377,6 +410,60 @@ class MatrixChannel(BaseChannel):
         finally:
             if not is_progress:
                 await self._stop_typing_keepalive(msg.chat_id, clear_typing=True)
+
+    async def send_delta(
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Progressive streaming via event replacement."""
+        if not self.client:
+            return
+        meta = metadata or {}
+        if meta.get("_stream_end"):
+            if chat_id not in self._stream_bufs:
+                return
+            buf = self._stream_bufs.pop(chat_id)
+            if not buf.text or not buf.event_id:
+                return
+            relates_to = self._build_thread_relates_to(meta)
+            content = _build_matrix_text_content(buf.text, buf.event_id, relates_to)
+            await self._send_room_content(chat_id, content)
+            await self._set_typing(chat_id, False)
+            return
+
+        buf = self._stream_bufs.get(chat_id)
+        if buf is None:
+            buf = _StreamBuf()
+            self._stream_bufs[chat_id] = buf
+        buf.text += delta
+        if not buf.text.strip():
+            return
+
+        now = self.monotonic_time()
+        relates_to = self._build_thread_relates_to(meta)
+        if buf.event_id is None:
+            content = _build_matrix_text_content(buf.text, None, relates_to)
+            try:
+                response = await self._send_room_content(chat_id, content)
+            except Exception:
+                await self._set_typing(chat_id, False)
+                return
+            event_id = getattr(response, "event_id", None)
+            if isinstance(event_id, str) and event_id:
+                buf.event_id = event_id
+            buf.last_edit = now
+            return
+
+        if (now - buf.last_edit) < self._STREAM_EDIT_INTERVAL:
+            return
+        content = _build_matrix_text_content(buf.text, buf.event_id, relates_to)
+        try:
+            await self._send_room_content(chat_id, content)
+            buf.last_edit = now
+        except Exception:
+            await self._set_typing(chat_id, False)
 
     def _register_event_callbacks(self) -> None:
         self.client.add_event_callback(self._on_message, RoomMessageText)
