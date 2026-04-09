@@ -166,6 +166,17 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         auto_round=0,
     ) is False
 
+    bad_project = tmp_path / "PRJ-bad"
+    bad_project.mkdir()
+    (bad_project / "task_plan.json").write_text("{", encoding="utf-8")
+    assert loop._should_continue_auto_web(
+        channel="web",
+        run_mode="auto",
+        project_dir=str(bad_project),
+        final_content="all good",
+        auto_round=0,
+    ) is False
+
 
 async def test_run_agent_loop_tool_call_and_finish(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)

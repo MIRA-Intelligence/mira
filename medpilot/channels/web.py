@@ -22,6 +22,7 @@ from medpilot.bus.queue import MessageBus
 from medpilot.channels.base import BaseChannel
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
+from medpilot.task_plan.guardrails import guard_task_plan_file, reconcile_task_plan_data
 
 PLAN_FILENAME = "task_plan.json"
 PROJECT_DIR_PREFIX = "PRJ"
@@ -386,6 +387,7 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/api/sessions", self._handle_sessions)
         self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
         self._app.router.add_get("/api/plan", self._handle_plan)
+        self._app.router.add_get("/api/plan/lint", self._handle_plan_lint)
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
@@ -492,57 +494,10 @@ class WebChannel(BaseChannel):
             logger.warning("Failed to send to {}: {}", msg.chat_id, e)
 
     def _reconcile_plan_data(self, project_dir: Path, data: dict[str, Any]) -> bool:
-        experiments = data.get("experiments")
-        if not isinstance(experiments, list):
-            return False
-
-        changed = False
-        for exp in experiments:
-            if not isinstance(exp, dict):
-                continue
-
-            exp_id = exp.get("id")
-            if not isinstance(exp_id, str) or not exp_id:
-                continue
-
-            results_path = project_dir / "outputs" / exp_id.lower() / "results.json"
-            recovered_metrics = _load_json_file(results_path) if results_path.is_file() else None
-            if recovered_metrics is None:
-                continue
-
-            if exp.get("status") != "completed":
-                exp["status"] = "completed"
-                changed = True
-
-            merged_results = _merge_recovered_results(
-                exp.get("results"),
-                recovered_metrics,
-                _collect_output_artifacts(project_dir, exp_id),
-            )
-            if exp.get("results") != merged_results:
-                exp["results"] = merged_results
-                changed = True
-
-            if not exp.get("commit"):
-                commit = _latest_experiment_commit(project_dir, exp_id)
-                if commit:
-                    exp["commit"] = commit
-                    changed = True
-
-            if not exp.get("conclusion"):
-                exp["conclusion"] = "Recovered completed state from existing experiment artifacts."
-                changed = True
-
-        if not any(isinstance(exp, dict) and exp.get("status") == "running" for exp in experiments):
-            pending = next(
-                (exp.get("id") for exp in experiments if isinstance(exp, dict) and exp.get("status") == "pending"),
-                None,
-            )
-            current = data.get("current_experiment")
-            if pending and current != pending:
-                data["current_experiment"] = pending
-                changed = True
-
+        normalized, changed = reconcile_task_plan_data(data, project_dir)
+        if changed:
+            data.clear()
+            data.update(normalized)
         return changed
 
     def _load_plan_data(self, session_id: str, *, reconcile: bool = True) -> dict[str, Any] | None:
@@ -628,12 +583,24 @@ class WebChannel(BaseChannel):
                     continue
 
                 self._clients[session_id] = ws
-                try:
-                    self._load_plan_data(session_id)
-                except ValueError as exc:
-                    logger.warning(str(exc))
-
                 project_dir = str(self.projects_root / session_id)
+                guard = guard_task_plan_file(Path(project_dir), auto_fix=True)
+                if guard.get("fixed"):
+                    self._audit(
+                        source="system",
+                        action="task_plan_guard_auto_fix_applied",
+                        session_id=session_id,
+                        project_dir=Path(project_dir),
+                        details={"issues_after_fix": guard.get("issues", [])[:5]},
+                    )
+                elif guard.get("blocking"):
+                    self._audit(
+                        source="system",
+                        action="task_plan_guard_blocking_issue",
+                        session_id=session_id,
+                        project_dir=Path(project_dir),
+                        details={"issues": guard.get("issues", [])[:5]},
+                    )
                 self._audit(
                     source="ui",
                     action="ws_message_received",
@@ -921,6 +888,33 @@ class WebChannel(BaseChannel):
         if data is None:
             return web.json_response(None)
         return web.json_response(data)
+
+    async def _handle_plan_lint(self, request: web.Request) -> web.Response:
+        """Validate and optionally auto-fix a project's task plan."""
+        session_id = (request.query.get("session_id") or "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        auto_fix = (request.query.get("auto_fix", "1") or "1").strip().lower() not in {"0", "false", "no"}
+        project_dir = self.projects_root / session_id
+        if not project_dir.is_dir():
+            return web.json_response({"error": "project not found"}, status=404)
+
+        result = guard_task_plan_file(project_dir, auto_fix=auto_fix)
+        self._audit(
+            source="ui",
+            action="api_plan_lint",
+            session_id=session_id,
+            project_dir=project_dir,
+            details={
+                "auto_fix": auto_fix,
+                "ok": result.get("ok"),
+                "fixed": result.get("fixed"),
+                "blocking": result.get("blocking"),
+                "issue_count": len(result.get("issues", [])),
+            },
+        )
+        return web.json_response(result)
 
     def _project_meta_path(self, project_dir: Path) -> Path:
         return project_dir / PROJECT_META_DIRNAME / PROJECT_META_FILENAME

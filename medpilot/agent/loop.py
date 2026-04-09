@@ -32,6 +32,7 @@ from medpilot.bus.events import InboundMessage, OutboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.providers.base import LLMProvider
 from medpilot.session.manager import Session, SessionManager
+from medpilot.task_plan.guardrails import guard_task_plan_file
 
 if TYPE_CHECKING:
     from medpilot.config.schema import ChannelsConfig, ExecToolConfig
@@ -397,6 +398,23 @@ class AgentLoop:
             for exp in experiments
         )
 
+    @staticmethod
+    def _guard_task_plan_structure(project_dir: str | None) -> bool:
+        """Apply task_plan guardrails before auto-continue rounds."""
+        if not project_dir:
+            return True
+        result = guard_task_plan_file(Path(project_dir), auto_fix=True)
+        if result.get("fixed"):
+            logger.info("task_plan guardrails auto-fixed {}", project_dir)
+        if result.get("blocking"):
+            logger.warning(
+                "task_plan guardrails blocked auto-continue for {}: {}",
+                project_dir,
+                (result.get("issues") or [])[:3],
+            )
+            return False
+        return True
+
     def _build_auto_continue_message(
         self,
         channel: str,
@@ -428,6 +446,8 @@ class AgentLoop:
     ) -> bool:
         """Decide whether to schedule another internal auto-run cycle."""
         if channel != "web" or run_mode != "auto":
+            return False
+        if not self._guard_task_plan_structure(project_dir):
             return False
         if auto_round >= self._AUTO_MAX_ROUNDS:
             logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)

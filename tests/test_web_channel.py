@@ -250,6 +250,41 @@ async def test_handle_plan_recovers_completed_experiment_from_outputs(web_channe
     assert body["current_experiment"] == "Exp005"
 
 
+async def test_handle_plan_lint_auto_fixes_structure(web_channel: WebChannel) -> None:
+    session = "PRJ-9001"
+    project_dir = web_channel.projects_root / session
+    (project_dir / "experiments" / "exp001").mkdir(parents=True)
+    (project_dir / "experiments" / "exp001" / "metrics.json").write_text(
+        json.dumps({"overall_r2": 0.51}),
+        encoding="utf-8",
+    )
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [{"id": "exp1", "status": "completed"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    resp = await web_channel._handle_plan_lint(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["ok"] is True
+    assert body["fixed"] is True
+    assert body["issues"] == []
+
+    saved = json.loads((project_dir / PLAN_FILENAME).read_text(encoding="utf-8"))
+    exp = saved["experiments"][0]
+    assert exp["id"] == "Exp001"
+    assert exp["results"]["metrics"] == {"overall_r2": 0.51}
+    assert "experiments/exp001/metrics.json" in exp["results"]["artifacts"]
+
+
 async def test_handle_history_returns_entries(web_channel: WebChannel) -> None:
     session_id = "PRJ-0001"
     project_dir = web_channel.projects_root / session_id
@@ -766,7 +801,9 @@ def test_web_helpers_cover_normalization_and_formatting() -> None:
 
 
 def test_reconcile_plan_data_without_experiments_returns_false(web_channel: WebChannel, tmp_path: Path) -> None:
-    assert web_channel._reconcile_plan_data(tmp_path, {"title": "demo"}) is False
+    payload = {"title": "demo"}
+    assert web_channel._reconcile_plan_data(tmp_path, payload) is False
+    assert payload == {"title": "demo"}
 
 
 def test_load_plan_data_errors_and_reconcile_write_warning(
