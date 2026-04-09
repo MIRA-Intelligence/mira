@@ -32,6 +32,8 @@ PROJECT_META_SCHEMA_VERSION = 1
 _ASSETS_DIR = Path(__file__).parent / "web_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".medpilot") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
+_PROJECT_EXPERIMENT_SNAPSHOT_REL_DIR = Path(".medpilot") / "snapshots" / "experiments"
+_RECOVERED_CONCLUSION_PLACEHOLDER = "Recovered completed experiment artifacts from workspace."
 _API_CONTRACT_VERSION = "v1"
 
 
@@ -109,6 +111,58 @@ def _load_json_file(path: Path) -> Any | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def _snapshot_from_experiment(exp: dict[str, Any], *, source: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "captured_at": f"{datetime.utcnow().isoformat()}Z",
+        "source": source,
+    }
+    for key in (
+        "title",
+        "question",
+        "hypothesis",
+        "prediction",
+        "method",
+        "results",
+        "conclusion",
+        "next",
+        "commit",
+    ):
+        if key in exp:
+            payload[key] = exp.get(key)
+    return payload
+
+
+def _is_snapshot_candidate(exp: dict[str, Any]) -> bool:
+    if exp.get("status") != "completed":
+        return False
+    results = exp.get("results")
+    findings = results.get("findings") if isinstance(results, dict) else None
+    conclusion = exp.get("conclusion")
+    has_findings = isinstance(findings, str) and bool(findings.strip())
+    has_conclusion = (
+        isinstance(conclusion, str)
+        and bool(conclusion.strip())
+        and conclusion.strip() != _RECOVERED_CONCLUSION_PLACEHOLDER
+    )
+    if has_findings or has_conclusion:
+        return True
+
+    has_metrics = (
+        isinstance(results, dict)
+        and isinstance(results.get("metrics"), dict)
+        and bool(results.get("metrics"))
+    )
+    has_artifacts = (
+        isinstance(results, dict)
+        and isinstance(results.get("artifacts"), list)
+        and bool(results.get("artifacts"))
+    )
+    return has_metrics and has_artifacts and not (
+        isinstance(conclusion, str)
+        and conclusion.strip() == _RECOVERED_CONCLUSION_PLACEHOLDER
+    )
 
 
 def _collect_output_artifacts(project_dir: Path, exp_id: str) -> list[str]:
@@ -453,11 +507,22 @@ class WebChannel(BaseChannel):
 
         ws = self._clients.get(msg.chat_id)
         is_progress = metadata.get("_progress", False)
+        msg_type = "progress" if is_progress else "response"
         common_details = {
-            "type": "progress" if is_progress else "response",
+            "type": msg_type,
             "tool_hint": bool(metadata.get("_tool_hint", False)),
             "content_preview": self._preview(msg.content),
         }
+        if msg.chat_id:
+            project_dir = self.projects_root / msg.chat_id
+            if project_dir.is_dir():
+                SessionManager(project_dir).append_ui_event(
+                    key=f"web:{msg.chat_id}",
+                    role="assistant",
+                    content=msg.content,
+                    msg_type=msg_type,
+                    metadata=metadata,
+                )
         if ws is None or ws.closed:
             self._audit(
                 source="agent",
@@ -469,7 +534,7 @@ class WebChannel(BaseChannel):
             return
 
         payload = {
-            "type": "progress" if is_progress else "response",
+            "type": msg_type,
             "session_id": msg.chat_id,
             "content": msg.content,
             "media": msg.media,
@@ -500,6 +565,111 @@ class WebChannel(BaseChannel):
             data.update(normalized)
         return changed
 
+    @staticmethod
+    def _snapshot_filename(exp_id: str) -> str:
+        safe = "".join(ch for ch in exp_id.strip() if ch.isalnum() or ch in {"-", "_"})
+        return safe or "experiment"
+
+    def _experiment_snapshot_path(self, project_dir: Path, exp_id: str) -> Path:
+        return (
+            project_dir
+            / _PROJECT_EXPERIMENT_SNAPSHOT_REL_DIR
+            / f"{self._snapshot_filename(exp_id)}.json"
+        )
+
+    def _load_experiment_snapshot(self, project_dir: Path, exp_id: str) -> dict[str, Any] | None:
+        payload = _load_json_file(self._experiment_snapshot_path(project_dir, exp_id))
+        return payload if isinstance(payload, dict) else None
+
+    def _save_experiment_snapshot(
+        self, project_dir: Path, exp_id: str, payload: dict[str, Any]
+    ) -> None:
+        snapshot_path = self._experiment_snapshot_path(project_dir, exp_id)
+        try:
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            snapshot_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("Failed to write experiment snapshot {}: {}", snapshot_path, exc)
+
+    def _recover_snapshot_from_git_history(
+        self, project_dir: Path, exp_id: str
+    ) -> dict[str, Any] | None:
+        if not (project_dir / ".git").is_dir():
+            return None
+        try:
+            log_result = subprocess.run(
+                ["git", "log", "--format=%H", "-n", "40", "--", PLAN_FILENAME],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=6,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if log_result.returncode != 0:
+            return None
+
+        commits = [line.strip() for line in log_result.stdout.splitlines() if line.strip()]
+        for commit in commits:
+            try:
+                show_result = subprocess.run(
+                    ["git", "show", f"{commit}:{PLAN_FILENAME}"],
+                    cwd=project_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=6,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if show_result.returncode != 0:
+                continue
+            try:
+                plan = json.loads(show_result.stdout)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(plan, dict):
+                continue
+            experiments = plan.get("experiments")
+            if not isinstance(experiments, list):
+                continue
+            for item in experiments:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("id") != exp_id:
+                    continue
+                if _is_snapshot_candidate(item):
+                    return _snapshot_from_experiment(item, source=f"git:{commit[:7]}")
+        return None
+
+    def _attach_experiment_snapshots(self, project_dir: Path, data: dict[str, Any]) -> None:
+        experiments = data.get("experiments")
+        if not isinstance(experiments, list):
+            return
+
+        for item in experiments:
+            if not isinstance(item, dict):
+                continue
+            exp_id = item.get("id")
+            if not isinstance(exp_id, str) or not exp_id.strip():
+                continue
+
+            snapshot = self._load_experiment_snapshot(project_dir, exp_id)
+            if snapshot is None:
+                if _is_snapshot_candidate(item):
+                    snapshot = _snapshot_from_experiment(item, source="task_plan")
+                    self._save_experiment_snapshot(project_dir, exp_id, snapshot)
+                elif item.get("status") == "completed":
+                    snapshot = self._recover_snapshot_from_git_history(project_dir, exp_id)
+                    if snapshot is not None:
+                        self._save_experiment_snapshot(project_dir, exp_id, snapshot)
+            if snapshot is not None:
+                item["snapshot"] = snapshot
+
     def _load_plan_data(self, session_id: str, *, reconcile: bool = True) -> dict[str, Any] | None:
         project_dir = self.projects_root / session_id
         plan_path = project_dir / PLAN_FILENAME
@@ -522,6 +692,7 @@ class WebChannel(BaseChannel):
             except OSError as exc:
                 logger.warning("Failed to write reconciled {}: {}", plan_path, exc)
 
+        self._attach_experiment_snapshots(project_dir, data)
         return data
 
     # ── CORS middleware ──────────────────────────────────────────────
@@ -614,6 +785,13 @@ class WebChannel(BaseChannel):
                         "media_count": len(media) if isinstance(media, list) else 0,
                     },
                 )
+                SessionManager(Path(project_dir)).append_ui_event(
+                    key=f"web:{session_id}",
+                    role="user",
+                    content=content,
+                    msg_type="response",
+                    metadata={"_user": True},
+                )
                 metadata: dict[str, Any] = {
                     "source": "web",
                     "project_dir": project_dir,
@@ -667,6 +845,23 @@ class WebChannel(BaseChannel):
                     metadata=metadata,
                     session_key=f"web:{session_id}",
                 )
+            elif msg_type == "bind":
+                session_id = data.get("session_id", session_id)
+                user_id = data.get("user_id", session_id or "anonymous")
+                if session_id is None:
+                    await ws.send_json(
+                        {"type": "error", "content": "session_id required"}
+                    )
+                    continue
+                self._clients[session_id] = ws
+                project_dir = str(self.projects_root / session_id)
+                self._audit(
+                    source="ui",
+                    action="ws_bind_received",
+                    session_id=session_id,
+                    project_dir=Path(project_dir),
+                    details={"user_id": user_id},
+                )
 
         # Client disconnected
         if session_id and self._clients.get(session_id) is ws:
@@ -710,12 +905,75 @@ class WebChannel(BaseChannel):
         ]
         return web.json_response({"sessions": sessions})
 
+    @staticmethod
+    def _history_entry_key(entry: dict[str, Any]) -> tuple[str, str, bool, str]:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        return (
+            str(entry.get("timestamp", "")),
+            str(entry.get("type", "")),
+            bool(metadata.get("_user", False)),
+            str(entry.get("content", "")),
+        )
+
+    @staticmethod
+    def _history_entry_soft_key(entry: dict[str, Any]) -> tuple[str, str, bool]:
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        return (
+            str(entry.get("timestamp", "")),
+            str(entry.get("type", "")),
+            bool(metadata.get("_user", False)),
+        )
+
+    def _load_audit_history_entries(self, session_id: str) -> list[dict[str, Any]]:
+        """Best-effort fallback for older sessions missing persisted chat messages."""
+        project_dir = self.projects_root / session_id
+        audit_file = project_dir / _PROJECT_AUDIT_REL_PATH
+        if not audit_file.is_file():
+            return []
+        rows: list[dict[str, Any]] = []
+        try:
+            for idx, line in enumerate(audit_file.read_text(encoding="utf-8").splitlines()):
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                action = item.get("action")
+                details = item.get("details") if isinstance(item.get("details"), dict) else {}
+                if action == "ws_message_received":
+                    content = details.get("content_preview")
+                    if not isinstance(content, str) or not content:
+                        continue
+                    rows.append({
+                        "id": f"audit-{session_id}-u-{idx}",
+                        "timestamp": item.get("timestamp") or "",
+                        "content": content,
+                        "type": "response",
+                        "metadata": {"_user": True},
+                    })
+                elif action in {"ws_outbound_sent", "ws_outbound_dropped"}:
+                    content = details.get("content_preview")
+                    if not isinstance(content, str) or not content:
+                        continue
+                    raw_type = details.get("type")
+                    entry_type = raw_type if raw_type in {"response", "progress", "tool_call", "error"} else "response"
+                    rows.append({
+                        "id": f"audit-{session_id}-a-{idx}",
+                        "timestamp": item.get("timestamp") or "",
+                        "content": content,
+                        "type": entry_type,
+                        "metadata": {},
+                    })
+        except (json.JSONDecodeError, OSError):
+            return []
+        return rows
+
     def _load_history_entries(self, session_id: str) -> list[dict[str, Any]]:
         project_dir = self.projects_root / session_id
         if not project_dir.is_dir():
             return []
 
-        session = SessionManager(project_dir).get_or_create(f"web:{session_id}")
+        manager = SessionManager(project_dir)
+        session_key = f"web:{session_id}"
+        session = manager.get_or_create(session_key)
         entries: list[dict[str, Any]] = []
 
         for idx, msg in enumerate(session.messages):
@@ -757,7 +1015,30 @@ class WebChannel(BaseChannel):
                         "metadata": {},
                     })
 
-        return entries
+        # Merge UI-level chat persistence (full content) and audit fallback (preview content).
+        merged = list(entries)
+        seen_exact = {self._history_entry_key(entry) for entry in merged}
+        seen_soft = {self._history_entry_soft_key(entry) for entry in merged}
+
+        for entry in manager.get_ui_history(session_key):
+            exact_key = self._history_entry_key(entry)
+            if exact_key in seen_exact:
+                continue
+            seen_exact.add(exact_key)
+            seen_soft.add(self._history_entry_soft_key(entry))
+            merged.append(entry)
+
+        for entry in self._load_audit_history_entries(session_id):
+            exact_key = self._history_entry_key(entry)
+            soft_key = self._history_entry_soft_key(entry)
+            if exact_key in seen_exact or soft_key in seen_soft:
+                continue
+            seen_exact.add(exact_key)
+            seen_soft.add(soft_key)
+            merged.append(entry)
+
+        merged.sort(key=lambda item: (str(item.get("timestamp", "")), str(item.get("id", ""))))
+        return merged
 
     async def _handle_history(self, request: web.Request) -> web.Response:
         session_id = request.match_info.get("session_id", "").strip()
