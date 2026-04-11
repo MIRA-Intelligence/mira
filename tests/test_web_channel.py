@@ -536,6 +536,45 @@ async def test_handle_history_uses_audit_fallback_when_session_sparse(web_channe
     assert "audit assistant msg" in contents
 
 
+async def test_handle_history_prefers_ui_entries_over_audit_preview_when_present(
+    web_channel: WebChannel,
+) -> None:
+    session_id = "PRJ-0011"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    manager = SessionManager(project_dir)
+    manager.append_ui_event(
+        key=f"web:{session_id}",
+        role="assistant",
+        content="full assistant message",
+        msg_type="response",
+        metadata={},
+        timestamp="2026-03-26T09:00:01",
+    )
+
+    audit_file = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    audit_file.write_text(
+        json.dumps({
+            "timestamp": "2026-03-26T09:00:01",
+            "source": "agent",
+            "action": "ws_outbound_sent",
+            "session_id": session_id,
+            "details": {"type": "response", "content_preview": "full assistant message"},
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": session_id}
+    resp = await web_channel._handle_history(req)
+    body = json.loads(resp.text)
+    contents = [entry["content"] for entry in body["entries"]]
+    assert contents.count("full assistant message") == 1
+
+
 async def test_handle_config_invalid_json(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(side_effect=json.JSONDecodeError("msg", "", 0))
@@ -563,6 +602,26 @@ async def test_handle_config_unchanged_without_key(web_channel: WebChannel, tmp_
     resp = await web_channel._handle_config(req)
     assert resp.status == 200
     assert json.loads(resp.text)["projects_root"] == str(tmp_path)
+
+
+async def test_handle_config_skips_audit_when_projects_root_unchanged(
+    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path.resolve()
+    web_channel.projects_root = root
+    audit_calls: list[dict[str, object]] = []
+
+    def _capture_audit(**kwargs: object) -> None:
+        audit_calls.append(kwargs)
+
+    monkeypatch.setattr(web_channel, "_audit", _capture_audit)
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"projects_root": str(root)})
+    resp = await web_channel._handle_config(req)
+
+    assert resp.status == 200
+    assert json.loads(resp.text)["projects_root"] == str(root)
+    assert audit_calls == []
 
 
 async def test_handle_validate_data_path_requires_valid_json(web_channel: WebChannel) -> None:
@@ -655,10 +714,40 @@ async def test_handle_project_meta_updates_display_name(web_channel: WebChannel)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["display_name"] == "Lung CT baseline"
+    assert body["run_mode"] == "auto"
+    assert body["agent_profile"] == "default"
 
     meta_file = project_dir / ".medpilot" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["display_name"] == "Lung CT baseline"
+    assert meta["run_mode"] == "auto"
+    assert meta["agent_profile"] == "default"
+
+
+async def test_handle_project_meta_updates_run_mode_and_profile(
+    web_channel: WebChannel,
+) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0002"
+    project_dir.mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0002"}
+    req.json = AsyncMock(return_value={
+        "run_mode": "manual",
+        "agent_profile": "research",
+    })
+    resp = await web_channel._handle_project_meta(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["display_name"] == "PRJ-0002"
+    assert body["run_mode"] == "manual"
+    assert body["agent_profile"] == "research"
+
+    meta_file = project_dir / ".medpilot" / "project.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["run_mode"] == "manual"
+    assert meta["agent_profile"] == "research"
 
 
 async def test_cors_allows_patch_method(web_channel: WebChannel) -> None:

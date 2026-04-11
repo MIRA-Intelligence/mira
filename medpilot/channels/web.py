@@ -29,6 +29,8 @@ PROJECT_DIR_PREFIX = "PRJ"
 PROJECT_META_DIRNAME = ".medpilot"
 PROJECT_META_FILENAME = "project.json"
 PROJECT_META_SCHEMA_VERSION = 1
+PROJECT_META_DEFAULT_RUN_MODE = "auto"
+PROJECT_META_DEFAULT_AGENT_PROFILE = "default"
 _ASSETS_DIR = Path(__file__).parent / "web_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".medpilot") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
@@ -974,68 +976,81 @@ class WebChannel(BaseChannel):
         manager = SessionManager(project_dir)
         session_key = f"web:{session_id}"
         session = manager.get_or_create(session_key)
-        entries: list[dict[str, Any]] = []
+        ui_entries = manager.get_ui_history(session_key)
+        merged: list[dict[str, Any]] = list(ui_entries)
+        seen_exact = {self._history_entry_key(entry) for entry in merged}
+        seen_soft = {self._history_entry_soft_key(entry) for entry in merged}
 
+        # Always keep tool-call trace from session messages; it's not persisted in UI events.
         for idx, msg in enumerate(session.messages):
-            timestamp = msg.get("timestamp") or ""
-            role = msg.get("role")
-
-            if role == "user":
-                content = _stringify_history_content(msg.get("content"))
-                if not content:
-                    continue
-                entries.append({
-                    "id": f"history-{session_id}-{idx}-user",
-                    "timestamp": timestamp,
-                    "content": content,
-                    "type": "response",
-                    "metadata": {"_user": True},
-                })
+            if msg.get("role") != "assistant":
                 continue
+            timestamp = msg.get("timestamp") or ""
+            for tool_idx, tool_call in enumerate(msg.get("tool_calls") or []):
+                if not isinstance(tool_call, dict):
+                    continue
+                entry = {
+                    "id": f"history-{session_id}-{idx}-tool-{tool_idx}",
+                    "timestamp": timestamp,
+                    "content": _format_tool_call(tool_call),
+                    "type": "tool_call",
+                    "metadata": {},
+                }
+                exact_key = self._history_entry_key(entry)
+                if exact_key in seen_exact:
+                    continue
+                seen_exact.add(exact_key)
+                seen_soft.add(self._history_entry_soft_key(entry))
+                merged.append(entry)
 
-            if role == "assistant":
-                content = _stringify_history_content(msg.get("content"))
-                if content:
-                    entries.append({
+        # Legacy fallback: only synthesize user/assistant from session messages when
+        # no UI-level history exists.
+        if not ui_entries:
+            for idx, msg in enumerate(session.messages):
+                timestamp = msg.get("timestamp") or ""
+                role = msg.get("role")
+                if role == "user":
+                    content = _stringify_history_content(msg.get("content"))
+                    if not content:
+                        continue
+                    entry = {
+                        "id": f"history-{session_id}-{idx}-user",
+                        "timestamp": timestamp,
+                        "content": content,
+                        "type": "response",
+                        "metadata": {"_user": True},
+                    }
+                elif role == "assistant":
+                    content = _stringify_history_content(msg.get("content"))
+                    if not content:
+                        continue
+                    entry = {
                         "id": f"history-{session_id}-{idx}-assistant",
                         "timestamp": timestamp,
                         "content": content,
                         "type": "response",
                         "metadata": {},
-                    })
+                    }
+                else:
+                    continue
+                exact_key = self._history_entry_key(entry)
+                soft_key = self._history_entry_soft_key(entry)
+                if exact_key in seen_exact or soft_key in seen_soft:
+                    continue
+                seen_exact.add(exact_key)
+                seen_soft.add(soft_key)
+                merged.append(entry)
 
-                for tool_idx, tool_call in enumerate(msg.get("tool_calls") or []):
-                    if not isinstance(tool_call, dict):
-                        continue
-                    entries.append({
-                        "id": f"history-{session_id}-{idx}-tool-{tool_idx}",
-                        "timestamp": timestamp,
-                        "content": _format_tool_call(tool_call),
-                        "type": "tool_call",
-                        "metadata": {},
-                    })
-
-        # Merge UI-level chat persistence (full content) and audit fallback (preview content).
-        merged = list(entries)
-        seen_exact = {self._history_entry_key(entry) for entry in merged}
-        seen_soft = {self._history_entry_soft_key(entry) for entry in merged}
-
-        for entry in manager.get_ui_history(session_key):
-            exact_key = self._history_entry_key(entry)
-            if exact_key in seen_exact:
-                continue
-            seen_exact.add(exact_key)
-            seen_soft.add(self._history_entry_soft_key(entry))
-            merged.append(entry)
-
-        for entry in self._load_audit_history_entries(session_id):
-            exact_key = self._history_entry_key(entry)
-            soft_key = self._history_entry_soft_key(entry)
-            if exact_key in seen_exact or soft_key in seen_soft:
-                continue
-            seen_exact.add(exact_key)
-            seen_soft.add(soft_key)
-            merged.append(entry)
+        # Audit preview fallback is strictly for very old/sparse sessions.
+        if not merged:
+            for entry in self._load_audit_history_entries(session_id):
+                exact_key = self._history_entry_key(entry)
+                soft_key = self._history_entry_soft_key(entry)
+                if exact_key in seen_exact or soft_key in seen_soft:
+                    continue
+                seen_exact.add(exact_key)
+                seen_soft.add(soft_key)
+                merged.append(entry)
 
         merged.sort(key=lambda item: (str(item.get("timestamp", "")), str(item.get("id", ""))))
         return merged
@@ -1058,13 +1073,15 @@ class WebChannel(BaseChannel):
 
         if "projects_root" in body:
             new_root = Path(body["projects_root"]).expanduser().resolve()
-            self.projects_root = new_root
-            self._audit(
-                source="ui",
-                action="api_projects_root_updated",
-                details={"projects_root": str(new_root)},
-            )
-            logger.info("Projects root updated to {}", new_root)
+            current_root = self.projects_root.expanduser().resolve()
+            if new_root != current_root:
+                self.projects_root = new_root
+                self._audit(
+                    source="ui",
+                    action="api_projects_root_updated",
+                    details={"projects_root": str(new_root)},
+                )
+                logger.info("Projects root updated to {}", new_root)
 
         return web.json_response({
             "projects_root": str(self.projects_root),
@@ -1220,6 +1237,8 @@ class WebChannel(BaseChannel):
         return {
             "id": project_id,
             "display_name": project_id,
+            "run_mode": PROJECT_META_DEFAULT_RUN_MODE,
+            "agent_profile": PROJECT_META_DEFAULT_AGENT_PROFILE,
             "created_at": now,
             "updated_at": now,
             "schema_version": PROJECT_META_SCHEMA_VERSION,
@@ -1244,6 +1263,9 @@ class WebChannel(BaseChannel):
 
         if meta.get("id") != project_id:
             meta["id"] = project_id
+
+        meta["run_mode"] = _normalize_run_mode(meta.get("run_mode"))
+        meta["agent_profile"] = _normalize_agent_profile(meta.get("agent_profile"))
 
         if not isinstance(meta.get("schema_version"), int):
             meta["schema_version"] = PROJECT_META_SCHEMA_VERSION
@@ -1270,6 +1292,10 @@ class WebChannel(BaseChannel):
             info: dict[str, Any] = {
                 "id": d.name,
                 "display_name": str(meta.get("display_name", d.name)),
+                "run_mode": str(meta.get("run_mode", PROJECT_META_DEFAULT_RUN_MODE)),
+                "agent_profile": str(
+                    meta.get("agent_profile", PROJECT_META_DEFAULT_AGENT_PROFILE)
+                ),
                 "has_meta": True,
             }
             plan_file = d / PLAN_FILENAME
@@ -1302,14 +1328,45 @@ class WebChannel(BaseChannel):
             body = await request.json()
         except (json.JSONDecodeError, TypeError):
             return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "JSON body must be an object"}, status=400)
+
+        has_display_name = "display_name" in body
+        has_run_mode = "run_mode" in body
+        has_agent_profile = "agent_profile" in body
+        if not any((has_display_name, has_run_mode, has_agent_profile)):
+            return web.json_response(
+                {
+                    "error": (
+                        "at least one of display_name/run_mode/agent_profile is required"
+                    )
+                },
+                status=400,
+            )
 
         display_name = body.get("display_name")
-        if not isinstance(display_name, str):
-            return web.json_response({"error": "display_name must be a string"}, status=400)
+        if has_display_name and not isinstance(display_name, str):
+            return web.json_response(
+                {"error": "display_name must be a string"}, status=400
+            )
 
-        trimmed = display_name.strip() or session_id
+        run_mode = body.get("run_mode")
+        if has_run_mode and not isinstance(run_mode, str):
+            return web.json_response({"error": "run_mode must be a string"}, status=400)
+
+        agent_profile = body.get("agent_profile")
+        if has_agent_profile and not isinstance(agent_profile, str):
+            return web.json_response(
+                {"error": "agent_profile must be a string"}, status=400
+            )
+
         meta = self._ensure_project_meta(project_dir)
-        meta["display_name"] = trimmed
+        if has_display_name:
+            meta["display_name"] = (display_name or "").strip() or session_id
+        if has_run_mode:
+            meta["run_mode"] = _normalize_run_mode(run_mode)
+        if has_agent_profile:
+            meta["agent_profile"] = _normalize_agent_profile(agent_profile)
         meta["updated_at"] = f"{datetime.utcnow().isoformat()}Z"
         self._write_project_meta(project_dir, meta)
 
@@ -1318,9 +1375,21 @@ class WebChannel(BaseChannel):
             action="api_project_meta_updated",
             session_id=session_id,
             project_dir=project_dir,
-            details={"display_name": trimmed},
+            details={
+                "display_name": meta.get("display_name"),
+                "run_mode": meta.get("run_mode"),
+                "agent_profile": meta.get("agent_profile"),
+            },
         )
-        return web.json_response({"id": session_id, "display_name": trimmed, "meta": meta})
+        return web.json_response(
+            {
+                "id": session_id,
+                "display_name": meta.get("display_name"),
+                "run_mode": meta.get("run_mode"),
+                "agent_profile": meta.get("agent_profile"),
+                "meta": meta,
+            }
+        )
 
     async def _handle_delete_project(self, request: web.Request) -> web.Response:
         """Delete a project directory from disk."""
