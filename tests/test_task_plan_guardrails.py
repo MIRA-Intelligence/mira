@@ -51,6 +51,36 @@ def test_guard_task_plan_reports_blocking_for_invalid_json(tmp_path: Path) -> No
     assert any("failed to parse task_plan.json" in issue for issue in result["issues"])
 
 
+def test_guard_task_plan_auto_fixes_duplicate_experiment_ids(tmp_path: Path) -> None:
+    project_dir = tmp_path / "PRJ-0003"
+    project_dir.mkdir(parents=True)
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "duplicate ids",
+                "status": "in_progress",
+                "current_experiment": "Exp003",
+                "experiments": [
+                    {"id": "Exp003", "title": "first", "status": "completed", "conclusion": "done"},
+                    {"id": "Exp003", "title": "second", "status": "pending"},
+                    {"id": "Exp004", "title": "third", "status": "pending"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=True)
+    assert result["ok"] is True
+    assert result["fixed"] is True
+    assert result["blocking"] is False
+
+    repaired = json.loads((project_dir / "task_plan.json").read_text(encoding="utf-8"))
+    ids = [exp["id"] for exp in repaired["experiments"]]
+    assert ids == ["Exp003", "Exp004", "Exp005"]
+    assert len(ids) == len(set(ids))
+
+
 def test_guard_task_plan_research_profile_requires_evidence_fields(tmp_path: Path) -> None:
     project_dir = tmp_path / "PRJ-0100"
     (project_dir / ".medpilot").mkdir(parents=True)

@@ -87,6 +87,24 @@ def _experiment_dirname(exp_id: str) -> str:
     return exp_id.strip().lower()
 
 
+def _experiment_numeric_id(exp_id: object) -> int | None:
+    if not isinstance(exp_id, str):
+        return None
+    match = _EXP_ID_PATTERN.match(exp_id.strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _next_experiment_id(used_ids: set[str], start: int) -> tuple[str, int]:
+    candidate = max(1, start)
+    while True:
+        exp_id = f"Exp{candidate:03d}"
+        if exp_id not in used_ids:
+            return exp_id, candidate
+        candidate += 1
+
+
 def _load_json(path: Path) -> Any | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -413,12 +431,25 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
 
     running_seen = False
     updated_experiments: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    max_numeric_id = 0
     for idx, exp in enumerate(experiments, start=1):
         item = dict(exp) if _is_mapping(exp) else {}
         if not _is_mapping(exp):
             changed = True
 
         exp_id = _normalize_experiment_id(item.get("id"), idx)
+        numeric_id = _experiment_numeric_id(exp_id)
+        if numeric_id is not None:
+            max_numeric_id = max(max_numeric_id, numeric_id)
+        if exp_id in used_ids:
+            exp_id, max_numeric_id = _next_experiment_id(
+                used_ids,
+                max(max_numeric_id + 1, idx),
+            )
+            item["id"] = exp_id
+            changed = True
+        used_ids.add(exp_id)
         if item.get("id") != exp_id:
             item["id"] = exp_id
             changed = True

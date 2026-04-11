@@ -404,6 +404,38 @@ async def test_handle_plan_lint_auto_fixes_structure(web_channel: WebChannel) ->
     assert "experiments/exp001/metrics.json" in exp["results"]["artifacts"]
 
 
+async def test_handle_plan_auto_fixes_duplicate_experiment_ids(
+    web_channel: WebChannel,
+) -> None:
+    session = "PRJ-9002"
+    project_dir = web_channel.projects_root / session
+    project_dir.mkdir(parents=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "dup",
+                "status": "in_progress",
+                "experiments": [
+                    {"id": "Exp003", "status": "completed", "conclusion": "done"},
+                    {"id": "Exp003", "status": "pending"},
+                    {"id": "Exp004", "status": "pending"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    resp = await web_channel._handle_plan(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    ids = [exp["id"] for exp in body["experiments"]]
+    assert ids == ["Exp003", "Exp004", "Exp005"]
+    assert len(ids) == len(set(ids))
+
+
 async def test_handle_history_returns_entries(web_channel: WebChannel) -> None:
     session_id = "PRJ-0001"
     project_dir = web_channel.projects_root / session_id
