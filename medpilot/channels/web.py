@@ -31,6 +31,8 @@ PROJECT_META_FILENAME = "project.json"
 PROJECT_META_SCHEMA_VERSION = 1
 PROJECT_META_DEFAULT_RUN_MODE = "auto"
 PROJECT_META_DEFAULT_AGENT_PROFILE = "default"
+PROJECT_META_DEFAULT_CONTRACT_VERSION = 1
+PROJECT_META_STRICT_CONTRACT_VERSION = 2
 _ASSETS_DIR = Path(__file__).parent / "web_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".medpilot") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
@@ -65,6 +67,14 @@ def _normalize_agent_profile(value: Any) -> str:
         if profile in {"engineer", "default", "research"}:
             return profile
     return "default"
+
+
+def _normalize_contract_version(value: Any) -> int:
+    """Normalize project-level contract version with safe fallback."""
+    if isinstance(value, int):
+        if value in {PROJECT_META_DEFAULT_CONTRACT_VERSION, PROJECT_META_STRICT_CONTRACT_VERSION}:
+            return value
+    return PROJECT_META_DEFAULT_CONTRACT_VERSION
 
 
 def _stringify_history_content(content: Any) -> str:
@@ -1239,6 +1249,7 @@ class WebChannel(BaseChannel):
             "display_name": project_id,
             "run_mode": PROJECT_META_DEFAULT_RUN_MODE,
             "agent_profile": PROJECT_META_DEFAULT_AGENT_PROFILE,
+            "contract_version": PROJECT_META_DEFAULT_CONTRACT_VERSION,
             "created_at": now,
             "updated_at": now,
             "schema_version": PROJECT_META_SCHEMA_VERSION,
@@ -1266,6 +1277,7 @@ class WebChannel(BaseChannel):
 
         meta["run_mode"] = _normalize_run_mode(meta.get("run_mode"))
         meta["agent_profile"] = _normalize_agent_profile(meta.get("agent_profile"))
+        meta["contract_version"] = _normalize_contract_version(meta.get("contract_version"))
 
         if not isinstance(meta.get("schema_version"), int):
             meta["schema_version"] = PROJECT_META_SCHEMA_VERSION
@@ -1295,6 +1307,9 @@ class WebChannel(BaseChannel):
                 "run_mode": str(meta.get("run_mode", PROJECT_META_DEFAULT_RUN_MODE)),
                 "agent_profile": str(
                     meta.get("agent_profile", PROJECT_META_DEFAULT_AGENT_PROFILE)
+                ),
+                "contract_version": int(
+                    _normalize_contract_version(meta.get("contract_version"))
                 ),
                 "has_meta": True,
             }
@@ -1334,11 +1349,12 @@ class WebChannel(BaseChannel):
         has_display_name = "display_name" in body
         has_run_mode = "run_mode" in body
         has_agent_profile = "agent_profile" in body
-        if not any((has_display_name, has_run_mode, has_agent_profile)):
+        has_contract_version = "contract_version" in body
+        if not any((has_display_name, has_run_mode, has_agent_profile, has_contract_version)):
             return web.json_response(
                 {
                     "error": (
-                        "at least one of display_name/run_mode/agent_profile is required"
+                        "at least one of display_name/run_mode/agent_profile/contract_version is required"
                     )
                 },
                 status=400,
@@ -1360,6 +1376,12 @@ class WebChannel(BaseChannel):
                 {"error": "agent_profile must be a string"}, status=400
             )
 
+        contract_version = body.get("contract_version")
+        if has_contract_version and not isinstance(contract_version, int):
+            return web.json_response(
+                {"error": "contract_version must be an integer"}, status=400
+            )
+
         meta = self._ensure_project_meta(project_dir)
         if has_display_name:
             meta["display_name"] = (display_name or "").strip() or session_id
@@ -1367,6 +1389,8 @@ class WebChannel(BaseChannel):
             meta["run_mode"] = _normalize_run_mode(run_mode)
         if has_agent_profile:
             meta["agent_profile"] = _normalize_agent_profile(agent_profile)
+        if has_contract_version:
+            meta["contract_version"] = _normalize_contract_version(contract_version)
         meta["updated_at"] = f"{datetime.utcnow().isoformat()}Z"
         self._write_project_meta(project_dir, meta)
 
@@ -1379,6 +1403,7 @@ class WebChannel(BaseChannel):
                 "display_name": meta.get("display_name"),
                 "run_mode": meta.get("run_mode"),
                 "agent_profile": meta.get("agent_profile"),
+                "contract_version": meta.get("contract_version"),
             },
         )
         return web.json_response(
@@ -1387,6 +1412,7 @@ class WebChannel(BaseChannel):
                 "display_name": meta.get("display_name"),
                 "run_mode": meta.get("run_mode"),
                 "agent_profile": meta.get("agent_profile"),
+                "contract_version": meta.get("contract_version"),
                 "meta": meta,
             }
         )

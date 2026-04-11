@@ -17,6 +17,7 @@ from medpilot.channels.web import (
     PLAN_FILENAME,
     WebChannel,
     _format_tool_call,
+    _normalize_contract_version,
     _load_ui_instructions,
     _normalize_agent_profile,
     _normalize_run_mode,
@@ -109,6 +110,16 @@ def test_normalize_agent_profile_accepts_known_values() -> None:
 def test_normalize_agent_profile_falls_back_to_default() -> None:
     assert _normalize_agent_profile("unknown") == "default"
     assert _normalize_agent_profile(None) == "default"
+
+
+def test_normalize_contract_version_accepts_known_values() -> None:
+    assert _normalize_contract_version(1) == 1
+    assert _normalize_contract_version(2) == 2
+
+
+def test_normalize_contract_version_falls_back_to_default() -> None:
+    assert _normalize_contract_version(9) == 1
+    assert _normalize_contract_version("2") == 1
 
 
 async def test_handle_health_returns_machine_readable_payload(web_channel: WebChannel) -> None:
@@ -694,12 +705,14 @@ async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebC
     assert ids == ["PRJ-0001", "PRJ-0002"]
     assert [item["display_name"] for item in body["projects"]] == ["PRJ-0001", "PRJ-0002"]
     assert all(item["has_meta"] for item in body["projects"])
+    assert all(item["contract_version"] == 1 for item in body["projects"])
 
     meta_file = web_channel.projects_root / "PRJ-0001" / ".medpilot" / "project.json"
     assert meta_file.is_file()
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["id"] == "PRJ-0001"
     assert meta["display_name"] == "PRJ-0001"
+    assert meta["contract_version"] == 1
 
 
 async def test_handle_project_meta_updates_display_name(web_channel: WebChannel) -> None:
@@ -716,12 +729,14 @@ async def test_handle_project_meta_updates_display_name(web_channel: WebChannel)
     assert body["display_name"] == "Lung CT baseline"
     assert body["run_mode"] == "auto"
     assert body["agent_profile"] == "default"
+    assert body["contract_version"] == 1
 
     meta_file = project_dir / ".medpilot" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["display_name"] == "Lung CT baseline"
     assert meta["run_mode"] == "auto"
     assert meta["agent_profile"] == "default"
+    assert meta["contract_version"] == 1
 
 
 async def test_handle_project_meta_updates_run_mode_and_profile(
@@ -743,11 +758,33 @@ async def test_handle_project_meta_updates_run_mode_and_profile(
     assert body["display_name"] == "PRJ-0002"
     assert body["run_mode"] == "manual"
     assert body["agent_profile"] == "research"
+    assert body["contract_version"] == 1
 
     meta_file = project_dir / ".medpilot" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["run_mode"] == "manual"
     assert meta["agent_profile"] == "research"
+    assert meta["contract_version"] == 1
+
+
+async def test_handle_project_meta_updates_contract_version(
+    web_channel: WebChannel,
+) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0003"
+    project_dir.mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0003"}
+    req.json = AsyncMock(return_value={"contract_version": 2})
+    resp = await web_channel._handle_project_meta(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["contract_version"] == 2
+
+    meta_file = project_dir / ".medpilot" / "project.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["contract_version"] == 2
 
 
 async def test_cors_allows_patch_method(web_channel: WebChannel) -> None:
@@ -1060,6 +1097,8 @@ def test_web_helpers_cover_normalization_and_formatting() -> None:
     assert _normalize_run_mode("unknown") == "manual"
     assert _normalize_agent_profile(" ENGINEER ") == "engineer"
     assert _normalize_agent_profile("bad") == "default"
+    assert _normalize_contract_version(2) == 2
+    assert _normalize_contract_version(None) == 1
     assert _safe_upload_name("../x.txt") == "x.txt"
     assert _stringify_history_content([{"type": "text", "text": "A"}, {"type": "image_url"}]) == "A\n[image]"
     assert _stringify_history_content({"k": 1}) == '{"k": 1}'

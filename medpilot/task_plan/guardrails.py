@@ -9,10 +9,60 @@ from typing import Any
 
 PLAN_FILENAME = "task_plan.json"
 PLAN_SCHEMA_VERSION = 1
+PROJECT_META_PATH = Path(".medpilot") / "project.json"
+DEFAULT_CONTRACT_VERSION = 1
+STRICT_CONTRACT_VERSION = 2
 
 _VALID_PLAN_STATUS = {"in_progress", "completed", "failed"}
 _VALID_EXPERIMENT_STATUS = {"pending", "running", "completed", "failed", "skipped"}
 _EXP_ID_PATTERN = re.compile(r"(?i)^exp[-_ ]?(\d{1,4})$")
+_RESEARCH_REQUIRED_COMPLETED_FIELDS = (
+    "theoretical_proof",
+    "isolation_test.control",
+    "isolation_test.treatment",
+    "isolation_test.isolated_variable",
+    "post_mortem.residual_analysis",
+    "post_mortem.implementation_fidelity",
+    "post_mortem.five_whys",
+    "evidence_refs",
+)
+_RESEARCH_REQUIRED_FALSIFY_FIELDS = (
+    "theoretical_proof",
+    "isolation_test.control",
+    "isolation_test.treatment",
+    "evidence_refs",
+)
+_ENGINEER_REQUIRED_COMPLETED_FIELDS = (
+    "commit",
+    "repro.script_path",
+    "repro.seed",
+    "repro.env",
+    "tests.summary",
+)
+_ENGINEER_REQUIRED_FALSIFY_FIELDS = (
+    "evidence_refs",
+    "tests.summary",
+)
+_DEFAULT_REQUIRED_COMPLETED_FIELDS: tuple[str, ...] = ()
+_DEFAULT_STRICT_REQUIRED_COMPLETED_FIELDS = (
+    "question",
+    "hypothesis",
+    "method",
+    "results",
+    "conclusion",
+)
+_DEFAULT_REQUIRED_FALSIFY_FIELDS = ("evidence_refs",)
+_FALSIFY_KEYWORDS = (
+    "falsif",
+    "reject",
+    "rejected",
+    "fail",
+    "failed",
+    "not supported",
+    "不支持",
+    "否定",
+    "拒绝",
+)
 
 
 def _is_mapping(value: object) -> bool:
@@ -52,6 +102,149 @@ def _load_text(path: Path, limit: int = 1200) -> str | None:
     if not text:
         return None
     return text[:limit]
+
+
+def _load_project_profile(project_dir: Path | None) -> str:
+    if project_dir is None:
+        return "default"
+    meta = _load_json(project_dir / PROJECT_META_PATH)
+    if isinstance(meta, dict):
+        profile = meta.get("agent_profile")
+        if isinstance(profile, str):
+            normalized = profile.strip().lower()
+            if normalized in {"research", "engineer", "default"}:
+                return normalized
+    return "default"
+
+
+def _load_project_contract_version(project_dir: Path | None) -> int:
+    if project_dir is None:
+        return DEFAULT_CONTRACT_VERSION
+    meta = _load_json(project_dir / PROJECT_META_PATH)
+    if isinstance(meta, dict):
+        value = meta.get("contract_version")
+        if isinstance(value, int) and value in {DEFAULT_CONTRACT_VERSION, STRICT_CONTRACT_VERSION}:
+            return value
+    return DEFAULT_CONTRACT_VERSION
+
+
+def _is_nonempty(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (int, float, bool)):
+        return True
+    if isinstance(value, list):
+        return any(_is_nonempty(item) for item in value)
+    if isinstance(value, dict):
+        return any(_is_nonempty(item) for item in value.values())
+    return value is not None
+
+
+def _get_nested(exp: dict[str, Any], dotted: str) -> tuple[bool, Any]:
+    current: Any = exp
+    for part in dotted.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False, None
+        current = current[part]
+    return True, current
+
+
+def _missing_required_fields(exp: dict[str, Any], fields: tuple[str, ...]) -> list[str]:
+    missing: list[str] = []
+    for field in fields:
+        exists, value = _get_nested(exp, field)
+        if not exists or not _is_nonempty(value):
+            missing.append(field)
+    return missing
+
+
+def _looks_like_hypothesis_rejection(text: object) -> bool:
+    if not isinstance(text, str):
+        return False
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in _FALSIFY_KEYWORDS)
+
+
+def _validate_evidence_refs(
+    exp_id: str, exp: dict[str, Any], project_dir: Path | None
+) -> list[str]:
+    issues: list[str] = []
+    refs = exp.get("evidence_refs")
+    if refs is None:
+        return issues
+    if not isinstance(refs, list):
+        issues.append(f"{exp_id}: evidence_refs must be a list")
+        return issues
+    metrics = exp.get("results", {}).get("metrics") if isinstance(exp.get("results"), dict) else None
+    for idx, ref in enumerate(refs, start=1):
+        if not isinstance(ref, dict):
+            issues.append(f"{exp_id}: evidence_refs[{idx}] must be an object")
+            continue
+        metric_key = ref.get("metric_key")
+        if metric_key is not None and not isinstance(metric_key, str):
+            issues.append(f"{exp_id}: evidence_refs[{idx}].metric_key must be a string")
+        artifact = ref.get("artifact")
+        if artifact is not None and not isinstance(artifact, str):
+            issues.append(f"{exp_id}: evidence_refs[{idx}].artifact must be a string")
+        if isinstance(metric_key, str) and metric_key and isinstance(metrics, dict):
+            if metric_key not in metrics:
+                issues.append(
+                    f"{exp_id}: evidence_refs[{idx}] metric_key '{metric_key}' not found in results.metrics"
+                )
+        if isinstance(artifact, str) and artifact and project_dir is not None:
+            artifact_path = project_dir / artifact
+            if not artifact_path.is_file():
+                issues.append(
+                    f"{exp_id}: evidence_refs[{idx}] artifact '{artifact}' does not exist"
+                )
+    return issues
+
+
+def _validate_profile_required_fields(
+    exp_id: str, exp: dict[str, Any], *, profile: str, contract_version: int
+) -> list[str]:
+    if profile == "research":
+        missing = _missing_required_fields(exp, _RESEARCH_REQUIRED_COMPLETED_FIELDS)
+        if missing:
+            return [f"{exp_id}: research profile missing required fields: {', '.join(missing)}"]
+        return []
+    if profile == "engineer":
+        missing = _missing_required_fields(exp, _ENGINEER_REQUIRED_COMPLETED_FIELDS)
+        if missing:
+            return [f"{exp_id}: engineer profile missing required fields: {', '.join(missing)}"]
+        return []
+    if profile == "default":
+        required = (
+            _DEFAULT_STRICT_REQUIRED_COMPLETED_FIELDS
+            if contract_version >= STRICT_CONTRACT_VERSION
+            else _DEFAULT_REQUIRED_COMPLETED_FIELDS
+        )
+        missing = _missing_required_fields(exp, required)
+        if missing:
+            return [f"{exp_id}: default profile missing required fields: {', '.join(missing)}"]
+    return []
+
+
+def _validate_profile_falsify_fields(
+    exp_id: str, exp: dict[str, Any], *, profile: str
+) -> list[str]:
+    if not _looks_like_hypothesis_rejection(exp.get("conclusion")):
+        return []
+    if profile == "research":
+        missing = _missing_required_fields(exp, _RESEARCH_REQUIRED_FALSIFY_FIELDS)
+        if missing:
+            return [f"{exp_id}: hypothesis rejection requires fields: {', '.join(missing)}"]
+        return []
+    if profile == "engineer":
+        missing = _missing_required_fields(exp, _ENGINEER_REQUIRED_FALSIFY_FIELDS)
+        if missing:
+            return [f"{exp_id}: hypothesis rejection requires fields: {', '.join(missing)}"]
+        return []
+    if profile == "default":
+        missing = _missing_required_fields(exp, _DEFAULT_REQUIRED_FALSIFY_FIELDS)
+        if missing:
+            return [f"{exp_id}: hypothesis rejection requires fields: {', '.join(missing)}"]
+    return []
 
 
 def _collect_artifacts(project_dir: Path, exp_id: str) -> list[str]:
@@ -116,11 +309,24 @@ def _merge_results(existing: object, recovered: dict[str, Any]) -> dict[str, Any
     return merged
 
 
-def lint_task_plan_data(data: object, project_dir: Path | None = None) -> list[str]:
+def lint_task_plan_data(
+    data: object,
+    project_dir: Path | None = None,
+    profile: str | None = None,
+    contract_version: int | None = None,
+) -> list[str]:
     """Return structural issues found in a task plan object."""
     issues: list[str] = []
     if not _is_mapping(data):
         return ["task_plan root must be a JSON object"]
+    effective_profile = profile or _load_project_profile(project_dir)
+    if isinstance(contract_version, int) and contract_version in {
+        DEFAULT_CONTRACT_VERSION,
+        STRICT_CONTRACT_VERSION,
+    }:
+        effective_contract_version = contract_version
+    else:
+        effective_contract_version = _load_project_contract_version(project_dir)
 
     experiments = data.get("experiments")
     if not isinstance(experiments, list):
@@ -149,6 +355,19 @@ def lint_task_plan_data(data: object, project_dir: Path | None = None) -> list[s
             running_count += 1
         if exp_status == "completed" and not (exp.get("results") or exp.get("conclusion")):
             issues.append(f"{exp_id}: completed experiment missing results/conclusion")
+        if exp_status == "completed":
+            issues.extend(
+                _validate_profile_required_fields(
+                    exp_id,
+                    exp,
+                    profile=effective_profile,
+                    contract_version=effective_contract_version,
+                )
+            )
+            issues.extend(
+                _validate_profile_falsify_fields(exp_id, exp, profile=effective_profile)
+            )
+            issues.extend(_validate_evidence_refs(exp_id, exp, project_dir))
 
         if project_dir and isinstance(exp.get("results"), dict):
             artifacts = exp["results"].get("artifacts")
@@ -267,7 +486,9 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
     return normalized, changed
 
 
-def guard_task_plan_file(project_dir: Path, auto_fix: bool = True) -> dict[str, Any]:
+def guard_task_plan_file(
+    project_dir: Path, auto_fix: bool = True, profile: str | None = None
+) -> dict[str, Any]:
     """Validate (and optionally auto-fix) task_plan.json under a project directory."""
     plan_path = project_dir / PLAN_FILENAME
     if not plan_path.is_file():
@@ -319,7 +540,7 @@ def guard_task_plan_file(project_dir: Path, auto_fix: bool = True) -> dict[str, 
                     "issues": [f"failed to write normalized task_plan.json: {exc}"],
                 }
 
-    issues = lint_task_plan_data(data, project_dir=project_dir)
+    issues = lint_task_plan_data(data, project_dir=project_dir, profile=profile)
     return {
         "ok": len(issues) == 0,
         "exists": True,

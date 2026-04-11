@@ -474,6 +474,41 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     assert any("auto-run round 1" in item for item in progress_events)
 
 
+async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+    progress_events: list[str] = []
+    calls = {"n": 0, "decide": 0}
+
+    def _decide(**kwargs):
+        calls["decide"] += 1
+        if calls["decide"] == 1:
+            loop._last_task_plan_guard_issues = ["Exp001: missing theoretical_proof"]
+        else:
+            loop._last_task_plan_guard_issues = []
+        return False
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        calls["n"] += 1
+        return f"round-{calls['n']}", [], messages + [{"role": "assistant", "content": f"round-{calls['n']}"}]
+
+    async def _progress(msg: str) -> None:
+        progress_events.append(msg)
+
+    monkeypatch.setattr(loop, "_should_continue_auto_web", _decide)
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+
+    msg = InboundMessage(
+        channel="web",
+        sender_id="u",
+        chat_id="PRJ-7",
+        content="go",
+        metadata={"run_mode": "auto", "project_dir": str(tmp_path / "PRJ-7")},
+    )
+    out = await loop._process_message(msg, on_progress=_progress)
+    assert out.content == "round-2"
+    assert any("guardrail repair 1" in item for item in progress_events)
+
+
 async def test_run_main_loop_and_process_direct(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
 
