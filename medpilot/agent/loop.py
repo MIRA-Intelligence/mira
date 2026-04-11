@@ -313,6 +313,26 @@ class AgentLoop:
         return "AGENTS.md"
 
     @staticmethod
+    def _compose_extra_system(
+        ui_system_instructions: object,
+        guard_notice: object,
+    ) -> str | None:
+        """Merge optional UI instructions with guardrail notices."""
+        base = (
+            ui_system_instructions.strip()
+            if isinstance(ui_system_instructions, str) and ui_system_instructions.strip()
+            else ""
+        )
+        notice = (
+            guard_notice.strip()
+            if isinstance(guard_notice, str) and guard_notice.strip()
+            else ""
+        )
+        if base and notice:
+            return f"{base}\n\n{notice}"
+        return base or notice or None
+
+    @staticmethod
     def _looks_like_user_input_request(text: str | None) -> bool:
         """Heuristic: detect when assistant explicitly needs user input."""
         if not text:
@@ -807,7 +827,10 @@ class AgentLoop:
 
         history = session.get_history(max_messages=self.memory_window)
         model_runtime = self._get_model_runtime(key)
-        extra_system = meta.get("_ui_system_instructions")
+        extra_system = self._compose_extra_system(
+            meta.get("_ui_system_instructions"),
+            meta.get("_task_plan_guard_notice"),
+        )
 
         ctx = ContextBuilder(memory_workspace) if project_dir else self.context
         initial_messages = ctx.build_messages(

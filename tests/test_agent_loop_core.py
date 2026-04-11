@@ -127,6 +127,10 @@ def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
     assert loop._agent_profile_to_agents_filename("research") == "AGENTS_RS.md"
     assert loop._agent_profile_to_agents_filename("engineer") == "AGENTS_EG.md"
     assert loop._agent_profile_to_agents_filename("default") == "AGENTS.md"
+    merged = loop._compose_extra_system("UI rules", "Guard notice")
+    assert merged == "UI rules\n\nGuard notice"
+    assert loop._compose_extra_system("", "Guard notice") == "Guard notice"
+    assert loop._compose_extra_system(None, None) is None
 
 
 def test_auto_run_decision_helpers(tmp_path: Path) -> None:

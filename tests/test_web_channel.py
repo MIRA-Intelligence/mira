@@ -16,6 +16,9 @@ from medpilot.channels.web import (
     _API_CONTRACT_VERSION,
     PLAN_FILENAME,
     WebChannel,
+    _build_task_plan_guard_notice,
+    _detect_guard_id_reassignments,
+    _extract_plan_experiment_ids,
     _format_tool_call,
     _normalize_contract_version,
     _load_ui_instructions,
@@ -120,6 +123,35 @@ def test_normalize_contract_version_accepts_known_values() -> None:
 def test_normalize_contract_version_falls_back_to_default() -> None:
     assert _normalize_contract_version(9) == 1
     assert _normalize_contract_version("2") == 1
+
+
+def test_guard_id_reassignment_helpers(tmp_path: Path) -> None:
+    project_dir = tmp_path / "PRJ-7001"
+    project_dir.mkdir(parents=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "experiments": [
+                    {"id": "Exp001"},
+                    {"id": "Exp003"},
+                    {"id": "Exp003"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before_ids = _extract_plan_experiment_ids(project_dir)
+    assert before_ids == ["Exp001", "Exp003", "Exp003"]
+
+    after_ids = ["Exp001", "Exp003", "Exp004"]
+    reassignments = _detect_guard_id_reassignments(before_ids, after_ids)
+    assert reassignments == [(3, "Exp003", "Exp004")]
+
+    notice = _build_task_plan_guard_notice(reassignments)
+    assert notice is not None
+    assert "Exp003 -> Exp004" in notice
+    assert _build_task_plan_guard_notice([]) is None
 
 
 async def test_handle_health_returns_machine_readable_payload(web_channel: WebChannel) -> None:
@@ -1252,6 +1284,61 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert handled[0]["metadata"]["agent_profile"] == "engineer"
     assert "_ui_system_instructions" in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"
+
+
+async def test_ws_handler_injects_guard_notice_on_id_reassignment(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4012"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [
+                    {"id": "Exp003", "status": "pending"},
+                    {"id": "Exp003", "status": "pending"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "message",
+                    "session_id": session_id,
+                    "user_id": "u1",
+                    "mode": "auto",
+                    "agent_profile": "default",
+                    "content": "check latest exp ids",
+                    "media": [],
+                }
+            ),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    notice = captured.get("metadata", {}).get("_task_plan_guard_notice")
+    assert isinstance(notice, str)
+    assert "Exp003 -> Exp004" in notice
+
+    repaired = json.loads((project_dir / PLAN_FILENAME).read_text(encoding="utf-8"))
+    ids = [item.get("id") for item in repaired.get("experiments", [])]
+    assert ids == ["Exp003", "Exp004"]
 
 
 async def test_ws_handler_bind_registers_active_client(

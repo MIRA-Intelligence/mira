@@ -125,6 +125,55 @@ def _load_json_file(path: Path) -> Any | None:
         return None
 
 
+def _extract_plan_experiment_ids(project_dir: Path) -> list[str]:
+    """Load task_plan experiment ids in order, best effort."""
+    payload = _load_json_file(project_dir / PLAN_FILENAME)
+    if not isinstance(payload, dict):
+        return []
+    experiments = payload.get("experiments")
+    if not isinstance(experiments, list):
+        return []
+    ids: list[str] = []
+    for item in experiments:
+        if isinstance(item, dict):
+            exp_id = item.get("id")
+            if isinstance(exp_id, str) and exp_id.strip():
+                ids.append(exp_id.strip())
+            else:
+                ids.append("")
+        else:
+            ids.append("")
+    return ids
+
+
+def _detect_guard_id_reassignments(
+    before_ids: list[str],
+    after_ids: list[str],
+) -> list[tuple[int, str, str]]:
+    """Return 1-based index id replacements made by guardrails."""
+    reassignments: list[tuple[int, str, str]] = []
+    for idx, (before_id, after_id) in enumerate(zip(before_ids, after_ids), start=1):
+        if before_id and after_id and before_id != after_id:
+            reassignments.append((idx, before_id, after_id))
+    return reassignments
+
+
+def _build_task_plan_guard_notice(
+    reassignments: list[tuple[int, str, str]],
+) -> str | None:
+    """Build an LLM-facing notice about guardrail id corrections."""
+    if not reassignments:
+        return None
+    lines = [
+        "Task-plan guardrails auto-corrected duplicate/invalid experiment IDs before this turn.",
+        "Use the new IDs as canonical and do not refer to retired IDs.",
+        "ID remapping:",
+    ]
+    for idx, old_id, new_id in reassignments[:8]:
+        lines.append(f"- item #{idx}: {old_id} -> {new_id}")
+    return "\n".join(lines)
+
+
 def _snapshot_from_experiment(exp: dict[str, Any], *, source: str) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "captured_at": f"{datetime.utcnow().isoformat()}Z",
@@ -767,28 +816,43 @@ class WebChannel(BaseChannel):
 
                 self._clients[session_id] = ws
                 project_dir = str(self.projects_root / session_id)
-                guard = guard_task_plan_file(Path(project_dir), auto_fix=True)
+                project_dir_path = Path(project_dir)
+                plan_ids_before = _extract_plan_experiment_ids(project_dir_path)
+                guard = guard_task_plan_file(project_dir_path, auto_fix=True)
+                guard_notice: str | None = None
+                if guard.get("fixed"):
+                    plan_ids_after = _extract_plan_experiment_ids(project_dir_path)
+                    reassignments = _detect_guard_id_reassignments(plan_ids_before, plan_ids_after)
+                    guard_notice = _build_task_plan_guard_notice(reassignments)
                 if guard.get("fixed"):
                     self._audit(
                         source="system",
                         action="task_plan_guard_auto_fix_applied",
                         session_id=session_id,
-                        project_dir=Path(project_dir),
+                        project_dir=project_dir_path,
                         details={"issues_after_fix": guard.get("issues", [])[:5]},
                     )
+                    if guard_notice:
+                        self._audit(
+                            source="system",
+                            action="task_plan_guard_id_reassigned",
+                            session_id=session_id,
+                            project_dir=project_dir_path,
+                            details={"notice": guard_notice},
+                        )
                 elif guard.get("blocking"):
                     self._audit(
                         source="system",
                         action="task_plan_guard_blocking_issue",
                         session_id=session_id,
-                        project_dir=Path(project_dir),
+                        project_dir=project_dir_path,
                         details={"issues": guard.get("issues", [])[:5]},
                     )
                 self._audit(
                     source="ui",
                     action="ws_message_received",
                     session_id=session_id,
-                    project_dir=Path(project_dir),
+                    project_dir=project_dir_path,
                     details={
                         "user_id": user_id,
                         "run_mode": run_mode,
@@ -812,6 +876,8 @@ class WebChannel(BaseChannel):
                 }
                 if self._ui_instructions:
                     metadata["_ui_system_instructions"] = self._ui_instructions
+                if guard_notice:
+                    metadata["_task_plan_guard_notice"] = guard_notice
                 await self._handle_message(
                     sender_id=user_id,
                     chat_id=session_id,
