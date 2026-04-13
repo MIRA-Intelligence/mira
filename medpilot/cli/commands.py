@@ -5,8 +5,11 @@ import json
 import os
 import select
 import signal
+import socket
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -63,6 +66,140 @@ def _format_model_selection(value: str | list[str] | None) -> str:
     if isinstance(value, list):
         return " -> ".join(value) if value else "[dim]not set[/dim]"
     return value
+
+
+def _probe_base_url(url: str | None) -> str:
+    """Return a short connectivity status for a provider base URL."""
+    if not url:
+        return "[dim]n/a[/dim]"
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            return "[yellow]invalid[/yellow]"
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        with socket.create_connection((host, port), timeout=0.8):
+            return "[green]reachable[/green]"
+    except Exception:
+        return "[red]unreachable[/red]"
+
+
+def _probe_urls_parallel(urls: list[str | None]) -> dict[str, str]:
+    """Probe unique URLs in parallel and return url->status map."""
+    unique_urls = sorted({u for u in urls if u})
+    if not unique_urls:
+        return {}
+    results: dict[str, str] = {}
+    max_workers = min(12, len(unique_urls))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_probe_base_url, url): url for url in unique_urls}
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                results[url] = future.result()
+            except Exception:
+                results[url] = "[red]unreachable[/red]"
+    return results
+
+
+_PROVIDER_DEFAULT_ENDPOINTS: dict[str, str] = {
+    # OAuth providers: probe public auth/start domains.
+    "github_copilot": "https://github.com",
+    "openai_codex": "https://chatgpt.com",
+    # SDK/default endpoints for providers that don't expose default_api_base in registry.
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com",
+    "deepseek": "https://api.deepseek.com",
+    "gemini": "https://generativelanguage.googleapis.com",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "qianfan": "https://qianfan.baidubce.com/v2",
+    "groq": "https://api.groq.com/openai/v1",
+    # Custom should stay empty until user provides endpoint.
+    "azure_openai": "https://YOUR-RESOURCE-NAME.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT",
+    "vllm": "http://localhost:8000/v1",
+}
+
+
+_PROVIDER_MODEL_EXAMPLES: dict[str, tuple[str, ...]] = {
+    "openai": ("gpt-4o", "gpt-4.1", "o3-mini"),
+    "anthropic": ("claude-3-7-sonnet-latest", "claude-opus-4-1"),
+    "openrouter": ("openai/gpt-4o-mini", "anthropic/claude-3.7-sonnet"),
+    "deepseek": ("deepseek-chat", "deepseek-reasoner"),
+    "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
+    "dashscope": ("qwen-plus", "qwen-max"),
+    "moonshot": ("kimi-k2.5", "moonshot-v1-8k"),
+    "mistral": ("mistral-large-latest", "ministral-8b-latest"),
+    "groq": ("llama-3.3-70b-versatile", "mixtral-8x7b-32768"),
+    "ollama": ("llama3.2", "qwen2.5"),
+    "vllm": ("meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-7B-Instruct"),
+    "ovms": ("meta-llama/Llama-3.1-8B-Instruct",),
+    "github_copilot": ("gpt-4o", "gpt-5"),
+    "openai_codex": ("gpt-5-codex", "gpt-5.1-codex"),
+}
+
+
+def _provider_probe_url(spec, provider_cfg: object | None) -> str | None:
+    """Resolve display/probe URL for a provider."""
+    cfg_base = getattr(provider_cfg, "api_base", None) if provider_cfg is not None else None
+    if cfg_base:
+        return str(cfg_base)
+    # Keep custom empty until user explicitly sets endpoint.
+    if spec.name == "custom":
+        return None
+    if spec.default_api_base:
+        return spec.default_api_base
+    return _PROVIDER_DEFAULT_ENDPOINTS.get(spec.name)
+
+
+def _validate_model_input(model: str) -> str | None:
+    """Validate model input and return normalized model or None."""
+    value = model.strip()
+    if not value:
+        return None
+    if any(ch.isspace() for ch in value):
+        return None
+    return value
+
+
+def _provider_model_examples(provider_name: str) -> tuple[str, ...]:
+    return _PROVIDER_MODEL_EXAMPLES.get(provider_name, ("<provider-model-name>",))
+
+
+def _prepare_model_default_for_provider(model: str, spec) -> str:
+    """Show bare model by default when current value has selected provider prefix."""
+    value = (model or "").strip()
+    if "/" not in value:
+        return value
+    prefix, rest = value.split("/", 1)
+    prefix_norm = prefix.replace("-", "_").lower()
+    if prefix_norm == spec.name:
+        return rest
+    litellm_norm = (spec.litellm_prefix or "").replace("-", "_").lower()
+    if litellm_norm and prefix_norm == litellm_norm:
+        return rest
+    return value
+
+
+def _model_matches_provider(model: str, provider_name: str) -> bool:
+    """Best-effort check that a model name matches the selected provider."""
+    from medpilot.providers.registry import find_by_name
+
+    spec = find_by_name(provider_name)
+    if not spec:
+        return True
+    model_lower = model.lower()
+    if "/" not in model_lower:
+        # In onboarding, provider is already selected; bare model names are allowed.
+        return True
+    prefix = f"{provider_name}/"
+    if model_lower.startswith(prefix):
+        return True
+    if spec.litellm_prefix and model_lower.startswith(f"{spec.litellm_prefix}/"):
+        return True
+    return any(kw in model_lower for kw in spec.keywords)
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -266,6 +403,7 @@ def onboard(
     from medpilot.cli.onboard import run_onboard
     from medpilot.config.loader import get_config_path, load_config, save_config, set_config_path
     from medpilot.config.schema import Config
+    from medpilot.providers.registry import PROVIDERS, find_by_name
 
     config_path = Path(config).expanduser().resolve() if config else get_config_path()
     if config:
@@ -341,6 +479,111 @@ def onboard(
         cfg.agents.defaults.workspace = workspace
         save_config(cfg, config_path)
 
+    # Quick provider setup for non-wizard onboarding in interactive terminals.
+    if not wizard and sys.stdin.isatty() and sys.stdout.isatty():
+        specs = list(PROVIDERS)
+        if specs and typer.confirm("Configure a model provider now?", default=True):
+            provider_rows: list[tuple[object, object | None, bool, str | None]] = []
+            for spec in specs:
+                provider_cfg = getattr(cfg.providers, spec.name, None)
+                configured = bool(
+                    provider_cfg and (
+                        provider_cfg.api_base if spec.is_local else (provider_cfg.api_key or spec.is_oauth)
+                    )
+                )
+                shown_url = _provider_probe_url(spec, provider_cfg)
+                provider_rows.append((spec, provider_cfg, configured, shown_url))
+            probe_map = _probe_urls_parallel([row[3] for row in provider_rows])
+
+            console.print("\nSupported providers:")
+            for idx, (spec, _provider_cfg, configured, shown_url) in enumerate(provider_rows, 1):
+                mark = " *" if configured else ""
+                conn = probe_map.get(shown_url, "[dim]n/a[/dim]") if shown_url else "[dim]n/a[/dim]"
+                if shown_url:
+                    url_part = f"[dim]{shown_url}[/dim]"
+                else:
+                    url_part = "[dim](provider uses SDK/default endpoint)[/dim]"
+                console.print(
+                    f"  {idx}. {spec.label} ({spec.name.replace('_', '-')}){mark}  {url_part}  {conn}"
+                )
+
+            while True:
+                selected_raw = typer.prompt(
+                    "Select provider number (leave empty to skip)", default="", show_default=False
+                ).strip()
+                if selected_raw == "":
+                    break
+                if not selected_raw.isdigit():
+                    console.print("[yellow]! Please enter a valid number[/yellow]")
+                    continue
+                selected_idx = int(selected_raw)
+                if not 1 <= selected_idx <= len(specs):
+                    console.print("[yellow]! Number out of range[/yellow]")
+                    continue
+
+                selected = specs[selected_idx - 1]
+                cfg.agents.defaults.provider = selected.name
+                if selected.is_oauth:
+                    save_config(cfg, config_path)
+                    _run_oauth_login(selected.name)
+                else:
+                    selected_cfg = getattr(cfg.providers, selected.name, None)
+                    if selected_cfg is not None:
+                        if selected.default_api_base and not selected_cfg.api_base:
+                            selected_cfg.api_base = selected.default_api_base
+                        api_key = typer.prompt(
+                            f"API key for {selected.label} (optional, hidden input)",
+                            default=selected_cfg.api_key or "",
+                            show_default=False,
+                            hide_input=True,
+                        ).strip()
+                        if api_key:
+                            selected_cfg.api_key = api_key
+                        setattr(cfg.providers, selected.name, selected_cfg)
+
+                examples = ", ".join(_provider_model_examples(selected.name))
+                console.print(
+                    f"[dim]Model examples for {selected.label}:[/dim] {examples}\n"
+                    "[dim]Tip:[/dim] after provider is selected, you can input model name without provider prefix."
+                )
+
+                current_model = cfg.agents.defaults.model or ""
+                model_default = _prepare_model_default_for_provider(current_model, selected)
+
+                while True:
+                    model_input = typer.prompt(
+                        "Model name (required)",
+                        default=model_default,
+                        show_default=bool(model_default),
+                    )
+                    normalized_model = _validate_model_input(model_input)
+                    if not normalized_model:
+                        console.print("[yellow]! Invalid model name (empty or contains spaces)[/yellow]")
+                        continue
+                    if not _model_matches_provider(normalized_model, selected.name):
+                        if not typer.confirm(
+                            "Model name may not match selected provider. Continue anyway?",
+                            default=False,
+                        ):
+                            continue
+                    cfg.agents.defaults.model = normalized_model
+                    break
+
+                save_config(cfg, config_path)
+
+                docs_url = (
+                    "Run `medpilot onboard` and choose this provider to start OAuth login."
+                    if selected.is_oauth
+                    else f"https://docs.litellm.ai/docs/providers/{selected.name.replace('_', '-')}"
+                )
+                console.print(
+                    f"[dim]Using provider:[/dim] {selected.name}\n"
+                    f"[dim]How to use:[/dim] set `agents.defaults.model` to a model from this provider, "
+                    f"then run `medpilot status`.\n"
+                    f"[dim]Provider docs:[/dim] {docs_url}"
+                )
+                break
+
     # Create workspace
     workspace_path = get_workspace_path(cfg.workspace_path)
 
@@ -357,11 +600,15 @@ def onboard(
     console.print(f"\n{__logo__} medpilot is ready!")
     console.print("\nNext steps:")
     console.print(f"  1. Add your API key to [cyan]{config_path.resolve()}[/cyan]")
-    console.print("     Get one at: https://openrouter.ai/keys")
+    provider_docs = "https://openrouter.ai/keys"
+    if cfg.agents.defaults.provider != "auto":
+        spec = find_by_name(cfg.agents.defaults.provider)
+        if spec:
+            provider_docs = f"https://docs.litellm.ai/docs/providers/{spec.name.replace('_', '-')}"
+    console.print(f"     Provider docs: {provider_docs}")
     config_hint = f" --config {config_path.resolve()}" if config else ""
     console.print(f"  2. Chat: [cyan]medpilot agent -m \"Hello!\"{config_hint}[/cyan]")
     console.print(f"  3. Gateway: [cyan]medpilot gateway{config_hint}[/cyan]")
-    # console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/medpilot#-chat-apps[/dim]")
 
 
 def _merge_missing_defaults(existing: object, defaults: object) -> object:
@@ -376,9 +623,6 @@ def _merge_missing_defaults(existing: object, defaults: object) -> object:
         else:
             merged[key] = _merge_missing_defaults(merged[key], value)
     return merged
-
-
-
 
 
 def _make_provider(config: Config):
@@ -1108,47 +1352,10 @@ def status():
 
 
 # ============================================================================
-# OAuth Login
+# OAuth Login (used by onboarding)
 # ============================================================================
 
-provider_app = typer.Typer(help="Manage providers")
-app.add_typer(provider_app, name="provider")
 
-
-_LOGIN_HANDLERS: dict[str, callable] = {}
-
-
-def _register_login(name: str):
-    def decorator(fn):
-        _LOGIN_HANDLERS[name] = fn
-        return fn
-    return decorator
-
-
-@provider_app.command("login")
-def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
-):
-    """Authenticate with an OAuth provider."""
-    from medpilot.providers.registry import PROVIDERS
-
-    key = provider.replace("-", "_")
-    spec = next((s for s in PROVIDERS if s.name == key and s.is_oauth), None)
-    if not spec:
-        names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
-        console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
-        raise typer.Exit(1)
-
-    handler = _LOGIN_HANDLERS.get(spec.name)
-    if not handler:
-        console.print(f"[red]Login not implemented for {spec.label}[/red]")
-        raise typer.Exit(1)
-
-    console.print(f"{__logo__} OAuth Login - {spec.label}\n")
-    handler()
-
-
-@_register_login("openai_codex")
 def _login_openai_codex() -> None:
     try:
         from oauth_cli_kit import get_token, login_oauth_interactive
@@ -1172,7 +1379,6 @@ def _login_openai_codex() -> None:
         raise typer.Exit(1)
 
 
-@_register_login("github_copilot")
 def _login_github_copilot() -> None:
     import asyncio
 
@@ -1188,6 +1394,26 @@ def _login_github_copilot() -> None:
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
+
+
+_LOGIN_HANDLERS: dict[str, callable] = {
+    "openai_codex": _login_openai_codex,
+    "github_copilot": _login_github_copilot,
+}
+
+
+def _run_oauth_login(provider_name: str) -> None:
+    from medpilot.providers.registry import find_by_name
+
+    spec = find_by_name(provider_name)
+    if not spec or not spec.is_oauth:
+        raise typer.Exit(1)
+    handler = _LOGIN_HANDLERS.get(spec.name)
+    if not handler:
+        console.print(f"[red]OAuth login not implemented for {spec.label}[/red]")
+        raise typer.Exit(1)
+    console.print(f"\n{__logo__} OAuth Login - {spec.label}\n")
+    handler()
 
 
 if __name__ == "__main__":

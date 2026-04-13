@@ -674,6 +674,18 @@ def _get_provider_names() -> dict[str, str]:
     return {name: data[0] for name, data in info.items() if name}
 
 
+def _provider_usage_hint(provider_name: str) -> str:
+    """Return a short provider usage hint shown after provider selection."""
+    provider_slug = provider_name.replace("_", "-")
+    return (
+        f"Selected provider: [bold]{provider_name}[/bold]\n"
+        "How to use it:\n"
+        "1. Set `agents.defaults.model` to a model from this provider.\n"
+        f"2. Verify with `medpilot status`.\n"
+        f"3. Check provider docs: https://docs.litellm.ai/docs/providers/{provider_slug}"
+    )
+
+
 def _configure_provider(config: Config, provider_name: str) -> None:
     """Configure a single LLM provider."""
     provider_config = getattr(config.providers, provider_name, None)
@@ -685,15 +697,36 @@ def _configure_provider(config: Config, provider_name: str) -> None:
     info = _get_provider_info()
     default_api_base = info.get(provider_name, (None, None, None, None))[3]
 
+    # Keep agent provider aligned with the selected provider in onboarding.
+    config.agents.defaults.provider = provider_name
+
+    # Pre-fill base URL from provider defaults when available.
     if default_api_base and not provider_config.api_base:
         provider_config.api_base = default_api_base
 
-    updated_provider = _configure_pydantic_model(
-        provider_config,
-        display_name,
-    )
-    if updated_provider is not None:
-        setattr(config.providers, provider_name, updated_provider)
+    console.print(Panel(_provider_usage_hint(provider_name), title=f"[bold]{display_name}[/bold]"))
+
+    # Ask API key last, as the main credential input step.
+    has_existing_key = bool(provider_config.api_key)
+    should_set_key = True
+    if has_existing_key:
+        key_action = _get_questionary().select(
+            "API Key",
+            choices=["Update API key", "Keep existing API key", "Clear API key"],
+            default="Keep existing API key",
+        ).ask()
+        if key_action == "Keep existing API key" or key_action is None:
+            should_set_key = False
+        elif key_action == "Clear API key":
+            provider_config.api_key = ""
+            should_set_key = False
+
+    if should_set_key:
+        api_key = _get_questionary().password("API Key:").ask()
+        if api_key is not None:
+            provider_config.api_key = api_key.strip()
+
+    setattr(config.providers, provider_name, provider_config)
 
 
 def _configure_providers(config: Config) -> None:

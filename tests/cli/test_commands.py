@@ -58,7 +58,7 @@ def test_onboard_fresh_install(mock_paths):
     """No existing config — should create from scratch."""
     config_file, workspace_dir, mock_ws = mock_paths
 
-    result = runner.invoke(app, ["onboard"])
+    result = runner.invoke(app, ["onboard"], input="n\n")
 
     assert result.exit_code == 0
     assert "Created config" in result.stdout
@@ -158,6 +158,7 @@ def test_onboard_uses_explicit_config_and_workspace_paths(tmp_path, monkeypatch)
     result = runner.invoke(
         app,
         ["onboard", "--config", str(config_path), "--workspace", str(workspace_path)],
+        input="n\n",
     )
 
     assert result.exit_code == 0

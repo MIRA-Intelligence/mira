@@ -18,6 +18,7 @@ from medpilot.cli import onboard as onboard_wizard
 from medpilot.cli.commands import _merge_missing_defaults
 from medpilot.cli.onboard import (
     _BACK_PRESSED,
+    _configure_provider,
     _configure_pydantic_model,
     _format_value,
     _get_field_display_name,
@@ -379,6 +380,70 @@ class TestProviderChannelInfo:
         for provider_name, value in info.items():
             assert isinstance(value, tuple)
             assert len(value) == 4  # (display_name, needs_api_key, needs_api_base, env_var)
+
+
+class TestConfigureProviderFlow:
+    def test_configure_provider_prefills_base_and_sets_api_key_last(self, monkeypatch):
+        config = Config()
+        config.providers.openrouter.api_base = ""
+        config.providers.openrouter.api_key = ""
+
+        select_answers = iter(["Update API key"])
+        password_answers = iter(["sk-or-test-key"])
+
+        class _Prompt:
+            def __init__(self, value):
+                self._value = value
+
+            def ask(self):
+                return self._value
+
+        class _FakeQuestionary:
+            @staticmethod
+            def select(*_args, **_kwargs):
+                return _Prompt(next(select_answers))
+
+            @staticmethod
+            def password(*_args, **_kwargs):
+                return _Prompt(next(password_answers))
+
+        monkeypatch.setattr(onboard_wizard, "questionary", _FakeQuestionary())
+
+        _configure_provider(config, "openrouter")
+
+        assert config.agents.defaults.provider == "openrouter"
+        assert config.providers.openrouter.api_base == "https://openrouter.ai/api/v1"
+        assert config.providers.openrouter.api_key == "sk-or-test-key"
+
+    def test_configure_provider_keeps_registry_name_when_existing_key_kept(self, monkeypatch):
+        config = Config()
+        config.providers.openai.api_key = "existing-key"
+
+        select_answers = iter(["Keep existing API key"])
+        password_answers = iter([])
+
+        class _Prompt:
+            def __init__(self, value):
+                self._value = value
+
+            def ask(self):
+                return self._value
+
+        class _FakeQuestionary:
+            @staticmethod
+            def select(*_args, **_kwargs):
+                return _Prompt(next(select_answers))
+
+            @staticmethod
+            def password(*_args, **_kwargs):
+                return _Prompt(next(password_answers))
+
+        monkeypatch.setattr(onboard_wizard, "questionary", _FakeQuestionary())
+
+        _configure_provider(config, "openai")
+
+        assert config.agents.defaults.provider == "openai"
+        assert config.providers.openai.api_key == "existing-key"
 
 
 class _SimpleDraftModel(BaseModel):

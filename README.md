@@ -88,8 +88,7 @@ MedPilot provides a comprehensive CLI for managing your sessions and configurati
 - **`medpilot status`**
   Check the current status of your MedPilot configuration, agent defaults, and workspace environment.
 
-- **`medpilot provider-login <provider>`**
-  Authenticate interactively via OAuth for supported models and providers (e.g., `openai-codex`, `github-copilot`).
+- OAuth providers (e.g., `openai-codex`, `github-copilot`) are now configured directly inside `medpilot onboard`.
 
 - **`medpilot gateway`**
   Launch the background gateway service. This enables external API endpoints and multi-channel traffic. 
