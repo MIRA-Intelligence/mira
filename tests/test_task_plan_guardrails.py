@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from medpilot.task_plan.guardrails import guard_task_plan_file
+from medpilot.task_plan.guardrails import get_task_plan_contract, guard_task_plan_file
 
 
 def test_guard_task_plan_auto_fixes_ids_and_recovers_metrics(tmp_path: Path) -> None:
@@ -213,3 +213,25 @@ def test_guard_task_plan_default_profile_contract_v2_requires_core_fields(
     assert result["ok"] is False
     assert result["blocking"] is True
     assert any("default profile missing required fields" in issue for issue in result["issues"])
+
+
+def test_get_task_plan_contract_for_research_profile() -> None:
+    contract = get_task_plan_contract(profile="research", contract_version=2)
+    assert contract["profile"] == "research"
+    assert contract["contract_version"] == 2
+    assert "theoretical_proof" in contract["required_completed_fields"]
+    assert "evidence_refs" in contract["required_falsify_fields"]
+    assert "falsif" in contract["falsify_keywords"]
+
+
+def test_get_task_plan_contract_default_profile_uses_contract_version() -> None:
+    v1 = get_task_plan_contract(profile="default", contract_version=1)
+    v2 = get_task_plan_contract(profile="default", contract_version=2)
+    assert v1["required_completed_fields"] == []
+    assert v2["required_completed_fields"] == [
+        "question",
+        "hypothesis",
+        "method",
+        "results",
+        "conclusion",
+    ]

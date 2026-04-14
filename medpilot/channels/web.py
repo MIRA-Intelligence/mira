@@ -22,7 +22,11 @@ from medpilot.bus.queue import MessageBus
 from medpilot.channels.base import BaseChannel
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
-from medpilot.task_plan.guardrails import guard_task_plan_file, reconcile_task_plan_data
+from medpilot.task_plan.guardrails import (
+    get_task_plan_contract,
+    guard_task_plan_file,
+    reconcile_task_plan_data,
+)
 
 PLAN_FILENAME = "task_plan.json"
 PROJECT_DIR_PREFIX = "PRJ"
@@ -189,6 +193,10 @@ def _snapshot_from_experiment(exp: dict[str, Any], *, source: str) -> dict[str, 
         "conclusion",
         "next",
         "commit",
+        "theoretical_proof",
+        "isolation_test",
+        "post_mortem",
+        "evidence_refs",
     ):
         if key in exp:
             payload[key] = exp.get(key)
@@ -502,6 +510,7 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/api/sessions", self._handle_sessions)
         self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
         self._app.router.add_get("/api/plan", self._handle_plan)
+        self._app.router.add_get("/api/plan/contract", self._handle_plan_contract)
         self._app.router.add_get("/api/plan/lint", self._handle_plan_lint)
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
@@ -1262,6 +1271,23 @@ class WebChannel(BaseChannel):
         if data is None:
             return web.json_response(None)
         return web.json_response(data)
+
+    async def _handle_plan_contract(self, request: web.Request) -> web.Response:
+        """Serve resolved task-plan contract requirements for one project."""
+        session_id = (request.query.get("session_id") or "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        project_dir = self.projects_root / session_id
+        if not project_dir.is_dir():
+            return web.json_response({"error": "project not found"}, status=404)
+
+        meta = self._ensure_project_meta(project_dir)
+        profile = _normalize_agent_profile(meta.get("agent_profile"))
+        contract_version = _normalize_contract_version(meta.get("contract_version"))
+        contract = get_task_plan_contract(
+            profile=profile, contract_version=contract_version
+        )
+        return web.json_response(contract)
 
     async def _handle_plan_lint(self, request: web.Request) -> web.Response:
         """Validate and optionally auto-fix a project's task plan."""

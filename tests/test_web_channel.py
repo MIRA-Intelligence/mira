@@ -227,6 +227,34 @@ async def test_handle_plan_missing_file(web_channel: WebChannel) -> None:
     assert json.loads(resp.text) is None
 
 
+async def test_handle_plan_contract_requires_session_id(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.query = {}
+    resp = await web_channel._handle_plan_contract(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "session_id required"}
+
+
+async def test_handle_plan_contract_returns_profile_rules(web_channel: WebChannel) -> None:
+    session = "PRJ-9015"
+    project_dir = web_channel.projects_root / session
+    (project_dir / ".medpilot").mkdir(parents=True)
+    (project_dir / ".medpilot" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 2}),
+        encoding="utf-8",
+    )
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    resp = await web_channel._handle_plan_contract(req)
+    body = json.loads(resp.text)
+
+    assert resp.status == 200
+    assert body["profile"] == "research"
+    assert body["contract_version"] == 2
+    assert "theoretical_proof" in body["required_completed_fields"]
+    assert "evidence_refs" in body["required_falsify_fields"]
+
+
 async def test_handle_plan_returns_json(web_channel: WebChannel) -> None:
     session = "sess-a"
     plan_dir = web_channel.projects_root / session

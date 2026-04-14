@@ -65,6 +65,67 @@ _FALSIFY_KEYWORDS = (
 )
 
 
+def _normalize_profile(profile: object) -> str:
+    if isinstance(profile, str):
+        normalized = profile.strip().lower()
+        if normalized in {"research", "engineer", "default"}:
+            return normalized
+    return "default"
+
+
+def _normalize_contract_version(contract_version: object) -> int:
+    if isinstance(contract_version, int) and contract_version in {
+        DEFAULT_CONTRACT_VERSION,
+        STRICT_CONTRACT_VERSION,
+    }:
+        return contract_version
+    return DEFAULT_CONTRACT_VERSION
+
+
+def _required_completed_fields_for_profile(
+    profile: str, contract_version: int
+) -> tuple[str, ...]:
+    if profile == "research":
+        return _RESEARCH_REQUIRED_COMPLETED_FIELDS
+    if profile == "engineer":
+        return _ENGINEER_REQUIRED_COMPLETED_FIELDS
+    if profile == "default":
+        if contract_version >= STRICT_CONTRACT_VERSION:
+            return _DEFAULT_STRICT_REQUIRED_COMPLETED_FIELDS
+        return _DEFAULT_REQUIRED_COMPLETED_FIELDS
+    return ()
+
+
+def _required_falsify_fields_for_profile(profile: str) -> tuple[str, ...]:
+    if profile == "research":
+        return _RESEARCH_REQUIRED_FALSIFY_FIELDS
+    if profile == "engineer":
+        return _ENGINEER_REQUIRED_FALSIFY_FIELDS
+    if profile == "default":
+        return _DEFAULT_REQUIRED_FALSIFY_FIELDS
+    return ()
+
+
+def get_task_plan_contract(
+    *, profile: object = "default", contract_version: object = DEFAULT_CONTRACT_VERSION
+) -> dict[str, Any]:
+    normalized_profile = _normalize_profile(profile)
+    normalized_contract_version = _normalize_contract_version(contract_version)
+    return {
+        "profile": normalized_profile,
+        "contract_version": normalized_contract_version,
+        "required_completed_fields": list(
+            _required_completed_fields_for_profile(
+                normalized_profile, normalized_contract_version
+            )
+        ),
+        "required_falsify_fields": list(
+            _required_falsify_fields_for_profile(normalized_profile)
+        ),
+        "falsify_keywords": list(_FALSIFY_KEYWORDS),
+    }
+
+
 def _is_mapping(value: object) -> bool:
     return isinstance(value, dict)
 
@@ -221,25 +282,10 @@ def _validate_evidence_refs(
 def _validate_profile_required_fields(
     exp_id: str, exp: dict[str, Any], *, profile: str, contract_version: int
 ) -> list[str]:
-    if profile == "research":
-        missing = _missing_required_fields(exp, _RESEARCH_REQUIRED_COMPLETED_FIELDS)
-        if missing:
-            return [f"{exp_id}: research profile missing required fields: {', '.join(missing)}"]
-        return []
-    if profile == "engineer":
-        missing = _missing_required_fields(exp, _ENGINEER_REQUIRED_COMPLETED_FIELDS)
-        if missing:
-            return [f"{exp_id}: engineer profile missing required fields: {', '.join(missing)}"]
-        return []
-    if profile == "default":
-        required = (
-            _DEFAULT_STRICT_REQUIRED_COMPLETED_FIELDS
-            if contract_version >= STRICT_CONTRACT_VERSION
-            else _DEFAULT_REQUIRED_COMPLETED_FIELDS
-        )
-        missing = _missing_required_fields(exp, required)
-        if missing:
-            return [f"{exp_id}: default profile missing required fields: {', '.join(missing)}"]
+    required = _required_completed_fields_for_profile(profile, contract_version)
+    missing = _missing_required_fields(exp, required)
+    if missing:
+        return [f"{exp_id}: {profile} profile missing required fields: {', '.join(missing)}"]
     return []
 
 
@@ -248,20 +294,10 @@ def _validate_profile_falsify_fields(
 ) -> list[str]:
     if not _looks_like_hypothesis_rejection(exp.get("conclusion")):
         return []
-    if profile == "research":
-        missing = _missing_required_fields(exp, _RESEARCH_REQUIRED_FALSIFY_FIELDS)
-        if missing:
-            return [f"{exp_id}: hypothesis rejection requires fields: {', '.join(missing)}"]
-        return []
-    if profile == "engineer":
-        missing = _missing_required_fields(exp, _ENGINEER_REQUIRED_FALSIFY_FIELDS)
-        if missing:
-            return [f"{exp_id}: hypothesis rejection requires fields: {', '.join(missing)}"]
-        return []
-    if profile == "default":
-        missing = _missing_required_fields(exp, _DEFAULT_REQUIRED_FALSIFY_FIELDS)
-        if missing:
-            return [f"{exp_id}: hypothesis rejection requires fields: {', '.join(missing)}"]
+    required = _required_falsify_fields_for_profile(profile)
+    missing = _missing_required_fields(exp, required)
+    if missing:
+        return [f"{exp_id}: hypothesis rejection requires fields: {', '.join(missing)}"]
     return []
 
 
@@ -337,14 +373,13 @@ def lint_task_plan_data(
     issues: list[str] = []
     if not _is_mapping(data):
         return ["task_plan root must be a JSON object"]
-    effective_profile = profile or _load_project_profile(project_dir)
-    if isinstance(contract_version, int) and contract_version in {
-        DEFAULT_CONTRACT_VERSION,
-        STRICT_CONTRACT_VERSION,
-    }:
-        effective_contract_version = contract_version
+    effective_profile = _normalize_profile(profile or _load_project_profile(project_dir))
+    if contract_version is not None:
+        effective_contract_version = _normalize_contract_version(contract_version)
     else:
-        effective_contract_version = _load_project_contract_version(project_dir)
+        effective_contract_version = _normalize_contract_version(
+            _load_project_contract_version(project_dir)
+        )
 
     experiments = data.get("experiments")
     if not isinstance(experiments, list):
