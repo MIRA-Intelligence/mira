@@ -9,7 +9,6 @@ import re
 from typing import Any
 from urllib.parse import quote, urlparse
 
-import ddgs
 import httpx
 
 from medpilot.agent.tools.base import Tool
@@ -185,7 +184,13 @@ class WebSearchTool(Tool):
 
     async def _search_duckduckgo(self, query: str, count: int) -> str:
         def _run() -> list[dict[str, Any]]:
-            client = ddgs.DDGS()
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                raise RuntimeError(
+                    "DuckDuckGo search requires 'ddgs'. Install dependencies and retry."
+                ) from None
+            client = DDGS()
             return list(client.text(query, max_results=count))
 
         try:

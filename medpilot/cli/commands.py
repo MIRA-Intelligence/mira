@@ -201,6 +201,17 @@ def _model_matches_provider(model: str, provider_name: str) -> bool:
         return True
     return any(kw in model_lower for kw in spec.keywords)
 
+
+def _coerce_model_for_provider(model: str, provider_name: str) -> str:
+    """Coerce obviously mismatched models to a safe provider-specific default."""
+    value = model.strip()
+    if _model_matches_provider(value, provider_name):
+        return value
+    examples = _provider_model_examples(provider_name)
+    if not examples:
+        return value
+    return examples[0]
+
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
@@ -566,7 +577,12 @@ def onboard(
                             default=False,
                         ):
                             continue
-                    cfg.agents.defaults.model = normalized_model
+                    cfg.agents.defaults.model = _coerce_model_for_provider(normalized_model, selected.name)
+                    if cfg.agents.defaults.model != normalized_model:
+                        console.print(
+                            f"[yellow]! Model '{normalized_model}' does not match provider '{selected.name}', "
+                            f"using '{cfg.agents.defaults.model}' instead.[/yellow]"
+                        )
                     break
 
                 save_config(cfg, config_path)
@@ -1357,6 +1373,15 @@ def status():
 
 
 def _login_openai_codex() -> None:
+    # Keep OAuth state under writable medpilot home in containers.
+    writable_home = Path("/home/medpilot/.medpilot")
+    writable_home.mkdir(parents=True, exist_ok=True)
+    (writable_home / ".config" / "litellm").mkdir(parents=True, exist_ok=True)
+    (writable_home / ".local" / "share").mkdir(parents=True, exist_ok=True)
+    (writable_home / ".cache").mkdir(parents=True, exist_ok=True)
+    os.environ["XDG_CONFIG_HOME"] = str(writable_home / ".config")
+    os.environ["XDG_DATA_HOME"] = str(writable_home / ".local" / "share")
+    os.environ["XDG_CACHE_HOME"] = str(writable_home / ".cache")
     try:
         from oauth_cli_kit import get_token, login_oauth_interactive
         token = None
@@ -1380,16 +1405,21 @@ def _login_openai_codex() -> None:
 
 
 def _login_github_copilot() -> None:
-    import asyncio
+    # Keep OAuth state under writable medpilot home in containers.
+    writable_home = Path("/home/medpilot/.medpilot")
+    writable_home.mkdir(parents=True, exist_ok=True)
+    (writable_home / ".config").mkdir(parents=True, exist_ok=True)
+    (writable_home / ".local" / "share").mkdir(parents=True, exist_ok=True)
+    (writable_home / ".cache").mkdir(parents=True, exist_ok=True)
+    os.environ["XDG_CONFIG_HOME"] = str(writable_home / ".config")
+    os.environ["XDG_DATA_HOME"] = str(writable_home / ".local" / "share")
+    os.environ["XDG_CACHE_HOME"] = str(writable_home / ".cache")
 
     console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
-
-    async def _trigger():
-        from litellm import acompletion
-        await acompletion(model="github_copilot/gpt-4o", messages=[{"role": "user", "content": "hi"}], max_tokens=1)
-
     try:
-        asyncio.run(_trigger())
+        from medpilot.providers.github_copilot_provider import login_github_copilot
+
+        login_github_copilot(print_fn=lambda s: console.print(s))
         console.print("[green]✓ Authenticated with GitHub Copilot[/green]")
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")

@@ -1,4 +1,5 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+ARG BUILD_BRIDGE=1
 
 # Install Node.js 20 for the WhatsApp bridge
 RUN apt-get update && \
@@ -29,7 +30,14 @@ RUN uv pip install --system --no-cache .
 WORKDIR /app/bridge
 RUN git config --global --add url."https://github.com/".insteadOf ssh://git@github.com/ && \
     git config --global --add url."https://github.com/".insteadOf git@github.com: && \
-    npm install && npm run build
+    git config --global --add url."https://github.com/".insteadOf git+ssh://git@github.com/ && \
+    git config --global --add url."https://github.com/".insteadOf ssh://github.com/ && \
+    git config --global --add url."https://github.com/".insteadOf git://github.com/ && \
+    if [ "$BUILD_BRIDGE" = "1" ]; then \
+      npm install && npm run build; \
+    else \
+      echo "Skipping bridge build (BUILD_BRIDGE=$BUILD_BRIDGE)"; \
+    fi
 WORKDIR /app
 
 # Create non-root user and config directory

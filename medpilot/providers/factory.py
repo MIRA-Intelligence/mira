@@ -20,6 +20,11 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
         raise ValueError("No model configured. Set agents.defaults.model in config.json.")
     provider_name = config.get_provider_name(resolved_model)
     provider_config = config.get_provider(resolved_model)
+    if not provider_name:
+        raise ValueError(
+            f"Unable to match provider for model '{resolved_model}'. "
+            "Set agents.defaults.provider explicitly in config.json."
+        )
 
     if provider_name == "openai_codex" or resolved_model.startswith("openai-codex/"):
         return OpenAICodexProvider(default_model=resolved_model)

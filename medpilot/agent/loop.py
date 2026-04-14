@@ -823,9 +823,12 @@ class AgentLoop:
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                err_text = "Sorry, I encountered an error."
+                if msg.channel == "cli":
+                    err_text += " Run `medpilot agent --logs` to view details."
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
+                    content=err_text,
                 ))
             return
         async with self._processing_lock:
@@ -843,9 +846,12 @@ class AgentLoop:
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                err_text = "Sorry, I encountered an error."
+                if msg.channel == "cli":
+                    err_text += " Run `medpilot agent --logs` to view details."
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
+                    content=err_text,
                 ))
 
     async def close_mcp(self) -> None:

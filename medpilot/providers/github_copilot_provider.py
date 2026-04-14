@@ -182,7 +182,7 @@ class GitHubCopilotProvider(OpenAICompatProvider):
 
         github_token = _load_github_token()
         if not github_token or not github_token.access:
-            raise RuntimeError("GitHub Copilot is not logged in. Run: medpilot provider login github-copilot")
+            raise RuntimeError("GitHub Copilot is not logged in. Run: medpilot onboard and choose Github Copilot.")
 
         timeout = httpx.Timeout(20.0, connect=20.0)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=True) as client:

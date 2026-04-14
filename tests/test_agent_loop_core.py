@@ -272,6 +272,13 @@ async def test_dispatch_and_control_handlers(tmp_path: Path) -> None:
     err = await loop.bus.consume_outbound()
     assert err.content == "Sorry, I encountered an error."
 
+    cli_err_msg = InboundMessage(channel="cli", sender_id="u", chat_id="c", content="x")
+    loop._process_message = _boom
+    await loop._dispatch(cli_err_msg)
+    cli_err = await loop.bus.consume_outbound()
+    assert "Sorry, I encountered an error." in cli_err.content
+    assert "medpilot agent --logs" in cli_err.content
+
 
 def test_save_turn_and_project_session_cache(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)

@@ -49,6 +49,17 @@ services:
 
   medpilot-cli:
     <<: *common-config
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        BUILD_BRIDGE: "0"
+    user: "479001138:479001138"
+    environment:
+      - MEDPILOT_CONFIG_PATH=/home/medpilot/.medpilot/config.json
+      - XDG_CONFIG_HOME=/home/medpilot/.medpilot/.config
+      - XDG_DATA_HOME=/home/medpilot/.medpilot/.local/share
+      - XDG_CACHE_HOME=/home/medpilot/.medpilot/.cache
     profiles:
       - cli
     command: ["status"]
