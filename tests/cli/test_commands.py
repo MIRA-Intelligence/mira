@@ -197,6 +197,32 @@ def test_onboard_wizard_preserves_explicit_config_in_next_steps(tmp_path, monkey
     assert f"medpilot gateway --config {resolved_config}" in compact_output
 
 
+def test_coerce_model_for_provider_prepends_prefix():
+    from medpilot.cli.commands import _coerce_model_for_provider
+
+    # OpenRouter has prefix 'openrouter'
+    assert _coerce_model_for_provider("claude-3-opus", "openrouter") == "openrouter/claude-3-opus"
+
+
+def test_coerce_model_for_provider_skips_prefix_if_present():
+    from medpilot.cli.commands import _coerce_model_for_provider
+
+    assert _coerce_model_for_provider("openrouter/anthropic/claude-3-opus", "openrouter") == "openrouter/anthropic/claude-3-opus"
+
+
+def test_coerce_model_for_provider_skips_prefix_if_auto():
+    from medpilot.cli.commands import _coerce_model_for_provider
+
+    assert _coerce_model_for_provider("gpt-4o", "auto") == "gpt-4o"
+
+
+def test_coerce_model_for_provider_skips_prefix_if_no_litellm_prefix():
+    from medpilot.cli.commands import _coerce_model_for_provider
+
+    # OpenAI provider has litellm_prefix=""
+    assert _coerce_model_for_provider("gpt-4o", "openai") == "gpt-4o"
+
+
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():
     config = Config()
     config.agents.defaults.model = "github-copilot/gpt-5.3-codex"

@@ -496,9 +496,18 @@ def _handle_model_field(
     """Handle the 'model' field with autocomplete and context-window auto-fill."""
     provider = _get_current_provider(working_model)
     new_value = _input_model_with_autocomplete(field_display, current_value, provider)
-    if new_value is not None and new_value != current_value:
-        setattr(working_model, field_name, new_value)
-        _try_auto_fill_context_window(working_model, new_value)
+    if new_value is not None:
+        # Prepend provider prefix if missing
+        if "/" not in new_value and provider != "auto":
+            from medpilot.providers.registry import find_by_name
+
+            spec = find_by_name(provider)
+            if spec and spec.litellm_prefix:
+                new_value = f"{spec.litellm_prefix}/{new_value}"
+
+        if new_value != current_value:
+            setattr(working_model, field_name, new_value)
+            _try_auto_fill_context_window(working_model, new_value)
 
 
 def _handle_context_window_field(
@@ -514,6 +523,9 @@ def _handle_context_window_field(
 
 _FIELD_HANDLERS: dict[str, Any] = {
     "model": _handle_model_field,
+    "small_model": _handle_model_field,
+    "medium_model": _handle_model_field,
+    "large_model": _handle_model_field,
     "context_window_tokens": _handle_context_window_field,
 }
 

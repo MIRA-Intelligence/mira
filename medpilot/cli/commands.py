@@ -205,6 +205,15 @@ def _model_matches_provider(model: str, provider_name: str) -> bool:
 def _coerce_model_for_provider(model: str, provider_name: str) -> str:
     """Coerce obviously mismatched models to a safe provider-specific default."""
     value = model.strip()
+
+    # Prepend provider prefix if missing
+    if "/" not in value and provider_name != "auto":
+        from medpilot.providers.registry import find_by_name
+
+        spec = find_by_name(provider_name)
+        if spec and spec.litellm_prefix:
+            value = f"{spec.litellm_prefix}/{value}"
+
     if _model_matches_provider(value, provider_name):
         return value
     examples = _provider_model_examples(provider_name)

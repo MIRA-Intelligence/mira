@@ -558,3 +558,61 @@ class TestRunOnboardExitBehavior:
 
         assert result.should_save is False
         assert result.config.model_dump(by_alias=True) == initial_config.model_dump(by_alias=True)
+
+class TestHandleModelField:
+    def test_handle_model_field_prepends_prefix(self, monkeypatch):
+        from medpilot.cli.onboard import _handle_model_field
+        from medpilot.config.schema import AgentDefaults
+
+        working_model = AgentDefaults(provider="openrouter")
+
+        monkeypatch.setattr(
+            "medpilot.cli.onboard._input_model_with_autocomplete",
+            lambda display, current, provider: "claude-3-opus"
+        )
+        monkeypatch.setattr(
+            "medpilot.cli.onboard._try_auto_fill_context_window",
+            lambda *args: None
+        )
+
+        _handle_model_field(working_model, "model", "Model", None)
+
+        assert working_model.model == "openrouter/claude-3-opus"
+
+    def test_handle_model_field_skips_prefix_if_present(self, monkeypatch):
+        from medpilot.cli.onboard import _handle_model_field
+        from medpilot.config.schema import AgentDefaults
+
+        working_model = AgentDefaults(provider="openrouter")
+
+        monkeypatch.setattr(
+            "medpilot.cli.onboard._input_model_with_autocomplete",
+            lambda display, current, provider: "anthropic/claude-3-opus"
+        )
+        monkeypatch.setattr(
+            "medpilot.cli.onboard._try_auto_fill_context_window",
+            lambda *args: None
+        )
+
+        _handle_model_field(working_model, "model", "Model", None)
+
+        assert working_model.model == "anthropic/claude-3-opus"
+
+    def test_handle_model_field_skips_prefix_if_no_litellm_prefix(self, monkeypatch):
+        from medpilot.cli.onboard import _handle_model_field
+        from medpilot.config.schema import AgentDefaults
+
+        working_model = AgentDefaults(provider="openai")
+
+        monkeypatch.setattr(
+            "medpilot.cli.onboard._input_model_with_autocomplete",
+            lambda display, current, provider: "gpt-4o"
+        )
+        monkeypatch.setattr(
+            "medpilot.cli.onboard._try_auto_fill_context_window",
+            lambda *args: None
+        )
+
+        _handle_model_field(working_model, "model", "Model", None)
+
+        assert working_model.model == "gpt-4o"

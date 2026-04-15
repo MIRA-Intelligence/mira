@@ -314,6 +314,19 @@ class AgentDefaults(Base):
                     break
             if found:
                 candidates = normalize_model_candidates(value)
+
+                # Prepend provider prefix if missing and provider is specified
+                provider = payload.get("provider", "auto")
+                if provider != "auto":
+                    from medpilot.providers.registry import find_by_name
+
+                    spec = find_by_name(provider)
+                    if spec and spec.litellm_prefix:
+                        prefix = f"{spec.litellm_prefix}/"
+                        candidates = [
+                            f"{prefix}{c}" if "/" not in c else c for c in candidates
+                        ]
+
                 payload[f"{key}_candidates"] = candidates
                 primary = candidates[0] if candidates else None
                 payload[key] = primary
