@@ -176,10 +176,48 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        self.tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
-        self.tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        skill_access_dirs: list[Path] = []
+        if self.restrict_to_workspace:
+            from medpilot.agent.skills import SkillsLoader
+
+            def _add_skill_dir(path: Path) -> None:
+                try:
+                    resolved = path.resolve()
+                except Exception:
+                    return
+                if resolved != self.workspace and resolved not in skill_access_dirs:
+                    skill_access_dirs.append(resolved)
+
+            skills_loader = SkillsLoader(self.workspace)
+            for root in skills_loader.workspace_skills_roots:
+                _add_skill_dir(root)
+            if skills_loader.builtin_skills:
+                _add_skill_dir(skills_loader.builtin_skills)
+            for skill in skills_loader.list_skills(filter_unavailable=False):
+                skill_path = Path(skill["path"])
+                _add_skill_dir(skill_path.parent)
+                parent = skill_path.parent.parent
+                if parent != skill_path.parent:
+                    _add_skill_dir(parent)
+
+        self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs))
+        self.tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs))
+        self.tools.register(
+            GrepTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                extra_allowed_dirs=skill_access_dirs,
+            )
+        )
+        self.tools.register(
+            GlobTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                extra_allowed_dirs=skill_access_dirs,
+            )
+        )
         if self.exec_config.enable:
             self.tools.register(ExecTool(
                 working_dir=str(self.workspace),
@@ -877,6 +915,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -915,6 +954,11 @@ class AgentLoop:
 
         session = sessions_mgr.get_or_create(key)
         memory_workspace = Path(project_dir) if project_dir else self.workspace
+        recent_skill_names = []
+        if isinstance(session.metadata, dict):
+            raw_recent = session.metadata.get("_recent_skills")
+            if isinstance(raw_recent, list):
+                recent_skill_names = [str(s) for s in raw_recent if isinstance(s, str)]
 
         # Slash commands
         cmd = msg.content.strip().lower()
@@ -993,9 +1037,39 @@ class AgentLoop:
         extra_system = meta.get("_ui_system_instructions")
 
         ctx = ContextBuilder(memory_workspace) if project_dir else self.context
+        suggested_skills = ctx.skills.suggest_skills(
+            msg.content,
+            recent=recent_skill_names,
+            limit=3,
+        )
+        active_skills: list[str] = []
+        for name in [*recent_skill_names, *suggested_skills]:
+            if name not in active_skills:
+                active_skills.append(name)
+        active_skills = active_skills[-4:]
+        skill_hint = ""
+        if suggested_skills:
+            skill_hint = (
+                "Skill routing hint: this request likely matches one or more skills. "
+                "Before answering, use read_file to inspect these SKILL.md files if relevant:\n"
+                + "\n".join(f"- {name}" for name in suggested_skills)
+            )
+            if on_progress:
+                try:
+                    await on_progress(
+                        f"skill router -> {', '.join(suggested_skills)}",
+                        tool_hint=True,
+                    )
+                except TypeError:
+                    await on_progress(f"skill router -> {', '.join(suggested_skills)}")
+        if extra_system:
+            extra_system = skill_hint + "\n\n" + extra_system if skill_hint else extra_system
+        else:
+            extra_system = skill_hint or None
         initial_messages = ctx.build_messages(
             history=history,
             current_message=msg.content,
+            skill_names=active_skills or None,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
@@ -1013,9 +1087,18 @@ class AgentLoop:
             ))
 
         progress_cb = on_progress or _bus_progress
+        current_turn_skills: set[str] = set()
         audit_cb = None
-        if msg.channel == "web":
-            async def _web_audit(details: dict[str, Any]) -> None:
+        emit_audit_to_channel = msg.channel == "web" or bool(meta.get("_emit_skill_audit"))
+        if emit_audit_to_channel or audit_hook:
+            async def _audit(details: dict[str, Any]) -> None:
+                skill_name = details.get("skill_name")
+                if isinstance(skill_name, str) and skill_name.strip():
+                    current_turn_skills.add(skill_name.strip())
+                if audit_hook:
+                    await audit_hook(details)
+                if not emit_audit_to_channel:
+                    return
                 metadata = dict(msg.metadata or {})
                 metadata["_audit_only"] = True
                 metadata["_audit_event"] = "skill_invoked"
@@ -1027,7 +1110,7 @@ class AgentLoop:
                     metadata=metadata,
                 ))
 
-            audit_cb = _web_audit
+            audit_cb = _audit
         run_kwargs: dict[str, Any] = {
             "model_runtime": model_runtime,
             "on_progress": progress_cb,
@@ -1068,6 +1151,18 @@ class AgentLoop:
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
+
+        if isinstance(session.metadata, dict):
+            prior = session.metadata.get("_recent_skills")
+            merged: list[str] = []
+            if isinstance(prior, list):
+                for item in prior:
+                    if isinstance(item, str) and item not in merged:
+                        merged.append(item)
+            for item in sorted(current_turn_skills):
+                if item not in merged:
+                    merged.append(item)
+            session.metadata["_recent_skills"] = merged[-10:]
 
         self._save_turn(session, all_msgs, 1 + len(history))
         sessions_mgr.save(session)
@@ -1194,11 +1289,17 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> OutboundMessage | str | None:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(
+            msg,
+            session_key=session_key,
+            on_progress=on_progress,
+            audit_hook=audit_hook,
+        )
         if response is None:
             return ""
         if isinstance(response, OutboundMessage) and isinstance(content, str) and content.strip().startswith("/"):

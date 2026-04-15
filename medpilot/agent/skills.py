@@ -100,12 +100,14 @@ class SkillsLoader:
         for root in self.workspace_skills_roots:
             if not root.exists():
                 continue
-            for skill_dir in root.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and skill_dir.name not in seen_names:
-                        seen_names.add(skill_dir.name)
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
+            for skill_file in root.rglob("SKILL.md"):
+                if not skill_file.is_file():
+                    continue
+                skill_name = skill_file.parent.name
+                if skill_name in seen_names:
+                    continue
+                seen_names.add(skill_name)
+                skills.append({"name": skill_name, "path": str(skill_file), "source": "workspace"})
 
         # Plugin skills (global install + scope toggles)
         for plugin_skill in self._list_plugin_skills():
@@ -318,3 +320,119 @@ class SkillsLoader:
                 return metadata
 
         return None
+
+    def suggest_skills(
+        self,
+        query: str,
+        *,
+        recent: list[str] | None = None,
+        limit: int = 3,
+    ) -> list[str]:
+        """Suggest likely relevant skills for a user query."""
+        text = (query or "").strip()
+        if not text:
+            return []
+        if limit < 1:
+            limit = 1
+
+        available = self.list_skills(filter_unavailable=True)
+        if not available:
+            return []
+
+        recent_names = [name for name in (recent or []) if isinstance(name, str)]
+        is_follow_up = self._looks_like_follow_up(text)
+        if is_follow_up and recent_names:
+            picked: list[str] = []
+            for name in recent_names:
+                if any(s["name"] == name for s in available) and name not in picked:
+                    picked.append(name)
+                if len(picked) >= limit:
+                    break
+            if picked:
+                return picked
+
+        query_tokens = self._tokenize(text)
+        query_lc = text.lower()
+        scored: list[tuple[int, str]] = []
+
+        for entry in available:
+            name = entry["name"]
+            meta = self.get_skill_metadata(name) or {}
+            desc = str(meta.get("description") or "")
+            path = str(entry.get("path") or "")
+
+            base_text = " ".join((name, desc, path))
+            score = self._score_skill_match(
+                query_lc=query_lc,
+                query_tokens=query_tokens,
+                skill_name=name,
+                skill_text=base_text,
+            )
+            if score > 0:
+                scored.append((score, name))
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        result: list[str] = []
+        for _, name in scored:
+            if name not in result:
+                result.append(name)
+            if len(result) >= limit:
+                break
+        return result
+
+    @staticmethod
+    def _looks_like_follow_up(text: str) -> bool:
+        lowered = text.lower()
+        markers = (
+            "继续", "接着", "刚才", "之前", "上次", "继续之前", "continue", "resume", "previous", "last task",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        lowered = text.lower()
+        latin = re.findall(r"[a-z0-9][a-z0-9._+-]*", lowered)
+        cjk_chunks = re.findall(r"[\u4e00-\u9fff]+", text)
+        tokens: set[str] = set(latin)
+        for chunk in cjk_chunks:
+            tokens.add(chunk)
+            if len(chunk) > 1:
+                tokens.update(chunk)
+        return {t for t in tokens if t}
+
+    @staticmethod
+    def _skill_aliases(skill_name: str) -> tuple[str, ...]:
+        aliases: dict[str, tuple[str, ...]] = {
+            "medical-image-dl-pipeline": (
+                "medical", "imaging", "mri", "ct", "dicom", "nifti", "monai", "artifact", "motion",
+                "ghost", "k-space", "2.5d", "3d", "unet", "radiology", "医学", "影像", "伪影", "呼吸", "运动",
+                "去伪影",
+            ),
+            "dicom2nifti": ("dicom", "nifti", "医学", "影像", "转换"),
+            "monai": ("monai", "medical", "imaging", "医学", "影像"),
+        }
+        return aliases.get(skill_name, ())
+
+    def _score_skill_match(
+        self,
+        *,
+        query_lc: str,
+        query_tokens: set[str],
+        skill_name: str,
+        skill_text: str,
+    ) -> int:
+        score = 0
+        skill_lc = skill_text.lower()
+        name_tokens = self._tokenize(skill_name.replace("-", " "))
+        score += len(name_tokens.intersection(query_tokens)) * 4
+
+        skill_tokens = self._tokenize(skill_text)
+        score += len(skill_tokens.intersection(query_tokens)) * 2
+
+        for alias in self._skill_aliases(skill_name):
+            alias_lc = alias.lower()
+            if alias_lc in query_lc:
+                score += 6
+            if alias_lc in skill_lc:
+                score += 1
+        return score

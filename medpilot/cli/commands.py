@@ -983,6 +983,8 @@ def agent(
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show medpilot runtime logs during chat"),
+    verbose: bool = typer.Option(False, "--verbose/--no-verbose", help="Show verbose runtime hints (including invoked skills)"),
+    debug: bool = typer.Option(False, "--debug/--no-debug", help="Alias of --verbose"),
 ):
     """Interact with the agent directly."""
     from loguru import logger
@@ -1011,7 +1013,12 @@ def agent(
     cron_store_path = _workspace_cron_store(config)
     cron = CronService(cron_store_path)
 
-    if logs:
+    verbose_mode = verbose or debug
+    # In interactive chat, verbose output is more stable than raw runtime logs.
+    # Keep --debug useful (skill/tool visibility) without TTY log interleaving.
+    logs_mode = logs or (debug and message is not None)
+
+    if logs_mode:
         logger.enable("medpilot")
     else:
         logger.disable("medpilot")
@@ -1040,7 +1047,7 @@ def agent(
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
     def _thinking_ctx():
-        if logs:
+        if logs_mode:
             from contextlib import nullcontext
             return nullcontext()
         # Animated spinner is safe to use with prompt_toolkit input handling
@@ -1054,11 +1061,43 @@ def agent(
             return
         console.print(f"  [dim]↳ {content}[/dim]")
 
+    async def _cli_audit(details: dict[str, object]) -> None:
+        if not verbose_mode:
+            return
+        event = str(details.get("tool", "") or "")
+        if event != "read_file":
+            return
+        skill_name = str(details.get("skill_name", "") or "").strip()
+        if not skill_name:
+            return
+        console.print(f"  [cyan]↳ skill:[/cyan] {skill_name}")
+
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
+            invoked_skills: set[str] = set()
+
+            async def _cli_audit_once(details: dict[str, object]) -> None:
+                event = str(details.get("tool", "") or "")
+                if event != "read_file":
+                    return
+                skill_name = str(details.get("skill_name", "") or "").strip()
+                if not skill_name:
+                    return
+                if skill_name not in invoked_skills:
+                    invoked_skills.add(skill_name)
+                    console.print(f"  [cyan]↳ skill:[/cyan] {skill_name}")
+
             with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
+                if verbose_mode:
+                    response = await agent_loop.process_direct(
+                        message,
+                        session_id,
+                        on_progress=_cli_progress,
+                        audit_hook=_cli_audit_once,
+                    )
+                else:
+                    response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
             if hasattr(response, "content"):
                 _print_agent_response(
                     getattr(response, "content", ""),
@@ -1067,6 +1106,9 @@ def agent(
                 )
             else:
                 _print_agent_response(str(response), render_markdown=markdown, metadata={})
+            if verbose_mode:
+                used = ", ".join(sorted(invoked_skills)) if invoked_skills else "none"
+                console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -1096,17 +1138,33 @@ def agent(
         # SIGPIPE is not available on Windows
         if hasattr(signal, 'SIGPIPE'):
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        # Some shells (notably zsh) can suspend the process when background/patch_stdout
+        # interactions touch the TTY. Ignore job-control TTY signals in interactive mode.
+        if hasattr(signal, 'SIGTTOU'):
+            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        if hasattr(signal, 'SIGTTIN'):
+            signal.signal(signal.SIGTTIN, signal.SIG_IGN)
 
         async def run_interactive():
             bus_task = asyncio.create_task(agent_loop.run())
             turn_done = asyncio.Event()
             turn_done.set()
             turn_response: list[str] = []
+            turn_skills: set[str] = set()
 
             async def _consume_outbound():
                 while True:
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+                        if msg.metadata.get("_audit_only"):
+                            if verbose_mode and msg.metadata.get("_audit_event") == "skill_invoked":
+                                details = msg.metadata.get("_audit_details") or {}
+                                if isinstance(details, dict):
+                                    skill_name = str(details.get("skill_name", "") or "").strip()
+                                    if skill_name:
+                                        turn_skills.add(skill_name)
+                                        console.print(f"  [cyan]↳ skill:[/cyan] {skill_name}")
+                            continue
                         if msg.metadata.get("_progress"):
                             is_tool_hint = msg.metadata.get("_tool_hint", False)
                             ch = agent_loop.channels_config
@@ -1146,12 +1204,14 @@ def agent(
 
                         turn_done.clear()
                         turn_response.clear()
+                        turn_skills.clear()
 
                         await bus.publish_inbound(InboundMessage(
                             channel=cli_channel,
                             sender_id="user",
                             chat_id=cli_chat_id,
                             content=user_input,
+                            metadata={"_emit_skill_audit": True} if verbose_mode else {},
                         ))
 
                         with _thinking_ctx():
@@ -1159,6 +1219,9 @@ def agent(
 
                         if turn_response:
                             _print_agent_response(turn_response[0], render_markdown=markdown)
+                        if verbose_mode:
+                            used = ", ".join(sorted(turn_skills)) if turn_skills else "none"
+                            console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
                     except KeyboardInterrupt:
                         _restore_terminal()
                         console.print("\nGoodbye!")

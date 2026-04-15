@@ -123,6 +123,7 @@ class ExecTool(Tool):
             try:
                 await create_shell(
                     "true" if not _IS_WINDOWS else "ver",
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
@@ -216,6 +217,7 @@ class ExecTool(Tool):
                 comspec,
                 "/c",
                 command,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
@@ -226,6 +228,7 @@ class ExecTool(Tool):
             "-l",
             "-c",
             command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,

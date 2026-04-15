@@ -457,6 +457,8 @@ def test_agent_help_shows_workspace_and_config_options():
     assert "-w" in stripped_output
     assert "--config" in stripped_output
     assert "-c" in stripped_output
+    assert "--verbose" in stripped_output
+    assert "--debug" in stripped_output
 
 
 def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_runtime):
@@ -474,6 +476,27 @@ def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_
     mock_agent_runtime["print_response"].assert_called_once_with(
         "mock-response", render_markdown=True, metadata={},
     )
+
+
+def test_agent_verbose_passes_audit_hook(mock_agent_runtime):
+    result = runner.invoke(app, ["agent", "-m", "hello", "--verbose"])
+
+    assert result.exit_code == 0
+    kwargs = mock_agent_runtime["agent_loop"].process_direct.await_args.kwargs
+    assert "audit_hook" in kwargs
+    assert callable(kwargs["audit_hook"])
+
+
+def test_agent_verbose_prints_skills_used_none_when_no_skill_invoked(mock_agent_runtime):
+    result = runner.invoke(app, ["agent", "-m", "hello", "--verbose"])
+    assert result.exit_code == 0
+    assert "skills used:" in result.stdout
+    assert "none" in result.stdout.lower()
+
+
+def test_agent_debug_single_message_enables_logs(mock_agent_runtime):
+    result = runner.invoke(app, ["agent", "-m", "hello", "--debug"])
+    assert result.exit_code == 0
 
 
 def test_agent_uses_explicit_config_path(mock_agent_runtime, tmp_path: Path):

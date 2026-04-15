@@ -17,6 +17,7 @@ from medpilot.bus.queue import MessageBus
 from medpilot.config.schema import ChannelsConfig, ExecToolConfig
 from medpilot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from medpilot.session.manager import Session, SessionManager
+from medpilot.agent.tools.filesystem import _resolve_path
 
 
 class _NoopProvider(LLMProvider):
@@ -98,6 +99,36 @@ def _make_real_loop(tmp_path: Path) -> AgentLoop:
         exec_config=ExecToolConfig(timeout=5),
         session_manager=SessionManager(tmp_path),
     )
+
+
+def test_restrict_workspace_allows_nested_workspace_medpilot_skills_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    nested_skills = workspace / ".medpilot" / "skills" / "medical-imaging" / "medical-image-dl-pipeline"
+    nested_skills.mkdir(parents=True)
+    skill_file = nested_skills / "SKILL.md"
+    skill_file.write_text("# skill", encoding="utf-8")
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=_NoopProvider(),
+        workspace=workspace,
+        model="dummy/default",
+        channels_config=ChannelsConfig(),
+        exec_config=ExecToolConfig(timeout=5),
+        session_manager=SessionManager(workspace),
+        restrict_to_workspace=True,
+    )
+
+    read_tool = loop.tools.get("read_file")
+    assert read_tool is not None
+    resolved = _resolve_path(
+        str(skill_file),
+        workspace=read_tool._workspace,
+        allowed_dir=read_tool._allowed_dir,
+        extra_allowed_dirs=read_tool._extra_allowed_dirs,
+    )
+    assert resolved == skill_file.resolve()
 
 
 def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
@@ -411,6 +442,50 @@ async def test_process_message_system_help_new_and_normal(monkeypatch, tmp_path:
     assert norm_resp.content == "done"
 
 
+async def test_process_message_updates_recent_skills_metadata(monkeypatch, tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        if audit_hook:
+            await audit_hook({"tool": "read_file", "skill_name": "medical-image-dl-pipeline", "path": "/tmp/SKILL.md"})
+        return "done", [], messages + [{"role": "assistant", "content": "done"}]
+
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+    msg = InboundMessage(channel="web", sender_id="u", chat_id="PRJ-7", content="继续之前任务")
+    out = await loop._process_message(msg)
+    assert out.content == "done"
+    session = loop.sessions.get_or_create("web:PRJ-7")
+    assert session.metadata.get("_recent_skills") == ["medical-image-dl-pipeline"]
+
+
+async def test_process_message_injects_active_skills_into_context(monkeypatch, tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+    captured: dict[str, Any] = {}
+
+    original_build_messages = loop.context.build_messages
+
+    def _capture_build_messages(*args, **kwargs):
+        captured["skill_names"] = kwargs.get("skill_names")
+        return original_build_messages(*args, **kwargs)
+
+    monkeypatch.setattr(loop.context, "build_messages", _capture_build_messages)
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        return "done", [], messages + [{"role": "assistant", "content": "done"}]
+
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+    msg = InboundMessage(
+        channel="web",
+        sender_id="u",
+        chat_id="PRJ-8",
+        content="继续之前的医学影像去伪影任务",
+    )
+    out = await loop._process_message(msg)
+    assert out.content == "done"
+    assert captured.get("skill_names")
+    assert "medical-image-dl-pipeline" in captured["skill_names"]
+
+
 async def test_process_message_new_failure_and_message_tool_short_circuit(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
     session = loop.sessions.get_or_create("web:PRJ-3")
@@ -507,13 +582,13 @@ async def test_run_main_loop_and_process_direct(monkeypatch, tmp_path: Path) -> 
     await runner
     assert loop._running is False
 
-    async def _proc_ok(msg, session_key=None, on_progress=None):
+    async def _proc_ok(msg, session_key=None, on_progress=None, audit_hook=None):
         return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="direct-ok")
 
     monkeypatch.setattr(loop, "_process_message", _proc_ok)
     assert await loop.process_direct("hello") == "direct-ok"
 
-    async def _proc_none(msg, session_key=None, on_progress=None):
+    async def _proc_none(msg, session_key=None, on_progress=None, audit_hook=None):
         return None
 
     monkeypatch.setattr(loop, "_process_message", _proc_none)
