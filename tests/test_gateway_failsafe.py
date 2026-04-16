@@ -18,6 +18,7 @@ def mock_runtime_dir(tmp_path):
 
 def test_gateway_pid_lock_prevents_startup(mock_runtime_dir, monkeypatch):
     """测试：当 PID 文件存在且进程运行时，网关应拒绝启动"""
+    monkeypatch.setenv("MEDPILOT_SKIP_GATEWAY_FAILSAVE", "")
     pid_file = mock_runtime_dir / "gateway.pid"
     current_pid = os.getpid()
     pid_file.write_text(str(current_pid))
@@ -32,6 +33,7 @@ def test_gateway_pid_lock_prevents_startup(mock_runtime_dir, monkeypatch):
 
 def test_gateway_port_conflict_prevents_startup(mock_runtime_dir, monkeypatch):
     """测试：当端口已被占用时，网关应拒绝启动"""
+    monkeypatch.setenv("MEDPILOT_SKIP_GATEWAY_FAILSAVE", "")
     pid_file = mock_runtime_dir / "gateway.pid"
     if pid_file.exists():
         pid_file.unlink()
@@ -57,6 +59,7 @@ def test_gateway_port_conflict_prevents_startup(mock_runtime_dir, monkeypatch):
 
 def test_gateway_creates_pid_file(mock_runtime_dir, monkeypatch):
     """测试：正常启动时创建 PID 文件"""
+    monkeypatch.setenv("MEDPILOT_SKIP_GATEWAY_FAILSAVE", "")
     pid_file = mock_runtime_dir / "gateway.pid"
     if pid_file.exists():
         pid_file.unlink()
