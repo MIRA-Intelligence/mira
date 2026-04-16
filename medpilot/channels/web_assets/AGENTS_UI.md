@@ -133,8 +133,8 @@ When the user asks to re-plan based on completed experiments and current
 
 ## Result Phase
 
-When the user requests a final deliverable (or experiments reach a natural
-conclusion), populate the `result` section in `task_plan.json`:
+When the user requests a final deliverable, populate the `result` section in
+`task_plan.json`:
 - `summary`: a concise summary of all findings
 - `output_path`: the file path to the generated deliverable (relative to project dir)
 - `output_type`: one of `paper`, `report`, `analysis`, `code`
