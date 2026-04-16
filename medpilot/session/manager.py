@@ -12,6 +12,12 @@ from loguru import logger
 from medpilot.config.paths import get_legacy_sessions_dir
 from medpilot.utils.helpers import ensure_dir, safe_filename, get_medpilot_dir
 
+_EVENT_METADATA = "metadata"
+_EVENT_MESSAGE = "message"
+_EVENT_UI = "ui_event"
+_EVENT_RESET = "session_reset"
+_SESSION_EVENT_SCHEMA_VERSION = 2
+
 
 @dataclass
 class Session:
@@ -27,10 +33,14 @@ class Session:
 
     key: str  # channel:chat_id
     messages: list[dict[str, Any]] = field(default_factory=list)
+    ui_events: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
+    _persisted_messages: int = 0
+    _persisted_ui_events: int = 0
+    _reset_pending: bool = False
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -41,6 +51,26 @@ class Session:
             **kwargs
         }
         self.messages.append(msg)
+        self.updated_at = datetime.now()
+
+    def add_ui_event(
+        self,
+        *,
+        role: str,
+        content: str,
+        msg_type: str = "response",
+        timestamp: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Append one UI-visible chat event to the session log."""
+        event = {
+            "role": role,
+            "content": content,
+            "type": msg_type,
+            "timestamp": timestamp or datetime.now().isoformat(),
+            "metadata": metadata or {},
+        }
+        self.ui_events.append(event)
         self.updated_at = datetime.now()
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
@@ -172,6 +202,8 @@ class Session:
         """Clear all messages and reset session to initial state."""
         self.messages = []
         self.last_consolidated = 0
+        self._reset_pending = True
+        self._persisted_messages = 0
         self.updated_at = datetime.now()
 
 
@@ -197,6 +229,51 @@ class SessionManager:
         """Legacy global session path (~/.medpilot/sessions/)."""
         safe_key = safe_filename(key.replace(":", "_"))
         return self.legacy_sessions_dir / f"{safe_key}.jsonl"
+
+    @staticmethod
+    def _session_metadata_event(session: Session) -> dict[str, Any]:
+        return {
+            "_type": _EVENT_METADATA,
+            "schema_version": _SESSION_EVENT_SCHEMA_VERSION,
+            "key": session.key,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "metadata": session.metadata,
+            "last_consolidated": session.last_consolidated,
+        }
+
+    @staticmethod
+    def _message_event(session_key: str, message: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "_type": _EVENT_MESSAGE,
+            "schema_version": _SESSION_EVENT_SCHEMA_VERSION,
+            "key": session_key,
+            "message": message,
+        }
+
+    @staticmethod
+    def _ui_event(session_key: str, event: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "_type": _EVENT_UI,
+            "schema_version": _SESSION_EVENT_SCHEMA_VERSION,
+            "key": session_key,
+            "event": event,
+        }
+
+    @staticmethod
+    def _reset_event(session_key: str, timestamp: str) -> dict[str, Any]:
+        return {
+            "_type": _EVENT_RESET,
+            "schema_version": _SESSION_EVENT_SCHEMA_VERSION,
+            "key": session_key,
+            "timestamp": timestamp,
+        }
+
+    @staticmethod
+    def _append_event(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -235,8 +312,10 @@ class SessionManager:
 
         try:
             messages = []
+            ui_events = []
             metadata = {}
             created_at = None
+            updated_at = None
             last_consolidated = 0
 
             with open(path, encoding="utf-8") as f:
@@ -246,43 +325,128 @@ class SessionManager:
                         continue
 
                     data = json.loads(line)
+                    event_type = data.get("_type")
 
-                    if data.get("_type") == "metadata":
+                    # Backward-compatible metadata entries
+                    if event_type == _EVENT_METADATA:
                         metadata = data.get("metadata", {})
-                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
-                        last_consolidated = data.get("last_consolidated", 0)
-                    else:
+                        if data.get("created_at"):
+                            created_at = datetime.fromisoformat(data["created_at"])
+                        if data.get("updated_at"):
+                            updated_at = datetime.fromisoformat(data["updated_at"])
+                        last_consolidated = int(data.get("last_consolidated", 0) or 0)
+                        continue
+
+                    # New append-only message envelope
+                    if event_type == _EVENT_MESSAGE:
+                        msg = data.get("message")
+                        if isinstance(msg, dict):
+                            messages.append(msg)
+                        continue
+
+                    # New append-only UI event envelope
+                    if event_type == _EVENT_UI:
+                        evt = data.get("event")
+                        if isinstance(evt, dict):
+                            ui_events.append(evt)
+                        continue
+
+                    # Logical reset marker for LLM context window
+                    if event_type == _EVENT_RESET:
+                        messages = []
+                        last_consolidated = 0
+                        continue
+
+                    # Legacy raw message line format
+                    if isinstance(data, dict) and data.get("role"):
                         messages.append(data)
 
-            return Session(
+            session = Session(
                 key=key,
                 messages=messages,
+                ui_events=ui_events,
                 created_at=created_at or datetime.now(),
+                updated_at=updated_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
             )
+            session._persisted_messages = len(messages)
+            session._persisted_ui_events = len(ui_events)
+            return session
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
             return None
 
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
+        """Persist session changes in append-only event form."""
         path = self._get_session_path(session.key)
+        if not path.exists():
+            self._append_event(path, self._session_metadata_event(session))
 
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        if session._reset_pending:
+            self._append_event(path, self._reset_event(session.key, session.updated_at.isoformat()))
+            session._reset_pending = False
+            session._persisted_messages = 0
+
+        new_messages = session.messages[session._persisted_messages:]
+        for msg in new_messages:
+            self._append_event(path, self._message_event(session.key, msg))
+        session._persisted_messages = len(session.messages)
+
+        new_ui_events = session.ui_events[session._persisted_ui_events:]
+        for event in new_ui_events:
+            self._append_event(path, self._ui_event(session.key, event))
+        session._persisted_ui_events = len(session.ui_events)
+
+        self._append_event(path, self._session_metadata_event(session))
 
         self._cache[session.key] = session
+
+    def append_ui_event(
+        self,
+        *,
+        key: str,
+        role: str,
+        content: str,
+        msg_type: str = "response",
+        metadata: dict[str, Any] | None = None,
+        timestamp: str | None = None,
+    ) -> None:
+        """Append one UI-visible event into the unified session event log."""
+        session = self.get_or_create(key)
+        session.add_ui_event(
+            role=role,
+            content=content,
+            msg_type=msg_type,
+            metadata=metadata,
+            timestamp=timestamp,
+        )
+        self.save(session)
+
+    def get_ui_history(self, key: str) -> list[dict[str, Any]]:
+        """Build UI display entries from the unified event log."""
+        session = self.get_or_create(key)
+        entries: list[dict[str, Any]] = []
+
+        for idx, event in enumerate(session.ui_events):
+            role = event.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            if role == "user":
+                metadata = {**metadata, "_user": True}
+            entry_type = event.get("type")
+            if entry_type not in {"response", "progress", "tool_call", "error"}:
+                entry_type = "response"
+            entries.append({
+                "id": f"ui-{safe_filename(key)}-{idx}",
+                "timestamp": event.get("timestamp") or "",
+                "content": event.get("content") or "",
+                "type": entry_type,
+                "metadata": metadata,
+            })
+
+        return [entry for entry in entries if entry["content"]]
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
@@ -299,19 +463,24 @@ class SessionManager:
 
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
-                # Read just the metadata line
+                latest_meta: dict[str, Any] | None = None
                 with open(path, encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-                    if first_line:
-                        data = json.loads(first_line)
-                        if data.get("_type") == "metadata":
-                            key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append({
-                                "key": key,
-                                "created_at": data.get("created_at"),
-                                "updated_at": data.get("updated_at"),
-                                "path": str(path)
-                            })
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        data = json.loads(line)
+                        if data.get("_type") == _EVENT_METADATA:
+                            latest_meta = data
+
+                if latest_meta:
+                    key = latest_meta.get("key") or path.stem.replace("_", ":", 1)
+                    sessions.append({
+                        "key": key,
+                        "created_at": latest_meta.get("created_at"),
+                        "updated_at": latest_meta.get("updated_at"),
+                        "path": str(path),
+                    })
             except Exception:
                 continue
 

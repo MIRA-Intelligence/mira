@@ -32,6 +32,7 @@ from medpilot.bus.events import InboundMessage, OutboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.providers.base import LLMProvider
 from medpilot.session.manager import Session, SessionManager
+from medpilot.task_plan.guardrails import guard_task_plan_file
 
 if TYPE_CHECKING:
     from medpilot.config.schema import ChannelsConfig, ExecToolConfig
@@ -52,6 +53,7 @@ class AgentLoop:
 
     _TOOL_RESULT_MAX_CHARS = 500
     _AUTO_MAX_ROUNDS = 20
+    _AUTO_GUARD_REPAIR_MAX = 1
     _AUTO_CONTINUE_MARKER = "[AUTO-CONTINUE-INTERNAL]"
 
     def __init__(
@@ -127,6 +129,7 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._session_run_modes: dict[str, str] = {}  # session_key -> manual|auto
         self._session_agent_profiles: dict[str, str] = {}  # session_key -> engineer|default|research
+        self._last_task_plan_guard_issues: list[str] = []
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
@@ -310,6 +313,26 @@ class AgentLoop:
         return "AGENTS.md"
 
     @staticmethod
+    def _compose_extra_system(
+        ui_system_instructions: object,
+        guard_notice: object,
+    ) -> str | None:
+        """Merge optional UI instructions with guardrail notices."""
+        base = (
+            ui_system_instructions.strip()
+            if isinstance(ui_system_instructions, str) and ui_system_instructions.strip()
+            else ""
+        )
+        notice = (
+            guard_notice.strip()
+            if isinstance(guard_notice, str) and guard_notice.strip()
+            else ""
+        )
+        if base and notice:
+            return f"{base}\n\n{notice}"
+        return base or notice or None
+
+    @staticmethod
     def _looks_like_user_input_request(text: str | None) -> bool:
         """Heuristic: detect when assistant explicitly needs user input."""
         if not text:
@@ -397,6 +420,27 @@ class AgentLoop:
             for exp in experiments
         )
 
+    def _guard_task_plan_structure(
+        self, project_dir: str | None, profile: str | None = None
+    ) -> bool:
+        """Apply task_plan guardrails before auto-continue rounds."""
+        if not project_dir:
+            self._last_task_plan_guard_issues = []
+            return True
+        result = guard_task_plan_file(Path(project_dir), auto_fix=True, profile=profile)
+        issues = list(result.get("issues") or [])
+        self._last_task_plan_guard_issues = issues
+        if result.get("fixed"):
+            logger.info("task_plan guardrails auto-fixed {}", project_dir)
+        if result.get("blocking"):
+            logger.warning(
+                "task_plan guardrails blocked auto-continue for {}: {}",
+                project_dir,
+                issues[:3],
+            )
+            return False
+        return True
+
     def _build_auto_continue_message(
         self,
         channel: str,
@@ -417,6 +461,31 @@ class AgentLoop:
             "Do not stop for confirmation unless user input is strictly required."
         )
 
+    def _build_auto_guardrail_repair_message(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        project_dir: str | None,
+        run_mode: str,
+        issues: list[str],
+    ) -> str:
+        """Build an internal message asking model to patch blocked plan fields."""
+        runtime_ctx = ContextBuilder._build_runtime_context(
+            channel,
+            chat_id,
+            project_dir,
+            run_mode=run_mode,
+        )
+        issue_lines = "\n".join(f"- {item}" for item in issues[:8]) if issues else "- unknown issue"
+        return (
+            f"{runtime_ctx}\n\n{self._AUTO_CONTINUE_MARKER}\n"
+            "Guardrail validation blocked task_plan progression. "
+            "Patch task_plan.json to satisfy the missing required fields only.\n"
+            "Do NOT rewrite prior conclusions or metrics unless logically necessary.\n"
+            f"Missing/invalid items:\n{issue_lines}"
+        )
+
     def _should_continue_auto_web(
         self,
         *,
@@ -425,9 +494,12 @@ class AgentLoop:
         project_dir: str | None,
         final_content: str | None,
         auto_round: int,
+        agent_profile: str | None = None,
     ) -> bool:
         """Decide whether to schedule another internal auto-run cycle."""
         if channel != "web" or run_mode != "auto":
+            return False
+        if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
             return False
         if auto_round >= self._AUTO_MAX_ROUNDS:
             logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
@@ -755,7 +827,10 @@ class AgentLoop:
 
         history = session.get_history(max_messages=self.memory_window)
         model_runtime = self._get_model_runtime(key)
-        extra_system = meta.get("_ui_system_instructions")
+        extra_system = self._compose_extra_system(
+            meta.get("_ui_system_instructions"),
+            meta.get("_task_plan_guard_notice"),
+        )
 
         ctx = ContextBuilder(memory_workspace) if project_dir else self.context
         initial_messages = ctx.build_messages(
@@ -801,6 +876,7 @@ class AgentLoop:
         )
 
         auto_round = 0
+        guard_repair_round = 0
         while True:
             current_mode = self._session_run_modes.get(key, run_mode)
             if not self._should_continue_auto_web(
@@ -809,7 +885,40 @@ class AgentLoop:
                 project_dir=project_dir,
                 final_content=final_content,
                 auto_round=auto_round,
+                agent_profile=agent_profile,
             ):
+                guard_issues = list(getattr(self, "_last_task_plan_guard_issues", []))
+                if (
+                    msg.channel == "web"
+                    and current_mode == "auto"
+                    and guard_issues
+                    and guard_repair_round < self._AUTO_GUARD_REPAIR_MAX
+                    and not self._looks_like_failure_response(final_content)
+                    and not self._looks_like_user_input_request(final_content)
+                ):
+                    guard_repair_round += 1
+                    auto_round += 1
+                    await progress_cb(
+                        f"auto-run guardrail repair {guard_repair_round}: "
+                        "filling required evidence fields"
+                    )
+                    all_msgs.append({
+                        "role": "user",
+                        "content": self._build_auto_guardrail_repair_message(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            project_dir=project_dir,
+                            run_mode=current_mode,
+                            issues=guard_issues,
+                        ),
+                    })
+                    final_content, _, all_msgs = await self._run_agent_loop(
+                        all_msgs,
+                        model_runtime=model_runtime,
+                        on_progress=progress_cb,
+                        audit_hook=audit_cb,
+                    )
+                    continue
                 break
             run_mode = current_mode
             auto_round += 1
