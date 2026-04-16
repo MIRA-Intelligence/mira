@@ -1,9 +1,8 @@
-import os
 import pytest
+from unittest.mock import patch
 
 @pytest.fixture(autouse=True)
-def skip_gateway_failsave():
-    """Globally skip gateway fail-safe checks during tests to prevent port/PID collision issues."""
-    os.environ["MEDPILOT_SKIP_GATEWAY_FAILSAVE"] = "1"
-    yield
-    # We don't necessarily need to unset it as it's a global test setting
+def mock_gateway_failsafe():
+    """Globally mock the gateway failsafe check to avoid PID/port collision issues in tests."""
+    with patch("medpilot.cli.commands._gateway_failsafe_check") as mock:
+        yield mock

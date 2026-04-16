@@ -721,6 +721,56 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 # ============================================================================
 
 
+def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool = False) -> None:
+    """Check for existing MedPilot instances by PID file and port."""
+    import atexit
+    import os
+    import psutil
+    import socket
+    from pathlib import Path
+
+    if os.environ.get("MEDPILOT_SKIP_GATEWAY_FAILSAVE"):
+        return
+
+    pid_file = Path("~/.medpilot/runtime/gateway.pid").expanduser()
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. 检查 PID 文件
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            if psutil.pid_exists(old_pid):
+                proc = psutil.Process(old_pid)
+                if "medpilot" in " ".join(proc.cmdline()):
+                    # Note: Using basic print here as it is before main gateway loop setup
+                    print(f"错误: MedPilot 已经在运行中 (PID: {old_pid})。")
+                    print("提示: 请先停止旧进程，或使用 `medpilot-agent stop`。")
+                    raise typer.Exit(1)
+        except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied, typer.Exit):
+            if isinstance(sys.exc_info()[1], typer.Exit):
+                raise
+            pass
+
+    # 2. 检查端口占用
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            check_host = "127.0.0.1" if gateway_host == "0.0.0.0" else gateway_host
+            if s.connect_ex((check_host, gateway_port)) == 0:
+                print(f"错误: 端口 {gateway_port} 已被占用。")
+                print("提示: 这通常意味着 MedPilot 已经在运行中。请检查系统进程。")
+                raise typer.Exit(1)
+    except typer.Exit:
+        raise
+    except Exception as e:
+        if verbose:
+            print(f"端口探测异常: {e}")
+
+    # 3. 写入当前 PID
+    pid_file.write_text(str(os.getpid()))
+    atexit.register(lambda: pid_file.unlink(missing_ok=True))
+
+
 @app.command()
 def gateway(
     host: str | None = typer.Option(None, "--host", help="Gateway host"),
@@ -775,43 +825,7 @@ def gateway(
     gateway_host = config.gateway.host
     gateway_port = config.gateway.port
 
-    # --- 防呆机制 (Fail-safe) ---
-    pid_file = Path("~/.medpilot/runtime/gateway.pid").expanduser()
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    
-    # 1. 检查 PID 文件
-    if pid_file.exists():
-        try:
-            old_pid = int(pid_file.read_text().strip())
-            if psutil.pid_exists(old_pid):
-                proc = psutil.Process(old_pid)
-                if "medpilot" in " ".join(proc.cmdline()):
-                    console.print(f"[red]错误: MedPilot 已经在运行中 (PID: {old_pid})。[/red]")
-                    console.print("[yellow]提示: 请先停止旧进程，或使用 `medpilot-agent stop`。[/yellow]")
-                    raise typer.Exit(1)
-        except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-
-    # 2. 检查端口占用
-    import socket
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.5)
-            check_host = "127.0.0.1" if gateway_host == "0.0.0.0" else gateway_host
-            if s.connect_ex((check_host, gateway_port)) == 0:
-                console.print(f"[red]错误: 端口 {gateway_port} 已被占用。[/red]")
-                console.print("[yellow]提示: 这通常意味着 MedPilot 已经在运行中。请检查系统进程。[/yellow]")
-                raise typer.Exit(1)
-    except typer.Exit:
-        raise
-    except Exception as e:
-        if verbose:
-            console.print(f"[dim]端口探测异常: {e}[/dim]")
-
-    # 3. 写入当前 PID
-    pid_file.write_text(str(os.getpid()))
-    atexit.register(lambda: pid_file.unlink(missing_ok=True))
-    # --- 防呆机制结束 ---
+    _gateway_failsafe_check(gateway_host, gateway_port, verbose)
 
     console.print(f"{__logo__} Starting medpilot gateway on {gateway_host}:{gateway_port}...")
     sync_workspace_templates(config.workspace_path)
