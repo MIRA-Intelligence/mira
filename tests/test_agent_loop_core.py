@@ -153,21 +153,18 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
-        auto_round=0,
     ) is True
     assert loop._should_continue_auto_web(
         channel="cli",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
-        auto_round=0,
     ) is False
     assert loop._should_continue_auto_web(
         channel="web",
         run_mode="auto",
         project_dir=str(project),
         final_content="please confirm",
-        auto_round=0,
     ) is False
 
     bad_project = tmp_path / "PRJ-bad"
@@ -178,8 +175,51 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         run_mode="auto",
         project_dir=str(bad_project),
         final_content="all good",
-        auto_round=0,
     ) is False
+
+
+def test_automation_policy_helpers(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+
+    policy = loop._parse_automation_policy(
+        {
+            "logic": "OR",
+            "goals": [
+                {"metric": "Dice", "operator": ">", "value": 0.8},
+                {"metric": "HD95", "operator": "<", "value": 5.0},
+            ],
+            "maxExperiments": 8,
+            "maxTokens": 1000,
+        }
+    )
+    assert policy is not None
+    assert policy["logic"] == "OR"
+    assert len(policy["goals"]) == 2
+
+    plan = {
+        "experiments": [
+            {"status": "completed", "results": {"metrics": {"Dice": 0.82, "HD95": 6.1}}},
+            {"status": "pending", "results": {"metrics": {}}},
+        ]
+    }
+    stop_reason = AgentLoop._evaluate_automation_stop_policy(policy, plan=plan, tokens_used=100)
+    assert stop_reason == "automation goals reached"
+
+    strict_policy = loop._parse_automation_policy(
+        {
+            "logic": "AND",
+            "goals": [{"metric": "Dice", "operator": ">=", "value": 0.9}],
+            "maxExperiments": 1,
+        }
+    )
+    assert strict_policy is not None
+    exp_reason = AgentLoop._evaluate_automation_stop_policy(strict_policy, plan=plan, tokens_used=100)
+    assert "max experiments reached" in (exp_reason or "")
+
+    token_policy = loop._parse_automation_policy({"maxTokens": 200})
+    assert token_policy is not None
+    token_reason = AgentLoop._evaluate_automation_stop_policy(token_policy, plan=plan, tokens_used=250)
+    assert "token budget reached" in (token_reason or "")
 
 
 async def test_run_agent_loop_tool_call_and_finish(tmp_path: Path) -> None:

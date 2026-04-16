@@ -30,6 +30,7 @@ sequence so the dashboard can show the queue before execution begins. Fill in
 ## Research Phase
 
 When starting a new project, begin with background research:
+- If `Project Directory/references/` contains uploaded materials, read those local files first and ground your initial survey in them before broad external search.
 - Search for relevant literature and add references to `task_plan.json` → `research.references`
 - Write a brief survey overview in `research.survey`
 - Note key observations and domain-specific facts in `research.notes`

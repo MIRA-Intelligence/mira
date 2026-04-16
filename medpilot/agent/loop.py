@@ -52,7 +52,6 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
-    _AUTO_MAX_ROUNDS = 20
     _AUTO_GUARD_REPAIR_MAX = 1
     _AUTO_CONTINUE_MARKER = "[AUTO-CONTINUE-INTERNAL]"
 
@@ -129,7 +128,9 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._session_run_modes: dict[str, str] = {}  # session_key -> manual|auto
         self._session_agent_profiles: dict[str, str] = {}  # session_key -> engineer|default|research
+        self._session_automation_policies: dict[str, dict[str, Any] | None] = {}
         self._last_task_plan_guard_issues: list[str] = []
+        self._last_loop_tokens_used: int = 0
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
@@ -287,6 +288,58 @@ class AgentLoop:
                 return profile
         return None
 
+    @staticmethod
+    def _parse_automation_policy(value: object) -> dict[str, Any] | None:
+        """Parse automation policy, returning None when absent/invalid."""
+        if not isinstance(value, dict):
+            return None
+
+        logic_raw = value.get("logic")
+        logic = "AND"
+        if isinstance(logic_raw, str) and logic_raw.strip().upper() in {"AND", "OR"}:
+            logic = logic_raw.strip().upper()
+
+        goals: list[dict[str, Any]] = []
+        raw_goals = value.get("goals")
+        if isinstance(raw_goals, list):
+            for item in raw_goals:
+                if not isinstance(item, dict):
+                    continue
+                metric = item.get("metric")
+                operator = item.get("operator")
+                raw_target = item.get("value")
+                if not isinstance(metric, str) or not metric.strip():
+                    continue
+                if not isinstance(operator, str) or operator not in {">", ">=", "<", "<=", "=="}:
+                    continue
+                try:
+                    target = float(raw_target)
+                except (TypeError, ValueError):
+                    continue
+                goals.append({
+                    "metric": metric.strip(),
+                    "operator": operator,
+                    "value": target,
+                })
+
+        max_experiments = value.get("maxExperiments")
+        if not isinstance(max_experiments, int) or max_experiments <= 0:
+            max_experiments = None
+
+        max_tokens = value.get("maxTokens")
+        if not isinstance(max_tokens, int) or max_tokens <= 0:
+            max_tokens = None
+
+        if not goals and max_experiments is None and max_tokens is None:
+            return None
+
+        parsed: dict[str, Any] = {"logic": logic, "goals": goals}
+        if max_experiments is not None:
+            parsed["maxExperiments"] = max_experiments
+        if max_tokens is not None:
+            parsed["maxTokens"] = max_tokens
+        return parsed
+
     def _resolve_session_run_mode(self, session_key: str, inbound_value: object) -> str:
         """Resolve effective mode for a session, updating cache if explicitly provided."""
         explicit = self._parse_run_mode(inbound_value)
@@ -302,6 +355,18 @@ class AgentLoop:
             self._session_agent_profiles[session_key] = explicit
             return explicit
         return self._session_agent_profiles.get(session_key, "default")
+
+    def _resolve_session_automation_policy(
+        self,
+        session_key: str,
+        inbound_value: object,
+    ) -> dict[str, Any] | None:
+        """Resolve automation policy for a session, updating cache when provided."""
+        if inbound_value is not None:
+            parsed = self._parse_automation_policy(inbound_value)
+            self._session_automation_policies[session_key] = parsed
+            return parsed
+        return self._session_automation_policies.get(session_key)
 
     @staticmethod
     def _agent_profile_to_agents_filename(profile: str) -> str:
@@ -420,6 +485,115 @@ class AgentLoop:
             for exp in experiments
         )
 
+    @staticmethod
+    def _to_number(value: object) -> float | None:
+        """Convert metric value to float when possible."""
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _collect_latest_plan_metrics(cls, plan: dict | None) -> dict[str, float]:
+        """Collect latest numeric metrics from completed experiments."""
+        if not plan:
+            return {}
+        experiments = plan.get("experiments")
+        if not isinstance(experiments, list):
+            return {}
+
+        metrics: dict[str, float] = {}
+        for exp in experiments:
+            if not isinstance(exp, dict) or exp.get("status") != "completed":
+                continue
+            results = exp.get("results")
+            metric_map = results.get("metrics") if isinstance(results, dict) else None
+            if not isinstance(metric_map, dict):
+                continue
+            for metric_name, raw_value in metric_map.items():
+                if not isinstance(metric_name, str) or not metric_name.strip():
+                    continue
+                numeric = cls._to_number(raw_value)
+                if numeric is None:
+                    continue
+                metrics[metric_name.strip()] = numeric
+        return metrics
+
+    @staticmethod
+    def _count_completed_experiments(plan: dict | None) -> int:
+        """Count completed experiments in task plan."""
+        if not plan:
+            return 0
+        experiments = plan.get("experiments")
+        if not isinstance(experiments, list):
+            return 0
+        return sum(1 for exp in experiments if isinstance(exp, dict) and exp.get("status") == "completed")
+
+    @staticmethod
+    def _compare_goal(metric_value: float, operator: str, target: float) -> bool:
+        """Evaluate one metric threshold predicate."""
+        if operator == ">":
+            return metric_value > target
+        if operator == ">=":
+            return metric_value >= target
+        if operator == "<":
+            return metric_value < target
+        if operator == "<=":
+            return metric_value <= target
+        if operator == "==":
+            return abs(metric_value - target) <= 1e-9
+        return False
+
+    @classmethod
+    def _evaluate_automation_stop_policy(
+        cls,
+        policy: dict[str, Any] | None,
+        *,
+        plan: dict | None,
+        tokens_used: int,
+    ) -> str | None:
+        """Return stop reason if auto-stop policy threshold is reached."""
+        if not policy:
+            return None
+
+        goals = policy.get("goals") if isinstance(policy.get("goals"), list) else []
+        if goals:
+            metrics = cls._collect_latest_plan_metrics(plan)
+            evaluations: list[bool] = []
+            for goal in goals:
+                if not isinstance(goal, dict):
+                    continue
+                metric = goal.get("metric")
+                operator = goal.get("operator")
+                target = cls._to_number(goal.get("value"))
+                if not isinstance(metric, str) or not metric.strip() or not isinstance(operator, str) or target is None:
+                    continue
+                metric_value = metrics.get(metric.strip())
+                evaluations.append(
+                    metric_value is not None and cls._compare_goal(metric_value, operator, target)
+                )
+            if evaluations:
+                logic = str(policy.get("logic", "AND")).upper()
+                goals_met = all(evaluations) if logic == "AND" else any(evaluations)
+                if goals_met:
+                    return "automation goals reached"
+
+        max_experiments = policy.get("maxExperiments")
+        if isinstance(max_experiments, int) and max_experiments > 0:
+            completed = cls._count_completed_experiments(plan)
+            if completed >= max_experiments:
+                return f"max experiments reached ({completed}/{max_experiments})"
+
+        max_tokens = policy.get("maxTokens")
+        if isinstance(max_tokens, int) and max_tokens > 0 and tokens_used >= max_tokens:
+            return f"token budget reached ({tokens_used}/{max_tokens})"
+
+        return None
+
     def _guard_task_plan_structure(
         self, project_dir: str | None, profile: str | None = None
     ) -> bool:
@@ -493,16 +667,12 @@ class AgentLoop:
         run_mode: str,
         project_dir: str | None,
         final_content: str | None,
-        auto_round: int,
         agent_profile: str | None = None,
     ) -> bool:
         """Decide whether to schedule another internal auto-run cycle."""
         if channel != "web" or run_mode != "auto":
             return False
         if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
-            return False
-        if auto_round >= self._AUTO_MAX_ROUNDS:
-            logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
             return False
         if self._looks_like_failure_response(final_content):
             return False
@@ -538,6 +708,7 @@ class AgentLoop:
         tools_used: list[str] = []
         active_provider: LLMProvider | None = None
         active_route = None
+        loop_tokens_used = 0
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -552,6 +723,9 @@ class AgentLoop:
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
             )
+            usage_total = response.usage.get("total_tokens") if isinstance(response.usage, dict) else None
+            if isinstance(usage_total, int) and usage_total > 0:
+                loop_tokens_used += usage_total
 
             if iteration == 1 and on_progress and self.model_router and self.model_router.enabled:
                 await on_progress(
@@ -630,6 +804,7 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
+        self._last_loop_tokens_used = loop_tokens_used
         return final_content, tools_used, messages
 
     async def run(self) -> None:
@@ -755,6 +930,10 @@ class AgentLoop:
         key = session_key or msg.session_key
         run_mode = self._resolve_session_run_mode(key, meta.get("run_mode"))
         agent_profile = self._resolve_session_agent_profile(key, meta.get("agent_profile"))
+        automation_policy = self._resolve_session_automation_policy(
+            key,
+            meta.get("automation_policy"),
+        )
         agents_filename = self._agent_profile_to_agents_filename(agent_profile)
         if project_dir:
             sessions_mgr = self._get_project_sessions(project_dir)
@@ -793,6 +972,7 @@ class AgentLoop:
             sessions_mgr.save(session)
             sessions_mgr.invalidate(session.key)
             self._session_model_runtimes.pop(session.key, None)
+            self._session_automation_policies.pop(session.key, None)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -874,17 +1054,29 @@ class AgentLoop:
             on_progress=progress_cb,
             audit_hook=audit_cb,
         )
+        total_tokens_used = self._last_loop_tokens_used
 
         auto_round = 0
         guard_repair_round = 0
         while True:
             current_mode = self._session_run_modes.get(key, run_mode)
+            automation_policy = self._resolve_session_automation_policy(key, None)
+            if msg.channel == "web" and current_mode == "auto":
+                current_plan = self._load_task_plan(project_dir)
+                stop_reason = self._evaluate_automation_stop_policy(
+                    automation_policy,
+                    plan=current_plan,
+                    tokens_used=total_tokens_used,
+                )
+                if stop_reason:
+                    await progress_cb(f"auto-run stop condition: {stop_reason}")
+                    break
+
             if not self._should_continue_auto_web(
                 channel=msg.channel,
                 run_mode=current_mode,
                 project_dir=project_dir,
                 final_content=final_content,
-                auto_round=auto_round,
                 agent_profile=agent_profile,
             ):
                 guard_issues = list(getattr(self, "_last_task_plan_guard_issues", []))
@@ -918,6 +1110,7 @@ class AgentLoop:
                         on_progress=progress_cb,
                         audit_hook=audit_cb,
                     )
+                    total_tokens_used += self._last_loop_tokens_used
                     continue
                 break
             run_mode = current_mode
@@ -940,6 +1133,7 @@ class AgentLoop:
                 on_progress=progress_cb,
                 audit_hook=audit_cb,
             )
+            total_tokens_used += self._last_loop_tokens_used
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."

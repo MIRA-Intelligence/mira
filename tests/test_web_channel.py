@@ -1,5 +1,6 @@
 import json
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -879,6 +880,34 @@ async def test_handle_project_meta_updates_contract_version(
     assert meta["contract_version"] == 2
 
 
+async def test_handle_project_meta_updates_automation_policy(
+    web_channel: WebChannel,
+) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0008"
+    project_dir.mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0008"}
+    req.json = AsyncMock(return_value={
+        "automation_policy": {
+            "logic": "OR",
+            "goals": [{"metric": "Dice", "operator": ">", "value": 0.8}],
+            "maxExperiments": 12,
+            "maxTokens": 200000,
+        }
+    })
+    resp = await web_channel._handle_project_meta(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["automation_policy"]["logic"] == "OR"
+    assert body["automation_policy"]["maxExperiments"] == 12
+
+    meta_file = project_dir / ".medpilot" / "project.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
+
+
 async def test_cors_allows_patch_method(web_channel: WebChannel) -> None:
     web_channel.config.cors_origins = ["*"]
     req = MagicMock(spec=web.Request)
@@ -894,6 +923,7 @@ async def test_cors_allows_patch_method(web_channel: WebChannel) -> None:
 async def test_handle_upload_project_files_invalid_multipart(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {}
     req.multipart = AsyncMock(side_effect=RuntimeError("bad form"))
 
     resp = await web_channel._handle_upload_project_files(req)
@@ -904,6 +934,7 @@ async def test_handle_upload_project_files_invalid_multipart(web_channel: WebCha
 async def test_handle_upload_project_files_missing_files(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {}
     req.multipart = AsyncMock(return_value=_FakeMultipart([
         _FakePart(name="metadata", filename="ignored.txt", chunks=[b"abc"]),
     ]))
@@ -916,6 +947,7 @@ async def test_handle_upload_project_files_missing_files(web_channel: WebChannel
 async def test_handle_upload_project_files_writes_data_files(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {}
     req.multipart = AsyncMock(return_value=_FakeMultipart([
         _FakePart(name="files", filename="sample.csv", chunks=[b"a,", b"b\n"]),
         _FakePart(name="files", filename="sample.csv", chunks=[b"c,d\n"]),
@@ -925,14 +957,90 @@ async def test_handle_upload_project_files_writes_data_files(web_channel: WebCha
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["session_id"] == "PRJ-0001"
+    assert body["target"] == "data"
     assert body["uploaded"] == [
         {"name": "sample.csv", "path": "data/sample.csv", "size": 4},
         {"name": "sample_1.csv", "path": "data/sample_1.csv", "size": 4},
     ]
+    assert body["extracted"] == []
 
     data_dir = web_channel.projects_root / "PRJ-0001" / "data"
     assert (data_dir / "sample.csv").read_bytes() == b"a,b\n"
     assert (data_dir / "sample_1.csv").read_bytes() == b"c,d\n"
+
+
+async def test_handle_upload_project_files_references_extracts_zip(
+    web_channel: WebChannel,
+) -> None:
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        zf.writestr("papers/paper_a.pdf", b"%PDF-1.4")
+        zf.writestr("notes/summary.txt", b"ok")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0002"}
+    req.query = {"target": "references"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="seed.pdf", chunks=[b"%PDF-1.7"]),
+        _FakePart(name="files", filename="bundle.zip", chunks=[zip_buf.getvalue()]),
+    ]))
+
+    resp = await web_channel._handle_upload_project_files(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["session_id"] == "PRJ-0002"
+    assert body["target"] == "references"
+    assert body["uploaded"] == [
+        {"name": "seed.pdf", "path": "references/seed.pdf", "size": 8},
+        {"name": "bundle.zip", "path": "references/bundle.zip", "size": len(zip_buf.getvalue())},
+    ]
+    extracted_paths = {item["path"] for item in body["extracted"]}
+    assert extracted_paths == {
+        "references/bundle/papers/paper_a.pdf",
+        "references/bundle/notes/summary.txt",
+    }
+
+    refs_dir = web_channel.projects_root / "PRJ-0002" / "references"
+    assert (refs_dir / "seed.pdf").read_bytes() == b"%PDF-1.7"
+    assert (refs_dir / "bundle" / "papers" / "paper_a.pdf").read_bytes() == b"%PDF-1.4"
+    assert (refs_dir / "bundle" / "notes" / "summary.txt").read_bytes() == b"ok"
+
+
+async def test_handle_upload_project_files_references_rejects_non_pdf_zip(
+    web_channel: WebChannel,
+) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0003"}
+    req.query = {"target": "references"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="notes.txt", chunks=[b"hello"]),
+    ]))
+
+    resp = await web_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {
+        "error": "references uploads only support .pdf and .zip files"
+    }
+
+
+async def test_handle_upload_project_files_references_rejects_zip_slip(
+    web_channel: WebChannel,
+) -> None:
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        zf.writestr("../escape.txt", b"bad")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0004"}
+    req.query = {"target": "references"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="unsafe.zip", chunks=[zip_buf.getvalue()]),
+    ]))
+
+    resp = await web_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert "unsafe zip entry" in json.loads(resp.text)["error"]
+    assert not (web_channel.projects_root / "escape.txt").exists()
 
 
 async def test_handle_project_artifact_serves_file(web_channel: WebChannel) -> None:
@@ -1277,6 +1385,11 @@ async def test_ws_handler_message_and_set_mode_dispatch(
                     "user_id": "u1",
                     "mode": "AUTO",
                     "agent_profile": "engineer",
+                    "automation_policy": {
+                        "logic": "AND",
+                        "goals": [{"metric": "Dice", "operator": ">", "value": 0.8}],
+                        "maxExperiments": 8,
+                    },
                     "content": "hello",
                     "media": ["a.png"],
                 }
@@ -1310,8 +1423,13 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert len(handled) == 2
     assert handled[0]["metadata"]["run_mode"] == "auto"
     assert handled[0]["metadata"]["agent_profile"] == "engineer"
+    assert handled[0]["metadata"]["automation_policy"]["maxExperiments"] == 8
     assert "_ui_system_instructions" in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"
+
+    meta_file = web_channel.projects_root / "PRJ-4001" / ".medpilot" / "project.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
 
 
 async def test_ws_handler_injects_guard_notice_on_id_reassignment(
