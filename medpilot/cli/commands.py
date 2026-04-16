@@ -723,12 +723,16 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 
 @app.command()
 def gateway(
+    host: str | None = typer.Option(None, "--host", help="Gateway host"),
     port: int | None = typer.Option(None, "--port", "-p", help="Gateway port"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Start the medpilot gateway."""
+    import atexit
+    import os
+    import psutil
     from medpilot.agent.loop import AgentLoop
     from medpilot.bus.queue import MessageBus
     from medpilot.channels.manager import ChannelManager
@@ -746,8 +750,70 @@ def gateway(
     from medpilot.utils.env import auto_activate_env
     auto_activate_env(config.workspace_path)
 
-    gateway_port = port if port is not None else config.gateway.port
-    console.print(f"{__logo__} Starting medpilot gateway on port {gateway_port}...")
+    if host is not None:
+        config.gateway.host = host
+        web_cfg = getattr(config.channels, "web", None)
+        if isinstance(web_cfg, dict):
+            web_cfg["host"] = host
+        elif web_cfg is not None:
+            try:
+                web_cfg.host = host
+            except AttributeError:
+                pass
+
+    if port is not None:
+        config.gateway.port = port
+        web_cfg = getattr(config.channels, "web", None)
+        if isinstance(web_cfg, dict):
+            web_cfg["port"] = port
+        elif web_cfg is not None:
+            try:
+                web_cfg.port = port
+            except AttributeError:
+                pass
+
+    gateway_host = config.gateway.host
+    gateway_port = config.gateway.port
+
+    # --- 防呆机制 (Fail-safe) ---
+    pid_file = Path("~/.medpilot/runtime/gateway.pid").expanduser()
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # 1. 检查 PID 文件
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            if psutil.pid_exists(old_pid):
+                proc = psutil.Process(old_pid)
+                if "medpilot" in " ".join(proc.cmdline()):
+                    console.print(f"[red]错误: MedPilot 已经在运行中 (PID: {old_pid})。[/red]")
+                    console.print("[yellow]提示: 请先停止旧进程，或使用 `medpilot-agent stop`。[/yellow]")
+                    raise typer.Exit(1)
+        except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    # 2. 检查端口占用
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            check_host = "127.0.0.1" if gateway_host == "0.0.0.0" else gateway_host
+            if s.connect_ex((check_host, gateway_port)) == 0:
+                console.print(f"[red]错误: 端口 {gateway_port} 已被占用。[/red]")
+                console.print("[yellow]提示: 这通常意味着 MedPilot 已经在运行中。请检查系统进程。[/yellow]")
+                raise typer.Exit(1)
+    except typer.Exit:
+        raise
+    except Exception as e:
+        if verbose:
+            console.print(f"[dim]端口探测异常: {e}[/dim]")
+
+    # 3. 写入当前 PID
+    pid_file.write_text(str(os.getpid()))
+    atexit.register(lambda: pid_file.unlink(missing_ok=True))
+    # --- 防呆机制结束 ---
+
+    console.print(f"{__logo__} Starting medpilot gateway on {gateway_host}:{gateway_port}...")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)

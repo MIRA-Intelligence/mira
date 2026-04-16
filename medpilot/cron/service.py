@@ -93,8 +93,10 @@ class CronService:
         if self.store_path.exists():
             parsed = self._read_store_from_disk()
             self._store = parsed if parsed is not None else CronStore()
+            self._last_mtime_ns = self.store_path.stat().st_mtime_ns
         else:
             self._store = CronStore()
+            self._last_mtime_ns = 0
 
         return self._store
 

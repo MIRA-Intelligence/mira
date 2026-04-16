@@ -1,6 +1,6 @@
 [project]
 name = "medpilot"
-version = "0.0.0"
+version = "0.3.0"
 description = "A lightweight personal AI assistant framework"
 readme = "README.md"
 requires-python = ">=3.11"

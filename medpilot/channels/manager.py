@@ -29,8 +29,31 @@ class ChannelManager:
 
     @staticmethod
     def _to_ns(value: Any) -> Any:
+        from pydantic import BaseModel
+        import re
+
+        def to_snake(name: str) -> str:
+            name = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
+            return re.sub("([a-z0-9])([A-Z])", r"\1_\2", name).lower()
+
         if is_dataclass(value):
             return SimpleNamespace(**asdict(value))
+
+        d = None
+        if isinstance(value, BaseModel):
+            d = value.model_dump()
+        elif isinstance(value, dict):
+            d = value
+
+        if d is not None:
+            ns_dict: dict[str, Any] = {}
+            for k, v in d.items():
+                ns_dict[k] = v
+                snake_k = to_snake(k)
+                if snake_k != k:
+                    ns_dict.setdefault(snake_k, v)
+            return SimpleNamespace(**ns_dict)
+
         return value
 
     @staticmethod
