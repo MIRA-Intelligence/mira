@@ -689,13 +689,32 @@ async def test_handle_config_invalid_json(web_channel: WebChannel) -> None:
 async def test_handle_config_updates_projects_root(web_channel: WebChannel, tmp_path: Path) -> None:
     new_root = tmp_path / "projects"
     new_root.mkdir()
+    persisted_paths: list[Path] = []
+
+    def _persist(path: Path) -> Path:
+        persisted_paths.append(path)
+        return tmp_path / "config_a.json"
+
+    web_channel._persist_projects_root_to_config = _persist  # type: ignore[method-assign]
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"projects_root": str(new_root)})
     resp = await web_channel._handle_config(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["projects_root"] == str(new_root.resolve())
+    assert body["config_path"] == str((tmp_path / "config_a.json").resolve())
+    assert body["persisted"] is True
     assert web_channel.projects_root == new_root.resolve()
+    assert persisted_paths == [new_root.resolve()]
+
+
+async def test_handle_config_rejects_non_string_projects_root(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"projects_root": 123})
+    resp = await web_channel._handle_config(req)
+
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "projects_root must be a string"}
 
 
 async def test_handle_config_unchanged_without_key(web_channel: WebChannel, tmp_path: Path) -> None:
@@ -713,18 +732,28 @@ async def test_handle_config_skips_audit_when_projects_root_unchanged(
     root = tmp_path.resolve()
     web_channel.projects_root = root
     audit_calls: list[dict[str, object]] = []
+    persisted_paths: list[Path] = []
 
     def _capture_audit(**kwargs: object) -> None:
         audit_calls.append(kwargs)
 
+    def _persist(path: Path) -> Path:
+        persisted_paths.append(path)
+        return tmp_path / "config_b.json"
+
     monkeypatch.setattr(web_channel, "_audit", _capture_audit)
+    monkeypatch.setattr(web_channel, "_persist_projects_root_to_config", _persist)
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"projects_root": str(root)})
     resp = await web_channel._handle_config(req)
 
     assert resp.status == 200
-    assert json.loads(resp.text)["projects_root"] == str(root)
+    body = json.loads(resp.text)
+    assert body["projects_root"] == str(root)
+    assert body["config_path"] == str((tmp_path / "config_b.json").resolve())
+    assert body["persisted"] is True
     assert audit_calls == []
+    assert persisted_paths == [root]
 
 
 async def test_handle_validate_data_path_requires_valid_json(web_channel: WebChannel) -> None:
