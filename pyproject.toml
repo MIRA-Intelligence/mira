@@ -46,6 +46,7 @@ dependencies = [
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
     "ddgs>=9.0.0,<10.0.0",
+    "psutil>=6.0.0",
 ]
 
 [project.optional-dependencies]
