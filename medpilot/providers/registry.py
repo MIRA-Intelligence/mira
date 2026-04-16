@@ -12,6 +12,7 @@ Every entry writes out all fields so you can copy-paste as a template.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -162,6 +163,54 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    ProviderSpec(
+        name="volcengine_coding_plan",
+        keywords=("volcengine_coding_plan", "volcengine-coding-plan", "coding-plan"),
+        env_key="OPENAI_API_KEY",
+        display_name="VolcEngine Coding Plan",
+        litellm_prefix="volcengine",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="volces.com/api/coding",
+        default_api_base="https://ark.cn-beijing.volces.com/api/coding/v3",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    ProviderSpec(
+        name="byteplus",
+        keywords=("byteplus",),
+        env_key="OPENAI_API_KEY",
+        display_name="BytePlus",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="byteplus",
+        default_api_base="https://ark.byteintlapi.com/api/v3",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    ProviderSpec(
+        name="byteplus_coding_plan",
+        keywords=("byteplus_coding_plan", "byteplus-coding-plan"),
+        env_key="OPENAI_API_KEY",
+        display_name="BytePlus Coding Plan",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="byteplusapi.com/api/coding",
+        default_api_base="https://ark.byteintlapi.com/api/coding/v3",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(
@@ -230,7 +279,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_key_prefix="",
         detect_by_base_keyword="",
         default_api_base="",
-        strip_model_prefix=False,
+        strip_model_prefix=True,
         model_overrides=(),
         is_oauth=True,  # OAuth-based authentication
     ),
@@ -341,7 +390,71 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    ProviderSpec(
+        name="mistral",
+        keywords=("mistral",),
+        env_key="MISTRAL_API_KEY",
+        display_name="Mistral",
+        litellm_prefix="mistral",
+        skip_prefixes=("mistral/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.mistral.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    ProviderSpec(
+        name="stepfun",
+        keywords=("stepfun", "step-1"),
+        env_key="STEPFUN_API_KEY",
+        display_name="StepFun",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.stepfun.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+    ProviderSpec(
+        name="xiaomi_mimo",
+        keywords=("xiaomi_mimo", "mimo"),
+        env_key="OPENAI_API_KEY",
+        display_name="Xiaomi MIMO",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.xiaomi.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Local deployment (matched by config key, NOT by api_base) =========
+    ProviderSpec(
+        name="ollama",
+        keywords=("ollama",),
+        env_key="",
+        display_name="Ollama",
+        litellm_prefix="ollama",
+        skip_prefixes=("ollama/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=True,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="11434",
+        default_api_base="http://localhost:11434/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # vLLM / any OpenAI-compatible local server.
     # Detected when config key is "vllm" (provider_name="vllm").
     ProviderSpec(
@@ -360,7 +473,39 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    ProviderSpec(
+        name="ovms",
+        keywords=("ovms", "openvino"),
+        env_key="",
+        display_name="OVMS",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=False,
+        is_local=True,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="ovms",
+        default_api_base="http://localhost:8000/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Auxiliary (not a primary LLM provider) ============================
+    ProviderSpec(
+        name="qianfan",
+        keywords=("qianfan", "ernie"),
+        env_key="QIANFAN_API_KEY",
+        display_name="Qianfan",
+        litellm_prefix="qianfan",
+        skip_prefixes=("qianfan/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # Groq: mainly used for Whisper voice transcription, also usable for LLM.
     # Needs "groq/" prefix for LiteLLM routing. Placed last — it rarely wins fallback.
     ProviderSpec(
@@ -442,7 +587,8 @@ def find_gateway(
 
 def find_by_name(name: str) -> ProviderSpec | None:
     """Find a provider spec by config field name, e.g. "dashscope"."""
+    key = re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
     for spec in PROVIDERS:
-        if spec.name == name:
+        if spec.name == key:
             return spec
     return None

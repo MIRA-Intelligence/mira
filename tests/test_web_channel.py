@@ -1546,6 +1546,120 @@ async def test_ws_handler_persists_ui_chat_user_entry(
     assert any(event.get("role") == "user" and event.get("content") == "persist me" for event in session.ui_events)
 
 
+async def test_ws_handler_injects_guard_notice_on_id_reassignment(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4012"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [
+                    {"id": "Exp003", "status": "pending"},
+                    {"id": "Exp003", "status": "pending"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "message",
+                    "session_id": session_id,
+                    "user_id": "u1",
+                    "mode": "auto",
+                    "agent_profile": "default",
+                    "content": "check latest exp ids",
+                    "media": [],
+                }
+            ),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    notice = captured.get("metadata", {}).get("_task_plan_guard_notice")
+    assert isinstance(notice, str)
+    assert "Exp003 -> Exp004" in notice
+
+    repaired = json.loads((project_dir / PLAN_FILENAME).read_text(encoding="utf-8"))
+    ids = [item.get("id") for item in repaired.get("experiments", [])]
+    assert ids == ["Exp003", "Exp004"]
+
+
+async def test_ws_handler_bind_registers_active_client(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (web_channel.projects_root / "PRJ-4011").mkdir(parents=True, exist_ok=True)
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "bind",
+                    "session_id": "PRJ-4011",
+                    "user_id": "u1",
+                }
+            ),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    assert "PRJ-4011" not in web_channel._clients
+    # Connection closes after handler loop exits; verify bind was accepted via audit entry.
+    audit_log = web_channel.projects_root / "PRJ-4011" / ".medpilot" / "logs" / "actions.jsonl"
+    assert audit_log.is_file()
+    lines = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(item.get("action") == "ws_bind_received" for item in lines)
+
+
+async def test_ws_handler_persists_ui_chat_user_entry(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4010"
+    (web_channel.projects_root / session_id).mkdir(parents=True)
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps({
+                "type": "message",
+                "session_id": session_id,
+                "user_id": "u1",
+                "content": "persist me",
+                "media": [],
+            }),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+
+    async def _handle_message(**kwargs):
+        return None
+
+    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    manager = SessionManager(web_channel.projects_root / session_id)
+    session = manager.get_or_create(f"web:{session_id}")
+    assert any(event.get("role") == "user" and event.get("content") == "persist me" for event in session.ui_events)
+
+
 async def test_handle_status_and_sessions_endpoints(web_channel: WebChannel) -> None:
     ws = MagicMock()
     ws.closed = False

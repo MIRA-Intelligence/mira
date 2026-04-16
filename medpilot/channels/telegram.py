@@ -6,9 +6,13 @@ import asyncio
 import re
 import time
 import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
 
 from loguru import logger
 from telegram import BotCommand, ReplyParameters, Update
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -17,9 +21,23 @@ from medpilot.bus.queue import MessageBus
 from medpilot.channels.base import BaseChannel
 from medpilot.config.paths import get_media_dir
 from medpilot.config.schema import TelegramConfig
+from medpilot.security.network import validate_url_target
 from medpilot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN
+_SEND_MAX_RETRIES = 3
+_SEND_RETRY_BASE_DELAY = 0.5
+
+
+@dataclass
+class _StreamBuf:
+    """Per-chat streaming accumulator."""
+
+    text: str = ""
+    message_id: int | None = None
+    last_edit: float = 0.0
+    stream_id: str | None = None
 
 
 def _strip_md(s: str) -> str:
@@ -161,15 +179,26 @@ class TelegramChannel(BaseChannel):
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
         BotCommand("stop", "Stop the current task"),
+        BotCommand("status", "Show bot status"),
+        BotCommand("dream", "Run Dream memory consolidation now"),
+        BotCommand("dream_log", "Show the latest Dream memory change"),
+        BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
         BotCommand("help", "Show available commands"),
     ]
 
+    @classmethod
+    def default_config(cls) -> dict[str, object]:
+        cfg = TelegramConfig()
+        return cfg.model_dump(by_alias=True)
+
     def __init__(
         self,
-        config: TelegramConfig,
+        config: TelegramConfig | dict[str, object],
         bus: MessageBus,
         groq_api_key: str = "",
     ):
+        if isinstance(config, dict):
+            config = TelegramConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
@@ -179,6 +208,33 @@ class TelegramChannel(BaseChannel):
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         self._message_threads: dict[tuple[str, int], int] = {}
+        self._stream_bufs: dict[str, _StreamBuf] = {}
+        self._bot_user_id: int | None = None
+        self._bot_username: str | None = None
+
+    async def _ensure_bot_identity(self) -> tuple[int | None, str | None]:
+        if self._bot_user_id is not None or self._bot_username is not None:
+            return self._bot_user_id, self._bot_username
+        if not self._app:
+            return None, None
+        try:
+            me = await self._app.bot.get_me()
+            self._bot_user_id = getattr(me, "id", None)
+            self._bot_username = getattr(me, "username", None)
+        except Exception:
+            return None, None
+        return self._bot_user_id, self._bot_username
+
+    async def _is_message_mentioned(self, message) -> bool:
+        bot_id, username = await self._ensure_bot_identity()
+        reply = getattr(message, "reply_to_message", None)
+        reply_user = getattr(reply, "from_user", None) if reply else None
+        if bot_id and reply_user and getattr(reply_user, "id", None) == bot_id:
+            return True
+        if not username:
+            return False
+        content = (message.text or "") + "\n" + (message.caption or "")
+        return f"@{username}" in content
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -209,13 +265,20 @@ class TelegramChannel(BaseChannel):
 
         # Build the application with larger connection pool to avoid pool-timeout on long runs
         req = HTTPXRequest(
-            connection_pool_size=16,
-            pool_timeout=5.0,
+            connection_pool_size=getattr(self.config, "connection_pool_size", 32),
+            pool_timeout=getattr(self.config, "pool_timeout", 5.0),
             connect_timeout=30.0,
             read_timeout=30.0,
             proxy=self.config.proxy if self.config.proxy else None,
         )
-        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
+        poll_req = HTTPXRequest(
+            connection_pool_size=4,
+            pool_timeout=getattr(self.config, "pool_timeout", 5.0),
+            connect_timeout=30.0,
+            read_timeout=30.0,
+            proxy=self.config.proxy if self.config.proxy else None,
+        )
+        builder = Application.builder().token(self.config.token).request(req).get_updates_request(poll_req)
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
@@ -253,7 +316,8 @@ class TelegramChannel(BaseChannel):
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
             allowed_updates=["message"],
-            drop_pending_updates=True  # Ignore old messages on startup
+            drop_pending_updates=True,
+            error_callback=lambda err: logger.warning("Telegram polling error: {}", err),
         )
 
         # Keep running until stopped
@@ -332,16 +396,33 @@ class TelegramChannel(BaseChannel):
                     "voice": self._app.bot.send_voice,
                     "audio": self._app.bot.send_audio,
                 }.get(media_type, self._app.bot.send_document)
-                param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
-                with open(media_path, 'rb') as f:
+                param = (
+                    "photo"
+                    if media_type == "photo"
+                    else media_type
+                    if media_type in ("voice", "audio")
+                    else "document"
+                )
+                if media_path.startswith(("http://", "https://")):
+                    ok, reason = validate_url_target(media_path)
+                    if not ok:
+                        raise ValueError(reason)
                     await sender(
                         chat_id=chat_id,
-                        **{param: f},
+                        **{param: media_path},
                         reply_parameters=reply_params,
                         **thread_kwargs,
                     )
+                else:
+                    with open(media_path, "rb") as f:
+                        await sender(
+                            chat_id=chat_id,
+                            **{param: f},
+                            reply_parameters=reply_params,
+                            **thread_kwargs,
+                        )
             except Exception as e:
-                filename = media_path.rsplit("/", 1)[-1]
+                filename = Path(urlparse(media_path).path or media_path).name
                 logger.error("Failed to send media {}: {}", media_path, e)
                 await self._app.bot.send_message(
                     chat_id=chat_id,
@@ -371,7 +452,8 @@ class TelegramChannel(BaseChannel):
         """Send a plain text message with HTML fallback."""
         try:
             html = _markdown_to_telegram_html(text)
-            await self._app.bot.send_message(
+            await self._call_with_retry(
+                self._app.bot.send_message,
                 chat_id=chat_id, text=html, parse_mode="HTML",
                 reply_parameters=reply_params,
                 **(thread_kwargs or {}),
@@ -379,7 +461,8 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.warning("HTML parse failed, falling back to plain text: {}", e)
             try:
-                await self._app.bot.send_message(
+                await self._call_with_retry(
+                    self._app.bot.send_message,
                     chat_id=chat_id,
                     text=text,
                     reply_parameters=reply_params,
@@ -387,6 +470,7 @@ class TelegramChannel(BaseChannel):
                 )
             except Exception as e2:
                 logger.error("Error sending Telegram message: {}", e2)
+                raise
 
     async def _send_with_streaming(
         self,
@@ -426,14 +510,11 @@ class TelegramChannel(BaseChannel):
 
     async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command, bypassing ACL so all users can access it."""
+        from medpilot.command.builtin import build_help_text
+
         if not update.message:
             return
-        await update.message.reply_text(
-            "🐈 medpilot commands:\n"
-            "/new — Start a new conversation\n"
-            "/stop — Stop the current task\n"
-            "/help — Show available commands"
-        )
+        await update.message.reply_text(build_help_text())
 
     @staticmethod
     def _sender_id(user) -> str:
@@ -445,9 +526,24 @@ class TelegramChannel(BaseChannel):
     def _derive_topic_session_key(message) -> str | None:
         """Derive topic-scoped session key for non-private Telegram chats."""
         message_thread_id = getattr(message, "message_thread_id", None)
-        if message.chat.type == "private" or message_thread_id is None:
+        if message_thread_id is None:
             return None
         return f"telegram:{message.chat_id}:topic:{message_thread_id}"
+
+    @staticmethod
+    def _normalize_telegram_command(content: str) -> str:
+        text = (content or "").strip()
+        if not text.startswith("/"):
+            return text
+        parts = text.split(None, 1)
+        cmd = parts[0].split("@", 1)[0]
+        args = parts[1] if len(parts) > 1 else ""
+        alias_map = {
+            "/dream_log": "/dream-log",
+            "/dream_restore": "/dream-restore",
+        }
+        cmd = alias_map.get(cmd, cmd)
+        return f"{cmd} {args}".strip()
 
     @staticmethod
     def _build_message_metadata(message, user) -> dict:
@@ -472,6 +568,66 @@ class TelegramChannel(BaseChannel):
         if len(self._message_threads) > 1000:
             self._message_threads.pop(next(iter(self._message_threads)))
 
+    async def _extract_reply_context(self, message) -> str | None:
+        """Extract text context from the message being replied to."""
+        reply = getattr(message, "reply_to_message", None)
+        if not reply:
+            return None
+        text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+        if len(text) > TELEGRAM_REPLY_CONTEXT_MAX_LEN:
+            text = text[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
+        if not text:
+            return None
+        reply_user = getattr(reply, "from_user", None)
+        if reply_user and getattr(reply_user, "username", None):
+            return f"[Reply to @{reply_user.username}: {text}]"
+        if reply_user and getattr(reply_user, "first_name", None):
+            return f"[Reply to {reply_user.first_name}: {text}]"
+        return f"[Reply to: {text}]"
+
+    async def _download_message_media(
+        self,
+        msg,
+        *,
+        add_failure_content: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        """Download media from a message and return (media_paths, content_parts)."""
+        media_file = None
+        media_type = None
+        if getattr(msg, "photo", None):
+            media_file = msg.photo[-1]
+            media_type = "image"
+        elif getattr(msg, "voice", None):
+            media_file = msg.voice
+            media_type = "voice"
+        elif getattr(msg, "audio", None):
+            media_file = msg.audio
+            media_type = "audio"
+        elif getattr(msg, "document", None):
+            media_file = msg.document
+            media_type = "file"
+
+        if not media_file or not self._app:
+            return [], []
+
+        try:
+            file = await self._app.bot.get_file(media_file.file_id)
+            ext = self._get_extension(
+                media_type,
+                getattr(media_file, "mime_type", None),
+                getattr(media_file, "file_name", None),
+            )
+            media_dir = get_media_dir("telegram")
+            base = getattr(media_file, "file_unique_id", None) or media_file.file_id[:16]
+            file_path = media_dir / f"{base}{ext}"
+            await file.download_to_drive(str(file_path))
+            content = f"[{media_type}: {file_path}]"
+            return [str(file_path)], [content]
+        except Exception:
+            if add_failure_content:
+                return [], [f"[{media_type}: download failed]"]
+            return [], []
+
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
@@ -482,7 +638,7 @@ class TelegramChannel(BaseChannel):
         await self._handle_message(
             sender_id=self._sender_id(user),
             chat_id=str(message.chat_id),
-            content=message.text,
+            content=self._normalize_telegram_command(message.text or ""),
             metadata=self._build_message_metadata(message, user),
             session_key=self._derive_topic_session_key(message),
         )
@@ -505,11 +661,17 @@ class TelegramChannel(BaseChannel):
         content_parts = []
         media_paths = []
 
+        if reply_context := await self._extract_reply_context(message):
+            content_parts.append(reply_context)
+
         # Text content
         if message.text:
             content_parts.append(message.text)
         if message.caption:
             content_parts.append(message.caption)
+        if getattr(message, "location", None):
+            loc = message.location
+            content_parts.append(f"[location: {loc.latitude}, {loc.longitude}]")
 
         # Handle media files
         media_file = None
@@ -530,37 +692,19 @@ class TelegramChannel(BaseChannel):
 
         # Download media if present
         if media_file and self._app:
-            try:
-                file = await self._app.bot.get_file(media_file.file_id)
-                ext = self._get_extension(
-                    media_type,
-                    getattr(media_file, 'mime_type', None),
-                    getattr(media_file, 'file_name', None),
-                )
-                media_dir = get_media_dir("telegram")
-
-                file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
-                await file.download_to_drive(str(file_path))
-
-                media_paths.append(str(file_path))
-
-                # Handle voice transcription
-                if media_type == "voice" or media_type == "audio":
-                    from medpilot.providers.transcription import GroqTranscriptionProvider
-                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                    transcription = await transcriber.transcribe(file_path)
-                    if transcription:
-                        logger.info("Transcribed {}: {}...", media_type, transcription[:50])
-                        content_parts.append(f"[transcription: {transcription}]")
+            d_paths, d_parts = await self._download_message_media(message, add_failure_content=True)
+            media_paths.extend(d_paths)
+            content_parts.extend(d_parts)
+        elif self._app:
+            reply = getattr(message, "reply_to_message", None)
+            if reply:
+                r_paths, r_parts = await self._download_message_media(reply, add_failure_content=False)
+                media_paths.extend(r_paths)
+                if r_parts:
+                    if reply_context:
+                        content_parts.insert(1, r_parts[0])
                     else:
-                        content_parts.append(f"[{media_type}: {file_path}]")
-                else:
-                    content_parts.append(f"[{media_type}: {file_path}]")
-
-                logger.debug("Downloaded {} to {}", media_type, file_path)
-            except Exception as e:
-                logger.error("Failed to download media: {}", e)
-                content_parts.append(f"[{media_type}: download failed]")
+                        content_parts.insert(0, f"[Reply to: {r_parts[0]}]")
 
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
@@ -569,6 +713,10 @@ class TelegramChannel(BaseChannel):
         str_chat_id = str(chat_id)
         metadata = self._build_message_metadata(message, user)
         session_key = self._derive_topic_session_key(message)
+        if message.chat.type != "private":
+            policy = getattr(self.config, "group_policy", "mention")
+            if policy == "mention" and not await self._is_message_mentioned(message):
+                return
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):
@@ -643,7 +791,118 @@ class TelegramChannel(BaseChannel):
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
-        logger.error("Telegram error: {}", context.error)
+        error = context.error
+        if isinstance(error, NetworkError):
+            text = str(error).strip() or "NetworkError"
+            logger.warning("Telegram network issue: {}", text)
+            return
+        logger.error("Telegram error: {}", error)
+
+    @staticmethod
+    def _is_not_modified_error(exc: Exception) -> bool:
+        return isinstance(exc, BadRequest) and "message is not modified" in str(exc).lower()
+
+    async def _call_with_retry(self, fn, *args, **kwargs):
+        """Retry Telegram API calls on transient timeout/network errors."""
+        for attempt in range(1, _SEND_MAX_RETRIES + 1):
+            try:
+                return await fn(*args, **kwargs)
+            except (TimedOut, NetworkError):
+                if attempt >= _SEND_MAX_RETRIES:
+                    raise
+                await asyncio.sleep(_SEND_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+
+    async def send_delta(
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Progressive message editing: send on first delta, edit on subsequent ones."""
+        if not self._app:
+            return
+        meta = metadata or {}
+        int_chat_id = int(chat_id)
+        stream_id = meta.get("_stream_id")
+
+        if meta.get("_stream_end"):
+            buf = self._stream_bufs.get(chat_id)
+            if not buf or not buf.message_id or not buf.text:
+                return
+            if stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id:
+                return
+            self._stop_typing(chat_id)
+            chunks = split_message(buf.text, TELEGRAM_MAX_MESSAGE_LEN)
+            primary_text = chunks[0] if chunks else buf.text
+            try:
+                html = _markdown_to_telegram_html(primary_text)
+                await self._call_with_retry(
+                    self._app.bot.edit_message_text,
+                    chat_id=int_chat_id,
+                    message_id=buf.message_id,
+                    text=html,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                if self._is_not_modified_error(e):
+                    self._stream_bufs.pop(chat_id, None)
+                    return
+                try:
+                    await self._call_with_retry(
+                        self._app.bot.edit_message_text,
+                        chat_id=int_chat_id,
+                        message_id=buf.message_id,
+                        text=primary_text,
+                    )
+                except Exception as e2:
+                    if self._is_not_modified_error(e2):
+                        pass
+                    else:
+                        raise
+            for extra_chunk in chunks[1:]:
+                await self._send_text(int_chat_id, extra_chunk)
+            self._stream_bufs.pop(chat_id, None)
+            return
+
+        buf = self._stream_bufs.get(chat_id)
+        if buf is None or (
+            stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id
+        ):
+            buf = _StreamBuf(stream_id=stream_id)
+            self._stream_bufs[chat_id] = buf
+        elif buf.stream_id is None:
+            buf.stream_id = stream_id
+        buf.text += delta
+        if not buf.text.strip():
+            return
+
+        now = time.monotonic()
+        thread_kwargs = {}
+        if message_thread_id := meta.get("message_thread_id"):
+            thread_kwargs["message_thread_id"] = message_thread_id
+        if buf.message_id is None:
+            sent = await self._call_with_retry(
+                self._app.bot.send_message,
+                chat_id=int_chat_id,
+                text=buf.text,
+                **thread_kwargs,
+            )
+            buf.message_id = sent.message_id
+            buf.last_edit = now
+        elif (now - buf.last_edit) >= 0.6:
+            try:
+                await self._call_with_retry(
+                    self._app.bot.edit_message_text,
+                    chat_id=int_chat_id,
+                    message_id=buf.message_id,
+                    text=buf.text,
+                )
+                buf.last_edit = now
+            except Exception as e:
+                if self._is_not_modified_error(e):
+                    buf.last_edit = now
+                    return
+                raise
 
     def _get_extension(
         self,
@@ -665,8 +924,6 @@ class TelegramChannel(BaseChannel):
             return ext
 
         if filename:
-            from pathlib import Path
-
             return "".join(Path(filename).suffixes)
 
         return ""

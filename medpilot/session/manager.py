@@ -100,7 +100,7 @@ class Session:
         pending_tool_calls: set[str] = set()
         for m in sliced:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
-            for k in ("tool_calls", "tool_call_id", "name"):
+            for k in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
                 if k in m:
                     entry[k] = m[k]
 
@@ -127,9 +127,9 @@ class Session:
 
         # --- Pass 2: strip assistant tool_calls that lost any results ---
         out = self._strip_incomplete_tool_calls(out)
-
-        # --- Pass 3: collapse consecutive same-role messages ---
-        out = self._collapse_consecutive_roles(out)
+        # Only collapse when assistant turns exist. Pure user-only history should stay append-only.
+        if any(m.get("role") == "assistant" for m in out):
+            out = self._collapse_consecutive_roles(out)
 
         return out
 
@@ -178,7 +178,7 @@ class Session:
         result: list[dict[str, Any]] = [messages[0]]
         for msg in messages[1:]:
             prev = result[-1]
-            if msg["role"] == prev["role"]:
+            if msg["role"] == prev["role"] and msg["role"] in {"user", "assistant"}:
                 # Merge: keep the later message's content; skip if empty.
                 prev_content = prev.get("content") or ""
                 curr_content = msg.get("content") or ""
@@ -204,6 +204,37 @@ class Session:
         self.last_consolidated = 0
         self._reset_pending = True
         self._persisted_messages = 0
+        self.updated_at = datetime.now()
+
+    def retain_recent_legal_suffix(self, keep_count: int) -> None:
+        """Keep a recent message suffix, aligned to a legal user-start boundary."""
+        if keep_count <= 0:
+            self.clear()
+            return
+        if keep_count >= len(self.messages):
+            return
+
+        start = len(self.messages) - keep_count
+        if self.messages[start].get("role") != "user":
+            forward_user = next(
+                (i for i in range(start, len(self.messages)) if self.messages[i].get("role") == "user"),
+                None,
+            )
+            if forward_user is not None:
+                start = forward_user
+            else:
+                backward_user = next(
+                    (i for i in range(start - 1, -1, -1) if self.messages[i].get("role") == "user"),
+                    None,
+                )
+                if backward_user is not None:
+                    start = backward_user
+
+        if start <= 0:
+            return
+
+        self.messages = self.messages[start:]
+        self.last_consolidated = max(0, self.last_consolidated - start)
         self.updated_at = datetime.now()
 
 

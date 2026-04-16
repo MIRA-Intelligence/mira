@@ -2,7 +2,9 @@
 
 import asyncio
 from collections import deque
+from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import unquote, urlparse
 
 from loguru import logger
 
@@ -110,22 +112,41 @@ class QQChannel(BaseChannel):
             msg_id = msg.metadata.get("message_id")
             self._msg_seq += 1
             msg_type = self._chat_type_cache.get(msg.chat_id, "c2c")
+            use_markdown = getattr(self.config, "msg_format", "text") == "markdown"
             if msg_type == "group":
-                await self._client.api.post_group_message(
-                    group_openid=msg.chat_id,
-                    msg_type=2,
-                    markdown={"content": msg.content},
-                    msg_id=msg_id,
-                    msg_seq=self._msg_seq,
-                )
+                if use_markdown:
+                    await self._client.api.post_group_message(
+                        group_openid=msg.chat_id,
+                        msg_type=2,
+                        markdown={"content": msg.content},
+                        msg_id=msg_id,
+                        msg_seq=self._msg_seq,
+                    )
+                else:
+                    await self._client.api.post_group_message(
+                        group_openid=msg.chat_id,
+                        msg_type=0,
+                        content=msg.content,
+                        msg_id=msg_id,
+                        msg_seq=self._msg_seq,
+                    )
             else:
-                await self._client.api.post_c2c_message(
-                    openid=msg.chat_id,
-                    msg_type=2,
-                    markdown={"content": msg.content},
-                    msg_id=msg_id,
-                    msg_seq=self._msg_seq,
-                )
+                if use_markdown:
+                    await self._client.api.post_c2c_message(
+                        openid=msg.chat_id,
+                        msg_type=2,
+                        markdown={"content": msg.content},
+                        msg_id=msg_id,
+                        msg_seq=self._msg_seq,
+                    )
+                else:
+                    await self._client.api.post_c2c_message(
+                        openid=msg.chat_id,
+                        msg_type=0,
+                        content=msg.content,
+                        msg_id=msg_id,
+                        msg_seq=self._msg_seq,
+                    )
         except Exception as e:
             logger.error("Error sending QQ message: {}", e)
 
@@ -150,6 +171,26 @@ class QQChannel(BaseChannel):
                 user_id = chat_id
                 self._chat_type_cache[chat_id] = "c2c"
 
+            ack = getattr(self.config, "ack_message", "").strip()
+            if ack and self._client:
+                self._msg_seq += 1
+                if is_group:
+                    await self._client.api.post_group_message(
+                        group_openid=chat_id,
+                        msg_type=0,
+                        content=ack,
+                        msg_id=data.id,
+                        msg_seq=self._msg_seq,
+                    )
+                else:
+                    await self._client.api.post_c2c_message(
+                        openid=chat_id,
+                        msg_type=0,
+                        content=ack,
+                        msg_id=data.id,
+                        msg_seq=self._msg_seq,
+                    )
+
             await self._handle_message(
                 sender_id=user_id,
                 chat_id=chat_id,
@@ -158,3 +199,16 @@ class QQChannel(BaseChannel):
             )
         except Exception:
             logger.exception("Error handling QQ message")
+
+    async def _read_media_bytes(self, media_path: str) -> tuple[bytes | None, str | None]:
+        path = media_path
+        if media_path.startswith("file://"):
+            parsed = urlparse(media_path)
+            path = unquote(parsed.path)
+        fp = Path(path)
+        if not fp.exists() or not fp.is_file():
+            return None, None
+        try:
+            return fp.read_bytes(), fp.name
+        except Exception:
+            return None, None
