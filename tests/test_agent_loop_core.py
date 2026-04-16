@@ -131,6 +131,23 @@ def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
     assert merged == "UI rules\n\nGuard notice"
     assert loop._compose_extra_system("", "Guard notice") == "Guard notice"
     assert loop._compose_extra_system(None, None) is None
+    auto_msg = loop._build_auto_continue_message(
+        channel="web",
+        chat_id="PRJ-9",
+        project_dir=str(tmp_path / "PRJ-9"),
+        run_mode="auto",
+    )
+    assert "Execute exactly ONE pending experiment in this round" in auto_msg
+    assert "immediately update and write task_plan.json" in auto_msg
+    checkpoint_msg = loop._build_auto_checkpoint_sync_message(
+        channel="web",
+        chat_id="PRJ-9",
+        project_dir=str(tmp_path / "PRJ-9"),
+        run_mode="auto",
+        running_ids=["Exp001"],
+    )
+    assert "Checkpoint barrier" in checkpoint_msg
+    assert "Exp001" in checkpoint_msg
 
 
 def test_auto_run_decision_helpers(tmp_path: Path) -> None:
@@ -147,6 +164,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     loaded = AgentLoop._load_task_plan(str(project))
     assert loaded is not None
     assert AgentLoop._plan_has_pending_work(loaded) is True
+    assert AgentLoop._running_experiment_ids(loaded) == []
 
     assert loop._should_continue_auto_web(
         channel="web",
@@ -176,6 +194,27 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         project_dir=str(bad_project),
         final_content="all good",
     ) is False
+
+    before = {
+        "experiments": [
+            {"id": "Exp001", "status": "running", "results": {"metrics": {}}},
+            {"id": "Exp002", "status": "pending"},
+        ]
+    }
+    after_unchanged = {
+        "experiments": [
+            {"id": "Exp001", "status": "running", "results": {"metrics": {}}},
+            {"id": "Exp002", "status": "pending"},
+        ]
+    }
+    after_updated = {
+        "experiments": [
+            {"id": "Exp001", "status": "completed", "results": {"metrics": {"Dice": 0.8}}},
+            {"id": "Exp002", "status": "pending"},
+        ]
+    }
+    assert AgentLoop._has_experiment_checkpoint_update(before, after_unchanged) is False
+    assert AgentLoop._has_experiment_checkpoint_update(before, after_updated) is True
 
 
 def test_automation_policy_helpers(tmp_path: Path) -> None:

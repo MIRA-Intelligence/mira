@@ -53,6 +53,7 @@ class AgentLoop:
 
     _TOOL_RESULT_MAX_CHARS = 500
     _AUTO_GUARD_REPAIR_MAX = 1
+    _AUTO_CHECKPOINT_REPAIR_MAX = 1
     _AUTO_CONTINUE_MARKER = "[AUTO-CONTINUE-INTERNAL]"
 
     def __init__(
@@ -486,6 +487,70 @@ class AgentLoop:
         )
 
     @staticmethod
+    def _plan_experiment_index(plan: dict | None) -> dict[str, dict[str, Any]]:
+        """Build experiment lookup by id from task_plan payload."""
+        if not plan:
+            return {}
+        experiments = plan.get("experiments")
+        if not isinstance(experiments, list):
+            return {}
+
+        index: dict[str, dict[str, Any]] = {}
+        for exp in experiments:
+            if not isinstance(exp, dict):
+                continue
+            exp_id = exp.get("id")
+            if not isinstance(exp_id, str):
+                continue
+            normalized = exp_id.strip()
+            if not normalized:
+                continue
+            index[normalized] = exp
+        return index
+
+    @staticmethod
+    def _running_experiment_ids(plan: dict | None) -> list[str]:
+        """Return ids of currently running experiments."""
+        if not plan:
+            return []
+        experiments = plan.get("experiments")
+        if not isinstance(experiments, list):
+            return []
+
+        ids: list[str] = []
+        for exp in experiments:
+            if not isinstance(exp, dict) or exp.get("status") != "running":
+                continue
+            exp_id = exp.get("id")
+            if isinstance(exp_id, str) and exp_id.strip():
+                ids.append(exp_id.strip())
+        return ids
+
+    @classmethod
+    def _has_experiment_checkpoint_update(
+        cls,
+        before_plan: dict | None,
+        after_plan: dict | None,
+    ) -> bool:
+        """Check whether running experiments were persisted in task_plan this round."""
+        running_ids = cls._running_experiment_ids(before_plan)
+        if not running_ids:
+            return True
+
+        before_index = cls._plan_experiment_index(before_plan)
+        after_index = cls._plan_experiment_index(after_plan)
+
+        for exp_id in running_ids:
+            before_entry = before_index.get(exp_id)
+            after_entry = after_index.get(exp_id)
+            # Entry disappeared or changed => task plan checkpoint advanced.
+            if after_entry is None:
+                return True
+            if before_entry != after_entry:
+                return True
+        return False
+
+    @staticmethod
     def _to_number(value: object) -> float | None:
         """Convert metric value to float when possible."""
         if isinstance(value, (int, float)):
@@ -631,8 +696,11 @@ class AgentLoop:
         )
         return (
             f"{runtime_ctx}\n\n{self._AUTO_CONTINUE_MARKER}\n"
-            "Continue automatically to the next pending experiment or stage. "
-            "Do not stop for confirmation unless user input is strictly required."
+            "Auto-run checkpoint requirements:\n"
+            "1) If you just finished an experiment, immediately update and write task_plan.json "
+            "(set status/results/conclusion/next for that experiment) BEFORE starting the next one.\n"
+            "2) Execute exactly ONE pending experiment in this round, then return control.\n"
+            "3) Do not stop for confirmation unless user input is strictly required."
         )
 
     def _build_auto_guardrail_repair_message(
@@ -658,6 +726,33 @@ class AgentLoop:
             "Patch task_plan.json to satisfy the missing required fields only.\n"
             "Do NOT rewrite prior conclusions or metrics unless logically necessary.\n"
             f"Missing/invalid items:\n{issue_lines}"
+        )
+
+    def _build_auto_checkpoint_sync_message(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        project_dir: str | None,
+        run_mode: str,
+        running_ids: list[str],
+    ) -> str:
+        """Build an internal message that forces per-experiment task_plan checkpointing."""
+        runtime_ctx = ContextBuilder._build_runtime_context(
+            channel,
+            chat_id,
+            project_dir,
+            run_mode=run_mode,
+        )
+        items = "\n".join(f"- {item}" for item in running_ids[:8]) if running_ids else "- running experiment"
+        return (
+            f"{runtime_ctx}\n\n{self._AUTO_CONTINUE_MARKER}\n"
+            "Checkpoint barrier: task_plan.json still shows the same running experiment(s) as before this round.\n"
+            "Before any new work, update and write task_plan.json now for the current running experiment(s):\n"
+            "1) set final status (completed/failed/skipped) if finished;\n"
+            "2) persist results/conclusion/next (or progress if still running);\n"
+            "3) then stop this turn.\n"
+            f"Running experiments to sync:\n{items}"
         )
 
     def _should_continue_auto_web(
@@ -1048,6 +1143,7 @@ class AgentLoop:
                 ))
 
             audit_cb = _web_audit
+        round_plan_before = self._load_task_plan(project_dir) if msg.channel == "web" else None
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages,
             model_runtime=model_runtime,
@@ -1055,12 +1151,49 @@ class AgentLoop:
             audit_hook=audit_cb,
         )
         total_tokens_used = self._last_loop_tokens_used
+        round_plan_after = self._load_task_plan(project_dir) if msg.channel == "web" else None
 
         auto_round = 0
         guard_repair_round = 0
+        checkpoint_repair_round = 0
         while True:
             current_mode = self._session_run_modes.get(key, run_mode)
             automation_policy = self._resolve_session_automation_policy(key, None)
+            if msg.channel == "web" and current_mode == "auto":
+                if not self._has_experiment_checkpoint_update(round_plan_before, round_plan_after):
+                    if checkpoint_repair_round >= self._AUTO_CHECKPOINT_REPAIR_MAX:
+                        await progress_cb(
+                            "auto-run stop condition: task_plan checkpoint missing after experiment round"
+                        )
+                        break
+                    checkpoint_repair_round += 1
+                    auto_round += 1
+                    running_ids = self._running_experiment_ids(round_plan_before)
+                    await progress_cb(
+                        f"auto-run checkpoint repair {checkpoint_repair_round}: "
+                        "forcing task_plan sync for running experiment"
+                    )
+                    all_msgs.append({
+                        "role": "user",
+                        "content": self._build_auto_checkpoint_sync_message(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            project_dir=project_dir,
+                            run_mode=current_mode,
+                            running_ids=running_ids,
+                        ),
+                    })
+                    round_plan_before = round_plan_after
+                    final_content, _, all_msgs = await self._run_agent_loop(
+                        all_msgs,
+                        model_runtime=model_runtime,
+                        on_progress=progress_cb,
+                        audit_hook=audit_cb,
+                    )
+                    total_tokens_used += self._last_loop_tokens_used
+                    round_plan_after = self._load_task_plan(project_dir)
+                    continue
+
             if msg.channel == "web" and current_mode == "auto":
                 current_plan = self._load_task_plan(project_dir)
                 stop_reason = self._evaluate_automation_stop_policy(
@@ -1127,6 +1260,7 @@ class AgentLoop:
                     run_mode,
                 ),
             })
+            round_plan_before = round_plan_after
             final_content, _, all_msgs = await self._run_agent_loop(
                 all_msgs,
                 model_runtime=model_runtime,
@@ -1134,6 +1268,7 @@ class AgentLoop:
                 audit_hook=audit_cb,
             )
             total_tokens_used += self._last_loop_tokens_used
+            round_plan_after = self._load_task_plan(project_dir)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
