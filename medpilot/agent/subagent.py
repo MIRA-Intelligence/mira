@@ -16,12 +16,14 @@ from medpilot.agent.tools.filesystem import (
     WriteFileTool,
 )
 from medpilot.agent.tools.registry import ToolRegistry
+from medpilot.agent.tools.search import GlobTool, GrepTool
 from medpilot.agent.tools.shell import ExecTool
 from medpilot.agent.tools.web import WebFetchTool, WebSearchTool
 from medpilot.bus.events import InboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.config.schema import ExecToolConfig
 from medpilot.providers.base import LLMProvider
+from medpilot.agent.runner import AgentRunSpec, AgentRunner
 
 
 class SubagentManager:
@@ -42,6 +44,7 @@ class SubagentManager:
         restrict_to_workspace: bool = False,
         provider_factory: Callable[[str], LLMProvider] | None = None,
         model_router: ModelRouter | None = None,
+        max_tool_result_chars: int = 16_000,
     ):
         from medpilot.config.schema import ExecToolConfig
         self.provider = provider
@@ -57,6 +60,8 @@ class SubagentManager:
         self.restrict_to_workspace = restrict_to_workspace
         self.provider_factory = provider_factory
         self.model_router = model_router
+        self.max_tool_result_chars = max_tool_result_chars
+        self.runner = AgentRunner(provider)
         self._session_runtimes: dict[str, RoutedProviderManager] = {}
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -113,7 +118,7 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
-        provider_runtime: RoutedProviderManager,
+        provider_runtime: RoutedProviderManager | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -126,12 +131,15 @@ class SubagentManager:
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-            ))
+            tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            if self.exec_config.enable:
+                tools.register(ExecTool(
+                    working_dir=str(self.workspace),
+                    timeout=self.exec_config.timeout,
+                    restrict_to_workspace=self.restrict_to_workspace,
+                    path_append=self.exec_config.path_append,
+                ))
             tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
 
@@ -141,66 +149,44 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
 
-            # Run agent loop (limited iterations)
-            max_iterations = 15
-            iteration = 0
-            final_result: str | None = None
-            active_provider: LLMProvider | None = None
-            active_route = None
-
-            while iteration < max_iterations:
-                iteration += 1
-
-                if active_provider is None or active_route is None:
-                    active_provider, active_route = await provider_runtime.resolve(messages, iteration)
-                response, active_route = await provider_runtime.chat(
-                    active_route,
-                    messages=messages,
-                    tools=tools.get_definitions(),
+            result = await self.runner.run(
+                AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    model=self.model,
+                    max_iterations=15,
+                    max_iterations_message="Task completed but no final response was generated.",
+                    max_tool_result_chars=self.max_tool_result_chars,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
+                    fail_on_tool_error=False,
                 )
-
-                if response.has_tool_calls:
-                    # Add assistant message with tool calls
-                    tool_call_dicts = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ]
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.content or "",
-                        "tool_calls": tool_call_dicts,
-                    })
-
-                    # Execute tools
-                    for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
-                        })
-                else:
-                    final_result = response.content
-                    break
-
-            if final_result is None:
-                final_result = "Task completed but no final response was generated."
+            )
+            final_result = result.final_content or "Task completed but no final response was generated."
+            status = "ok"
+            if any(e.get("status") == "error" for e in result.tool_events):
+                completed = [e for e in result.tool_events if e.get("status") == "ok"]
+                errors = [e for e in result.tool_events if e.get("status") == "error"]
+                lines = []
+                if completed:
+                    lines.append("Completed steps:")
+                    for e in completed:
+                        lines.append(f"- {e.get('name')}: {e.get('detail')}")
+                if errors:
+                    lines.append("Failure:")
+                    for e in errors:
+                        detail = str(e.get("detail") or "")
+                        if detail.startswith("Error executing ") and ": " in detail:
+                            detail = detail.split(": ", 1)[1]
+                        if " [Analyze the error above and try a different approach.]" in detail:
+                            detail = detail.split(" [Analyze the error above and try a different approach.]", 1)[0]
+                        lines.append(f"- {e.get('name')}: {detail}")
+                final_result = "\n".join(lines) if lines else final_result
+                status = "error"
 
             logger.info("Subagent [{}] completed successfully", task_id)
-            await self._announce_result(task_id, label, task, final_result, origin, "ok")
+            await self._announce_result(task_id, label, task, final_result, origin, status)
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"

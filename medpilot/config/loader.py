@@ -1,9 +1,12 @@
 """Configuration loading utilities."""
 
 import json
+import os
+import re
 from pathlib import Path
 
 from medpilot.config.schema import Config
+from medpilot.security.network import configure_ssrf_whitelist
 
 
 # Global variable to store current config path (for multi-instance support)
@@ -20,6 +23,9 @@ def get_config_path() -> Path:
     """Get the configuration file path."""
     if _current_config_path:
         return _current_config_path
+    env_path = os.environ.get("MEDPILOT_CONFIG_PATH")
+    if env_path:
+        return Path(env_path).expanduser()
     return Path.home() / ".medpilot" / "config.json"
 
 
@@ -40,12 +46,16 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             data = _migrate_config(data)
-            return Config.model_validate(data)
+            cfg = Config.model_validate(data)
+            configure_ssrf_whitelist(cfg.tools.ssrf_whitelist)
+            return cfg
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
 
-    return Config()
+    cfg = Config()
+    configure_ssrf_whitelist(cfg.tools.ssrf_whitelist)
+    return cfg
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
@@ -65,6 +75,32 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
+def resolve_config_env_vars(config: Config) -> Config:
+    """Return config copy with ${VAR} references resolved from environment."""
+    data = config.model_dump(mode="json", by_alias=True)
+    data = _resolve_env_vars(data)
+    return Config.model_validate(data)
+
+
+def _resolve_env_vars(obj: object) -> object:
+    """Recursively resolve ${VAR} patterns in string values."""
+    if isinstance(obj, str):
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _env_replace, obj)
+    if isinstance(obj, dict):
+        return {k: _resolve_env_vars(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_env_vars(v) for v in obj]
+    return obj
+
+
+def _env_replace(match: re.Match[str]) -> str:
+    name = match.group(1)
+    value = os.environ.get(name)
+    if value is None:
+        raise ValueError(f"Environment variable '{name}' referenced in config is not set")
+    return value
+
+
 def _migrate_config(data: dict) -> dict:
     """Migrate old config formats to current."""
     # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
@@ -72,4 +108,10 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    channels = data.get("channels", {})
+    if isinstance(channels, dict):
+        qq = channels.get("qq")
+        if isinstance(qq, dict) and "msgFormat" not in qq:
+            qq["msgFormat"] = "plain"
     return data

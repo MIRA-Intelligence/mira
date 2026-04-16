@@ -5,15 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import weakref
 from contextlib import AsyncExitStack
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from medpilot.command.router import CommandContext, CommandRouter
 from medpilot.agent.context import ContextBuilder
-from medpilot.agent.memory import MemoryStore
+from medpilot.agent.hook import AgentHook, AgentHookContext, CompositeHook
+from medpilot.agent.memory import Consolidator, Dream, MemoryStore
 from medpilot.agent.routing import ModelRouter, RoutedProviderManager
 from medpilot.agent.subagent import SubagentManager
 from medpilot.agent.tools.cron import CronTool
@@ -27,6 +31,7 @@ from medpilot.agent.tools.message import MessageTool
 from medpilot.agent.tools.registry import ToolRegistry
 from medpilot.agent.tools.shell import ExecTool
 from medpilot.agent.tools.spawn import SpawnTool
+from medpilot.agent.tools.search import GlobTool, GrepTool
 from medpilot.agent.tools.web import WebFetchTool, WebSearchTool
 from medpilot.bus.events import InboundMessage, OutboundMessage
 from medpilot.bus.queue import MessageBus
@@ -37,6 +42,8 @@ from medpilot.task_plan.guardrails import guard_task_plan_file
 if TYPE_CHECKING:
     from medpilot.config.schema import ChannelsConfig, ExecToolConfig
     from medpilot.cron.service import CronService
+
+UNIFIED_SESSION_KEY = "unified:default"
 
 
 class AgentLoop:
@@ -52,6 +59,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
+    _RUNTIME_CHECKPOINT_KEY = "_runtime_checkpoint"
     _AUTO_MAX_ROUNDS = 20
     _AUTO_GUARD_REPAIR_MAX = 1
     _AUTO_CONTINUE_MARKER = "[AUTO-CONTINUE-INTERNAL]"
@@ -71,12 +79,16 @@ class AgentLoop:
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
+        timezone: str | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         provider_factory: Callable[[str], LLMProvider] | None = None,
         model_router: ModelRouter | None = None,
+        context_window_tokens: int | None = None,
+        hooks: list[AgentHook] | None = None,
+        unified_session: bool = False,
     ):
         from medpilot.config.schema import ExecToolConfig
         self.bus = bus
@@ -90,12 +102,17 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.memory_window = memory_window
+        self.context_window_tokens = context_window_tokens or 65_536
         self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
+        self.timezone = timezone
         self.restrict_to_workspace = restrict_to_workspace
+        self._unified_session = unified_session
+        self._start_time = time.time()
+        self._last_usage: dict[str, int] = {}
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -117,6 +134,7 @@ class AgentLoop:
             model_router=model_router,
         )
         self._session_model_runtimes: dict[str, RoutedProviderManager] = {}
+        self._hook = CompositeHook(list(hooks)) if hooks else None
 
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -132,24 +150,92 @@ class AgentLoop:
         self._last_task_plan_guard_issues: list[str] = []
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
+        self._command_router = CommandRouter()
+        from medpilot.command.builtin import register_builtin_commands
+
+        register_builtin_commands(self._command_router)
+        generation_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", None)
+        completion_tokens = (
+            int(generation_max_tokens)
+            if isinstance(generation_max_tokens, int | float)
+            else self.max_tokens
+        )
+        self.consolidator = Consolidator(
+            store=MemoryStore(self.workspace),
+            provider=self.provider,
+            model=self.model,
+            sessions=self.sessions,
+            context_window_tokens=self.context_window_tokens,
+            build_messages=self.context.build_messages,
+            get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=completion_tokens,
+        )
+        self.dream = Dream(
+            store=self.consolidator.store,
+            provider=self.provider,
+            model=self.model,
+        )
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        self.tools.register(ExecTool(
-            working_dir=str(self.workspace),
-            timeout=self.exec_config.timeout,
-            restrict_to_workspace=self.restrict_to_workspace,
-            path_append=self.exec_config.path_append,
-        ))
+        skill_access_dirs: list[Path] = []
+        if self.restrict_to_workspace:
+            from medpilot.agent.skills import SkillsLoader
+
+            def _add_skill_dir(path: Path) -> None:
+                try:
+                    resolved = path.resolve()
+                except Exception:
+                    return
+                if resolved != self.workspace and resolved not in skill_access_dirs:
+                    skill_access_dirs.append(resolved)
+
+            skills_loader = SkillsLoader(self.workspace)
+            for root in skills_loader.workspace_skills_roots:
+                _add_skill_dir(root)
+            if skills_loader.builtin_skills:
+                _add_skill_dir(skills_loader.builtin_skills)
+            for skill in skills_loader.list_skills(filter_unavailable=False):
+                skill_path = Path(skill["path"])
+                _add_skill_dir(skill_path.parent)
+                parent = skill_path.parent.parent
+                if parent != skill_path.parent:
+                    _add_skill_dir(parent)
+
+        self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs))
+        self.tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs))
+        self.tools.register(
+            GrepTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                extra_allowed_dirs=skill_access_dirs,
+            )
+        )
+        self.tools.register(
+            GlobTool(
+                workspace=self.workspace,
+                allowed_dir=allowed_dir,
+                extra_allowed_dirs=skill_access_dirs,
+            )
+        )
+        if self.exec_config.enable:
+            self.tools.register(ExecTool(
+                working_dir=str(self.workspace),
+                timeout=self.exec_config.timeout,
+                restrict_to_workspace=self.restrict_to_workspace,
+                path_append=self.exec_config.path_append,
+            ))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
-            self.tools.register(CronTool(self.cron_service))
+            cron_tool = CronTool(self.cron_service)
+            setattr(cron_tool, "_default_timezone", self.timezone)
+            self.tools.register(cron_tool)
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -185,14 +271,22 @@ class AgentLoop:
         """Remove <think>…</think> blocks that some models embed in content."""
         if not text:
             return None
-        return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
+        cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
+        cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
+        return cleaned.strip() or None
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
         def _fmt(tc):
             args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
-            val = next(iter(args.values()), None) if isinstance(args, dict) else None
+            if not isinstance(args, dict):
+                return tc.name
+            if tc.name == "read_file":
+                path = args.get("path")
+                if isinstance(path, str) and path:
+                    return f"read {path}"
+            val = next(iter(args.values()), None)
             if not isinstance(val, str):
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
@@ -527,8 +621,10 @@ class AgentLoop:
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
-        model_runtime: RoutedProviderManager,
+        model_runtime: RoutedProviderManager | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
         audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
@@ -538,22 +634,90 @@ class AgentLoop:
         tools_used: list[str] = []
         active_provider: LLMProvider | None = None
         active_route = None
+        hook = getattr(self, "_hook", None)
 
         while iteration < self.max_iterations:
+            hook_ctx = AgentHookContext(iteration=iteration, messages=messages)
+            if hook:
+                await hook.before_iteration(hook_ctx)
             iteration += 1
 
-            if active_provider is None or active_route is None:
-                active_provider, active_route = await model_runtime.resolve(messages, iteration)
-            response, active_route = await model_runtime.chat(
-                active_route,
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                reasoning_effort=self.reasoning_effort,
+            use_routed_runtime = model_runtime is not None and (
+                self.model_router is not None or self.provider_factory is not None
             )
+            if not use_routed_runtime:
+                if on_stream is not None and hasattr(self.provider, "chat_stream_with_retry"):
+                    streamed_raw = ""
+                    streamed_clean = ""
 
-            if iteration == 1 and on_progress and self.model_router and self.model_router.enabled:
+                    async def _stream_delta(delta: str) -> None:
+                        nonlocal streamed_raw, streamed_clean
+                        if not delta:
+                            return
+                        streamed_raw += delta
+                        new_clean = self._strip_think(streamed_raw) or ""
+                        if not new_clean:
+                            streamed_clean = ""
+                            return
+                        if new_clean.startswith(streamed_clean):
+                            out = new_clean[len(streamed_clean):]
+                        else:
+                            out = new_clean
+                        streamed_clean = new_clean
+                        if out and on_stream:
+                            await on_stream(out)
+
+                    response = await self.provider.chat_stream_with_retry(
+                        model=self.model,
+                        messages=messages,
+                        tools=self.tools.get_definitions(),
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        reasoning_effort=self.reasoning_effort,
+                        on_content_delta=_stream_delta,
+                    )
+                    clean_streamed = self._strip_think(streamed_raw)
+                    if response.content and clean_streamed:
+                        response.content = clean_streamed
+                    if on_stream_end:
+                        await on_stream_end(resuming=False)
+                else:
+                    response = await self.provider.chat_with_retry(
+                        model=self.model,
+                        messages=messages,
+                        tools=self.tools.get_definitions(),
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        reasoning_effort=self.reasoning_effort,
+                    )
+            else:
+                if active_provider is None or active_route is None:
+                    active_provider, active_route = await model_runtime.resolve(messages, iteration)
+                response, active_route = await model_runtime.chat(
+                    active_route,
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                )
+            if isinstance(response.usage, dict):
+                self._last_usage = {
+                    "prompt_tokens": int(response.usage.get("prompt_tokens", 0) or 0),
+                    "completion_tokens": int(response.usage.get("completion_tokens", 0) or 0),
+                    "cached_tokens": int(response.usage.get("cached_tokens", 0) or 0),
+                }
+            hook_ctx.response = response
+            hook_ctx.usage = dict(response.usage or {})
+            hook_ctx.tool_calls = list(response.tool_calls or [])
+
+            if (
+                iteration == 1
+                and on_progress
+                and self.model_router
+                and self.model_router.enabled
+                and active_route is not None
+            ):
                 await on_progress(
                     self._route_hint(
                         active_route.tier,
@@ -588,6 +752,8 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
+                if hook:
+                    await hook.before_execute_tools(hook_ctx)
 
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
@@ -604,6 +770,10 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    hook_ctx.tool_results.append(result)
+                    hook_ctx.tool_events.append(
+                        {"name": tool_call.name, "status": "ok", "detail": str(result)}
+                    )
             else:
                 clean = self._strip_think(response.content)
                 if response.finish_reason == "error":
@@ -615,13 +785,29 @@ class AgentLoop:
                     messages = self.context.add_assistant_message(
                         messages, "(error — see previous log)"
                     )
+                    hook_ctx.final_content = final_content
+                    hook_ctx.stop_reason = "error"
+                    if hook:
+                        await hook.after_iteration(hook_ctx)
                     break
+                if clean is None and iteration < self.max_iterations:
+                    logger.warning("Received think-only/empty final response, retrying")
+                    continue
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
+                if hook:
+                    clean = hook.finalize_content(hook_ctx, clean)
                 final_content = clean
+                hook_ctx.final_content = final_content
+                hook_ctx.stop_reason = "completed"
+                if hook:
+                    await hook.after_iteration(hook_ctx)
                 break
+
+            if hook:
+                await hook.after_iteration(hook_ctx)
 
         if final_content is None and iteration >= self.max_iterations:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
@@ -649,10 +835,30 @@ class AgentLoop:
                 await self._handle_set_mode(msg)
             elif msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
+            elif self._command_router.is_priority(msg.content):
+                key = (
+                    UNIFIED_SESSION_KEY
+                    if self._unified_session and not msg.session_key_override
+                    else msg.session_key
+                )
+                session = self.sessions.get_or_create(key)
+                ctx = CommandContext(
+                    msg=msg,
+                    session=session,
+                    key=key,
+                    raw=msg.content.strip(),
+                    loop=self,
+                )
+                response = await self._command_router.dispatch_priority(ctx)
+                if response is not None:
+                    await self.bus.publish_outbound(response)
             else:
+                effective_key = (
+                    UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
+                )
                 task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                self._active_tasks.setdefault(effective_key, []).append(task)
+                task.add_done_callback(lambda t, k=effective_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -686,6 +892,55 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
+        if getattr(self, "_unified_session", False) and not msg.session_key_override:
+            msg.session_key_override = UNIFIED_SESSION_KEY
+
+        if bool((msg.metadata or {}).get("_wants_stream")):
+            stream_meta = dict(msg.metadata or {})
+
+            async def _on_stream(delta: str) -> None:
+                if not delta:
+                    return
+                meta = dict(stream_meta)
+                meta["_stream_delta"] = True
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=delta,
+                        metadata=meta,
+                    )
+                )
+
+            async def _on_stream_end(*, resuming: bool = False) -> None:
+                if resuming:
+                    return
+                meta = dict(stream_meta)
+                meta["_stream_end"] = True
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="",
+                        metadata=meta,
+                    )
+                )
+
+            try:
+                await self._process_message(msg, on_stream=_on_stream, on_stream_end=_on_stream_end)
+            except asyncio.CancelledError:
+                logger.info("Task cancelled for session {}", msg.session_key)
+                raise
+            except Exception:
+                logger.exception("Error processing message for session {}", msg.session_key)
+                err_text = "Sorry, I encountered an error."
+                if msg.channel == "cli":
+                    err_text += " Run `medpilot agent --logs` to view details."
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=err_text,
+                ))
+            return
         async with self._processing_lock:
             try:
                 response = await self._process_message(msg)
@@ -701,13 +956,18 @@ class AgentLoop:
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                err_text = "Sorry, I encountered an error."
+                if msg.channel == "cli":
+                    err_text += " Run `medpilot agent --logs` to view details."
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
+                    content=err_text,
                 ))
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
+        if self._consolidation_tasks:
+            await asyncio.gather(*list(self._consolidation_tasks), return_exceptions=True)
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -725,6 +985,9 @@ class AgentLoop:
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_stream: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -762,33 +1025,30 @@ class AgentLoop:
             sessions_mgr = self.sessions
 
         session = sessions_mgr.get_or_create(key)
+        memory_workspace = Path(project_dir) if project_dir else self.workspace
+        recent_skill_names = []
+        if isinstance(session.metadata, dict):
+            raw_recent = session.metadata.get("_recent_skills")
+            if isinstance(raw_recent, list):
+                recent_skill_names = [str(s) for s in raw_recent if isinstance(s, str)]
 
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
-            self._consolidating.add(session.key)
-            _mw = Path(project_dir) if project_dir else self.workspace
-            try:
-                async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True, workspace_override=_mw):
-                            return OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="Memory archival failed, session not cleared. Please try again.",
-                            )
-            except Exception:
-                logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                )
-            finally:
-                self._consolidating.discard(session.key)
-
+            if msg.channel == "cli":
+                snapshot = session.messages[session.last_consolidated:]
+                session.clear()
+                sessions_mgr.save(session)
+                sessions_mgr.invalidate(session.key)
+                self._session_model_runtimes.pop(session.key, None)
+                if snapshot:
+                    self._schedule_background(self.consolidator.archive(snapshot))
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="New session started.")
+            ok = await self._consolidate_memory(session, archive_all=True, workspace_override=memory_workspace)
+            if not ok:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="Memory archival failed. Session was not reset.")
             session.clear()
             sessions_mgr.save(session)
             sessions_mgr.invalidate(session.key)
@@ -796,10 +1056,28 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 medpilot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+            ctx = CommandContext(
+                msg=msg,
+                session=session,
+                key=key,
+                raw=msg.content.strip(),
+                loop=self,
+            )
+            handled = await self._command_router.dispatch(ctx)
+            if handled is not None:
+                return handled
 
-        memory_workspace = Path(project_dir) if project_dir else self.workspace
+        if cmd.startswith("/"):
+            ctx = CommandContext(
+                msg=msg,
+                session=session,
+                key=key,
+                raw=msg.content.strip(),
+                loop=self,
+            )
+            handled = await self._command_router.dispatch(ctx)
+            if handled is not None:
+                return handled
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
@@ -825,6 +1103,7 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        await self.consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
         model_runtime = self._get_model_runtime(key)
         extra_system = self._compose_extra_system(
@@ -833,9 +1112,39 @@ class AgentLoop:
         )
 
         ctx = ContextBuilder(memory_workspace) if project_dir else self.context
+        suggested_skills = ctx.skills.suggest_skills(
+            msg.content,
+            recent=recent_skill_names,
+            limit=3,
+        )
+        active_skills: list[str] = []
+        for name in [*recent_skill_names, *suggested_skills]:
+            if name not in active_skills:
+                active_skills.append(name)
+        active_skills = active_skills[-4:]
+        skill_hint = ""
+        if suggested_skills:
+            skill_hint = (
+                "Skill routing hint: this request likely matches one or more skills. "
+                "Before answering, use read_file to inspect these SKILL.md files if relevant:\n"
+                + "\n".join(f"- {name}" for name in suggested_skills)
+            )
+            if on_progress:
+                try:
+                    await on_progress(
+                        f"skill router -> {', '.join(suggested_skills)}",
+                        tool_hint=True,
+                    )
+                except TypeError:
+                    await on_progress(f"skill router -> {', '.join(suggested_skills)}")
+        if extra_system:
+            extra_system = skill_hint + "\n\n" + extra_system if skill_hint else extra_system
+        else:
+            extra_system = skill_hint or None
         initial_messages = ctx.build_messages(
             history=history,
             current_message=msg.content,
+            skill_names=active_skills or None,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
@@ -853,9 +1162,18 @@ class AgentLoop:
             ))
 
         progress_cb = on_progress or _bus_progress
+        current_turn_skills: set[str] = set()
         audit_cb = None
-        if msg.channel == "web":
-            async def _web_audit(details: dict[str, Any]) -> None:
+        emit_audit_to_channel = msg.channel == "web" or bool(meta.get("_emit_skill_audit"))
+        if emit_audit_to_channel or audit_hook:
+            async def _audit(details: dict[str, Any]) -> None:
+                skill_name = details.get("skill_name")
+                if isinstance(skill_name, str) and skill_name.strip():
+                    current_turn_skills.add(skill_name.strip())
+                if audit_hook:
+                    await audit_hook(details)
+                if not emit_audit_to_channel:
+                    return
                 metadata = dict(msg.metadata or {})
                 metadata["_audit_only"] = True
                 metadata["_audit_event"] = "skill_invoked"
@@ -867,13 +1185,17 @@ class AgentLoop:
                     metadata=metadata,
                 ))
 
-            audit_cb = _web_audit
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            model_runtime=model_runtime,
-            on_progress=progress_cb,
-            audit_hook=audit_cb,
-        )
+            audit_cb = _audit
+        run_kwargs: dict[str, Any] = {
+            "model_runtime": model_runtime,
+            "on_progress": progress_cb,
+            "audit_hook": audit_cb,
+        }
+        if on_stream is not None:
+            run_kwargs["on_stream"] = on_stream
+        if on_stream_end is not None:
+            run_kwargs["on_stream_end"] = on_stream_end
+        final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
 
         auto_round = 0
         guard_repair_round = 0
@@ -934,15 +1256,22 @@ class AgentLoop:
                     run_mode,
                 ),
             })
-            final_content, _, all_msgs = await self._run_agent_loop(
-                all_msgs,
-                model_runtime=model_runtime,
-                on_progress=progress_cb,
-                audit_hook=audit_cb,
-            )
+            final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
+
+        if isinstance(session.metadata, dict):
+            prior = session.metadata.get("_recent_skills")
+            merged: list[str] = []
+            if isinstance(prior, list):
+                for item in prior:
+                    if isinstance(item, str) and item not in merged:
+                        merged.append(item)
+            for item in sorted(current_turn_skills):
+                if item not in merged:
+                    merged.append(item)
+            session.metadata["_recent_skills"] = merged[-10:]
 
         self._save_turn(session, all_msgs, 1 + len(history))
         sessions_mgr.save(session)
@@ -966,7 +1295,9 @@ class AgentLoop:
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
             if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                if len(content) > getattr(self, "max_tool_result_chars", self._TOOL_RESULT_MAX_CHARS):
+                    cap = int(getattr(self, "max_tool_result_chars", self._TOOL_RESULT_MAX_CHARS))
+                    entry["content"] = content[:cap] + "\n... (truncated)"
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.
@@ -987,7 +1318,9 @@ class AgentLoop:
                             continue  # Strip runtime context from multimodal messages
                         if (c.get("type") == "image_url"
                                 and c.get("image_url", {}).get("url", "").startswith("data:image/")):
-                            filtered.append({"type": "text", "text": "[image]"})
+                            meta = c.get("_meta")
+                            path = meta.get("path") if isinstance(meta, dict) else None
+                            filtered.append({"type": "text", "text": f"[image: {path}]" if path else "[image]"})
                         else:
                             filtered.append(c)
                     if not filtered:
@@ -996,6 +1329,51 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    def _restore_runtime_checkpoint(self, session: Session) -> bool:
+        checkpoint = (session.metadata or {}).get(self._RUNTIME_CHECKPOINT_KEY)
+        if not isinstance(checkpoint, dict):
+            return False
+
+        assistant = checkpoint.get("assistant_message")
+        completed = checkpoint.get("completed_tool_results") or []
+        pending = checkpoint.get("pending_tool_calls") or []
+        if not isinstance(assistant, dict):
+            if isinstance(session.metadata, dict):
+                session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+            return False
+
+        reconstructed: list[dict[str, Any]] = [assistant]
+        for item in completed:
+            if isinstance(item, dict):
+                reconstructed.append(item)
+        for tc in pending:
+            if not isinstance(tc, dict):
+                continue
+            tc_id = tc.get("id")
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            reconstructed.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": fn.get("name") or "tool",
+                    "content": "Tool execution was interrupted before this tool finished.",
+                }
+            )
+
+        existing = list(session.messages or [])
+        if existing == reconstructed:
+            pass
+        elif len(existing) < len(reconstructed) and existing == reconstructed[: len(existing)]:
+            session.messages = reconstructed
+        elif len(existing) >= len(reconstructed) and existing[-len(reconstructed) :] == reconstructed:
+            pass
+        else:
+            session.messages = reconstructed
+
+        if isinstance(session.metadata, dict):
+            session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+        return True
 
     def _get_project_sessions(self, project_dir: str) -> SessionManager:
         """Return a per-project SessionManager, creating one if needed."""
@@ -1020,9 +1398,32 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
-    ) -> str:
+        audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> OutboundMessage | str | None:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
-        return response.content if response else ""
+        response = await self._process_message(
+            msg,
+            session_key=session_key,
+            on_progress=on_progress,
+            audit_hook=audit_hook,
+        )
+        if response is None:
+            return ""
+        if isinstance(response, OutboundMessage) and isinstance(content, str) and content.strip().startswith("/"):
+            return response
+        if isinstance(response, OutboundMessage) and channel == "cli":
+            return response.content
+        return response
+
+    def _schedule_background(self, coro: Awaitable[Any]) -> asyncio.Task:
+        """Track background coroutines so shutdown can await completion."""
+        task = asyncio.create_task(coro)
+        self._consolidation_tasks.add(task)
+
+        def _cleanup(done: asyncio.Task) -> None:
+            self._consolidation_tasks.discard(done)
+
+        task.add_done_callback(_cleanup)
+        return task

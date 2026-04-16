@@ -5,7 +5,10 @@ import json
 import os
 import re
 import threading
+import time
+import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +31,18 @@ MSG_TYPE_MAP = {
     "file": "[file]",
     "sticker": "[sticker]",
 }
+
+_STREAM_ELEMENT_ID = "streaming_md"
+
+
+@dataclass
+class _FeishuStreamBuf:
+    """Per-chat streaming accumulator."""
+
+    text: str = ""
+    card_id: str | None = None
+    sequence: int = 0
+    last_edit: float = 0.0
 
 
 def _extract_share_card_content(content_json: dict, msg_type: str) -> str:
@@ -244,6 +259,12 @@ class FeishuChannel(BaseChannel):
     """
 
     name = "feishu"
+    _STREAM_EDIT_INTERVAL = 0.5
+    _REPLY_CONTEXT_MAX_LEN = 300
+
+    @property
+    def supports_streaming(self) -> bool:
+        return bool(getattr(self.config, "streaming", True))
 
     def __init__(self, config: FeishuConfig, bus: MessageBus, groq_api_key: str = ""):
         super().__init__(config, bus)
@@ -254,6 +275,7 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -289,6 +311,9 @@ class FeishuChannel(BaseChannel):
         )
         builder = self._register_optional_event(
             builder, "register_p2_im_message_reaction_created_v1", self._on_reaction_created
+        )
+        builder = self._register_optional_event(
+            builder, "register_p2_im_message_reaction_deleted_v1", self._on_reaction_deleted
         )
         builder = self._register_optional_event(
             builder, "register_p2_im_message_message_read_v1", self._on_message_read
@@ -368,12 +393,17 @@ class FeishuChannel(BaseChannel):
 
             if not response.success():
                 logger.warning("Failed to add reaction: code={}, msg={}", response.code, response.msg)
+                return None
             else:
                 logger.debug("Added {} reaction to message {}", emoji_type, message_id)
+                if response.data and getattr(response.data, "reaction_id", None):
+                    return response.data.reaction_id
+                return None
         except Exception as e:
             logger.warning("Error adding reaction: {}", e)
+            return None
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
+    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> str | None:
         """
         Add a reaction emoji to a message (non-blocking).
 
@@ -383,7 +413,30 @@ class FeishuChannel(BaseChannel):
             return
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+        return await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+
+    def _remove_reaction_sync(self, message_id: str, reaction_id: str) -> None:
+        """Sync helper for removing reaction."""
+        from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+
+        try:
+            request = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(reaction_id)
+                .build()
+            )
+            response = self._client.im.v1.message_reaction.delete(request)
+            if not response.success():
+                logger.warning("Failed to remove reaction: code={}, msg={}", response.code, response.msg)
+        except Exception as e:
+            logger.warning("Error removing reaction: {}", e)
+
+    async def _remove_reaction(self, message_id: str, reaction_id: str | None) -> None:
+        if not self._client or not reaction_id:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._remove_reaction_sync, message_id, reaction_id)
 
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -401,8 +454,17 @@ class FeishuChannel(BaseChannel):
         lines = [_line.strip() for _line in table_text.strip().split("\n") if _line.strip()]
         if len(lines) < 3:
             return None
+
+        def clean_md(text: str) -> str:
+            text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+            text = re.sub(r"__(.*?)__", r"\1", text)
+            text = re.sub(r"~~(.*?)~~", r"\1", text)
+            text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"\1", text)
+            text = re.sub(r"`(.*?)`", r"\1", text)
+            return text.strip()
+
         def split(_line: str) -> list[str]:
-            return [c.strip() for c in _line.strip("|").split("|")]
+            return [clean_md(c) for c in _line.strip("|").split("|")]
         headers = split(lines[0])
         rows = [split(_line) for _line in lines[2:]]
         columns = [{"tag": "column", "name": f"c{i}", "display_name": h, "width": "auto"}
@@ -458,6 +520,14 @@ class FeishuChannel(BaseChannel):
 
     def _split_headings(self, content: str) -> list[dict]:
         """Split content by headings, converting headings to div elements."""
+        def clean_heading(text: str) -> str:
+            text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+            text = re.sub(r"__(.*?)__", r"\1", text)
+            text = re.sub(r"~~(.*?)~~", r"\1", text)
+            text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"\1", text)
+            text = re.sub(r"`(.*?)`", r"\1", text)
+            return text.strip()
+
         protected = content
         code_blocks = []
         for m in self._CODE_BLOCK_RE.finditer(content):
@@ -470,7 +540,7 @@ class FeishuChannel(BaseChannel):
             before = protected[last_end:m.start()].strip()
             if before:
                 elements.append({"tag": "markdown", "content": before})
-            text = m.group(2).strip()
+            text = clean_heading(m.group(2))
             elements.append({
                 "tag": "div",
                 "text": {
@@ -765,7 +835,9 @@ class FeishuChannel(BaseChannel):
 
         return None, f"[{msg_type}: download failed]"
 
-    def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
+    def _send_message_sync(
+        self, receive_id_type: str, receive_id: str, msg_type: str, content: str
+    ) -> str | None:
         """Send a single message (text/image/file/interactive) synchronously."""
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
         try:
@@ -784,11 +856,111 @@ class FeishuChannel(BaseChannel):
                     "Failed to send Feishu {} message: code={}, msg={}, log_id={}",
                     msg_type, response.code, response.msg, response.get_log_id()
                 )
-                return False
+                return None
             logger.debug("Feishu {} message sent to {}", msg_type, receive_id)
-            return True
+            if response.data and getattr(response.data, "message_id", None):
+                return response.data.message_id
+            return None
         except Exception as e:
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
+            return None
+
+    def _create_streaming_card_sync(self, receive_id_type: str, receive_id: str) -> str | None:
+        from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
+        try:
+            card_request = (
+                CreateCardRequest.builder()
+                .request_body(
+                    CreateCardRequestBody.builder()
+                    .type("streaming")
+                    .data(
+                        {
+                            "elements": [
+                                {"tag": "markdown", "element_id": _STREAM_ELEMENT_ID, "content": "..."}
+                            ]
+                        }
+                    )
+                    .build()
+                )
+                .build()
+            )
+            card_response = self._client.cardkit.v1.card.create(card_request)
+            if not card_response.success() or not card_response.data:
+                return None
+            card_id = card_response.data.card_id
+
+            send_request = (
+                CreateMessageRequest.builder()
+                .receive_id_type(receive_id_type)
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(receive_id)
+                    .msg_type("interactive")
+                    .content(json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False))
+                    .build()
+                )
+                .build()
+            )
+            send_resp = self._client.im.v1.message.create(send_request)
+            if not send_resp.success():
+                return None
+            return card_id
+        except Exception:
+            logger.exception("Error creating streaming card")
+            return None
+
+    def _stream_update_text_sync(self, card_id: str, text: str, sequence: int) -> bool:
+        from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
+
+        try:
+            request = (
+                ContentCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(_STREAM_ELEMENT_ID)
+                .request_body(
+                    ContentCardElementRequestBody.builder()
+                    .content(text)
+                    .sequence(sequence)
+                    .uuid(str(uuid.uuid4()))
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.cardkit.v1.card_element.content(request)
+            if not response.success():
+                logger.warning("Failed to update stream card {}: code={}, msg={}", card_id, response.code, response.msg)
+                return False
+            return True
+        except Exception as e:
+            logger.warning("Error updating stream card {}: {}", card_id, e)
+            return False
+
+    def _close_streaming_mode_sync(self, card_id: str, sequence: int) -> bool:
+        from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
+
+        settings_payload = {"streaming_mode": False}
+        try:
+            request = (
+                SettingsCardRequest.builder()
+                .card_id(card_id)
+                .request_body(
+                    SettingsCardRequestBody.builder()
+                    .settings(settings_payload)
+                    .sequence(sequence)
+                    .uuid(str(uuid.uuid4()))
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.cardkit.v1.card.settings(request)
+            if not response.success():
+                logger.warning("Failed to close streaming card {}: code={}, msg={}", card_id, response.code, response.msg)
+                return False
+            return True
+        except Exception as e:
+            logger.warning("Error closing streaming card {}: {}", card_id, e)
             return False
 
     async def send(self, msg: OutboundMessage) -> None:
@@ -816,10 +988,11 @@ class FeishuChannel(BaseChannel):
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
                     if key:
-                        # Use msg_type "media" for audio/video so users can play inline;
-                        # "file" for everything else (documents, archives, etc.)
-                        if ext in self._AUDIO_EXTS or ext in self._VIDEO_EXTS:
-                            media_type = "media"
+                        # Keep explicit types for compatibility with upstream tests.
+                        if ext in self._AUDIO_EXTS:
+                            media_type = "audio"
+                        elif ext in self._VIDEO_EXTS:
+                            media_type = "video"
                         else:
                             media_type = "file"
                         await loop.run_in_executor(
@@ -828,36 +1001,205 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
+                if bool((msg.metadata or {}).get("_tool_hint")):
+                    calls = self._split_tool_hint_calls(msg.content.strip())
+                    if len(calls) > 1:
+                        body = "\n".join(
+                            f"{call}," if i < len(calls) - 1 else call
+                            for i, call in enumerate(calls)
+                        )
+                    else:
+                        body = calls[0]
+                    md = f"**Tool Calls**\n\n```text\n{body}\n```"
+                    card = {
+                        "config": {"wide_screen_mode": True},
+                        "elements": [{"tag": "markdown", "content": md}],
+                    }
+                    await loop.run_in_executor(
+                        None,
+                        self._send_message_sync,
+                        receive_id_type,
+                        msg.chat_id,
+                        "interactive",
+                        json.dumps(card, ensure_ascii=False),
+                    )
+                    return
+
                 fmt = self._detect_msg_format(msg.content)
+
+                reply_message_id = (msg.metadata or {}).get("message_id")
+                use_reply = (
+                    bool(getattr(self.config, "reply_to_message", False))
+                    and bool(reply_message_id)
+                    and not bool((msg.metadata or {}).get("_progress"))
+                )
 
                 if fmt == "text":
                     # Short plain text – send as simple text message
                     text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
-                    await loop.run_in_executor(
-                        None, self._send_message_sync,
-                        receive_id_type, msg.chat_id, "text", text_body,
-                    )
+                    if use_reply:
+                        ok = await loop.run_in_executor(
+                            None, self._reply_message_sync, str(reply_message_id), "text", text_body
+                        )
+                        if not ok:
+                            await loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, "text", text_body,
+                            )
+                    else:
+                        await loop.run_in_executor(
+                            None, self._send_message_sync,
+                            receive_id_type, msg.chat_id, "text", text_body,
+                        )
 
                 elif fmt == "post":
                     # Medium content with links – send as rich-text post
                     post_body = self._markdown_to_post(msg.content)
-                    await loop.run_in_executor(
-                        None, self._send_message_sync,
-                        receive_id_type, msg.chat_id, "post", post_body,
-                    )
+                    if use_reply:
+                        ok = await loop.run_in_executor(
+                            None, self._reply_message_sync, str(reply_message_id), "post", post_body
+                        )
+                        if not ok:
+                            await loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, "post", post_body,
+                            )
+                    else:
+                        await loop.run_in_executor(
+                            None, self._send_message_sync,
+                            receive_id_type, msg.chat_id, "post", post_body,
+                        )
 
                 else:
                     # Complex / long content – send as interactive card
                     elements = self._build_card_elements(msg.content)
                     for chunk in self._split_elements_by_table_limit(elements):
                         card = {"config": {"wide_screen_mode": True}, "elements": chunk}
-                        await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
-                        )
+                        card_body = json.dumps(card, ensure_ascii=False)
+                        if use_reply:
+                            ok = await loop.run_in_executor(
+                                None, self._reply_message_sync, str(reply_message_id), "interactive", card_body
+                            )
+                            if not ok:
+                                await loop.run_in_executor(
+                                    None, self._send_message_sync,
+                                    receive_id_type, msg.chat_id, "interactive", card_body,
+                                )
+                        else:
+                            await loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, "interactive", card_body,
+                            )
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
+
+    @staticmethod
+    def _split_tool_hint_calls(content: str) -> list[str]:
+        calls: list[str] = []
+        buf: list[str] = []
+        in_quote = False
+        quote_char = ""
+        escape = False
+        for ch in content:
+            if escape:
+                buf.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                buf.append(ch)
+                escape = True
+                continue
+            if ch in ('"', "'"):
+                if in_quote and quote_char == ch:
+                    in_quote = False
+                    quote_char = ""
+                elif not in_quote:
+                    in_quote = True
+                    quote_char = ch
+                buf.append(ch)
+                continue
+            if ch == "," and not in_quote:
+                part = "".join(buf).strip()
+                if part:
+                    calls.append(part)
+                buf = []
+                continue
+            buf.append(ch)
+        part = "".join(buf).strip()
+        if part:
+            calls.append(part)
+        return calls if calls else [content.strip()]
+
+    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+        """Progressive streaming via Feishu CardKit."""
+        if not self._client:
+            return
+        meta = metadata or {}
+        loop = asyncio.get_running_loop()
+        rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
+
+        if meta.get("_stream_end"):
+            if (message_id := meta.get("message_id")) and (reaction_id := meta.get("reaction_id")):
+                await self._remove_reaction(message_id, reaction_id)
+
+            buf = self._stream_bufs.pop(chat_id, None)
+            if not buf or not buf.text:
+                return
+            if buf.card_id:
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None,
+                    self._stream_update_text_sync,
+                    buf.card_id,
+                    buf.text,
+                    buf.sequence,
+                )
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None,
+                    self._close_streaming_mode_sync,
+                    buf.card_id,
+                    buf.sequence,
+                )
+            else:
+                for chunk in self._split_elements_by_table_limit(self._build_card_elements(buf.text)):
+                    card = json.dumps(
+                        {"config": {"wide_screen_mode": True}, "elements": chunk},
+                        ensure_ascii=False,
+                    )
+                    await loop.run_in_executor(
+                        None,
+                        self._send_message_sync,
+                        rid_type,
+                        chat_id,
+                        "interactive",
+                        card,
+                    )
+            return
+
+        buf = self._stream_bufs.get(chat_id)
+        if buf is None:
+            buf = _FeishuStreamBuf()
+            self._stream_bufs[chat_id] = buf
+        buf.text += delta
+        if not buf.text.strip():
+            return
+
+        now = time.monotonic()
+        if buf.card_id is None:
+            card_id = await loop.run_in_executor(None, self._create_streaming_card_sync, rid_type, chat_id)
+            if card_id:
+                buf.card_id = card_id
+                buf.sequence = 1
+                await loop.run_in_executor(None, self._stream_update_text_sync, card_id, buf.text, 1)
+                buf.last_edit = now
+        elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
+            buf.sequence += 1
+            await loop.run_in_executor(
+                None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence
+            )
+            buf.last_edit = now
 
     def _on_message_sync(self, data: Any) -> None:
         """
@@ -907,6 +1249,7 @@ class FeishuChannel(BaseChannel):
 
             if msg_type == "text":
                 text = content_json.get("text", "")
+                text = self._resolve_mentions(text, getattr(message, "mentions", None))
                 if text:
                     content_parts.append(text)
 
@@ -951,6 +1294,14 @@ class FeishuChannel(BaseChannel):
                 content_parts.append(MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]"))
 
             content = "\n".join(content_parts) if content_parts else ""
+            parent_id = getattr(message, "parent_id", None)
+            root_id = getattr(message, "root_id", None)
+            if parent_id:
+                reply_ctx = await asyncio.get_running_loop().run_in_executor(
+                    None, self._get_message_content_sync, str(parent_id)
+                )
+                if reply_ctx:
+                    content = f"{reply_ctx}\n{content}" if content else reply_ctx
 
             if not content and not media_paths:
                 return
@@ -966,6 +1317,8 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
+                    "parent_id": parent_id,
+                    "root_id": root_id,
                 }
             )
 
@@ -976,6 +1329,10 @@ class FeishuChannel(BaseChannel):
         """Ignore reaction events so they do not generate SDK noise."""
         pass
 
+    def _on_reaction_deleted(self, data: Any) -> None:
+        """Ignore reaction-delete events."""
+        pass
+
     def _on_message_read(self, data: Any) -> None:
         """Ignore read events so they do not generate SDK noise."""
         pass
@@ -984,3 +1341,81 @@ class FeishuChannel(BaseChannel):
         """Ignore p2p-enter events when a user opens a bot chat."""
         logger.debug("Bot entered p2p chat (user opened chat window)")
         pass
+
+    @staticmethod
+    def _resolve_mentions(text: str, mentions: list[Any] | None) -> str:
+        if not text or not mentions:
+            return text
+        result = text
+        for mention in mentions:
+            key = getattr(mention, "key", "")
+            if not key or key not in result:
+                continue
+            mid = getattr(mention, "id", None)
+            if not mid:
+                continue
+            open_id = getattr(mid, "open_id", "") or ""
+            user_id = getattr(mid, "user_id", "") or ""
+            if not open_id and not user_id:
+                continue
+            name = getattr(mention, "name", "user")
+            if open_id and user_id:
+                repl = f"@{name} ({open_id}, user id: {user_id})"
+            elif open_id:
+                repl = f"@{name} ({open_id})"
+            else:
+                repl = f"@{name} (user id: {user_id})"
+            result = result.replace(key, repl)
+        return result
+
+    def _is_bot_mentioned(self, message: Any) -> bool:
+        content = getattr(message, "content", "") or ""
+        if "@_all" in content:
+            return True
+        mentions = getattr(message, "mentions", None) or []
+        if not mentions:
+            return False
+        bot_open_id = getattr(self, "_bot_open_id", None)
+        for mention in mentions:
+            mid = getattr(mention, "id", None)
+            if not mid:
+                continue
+            open_id = getattr(mid, "open_id", None)
+            user_id = getattr(mid, "user_id", None)
+            if bot_open_id and open_id == bot_open_id:
+                return True
+            if not bot_open_id and open_id and not user_id:
+                return True
+        return False
+
+    def _get_message_content_sync(self, message_id: str) -> str | None:
+        try:
+            response = self._client.im.v1.message.get(message_id)
+            if not response or not response.success():
+                return None
+            items = getattr(getattr(response, "data", None), "items", None) or []
+            if not items:
+                return None
+            item = items[0]
+            if getattr(item, "msg_type", "") != "text":
+                return None
+            raw = getattr(getattr(item, "body", None), "content", "") or ""
+            try:
+                text = json.loads(raw).get("text", "")
+            except Exception:
+                text = raw
+            text = (text or "").strip()
+            if not text:
+                return None
+            if len(text) > self._REPLY_CONTEXT_MAX_LEN:
+                text = text[: self._REPLY_CONTEXT_MAX_LEN] + "..."
+            return f"[Reply to: {text}]"
+        except Exception:
+            return None
+
+    def _reply_message_sync(self, parent_message_id: str, msg_type: str, content: str) -> bool:
+        try:
+            response = self._client.im.v1.message.reply(parent_message_id, msg_type, content)
+            return bool(response and response.success())
+        except Exception:
+            return False

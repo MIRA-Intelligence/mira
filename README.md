@@ -88,8 +88,7 @@ MedPilot provides a comprehensive CLI for managing your sessions and configurati
 - **`medpilot status`**
   Check the current status of your MedPilot configuration, agent defaults, and workspace environment.
 
-- **`medpilot provider-login <provider>`**
-  Authenticate interactively via OAuth for supported models and providers (e.g., `openai-codex`, `github-copilot`).
+- OAuth providers (e.g., `openai-codex`, `github-copilot`) are now configured directly inside `medpilot onboard`.
 
 - **`medpilot gateway`**
   Launch the background gateway service. This enables external API endpoints and multi-channel traffic. 
@@ -162,10 +161,16 @@ Use `.github/workflows/release-train.yml` (`workflow_dispatch`) to validate an
 
 ## 🏗️ Optional Self-hosted Path
 
-Self-hosted Docker templates are under `deploy/`:
+Docker-related files are in `deploy/`:
 
 - `deploy/docker-compose.yml`
+- `deploy/Dockerfile`
+- `deploy/entrypoint.sh`
 - `deploy/.env.example`
+
+Compose services include:
+- local build/run services: `medpilot-gateway`, `medpilot-api`, `medpilot-cli`
+- self-hosted release services (profile `self-hosted`): `medpilot-agent`, `medpilot-ui`
 
 Operator guide:
 
@@ -181,7 +186,7 @@ See `CLA.md` for details. By submitting a PR, you confirm acceptance of this CLA
 
 ## 🙏 Acknowledgments
 
-The foundational CLI framework of MedPilot is built heavily upon the [nanobot](https://github.com/HKUDS/nanobot). We sincerely thank the HKUDS team for their excellent open-source contribution to the community.
+The foundational CLI framework of MedPilot is built heavily upon the [medpilot](https://github.com/HKUDS/medpilot). We sincerely thank the HKUDS team for their excellent open-source contribution to the community.
 
 ---
 *Developed for researchers, by ECNU SKMR Lab.*
