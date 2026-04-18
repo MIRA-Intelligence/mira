@@ -162,23 +162,34 @@ def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
     assert merged == "UI rules\n\nGuard notice"
     assert loop._compose_extra_system("", "Guard notice") == "Guard notice"
     assert loop._compose_extra_system(None, None) is None
+    project = tmp_path / "PRJ-9"
+    (project / ".medpilot").mkdir(parents=True)
+    (project / ".medpilot" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 2}),
+        encoding="utf-8",
+    )
     auto_msg = loop._build_auto_continue_message(
         channel="web",
         chat_id="PRJ-9",
-        project_dir=str(tmp_path / "PRJ-9"),
+        project_dir=str(project),
         run_mode="auto",
+        agent_profile="research",
     )
     assert "Execute exactly ONE pending experiment in this round" in auto_msg
     assert "immediately update and write task_plan.json" in auto_msg
+    assert "Task-plan contract requirements" in auto_msg
+    assert "theoretical_proof" in auto_msg
     checkpoint_msg = loop._build_auto_checkpoint_sync_message(
         channel="web",
         chat_id="PRJ-9",
-        project_dir=str(tmp_path / "PRJ-9"),
+        project_dir=str(project),
         run_mode="auto",
         running_ids=["Exp001"],
+        agent_profile="research",
     )
     assert "Checkpoint barrier" in checkpoint_msg
     assert "Exp001" in checkpoint_msg
+    assert "do not mark an experiment as completed" in checkpoint_msg
 
 
 def test_auto_run_decision_helpers(tmp_path: Path) -> None:
@@ -248,8 +259,41 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
             {"id": "Exp002", "status": "pending"},
         ]
     }
+    after_multi = {
+        "experiments": [
+            {"id": "Exp001", "status": "completed", "results": {"metrics": {"Dice": 0.8}}},
+            {"id": "Exp002", "status": "failed"},
+        ]
+    }
     assert AgentLoop._has_experiment_checkpoint_update(before, after_unchanged) is False
     assert AgentLoop._has_experiment_checkpoint_update(before, after_updated) is True
+    assert AgentLoop._experiments_crossed_boundary(before, after_updated) == ["Exp001"]
+    assert AgentLoop._experiments_crossed_boundary(before, after_multi) == ["Exp001", "Exp002"]
+
+    before_result = {"experiments": [], "result": {"summary": "keep me"}}
+    after_result = {
+        "experiments": [],
+        "result": {"summary": "auto generated", "output_path": "outputs/", "output_type": "analysis"},
+    }
+    assert AgentLoop._has_result_section_update(before_result, after_result) is True
+    assert AgentLoop._looks_like_result_request("Manual export request for PRJ-1.") is True
+    assert AgentLoop._looks_like_result_request("continue experiments") is False
+    assert AgentLoop._looks_like_result_request(
+        "continue experiments", {"_allow_result_write": True}
+    ) is True
+
+    plan_file = project / "task_plan.json"
+    plan_file.write_text(json.dumps(after_result), encoding="utf-8")
+    restored, changed = loop._restore_result_section(
+        str(project),
+        before_plan=before_result,
+        after_plan=after_result,
+    )
+    assert changed is True
+    assert isinstance(restored, dict)
+    assert restored.get("result") == before_result["result"]
+    persisted = json.loads(plan_file.read_text(encoding="utf-8"))
+    assert persisted.get("result") == before_result["result"]
 
 
 def test_automation_policy_helpers(tmp_path: Path) -> None:

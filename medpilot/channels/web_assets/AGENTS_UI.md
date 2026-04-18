@@ -56,6 +56,9 @@ Question → Hypothesis → Prediction → Experiment → Analysis → Conclusio
 - In `auto` mode: continue to the next pending experiment automatically. Only stop
   early when user input is strictly required, the project is blocked by an error,
   or there are no pending/running experiments left.
+- In `auto` mode: in a single assistant turn, you may transition AT MOST ONE
+  experiment to a terminal status (`completed`/`failed`/`skipped`). You may
+  create or queue many `pending` experiments, but finish only one per turn.
 
 ### Workflow for each experiment
 

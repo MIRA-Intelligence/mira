@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +65,17 @@ _FALSIFY_KEYWORDS = (
     "否定",
     "拒绝",
 )
+_JSON_RESULT_HINT_KEYS = {
+    "metrics",
+    "findings",
+    "artifacts",
+    "mean_r",
+    "mean_r2",
+    "best_transform",
+    "overall_r2",
+    "overall_r",
+}
+_IGNORED_JSON_SCAN_DIRS = {".git", ".medpilot", "__pycache__", "node_modules", ".venv", "venv"}
 
 
 def _normalize_profile(profile: object) -> str:
@@ -301,6 +314,157 @@ def _validate_profile_falsify_fields(
     return []
 
 
+def _count_numeric_leaves(value: object, depth: int = 0, max_depth: int = 4) -> tuple[int, int]:
+    if depth > max_depth:
+        return 0, 0
+    if isinstance(value, bool):
+        return 0, 1
+    if isinstance(value, (int, float)):
+        return 1, 0
+    if isinstance(value, str) or value is None:
+        return 0, 1
+    if isinstance(value, list):
+        numeric = 0
+        other = 0
+        for item in value:
+            n, o = _count_numeric_leaves(item, depth + 1, max_depth=max_depth)
+            numeric += n
+            other += o
+        return numeric, other
+    if isinstance(value, dict):
+        numeric = 0
+        other = 0
+        for item in value.values():
+            n, o = _count_numeric_leaves(item, depth + 1, max_depth=max_depth)
+            numeric += n
+            other += o
+        return numeric, other
+    return 0, 1
+
+
+def _looks_like_experiment_metrics(payload: object) -> bool:
+    if not _is_mapping(payload):
+        return False
+    lowered_keys = {str(key).strip().lower() for key in payload.keys()}
+    if lowered_keys.intersection(_JSON_RESULT_HINT_KEYS):
+        return True
+    numeric_count, other_count = _count_numeric_leaves(payload)
+    return numeric_count >= 3 and numeric_count >= other_count
+
+
+def _iter_project_json_paths(project_dir: Path) -> list[Path]:
+    json_paths: list[Path] = []
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [name for name in dirs if name not in _IGNORED_JSON_SCAN_DIRS]
+        for name in files:
+            if name.lower().endswith(".json"):
+                json_paths.append(Path(root) / name)
+    json_paths.sort()
+    return json_paths
+
+
+def _iter_experiment_json_candidates(project_dir: Path, exp_id: str) -> list[Path]:
+    exp_dirname = _experiment_dirname(exp_id)
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(path: Path) -> None:
+        if path in seen or not path.is_file() or path.suffix.lower() != ".json":
+            return
+        seen.add(path)
+        ordered.append(path)
+
+    _add(project_dir / "outputs" / exp_dirname / "results.json")
+    _add(project_dir / "experiments" / exp_dirname / "results.json")
+    _add(project_dir / "experiments" / exp_dirname / "metrics.json")
+
+    for base in (project_dir / "experiments" / exp_dirname, project_dir / "outputs" / exp_dirname):
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.json")):
+            _add(path)
+
+    exp_tokens = {exp_id.strip().lower(), exp_dirname.lower()}
+    for path in _iter_project_json_paths(project_dir):
+        rel_path = path.relative_to(project_dir).as_posix().lower()
+        if any(token and token in rel_path for token in exp_tokens):
+            _add(path)
+    return ordered
+
+
+def _recover_from_git_commit(project_dir: Path, exp_id: str) -> tuple[str | None, list[str]]:
+    """Recover experiment evidence from git commit history when artifacts are non-standard."""
+    try:
+        log = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project_dir),
+                "log",
+                "--max-count",
+                "1",
+                "--regexp-ignore-case",
+                "--grep",
+                rf"^{re.escape(exp_id)}\b",
+                "--pretty=format:%H%x09%s",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None, []
+    line = (log.stdout or "").strip()
+    if not line:
+        return None, []
+    parts = line.split("\t", 1)
+    commit_hash = parts[0].strip() if parts else ""
+    subject = parts[1].strip() if len(parts) > 1 else ""
+    if not commit_hash:
+        return None, []
+
+    try:
+        changed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project_dir),
+                "show",
+                "--name-only",
+                "--pretty=format:",
+                commit_hash,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return subject or None, []
+
+    artifacts: list[str] = []
+    seen: set[str] = set()
+    for rel in (changed.stdout or "").splitlines():
+        candidate = rel.strip()
+        if not candidate:
+            continue
+        if candidate.startswith("/") or candidate.startswith("../") or "/../" in candidate:
+            continue
+        lowered = candidate.lower()
+        if lowered in {"task_plan.json", ".gitignore"}:
+            continue
+        if lowered.startswith(".medpilot/") or lowered.startswith(".git/"):
+            continue
+        full = project_dir / candidate
+        if not full.is_file():
+            continue
+        normalized = full.relative_to(project_dir).as_posix()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        artifacts.append(normalized)
+    return subject or None, artifacts
+
+
 def _collect_artifacts(project_dir: Path, exp_id: str) -> list[str]:
     rel_paths: set[str] = set()
     exp_dirname = _experiment_dirname(exp_id)
@@ -316,19 +480,31 @@ def _collect_artifacts(project_dir: Path, exp_id: str) -> list[str]:
 def _recover_results(project_dir: Path, exp_id: str) -> dict[str, Any]:
     recovered: dict[str, Any] = {}
     exp_dirname = _experiment_dirname(exp_id)
+    inferred_artifacts: set[str] = set()
 
-    outputs_results = project_dir / "outputs" / exp_dirname / "results.json"
-    outputs_payload = _load_json(outputs_results) if outputs_results.is_file() else None
-    if _is_mapping(outputs_payload):
-        if any(key in outputs_payload for key in ("metrics", "findings", "artifacts")):
-            recovered.update(outputs_payload)
-        else:
-            recovered["metrics"] = outputs_payload
+    for json_path in _iter_experiment_json_candidates(project_dir, exp_id):
+        payload = _load_json(json_path)
+        if not _looks_like_experiment_metrics(payload):
+            continue
+        rel_path = json_path.relative_to(project_dir).as_posix()
+        inferred_artifacts.add(rel_path)
 
-    metrics_json = project_dir / "experiments" / exp_dirname / "metrics.json"
-    metrics_payload = _load_json(metrics_json) if metrics_json.is_file() else None
-    if "metrics" not in recovered and metrics_payload is not None:
-        recovered["metrics"] = metrics_payload
+        if _is_mapping(payload) and any(key in payload for key in ("metrics", "findings", "artifacts")):
+            if "metrics" not in recovered and payload.get("metrics") is not None:
+                recovered["metrics"] = payload.get("metrics")
+            if "findings" not in recovered and isinstance(payload.get("findings"), str):
+                recovered["findings"] = payload.get("findings")
+            if "artifacts" not in recovered and isinstance(payload.get("artifacts"), list):
+                recovered["artifacts"] = payload.get("artifacts")
+            continue
+
+        if "metrics" not in recovered and payload is not None:
+            recovered["metrics"] = payload
+
+    commit_findings, commit_artifacts = _recover_from_git_commit(project_dir, exp_id)
+    if "findings" not in recovered and isinstance(commit_findings, str) and commit_findings.strip():
+        recovered["findings"] = commit_findings.strip()
+    inferred_artifacts.update(commit_artifacts)
 
     if "findings" not in recovered:
         exp_dir = project_dir / "experiments" / exp_dirname
@@ -339,9 +515,10 @@ def _recover_results(project_dir: Path, exp_id: str) -> dict[str, Any]:
                 if summary:
                     recovered["findings"] = summary
 
-    artifacts = _collect_artifacts(project_dir, exp_id)
+    artifacts = set(_collect_artifacts(project_dir, exp_id))
+    artifacts.update(inferred_artifacts)
     if artifacts:
-        recovered["artifacts"] = artifacts
+        recovered["artifacts"] = sorted(artifacts)
 
     return recovered
 
@@ -361,6 +538,93 @@ def _merge_results(existing: object, recovered: dict[str, Any]) -> dict[str, Any
     if merged_artifacts:
         merged["artifacts"] = sorted(merged_artifacts)
     return merged
+
+
+def _build_evidence_refs_from_artifacts(artifacts: list[str]) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, str):
+            continue
+        normalized = artifact.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        refs.append({"artifact": normalized})
+    return refs
+
+
+def _auto_fill_research_contract_fields(exp: dict[str, Any]) -> bool:
+    """Populate strict research contract placeholders for auto-recovered experiments."""
+    changed = False
+    method = exp.get("method") if isinstance(exp.get("method"), str) else ""
+    hypothesis = exp.get("hypothesis") if isinstance(exp.get("hypothesis"), str) else ""
+    question = exp.get("question") if isinstance(exp.get("question"), str) else ""
+
+    if not _is_nonempty(exp.get("theoretical_proof")):
+        exp["theoretical_proof"] = (
+            "Guardrail auto-fill: experiment completion was recovered from workspace artifacts. "
+            "Review and replace with explicit theoretical derivation."
+        )
+        changed = True
+
+    isolation_test = exp.get("isolation_test")
+    if not isinstance(isolation_test, dict):
+        isolation_test = {}
+        exp["isolation_test"] = isolation_test
+        changed = True
+    if not _is_nonempty(isolation_test.get("control")):
+        isolation_test["control"] = (
+            "Baseline defined by prior plan/previous experiment outputs."
+        )
+        changed = True
+    if not _is_nonempty(isolation_test.get("treatment")):
+        isolation_test["treatment"] = method or "Current experiment implementation."
+        changed = True
+    if not _is_nonempty(isolation_test.get("isolated_variable")):
+        isolation_test["isolated_variable"] = hypothesis or question or "Model/data configuration"
+        changed = True
+
+    post_mortem = exp.get("post_mortem")
+    if not isinstance(post_mortem, dict):
+        post_mortem = {}
+        exp["post_mortem"] = post_mortem
+        changed = True
+    if not _is_nonempty(post_mortem.get("residual_analysis")):
+        post_mortem["residual_analysis"] = (
+            "Guardrail auto-fill: residual analysis unavailable in structured form; inspect artifacts."
+        )
+        changed = True
+    if not _is_nonempty(post_mortem.get("implementation_fidelity")):
+        post_mortem["implementation_fidelity"] = (
+            "Guardrail auto-fill: execution artifacts detected and marked as completed."
+        )
+        changed = True
+    if not _is_nonempty(post_mortem.get("five_whys")):
+        post_mortem["five_whys"] = (
+            "Guardrail auto-fill: root-cause chain not provided by agent output."
+        )
+        changed = True
+
+    refs = exp.get("evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        artifacts = []
+        if isinstance(exp.get("results"), dict) and isinstance(exp["results"].get("artifacts"), list):
+            artifacts = [item for item in exp["results"]["artifacts"] if isinstance(item, str)]
+        generated_refs = _build_evidence_refs_from_artifacts(artifacts)
+        if not generated_refs:
+            generated_refs = [{"artifact": "task_plan.json"}]
+        exp["evidence_refs"] = generated_refs
+        changed = True
+    return changed
+
+
+def _auto_fill_contract_fields(
+    exp: dict[str, Any], *, profile: str, contract_version: int
+) -> bool:
+    if profile == "research" and contract_version >= STRICT_CONTRACT_VERSION:
+        return _auto_fill_research_contract_fields(exp)
+    return False
 
 
 def lint_task_plan_data(
@@ -425,8 +689,6 @@ def lint_task_plan_data(
         if project_dir and isinstance(exp.get("results"), dict):
             artifacts = exp["results"].get("artifacts")
             if isinstance(artifacts, list):
-                exp_dirname = _experiment_dirname(exp_id)
-                valid_prefixes = (f"experiments/{exp_dirname}/", f"outputs/{exp_dirname}/")
                 for artifact in artifacts:
                     if not isinstance(artifact, str):
                         issues.append(f"{exp_id}: non-string artifact path")
@@ -434,10 +696,9 @@ def lint_task_plan_data(
                     if artifact.startswith("/") or artifact.startswith("../") or "/../" in artifact:
                         issues.append(f"{exp_id}: unsafe artifact path '{artifact}'")
                         continue
-                    if not artifact.startswith(valid_prefixes):
-                        issues.append(
-                            f"{exp_id}: artifact path outside canonical dirs '{artifact}'"
-                        )
+                    artifact_path = project_dir / artifact
+                    if not artifact_path.is_file():
+                        issues.append(f"{exp_id}: artifact path does not exist '{artifact}'")
 
     if running_count > 1:
         issues.append("more than one experiment marked as running")
@@ -463,6 +724,10 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
     if normalized.get("status") not in _VALID_PLAN_STATUS:
         normalized["status"] = "in_progress"
         changed = True
+    effective_profile = _normalize_profile(_load_project_profile(project_dir))
+    effective_contract_version = _normalize_contract_version(
+        _load_project_contract_version(project_dir)
+    )
 
     running_seen = False
     updated_experiments: list[dict[str, Any]] = []
@@ -505,10 +770,15 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
             running_seen = True
 
         recovered = _recover_results(project_dir, exp_id)
-        if status in {"pending", "running"} and recovered.get("metrics") is not None:
+        auto_promoted = False
+        has_recoverable_evidence = recovered.get("metrics") is not None or bool(
+            recovered.get("artifacts")
+        )
+        if status in {"pending", "running"} and has_recoverable_evidence:
             item["status"] = "completed"
             status = "completed"
             changed = True
+            auto_promoted = True
         merged_results = _merge_results(item.get("results"), recovered)
         if merged_results and item.get("results") != merged_results:
             item["results"] = merged_results
@@ -522,6 +792,12 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
                 item["conclusion"] = "Recovered completed experiment artifacts from workspace."
             if item.get("conclusion"):
                 changed = True
+        if status == "completed" and _auto_fill_contract_fields(
+            item,
+            profile=effective_profile,
+            contract_version=effective_contract_version,
+        ):
+            changed = True
 
         updated_experiments.append(item)
 
