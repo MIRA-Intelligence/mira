@@ -105,7 +105,7 @@ def test_guard_task_plan_recovers_metrics_from_noncanonical_json(tmp_path: Path)
     assert "analysis/exp001_metrics_dump.json" in exp["results"]["artifacts"]
 
 
-def test_guard_task_plan_auto_fills_research_contract_for_recovered_experiment(
+def test_guard_task_plan_strict_mode_requires_model_completion_for_recovered_experiment(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "PRJ-0001D"
@@ -139,23 +139,18 @@ def test_guard_task_plan_auto_fills_research_contract_for_recovered_experiment(
     )
 
     result = guard_task_plan_file(project_dir, auto_fix=True)
-    assert result["ok"] is True
-    assert result["blocking"] is False
+    assert result["ok"] is False
+    assert result["blocking"] is True
 
     repaired = json.loads((project_dir / "task_plan.json").read_text(encoding="utf-8"))
     exp = repaired["experiments"][0]
     assert exp["status"] == "completed"
-    assert exp["theoretical_proof"]
-    assert exp["isolation_test"]["control"]
-    assert exp["isolation_test"]["treatment"]
-    assert exp["isolation_test"]["isolated_variable"]
-    assert exp["post_mortem"]["residual_analysis"]
-    assert exp["post_mortem"]["implementation_fidelity"]
-    assert exp["post_mortem"]["five_whys"]
-    assert isinstance(exp["evidence_refs"], list) and exp["evidence_refs"]
+    assert "theoretical_proof" not in exp
+    assert "post_mortem" not in exp
+    assert "evidence_refs" not in exp
 
 
-def test_guard_task_plan_auto_fills_research_contract_for_regular_completed_experiment(
+def test_guard_task_plan_strict_mode_does_not_auto_fill_completed_fields(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "PRJ-0001F"
@@ -186,17 +181,94 @@ def test_guard_task_plan_auto_fills_research_contract_for_regular_completed_expe
     )
 
     result = guard_task_plan_file(project_dir, auto_fix=True)
-    assert result["ok"] is True
-    assert result["blocking"] is False
-    assert result["fixed"] is True
+    assert result["ok"] is False
+    assert result["blocking"] is True
 
     repaired = json.loads((project_dir / "task_plan.json").read_text(encoding="utf-8"))
     exp = repaired["experiments"][0]
     assert exp["status"] == "completed"
-    assert exp["theoretical_proof"]
-    assert exp["isolation_test"]["control"]
-    assert exp["post_mortem"]["residual_analysis"]
-    assert isinstance(exp["evidence_refs"], list) and exp["evidence_refs"]
+    assert "theoretical_proof" not in exp
+    assert "post_mortem" not in exp
+    assert "evidence_refs" not in exp
+
+
+def test_guard_task_plan_strict_mode_does_not_promote_artifact_only_experiment(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "PRJ-0001G"
+    (project_dir / ".medpilot").mkdir(parents=True)
+    (project_dir / ".medpilot" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 2}),
+        encoding="utf-8",
+    )
+    (project_dir / "experiments" / "exp001").mkdir(parents=True)
+    (project_dir / "experiments" / "exp001" / "training.log").write_text(
+        "running...",
+        encoding="utf-8",
+    )
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [{"id": "Exp001", "status": "running"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=True)
+    assert result["ok"] is True
+    assert result["blocking"] is False
+    repaired = json.loads((project_dir / "task_plan.json").read_text(encoding="utf-8"))
+    exp = repaired["experiments"][0]
+    assert exp["status"] == "running"
+    assert "training.log" in " ".join(exp.get("results", {}).get("artifacts", []))
+
+
+def test_guard_task_plan_strict_mode_rejects_guardrail_placeholder_fields(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "PRJ-0001H"
+    (project_dir / ".medpilot").mkdir(parents=True)
+    (project_dir / ".medpilot" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 2}),
+        encoding="utf-8",
+    )
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [
+                    {
+                        "id": "Exp001",
+                        "status": "completed",
+                        "question": "Q",
+                        "hypothesis": "H",
+                        "method": "M",
+                        "results": {"metrics": {"mean_r": 0.8}},
+                        "conclusion": "done",
+                        "theoretical_proof": "Guardrail auto-fill: placeholder",
+                        "isolation_test": {"control": "ok", "treatment": "ok", "isolated_variable": "ok"},
+                        "post_mortem": {
+                            "residual_analysis": "Guardrail auto-fill: placeholder",
+                            "implementation_fidelity": "ok",
+                            "five_whys": "ok",
+                        },
+                        "evidence_refs": [{"artifact": "task_plan.json"}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=False)
+    assert result["ok"] is False
+    assert result["blocking"] is True
+    joined = "\n".join(result["issues"])
+    assert "research profile missing required fields" in joined
 
 
 def test_guard_task_plan_recovers_from_git_commit_when_no_metrics_json(

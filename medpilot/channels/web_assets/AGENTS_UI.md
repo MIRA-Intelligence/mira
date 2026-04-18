@@ -143,6 +143,14 @@ When the user requests a final deliverable, populate the `result` section in
 - `output_type`: one of `paper`, `report`, `analysis`, `code`
 - `sections`: structured content sections (title + content pairs)
 
+## Response Language Policy
+
+- Default to the same language as the user's latest message.
+- For new-project kickoff messages that contain mixed-language scaffolding, use
+  the language in the user-provided research description as the primary reply
+  language.
+- Only switch languages when the user explicitly requests the switch.
+
 ### Additional rules
 
 - This 3-stage protocol is **only** needed on the web channel.

@@ -232,6 +232,12 @@ def _is_nonempty(value: object) -> bool:
     return value is not None
 
 
+def _is_guardrail_placeholder_text(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower().startswith("guardrail auto-fill:")
+
+
 def _get_nested(exp: dict[str, Any], dotted: str) -> tuple[bool, Any]:
     current: Any = exp
     for part in dotted.split("."):
@@ -241,11 +247,19 @@ def _get_nested(exp: dict[str, Any], dotted: str) -> tuple[bool, Any]:
     return True, current
 
 
-def _missing_required_fields(exp: dict[str, Any], fields: tuple[str, ...]) -> list[str]:
+def _missing_required_fields(
+    exp: dict[str, Any],
+    fields: tuple[str, ...],
+    *,
+    allow_guardrail_placeholders: bool = True,
+) -> list[str]:
     missing: list[str] = []
     for field in fields:
         exists, value = _get_nested(exp, field)
         if not exists or not _is_nonempty(value):
+            missing.append(field)
+            continue
+        if not allow_guardrail_placeholders and _is_guardrail_placeholder_text(value):
             missing.append(field)
     return missing
 
@@ -296,19 +310,27 @@ def _validate_profile_required_fields(
     exp_id: str, exp: dict[str, Any], *, profile: str, contract_version: int
 ) -> list[str]:
     required = _required_completed_fields_for_profile(profile, contract_version)
-    missing = _missing_required_fields(exp, required)
+    missing = _missing_required_fields(
+        exp,
+        required,
+        allow_guardrail_placeholders=contract_version < STRICT_CONTRACT_VERSION,
+    )
     if missing:
         return [f"{exp_id}: {profile} profile missing required fields: {', '.join(missing)}"]
     return []
 
 
 def _validate_profile_falsify_fields(
-    exp_id: str, exp: dict[str, Any], *, profile: str
+    exp_id: str, exp: dict[str, Any], *, profile: str, contract_version: int
 ) -> list[str]:
     if not _looks_like_hypothesis_rejection(exp.get("conclusion")):
         return []
     required = _required_falsify_fields_for_profile(profile)
-    missing = _missing_required_fields(exp, required)
+    missing = _missing_required_fields(
+        exp,
+        required,
+        allow_guardrail_placeholders=contract_version < STRICT_CONTRACT_VERSION,
+    )
     if missing:
         return [f"{exp_id}: hypothesis rejection requires fields: {', '.join(missing)}"]
     return []
@@ -682,7 +704,12 @@ def lint_task_plan_data(
                 )
             )
             issues.extend(
-                _validate_profile_falsify_fields(exp_id, exp, profile=effective_profile)
+                _validate_profile_falsify_fields(
+                    exp_id,
+                    exp,
+                    profile=effective_profile,
+                    contract_version=effective_contract_version,
+                )
             )
             issues.extend(_validate_evidence_refs(exp_id, exp, project_dir))
 
@@ -774,7 +801,11 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
         has_recoverable_evidence = recovered.get("metrics") is not None or bool(
             recovered.get("artifacts")
         )
-        if status in {"pending", "running"} and has_recoverable_evidence:
+        strict_requires_structured_completion = (
+            effective_contract_version >= STRICT_CONTRACT_VERSION
+            and recovered.get("metrics") is None
+        )
+        if status in {"pending", "running"} and has_recoverable_evidence and not strict_requires_structured_completion:
             item["status"] = "completed"
             status = "completed"
             changed = True
@@ -792,10 +823,14 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
                 item["conclusion"] = "Recovered completed experiment artifacts from workspace."
             if item.get("conclusion"):
                 changed = True
-        if status == "completed" and _auto_fill_contract_fields(
-            item,
-            profile=effective_profile,
-            contract_version=effective_contract_version,
+        if (
+            status == "completed"
+            and effective_contract_version < STRICT_CONTRACT_VERSION
+            and _auto_fill_contract_fields(
+                item,
+                profile=effective_profile,
+                contract_version=effective_contract_version,
+            )
         ):
             changed = True
 

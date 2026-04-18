@@ -150,6 +150,7 @@ class AgentLoop:
         self._session_agent_profiles: dict[str, str] = {}  # session_key -> engineer|default|research
         self._session_automation_policies: dict[str, dict[str, Any] | None] = {}
         self._last_task_plan_guard_issues: list[str] = []
+        self._last_task_plan_guard_fixed: bool = False
         self._last_loop_tokens_used: int = 0
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
@@ -843,15 +844,21 @@ class AgentLoop:
             return after_plan, False
         return patched, True
     def _guard_task_plan_structure(
-        self, project_dir: str | None, profile: str | None = None
+        self,
+        project_dir: str | None,
+        *,
+        auto_fix: bool = True,
+        profile: str | None = None,
     ) -> bool:
         """Apply task_plan guardrails before auto-continue rounds."""
         if not project_dir:
             self._last_task_plan_guard_issues = []
+            self._last_task_plan_guard_fixed = False
             return True
-        result = guard_task_plan_file(Path(project_dir), auto_fix=True, profile=profile)
+        result = guard_task_plan_file(Path(project_dir), auto_fix=auto_fix, profile=profile)
         issues = list(result.get("issues") or [])
         self._last_task_plan_guard_issues = issues
+        self._last_task_plan_guard_fixed = bool(result.get("fixed"))
         if result.get("fixed"):
             logger.info("task_plan guardrails auto-fixed {}", project_dir)
         if result.get("blocking"):
@@ -916,6 +923,21 @@ class AgentLoop:
         )
         return "\n".join(lines)
 
+    def _is_strict_contract_enforced(
+        self, *, project_dir: str | None, agent_profile: str | None
+    ) -> bool:
+        """Whether current project is in strict contract mode with required fields."""
+        profile = self._parse_agent_profile(agent_profile) or "default"
+        contract_version = self._load_project_contract_version(project_dir)
+        contract = get_task_plan_contract(
+            profile=profile,
+            contract_version=contract_version,
+        )
+        return (
+            contract_version >= 2
+            and bool(contract.get("required_completed_fields"))
+        )
+
     def _build_auto_continue_message(
         self,
         channel: str,
@@ -967,6 +989,8 @@ class AgentLoop:
             "Guardrail validation blocked task_plan progression. "
             "Patch task_plan.json to satisfy the missing required fields only.\n"
             "Do NOT rewrite prior conclusions or metrics unless logically necessary.\n"
+            "Use concrete evidence from experiment artifacts/results; "
+            "placeholder text like 'Guardrail auto-fill: ...' is invalid in strict mode.\n"
             f"Missing/invalid items:\n{issue_lines}"
         )
 
@@ -1025,6 +1049,8 @@ class AgentLoop:
             "Guardrail validation blocked task_plan progression. "
             "Patch task_plan.json to satisfy the missing required fields only.\n"
             "Do NOT rewrite prior conclusions or metrics unless logically necessary.\n"
+            "Use concrete evidence from experiment artifacts/results; "
+            "placeholder text like 'Guardrail auto-fill: ...' is invalid in strict mode.\n"
             f"Missing/invalid items:\n{issue_lines}"
         )
 
@@ -1684,9 +1710,11 @@ class AgentLoop:
                     )
                 if crossed and project_dir:
                     code_guard = self._guard_task_plan_structure(
-                        project_dir, auto_fix=True, profile=agent_profile
+                        project_dir,
+                        auto_fix=True,
+                        profile=agent_profile,
                     )
-                    if code_guard.get("fixed"):
+                    if code_guard and self._last_task_plan_guard_fixed:
                         await progress_cb(
                             "auto-run guard: code-level contract normalization applied "
                             "after experiment transition"
@@ -1801,6 +1829,43 @@ class AgentLoop:
                                 )
                         continue
                     has_pending = self._plan_has_pending_work(self._load_task_plan(project_dir))
+                    strict_contract = self._is_strict_contract_enforced(
+                        project_dir=project_dir,
+                        agent_profile=agent_profile,
+                    )
+                    if strict_contract and has_pending and auto_round < self._AUTO_MAX_ROUNDS:
+                        guard_repair_round = 0
+                        auto_round += 1
+                        await progress_cb(
+                            "auto-run strict contract repair: required fields still missing; "
+                            "requesting targeted completion before next experiment"
+                        )
+                        all_msgs.append({
+                            "role": "user",
+                            "content": self._build_auto_guardrail_repair_message(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                project_dir=project_dir,
+                                run_mode=current_mode,
+                                issues=guard_issues,
+                            ),
+                        })
+                        guard_plan_before = round_plan_after if msg.channel == "web" else None
+                        final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
+                        total_tokens_used += self._last_loop_tokens_used
+                        round_plan_after = self._load_task_plan(project_dir)
+                        round_plan_before = guard_plan_before
+                        if msg.channel == "web" and not allow_result_write:
+                            round_plan_after, restored = self._restore_result_section(
+                                project_dir,
+                                before_plan=guard_plan_before,
+                                after_plan=round_plan_after,
+                            )
+                            if restored:
+                                await progress_cb(
+                                    "auto-run guard: skipped task_plan.result update without explicit export request"
+                                )
+                        continue
                     if has_pending and auto_round < self._AUTO_MAX_ROUNDS:
                         continue_despite_guard = True
                         await progress_cb(

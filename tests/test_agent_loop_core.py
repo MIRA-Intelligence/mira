@@ -190,6 +190,14 @@ def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
     assert "Checkpoint barrier" in checkpoint_msg
     assert "Exp001" in checkpoint_msg
     assert "do not mark an experiment as completed" in checkpoint_msg
+    assert loop._is_strict_contract_enforced(
+        project_dir=str(project),
+        agent_profile="research",
+    ) is True
+    assert loop._is_strict_contract_enforced(
+        project_dir=None,
+        agent_profile="default",
+    ) is False
 
 
 def test_auto_run_decision_helpers(tmp_path: Path) -> None:
