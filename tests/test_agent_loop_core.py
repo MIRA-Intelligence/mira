@@ -162,6 +162,42 @@ def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
     assert merged == "UI rules\n\nGuard notice"
     assert loop._compose_extra_system("", "Guard notice") == "Guard notice"
     assert loop._compose_extra_system(None, None) is None
+    project = tmp_path / "PRJ-9"
+    (project / ".medpilot").mkdir(parents=True)
+    (project / ".medpilot" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 2}),
+        encoding="utf-8",
+    )
+    auto_msg = loop._build_auto_continue_message(
+        channel="web",
+        chat_id="PRJ-9",
+        project_dir=str(project),
+        run_mode="auto",
+        agent_profile="research",
+    )
+    assert "Execute exactly ONE pending experiment in this round" in auto_msg
+    assert "immediately update and write task_plan.json" in auto_msg
+    assert "Task-plan contract requirements" in auto_msg
+    assert "theoretical_proof" in auto_msg
+    checkpoint_msg = loop._build_auto_checkpoint_sync_message(
+        channel="web",
+        chat_id="PRJ-9",
+        project_dir=str(project),
+        run_mode="auto",
+        running_ids=["Exp001"],
+        agent_profile="research",
+    )
+    assert "Checkpoint barrier" in checkpoint_msg
+    assert "Exp001" in checkpoint_msg
+    assert "do not mark an experiment as completed" in checkpoint_msg
+    assert loop._is_strict_contract_enforced(
+        project_dir=str(project),
+        agent_profile="research",
+    ) is True
+    assert loop._is_strict_contract_enforced(
+        project_dir=None,
+        agent_profile="default",
+    ) is False
 
 
 def test_auto_run_decision_helpers(tmp_path: Path) -> None:
@@ -178,6 +214,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     loaded = AgentLoop._load_task_plan(str(project))
     assert loaded is not None
     assert AgentLoop._plan_has_pending_work(loaded) is True
+    assert AgentLoop._running_experiment_ids(loaded) == []
 
     assert loop._should_continue_auto_web(
         channel="web",
@@ -212,6 +249,103 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         auto_round=0,
     ) is False
 
+    before = {
+        "experiments": [
+            {"id": "Exp001", "status": "running", "results": {"metrics": {}}},
+            {"id": "Exp002", "status": "pending"},
+        ]
+    }
+    after_unchanged = {
+        "experiments": [
+            {"id": "Exp001", "status": "running", "results": {"metrics": {}}},
+            {"id": "Exp002", "status": "pending"},
+        ]
+    }
+    after_updated = {
+        "experiments": [
+            {"id": "Exp001", "status": "completed", "results": {"metrics": {"Dice": 0.8}}},
+            {"id": "Exp002", "status": "pending"},
+        ]
+    }
+    after_multi = {
+        "experiments": [
+            {"id": "Exp001", "status": "completed", "results": {"metrics": {"Dice": 0.8}}},
+            {"id": "Exp002", "status": "failed"},
+        ]
+    }
+    assert AgentLoop._has_experiment_checkpoint_update(before, after_unchanged) is False
+    assert AgentLoop._has_experiment_checkpoint_update(before, after_updated) is True
+    assert AgentLoop._experiments_crossed_boundary(before, after_updated) == ["Exp001"]
+    assert AgentLoop._experiments_crossed_boundary(before, after_multi) == ["Exp001", "Exp002"]
+
+    before_result = {"experiments": [], "result": {"summary": "keep me"}}
+    after_result = {
+        "experiments": [],
+        "result": {"summary": "auto generated", "output_path": "outputs/", "output_type": "analysis"},
+    }
+    assert AgentLoop._has_result_section_update(before_result, after_result) is True
+    assert AgentLoop._looks_like_result_request("Manual export request for PRJ-1.") is True
+    assert AgentLoop._looks_like_result_request("continue experiments") is False
+    assert AgentLoop._looks_like_result_request(
+        "continue experiments", {"_allow_result_write": True}
+    ) is True
+
+    plan_file = project / "task_plan.json"
+    plan_file.write_text(json.dumps(after_result), encoding="utf-8")
+    restored, changed = loop._restore_result_section(
+        str(project),
+        before_plan=before_result,
+        after_plan=after_result,
+    )
+    assert changed is True
+    assert isinstance(restored, dict)
+    assert restored.get("result") == before_result["result"]
+    persisted = json.loads(plan_file.read_text(encoding="utf-8"))
+    assert persisted.get("result") == before_result["result"]
+
+
+def test_automation_policy_helpers(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+
+    policy = loop._parse_automation_policy(
+        {
+            "logic": "OR",
+            "goals": [
+                {"metric": "Dice", "operator": ">", "value": 0.8},
+                {"metric": "HD95", "operator": "<", "value": 5.0},
+            ],
+            "maxExperiments": 8,
+            "maxTokens": 1000,
+        }
+    )
+    assert policy is not None
+    assert policy["logic"] == "OR"
+    assert len(policy["goals"]) == 2
+
+    plan = {
+        "experiments": [
+            {"status": "completed", "results": {"metrics": {"Dice": 0.82, "HD95": 6.1}}},
+            {"status": "pending", "results": {"metrics": {}}},
+        ]
+    }
+    stop_reason = AgentLoop._evaluate_automation_stop_policy(policy, plan=plan, tokens_used=100)
+    assert stop_reason == "automation goals reached"
+
+    strict_policy = loop._parse_automation_policy(
+        {
+            "logic": "AND",
+            "goals": [{"metric": "Dice", "operator": ">=", "value": 0.9}],
+            "maxExperiments": 1,
+        }
+    )
+    assert strict_policy is not None
+    exp_reason = AgentLoop._evaluate_automation_stop_policy(strict_policy, plan=plan, tokens_used=100)
+    assert "max experiments reached" in (exp_reason or "")
+
+    token_policy = loop._parse_automation_policy({"maxTokens": 200})
+    assert token_policy is not None
+    token_reason = AgentLoop._evaluate_automation_stop_policy(token_policy, plan=plan, tokens_used=250)
+    assert "token budget reached" in (token_reason or "")
 
 async def test_run_agent_loop_tool_call_and_finish(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)

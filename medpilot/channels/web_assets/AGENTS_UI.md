@@ -30,6 +30,7 @@ sequence so the dashboard can show the queue before execution begins. Fill in
 ## Research Phase
 
 When starting a new project, begin with background research:
+- If `Project Directory/references/` contains uploaded materials, read those local files first and ground your initial survey in them before broad external search.
 - Search for relevant literature and add references to `task_plan.json` → `research.references`
 - Write a brief survey overview in `research.survey`
 - Note key observations and domain-specific facts in `research.notes`
@@ -55,6 +56,9 @@ Question → Hypothesis → Prediction → Experiment → Analysis → Conclusio
 - In `auto` mode: continue to the next pending experiment automatically. Only stop
   early when user input is strictly required, the project is blocked by an error,
   or there are no pending/running experiments left.
+- In `auto` mode: in a single assistant turn, you may transition AT MOST ONE
+  experiment to a terminal status (`completed`/`failed`/`skipped`). You may
+  create or queue many `pending` experiments, but finish only one per turn.
 
 ### Workflow for each experiment
 
@@ -132,12 +136,20 @@ When the user asks to re-plan based on completed experiments and current
 
 ## Result Phase
 
-When the user requests a final deliverable (or experiments reach a natural
-conclusion), populate the `result` section in `task_plan.json`:
+When the user requests a final deliverable, populate the `result` section in
+`task_plan.json`:
 - `summary`: a concise summary of all findings
 - `output_path`: the file path to the generated deliverable (relative to project dir)
 - `output_type`: one of `paper`, `report`, `analysis`, `code`
 - `sections`: structured content sections (title + content pairs)
+
+## Response Language Policy
+
+- Default to the same language as the user's latest message.
+- For new-project kickoff messages that contain mixed-language scaffolding, use
+  the language in the user-provided research description as the primary reply
+  language.
+- Only switch languages when the user explicitly requests the switch.
 
 ### Additional rules
 
