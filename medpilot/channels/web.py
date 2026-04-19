@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,61 @@ def _normalize_contract_version(value: Any) -> int:
         if value in {PROJECT_META_DEFAULT_CONTRACT_VERSION, PROJECT_META_STRICT_CONTRACT_VERSION}:
             return value
     return PROJECT_META_DEFAULT_CONTRACT_VERSION
+
+
+def _normalize_automation_policy(value: Any) -> dict[str, Any] | None:
+    """Normalize auto-stop policy payload from UI/project meta."""
+    if not isinstance(value, dict):
+        return None
+
+    logic_raw = value.get("logic")
+    logic = "AND"
+    if isinstance(logic_raw, str) and logic_raw.strip().upper() in {"AND", "OR"}:
+        logic = logic_raw.strip().upper()
+
+    goals: list[dict[str, Any]] = []
+    raw_goals = value.get("goals")
+    if isinstance(raw_goals, list):
+        for item in raw_goals:
+            if not isinstance(item, dict):
+                continue
+            metric = item.get("metric")
+            operator = item.get("operator")
+            raw_value = item.get("value")
+            if not isinstance(metric, str) or not metric.strip():
+                continue
+            if not isinstance(operator, str) or operator not in {">", ">=", "<", "<=", "=="}:
+                continue
+            try:
+                numeric = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            goals.append({
+                "metric": metric.strip(),
+                "operator": operator,
+                "value": numeric,
+            })
+
+    max_experiments = value.get("maxExperiments")
+    if not isinstance(max_experiments, int) or max_experiments <= 0:
+        max_experiments = None
+
+    max_tokens = value.get("maxTokens")
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        max_tokens = None
+
+    if not goals and max_experiments is None and max_tokens is None:
+        return None
+
+    normalized: dict[str, Any] = {
+        "logic": logic,
+        "goals": goals,
+    }
+    if max_experiments is not None:
+        normalized["maxExperiments"] = max_experiments
+    if max_tokens is not None:
+        normalized["maxTokens"] = max_tokens
+    return normalized
 
 
 def _stringify_history_content(content: Any) -> str:
@@ -286,6 +342,80 @@ def _next_available_path(base_dir: Path, filename: str) -> Path:
         if not alt.exists():
             return alt
         idx += 1
+
+
+def _next_available_dir(base_dir: Path, dirname: str) -> Path:
+    """Return a non-colliding directory path inside *base_dir*."""
+    candidate = base_dir / dirname
+    if not candidate.exists():
+        return candidate
+
+    base_name = dirname or "archive"
+    idx = 1
+    while True:
+        alt = base_dir / f"{base_name}_{idx}"
+        if not alt.exists():
+            return alt
+        idx += 1
+
+
+def _resolve_zip_member_path(extract_root: Path, member_name: str) -> Path | None:
+    """Resolve one zip member path safely under *extract_root*."""
+    normalized = member_name.replace("\\", "/")
+    raw = Path(normalized)
+    if raw.is_absolute():
+        return None
+
+    safe_parts: list[str] = []
+    for part in raw.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            return None
+        safe_parts.append(part)
+    if not safe_parts:
+        return None
+
+    root_resolved = extract_root.resolve()
+    candidate = (extract_root / Path(*safe_parts)).resolve()
+    try:
+        candidate.relative_to(root_resolved)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _extract_zip_into_references(
+    archive_path: Path,
+    references_dir: Path,
+    project_dir: Path,
+) -> list[dict[str, Any]]:
+    """Extract a ZIP archive into references/<zip_stem>/ with traversal checks."""
+    stem = Path(archive_path.name).stem.strip() or "archive"
+    extract_root = _next_available_dir(references_dir, stem)
+    extracted: list[dict[str, Any]] = []
+    archive_rel = archive_path.relative_to(project_dir).as_posix()
+
+    try:
+        with zipfile.ZipFile(archive_path) as zf:
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+                target = _resolve_zip_member_path(extract_root, member.filename)
+                if target is None:
+                    raise ValueError(f"unsafe zip entry: {member.filename}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member, "r") as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted.append({
+                    "archive": archive_rel,
+                    "path": target.relative_to(project_dir).as_posix(),
+                    "size": target.stat().st_size,
+                })
+    except zipfile.BadZipFile as exc:
+        raise ValueError("invalid zip archive") from exc
+
+    return extracted
 
 
 def _merge_recovered_results(existing: Any, recovered_metrics: Any, artifacts: list[str]) -> dict[str, Any]:
@@ -818,6 +948,7 @@ class WebChannel(BaseChannel):
                 media = data.get("media", [])
                 run_mode = _normalize_run_mode(data.get("mode"))
                 agent_profile = _normalize_agent_profile(data.get("agent_profile"))
+                incoming_policy = _normalize_automation_policy(data.get("automation_policy"))
 
                 if session_id is None:
                     await ws.send_json(
@@ -828,6 +959,13 @@ class WebChannel(BaseChannel):
                 self._clients[session_id] = ws
                 project_dir = str(self.projects_root / session_id)
                 project_dir_path = Path(project_dir)
+                meta = self._persist_project_runtime_preferences(
+                    project_dir_path,
+                    run_mode=run_mode,
+                    agent_profile=agent_profile,
+                    automation_policy=incoming_policy,
+                )
+                effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
                 plan_ids_before = _extract_plan_experiment_ids(project_dir_path)
                 guard = guard_task_plan_file(project_dir_path, auto_fix=True)
                 guard_notice: str | None = None
@@ -868,6 +1006,8 @@ class WebChannel(BaseChannel):
                         "user_id": user_id,
                         "run_mode": run_mode,
                         "agent_profile": agent_profile,
+                        "has_automation_policy": bool(effective_policy),
+                        "goal_count": len(effective_policy.get("goals", [])) if effective_policy else 0,
                         "content_preview": self._preview(content),
                         "media_count": len(media) if isinstance(media, list) else 0,
                     },
@@ -885,6 +1025,8 @@ class WebChannel(BaseChannel):
                     "run_mode": run_mode,
                     "agent_profile": agent_profile,
                 }
+                if effective_policy:
+                    metadata["automation_policy"] = effective_policy
                 if self._ui_instructions:
                     metadata["_ui_system_instructions"] = self._ui_instructions
                 if guard_notice:
@@ -1382,6 +1524,7 @@ class WebChannel(BaseChannel):
             "run_mode": PROJECT_META_DEFAULT_RUN_MODE,
             "agent_profile": PROJECT_META_DEFAULT_AGENT_PROFILE,
             "contract_version": PROJECT_META_DEFAULT_CONTRACT_VERSION,
+            "automation_policy": None,
             "created_at": now,
             "updated_at": now,
             "schema_version": PROJECT_META_SCHEMA_VERSION,
@@ -1410,6 +1553,7 @@ class WebChannel(BaseChannel):
         meta["run_mode"] = _normalize_run_mode(meta.get("run_mode"))
         meta["agent_profile"] = _normalize_agent_profile(meta.get("agent_profile"))
         meta["contract_version"] = _normalize_contract_version(meta.get("contract_version"))
+        meta["automation_policy"] = _normalize_automation_policy(meta.get("automation_policy"))
 
         if not isinstance(meta.get("schema_version"), int):
             meta["schema_version"] = PROJECT_META_SCHEMA_VERSION
@@ -1420,6 +1564,36 @@ class WebChannel(BaseChannel):
             meta["updated_at"] = baseline["updated_at"]
 
         self._write_project_meta(project_dir, meta)
+        return meta
+
+    def _persist_project_runtime_preferences(
+        self,
+        project_dir: Path,
+        *,
+        run_mode: str,
+        agent_profile: str,
+        automation_policy: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Persist runtime preferences for websocket-driven project sessions."""
+        project_dir.mkdir(parents=True, exist_ok=True)
+        meta = self._ensure_project_meta(project_dir)
+        changed = False
+
+        if meta.get("run_mode") != run_mode:
+            meta["run_mode"] = run_mode
+            changed = True
+        if meta.get("agent_profile") != agent_profile:
+            meta["agent_profile"] = agent_profile
+            changed = True
+
+        normalized_policy = _normalize_automation_policy(automation_policy)
+        if meta.get("automation_policy") != normalized_policy:
+            meta["automation_policy"] = normalized_policy
+            changed = True
+
+        if changed:
+            meta["updated_at"] = f"{datetime.utcnow().isoformat()}Z"
+            self._write_project_meta(project_dir, meta)
         return meta
 
     async def _handle_list_projects(self, _request: web.Request) -> web.Response:
@@ -1442,6 +1616,9 @@ class WebChannel(BaseChannel):
                 ),
                 "contract_version": int(
                     _normalize_contract_version(meta.get("contract_version"))
+                ),
+                "automation_policy": _normalize_automation_policy(
+                    meta.get("automation_policy")
                 ),
                 "has_meta": True,
             }
@@ -1482,11 +1659,19 @@ class WebChannel(BaseChannel):
         has_run_mode = "run_mode" in body
         has_agent_profile = "agent_profile" in body
         has_contract_version = "contract_version" in body
-        if not any((has_display_name, has_run_mode, has_agent_profile, has_contract_version)):
+        has_automation_policy = "automation_policy" in body
+        if not any((
+            has_display_name,
+            has_run_mode,
+            has_agent_profile,
+            has_contract_version,
+            has_automation_policy,
+        )):
             return web.json_response(
                 {
                     "error": (
-                        "at least one of display_name/run_mode/agent_profile/contract_version is required"
+                        "at least one of display_name/run_mode/agent_profile/"
+                        "contract_version/automation_policy is required"
                     )
                 },
                 status=400,
@@ -1514,6 +1699,12 @@ class WebChannel(BaseChannel):
                 {"error": "contract_version must be an integer"}, status=400
             )
 
+        automation_policy = body.get("automation_policy")
+        if has_automation_policy and not isinstance(automation_policy, (dict, type(None))):
+            return web.json_response(
+                {"error": "automation_policy must be an object or null"}, status=400
+            )
+
         meta = self._ensure_project_meta(project_dir)
         if has_display_name:
             meta["display_name"] = (display_name or "").strip() or session_id
@@ -1523,6 +1714,8 @@ class WebChannel(BaseChannel):
             meta["agent_profile"] = _normalize_agent_profile(agent_profile)
         if has_contract_version:
             meta["contract_version"] = _normalize_contract_version(contract_version)
+        if has_automation_policy:
+            meta["automation_policy"] = _normalize_automation_policy(automation_policy)
         meta["updated_at"] = f"{datetime.utcnow().isoformat()}Z"
         self._write_project_meta(project_dir, meta)
 
@@ -1536,6 +1729,7 @@ class WebChannel(BaseChannel):
                 "run_mode": meta.get("run_mode"),
                 "agent_profile": meta.get("agent_profile"),
                 "contract_version": meta.get("contract_version"),
+                "automation_policy": meta.get("automation_policy"),
             },
         )
         return web.json_response(
@@ -1545,6 +1739,7 @@ class WebChannel(BaseChannel):
                 "run_mode": meta.get("run_mode"),
                 "agent_profile": meta.get("agent_profile"),
                 "contract_version": meta.get("contract_version"),
+                "automation_policy": meta.get("automation_policy"),
                 "meta": meta,
             }
         )
@@ -1595,6 +1790,11 @@ class WebChannel(BaseChannel):
         session_id = request.match_info.get("session_id", "").strip()
         if not session_id:
             return web.json_response({"error": "session_id required"}, status=400)
+        target = (request.query.get("target") or "data").strip().lower()
+        if target not in {"data", "references"}:
+            return web.json_response(
+                {"error": "target must be one of: data, references"}, status=400
+            )
 
         try:
             multipart = await request.multipart()
@@ -1602,14 +1802,15 @@ class WebChannel(BaseChannel):
             return web.json_response({"error": "expected multipart/form-data"}, status=400)
 
         project_dir = self.projects_root / session_id
-        data_dir = project_dir / "data"
+        upload_dir = project_dir / target
         try:
-            data_dir.mkdir(parents=True, exist_ok=True)
+            upload_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            logger.warning("Failed to create upload directory {}: {}", data_dir, exc)
+            logger.warning("Failed to create upload directory {}: {}", upload_dir, exc)
             return web.json_response({"error": str(exc)}, status=500)
 
         uploaded: list[dict[str, Any]] = []
+        extracted: list[dict[str, Any]] = []
 
         while True:
             part = await multipart.next()
@@ -1626,11 +1827,22 @@ class WebChannel(BaseChannel):
             if not safe_name:
                 await part.release()
                 continue
+            if target == "references":
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in {".pdf", ".zip"}:
+                    return web.json_response(
+                        {
+                            "error": (
+                                "references uploads only support .pdf and .zip files"
+                            )
+                        },
+                        status=400,
+                    )
 
-            target = _next_available_path(data_dir, safe_name)
+            destination = _next_available_path(upload_dir, safe_name)
             size = 0
             try:
-                with target.open("wb") as f:
+                with destination.open("wb") as f:
                     while True:
                         chunk = await part.read_chunk()
                         if not chunk:
@@ -1638,14 +1850,28 @@ class WebChannel(BaseChannel):
                         f.write(chunk)
                         size += len(chunk)
             except OSError as exc:
-                logger.warning("Failed to write uploaded file {}: {}", target, exc)
+                logger.warning("Failed to write uploaded file {}: {}", destination, exc)
                 return web.json_response({"error": str(exc)}, status=500)
 
             uploaded.append({
-                "name": target.name,
-                "path": target.relative_to(project_dir).as_posix(),
+                "name": destination.name,
+                "path": destination.relative_to(project_dir).as_posix(),
                 "size": size,
             })
+            if target == "references" and destination.suffix.lower() == ".zip":
+                try:
+                    extracted.extend(
+                        _extract_zip_into_references(destination, upload_dir, project_dir)
+                    )
+                except ValueError as exc:
+                    return web.json_response({"error": str(exc)}, status=400)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to extract reference archive {}: {}",
+                        destination,
+                        exc,
+                    )
+                    return web.json_response({"error": str(exc)}, status=500)
 
         if not uploaded:
             return web.json_response({"error": "no files uploaded"}, status=400)
@@ -1656,14 +1882,18 @@ class WebChannel(BaseChannel):
             session_id=session_id,
             project_dir=project_dir,
             details={
+                "target": target,
                 "count": len(uploaded),
                 "files": [item.get("path", "") for item in uploaded],
+                "extracted": [item.get("path", "") for item in extracted],
             },
         )
 
         return web.json_response({
             "session_id": session_id,
+            "target": target,
             "uploaded": uploaded,
+            "extracted": extracted,
         })
 
     async def _handle_project_artifact(self, request: web.Request) -> web.Response:

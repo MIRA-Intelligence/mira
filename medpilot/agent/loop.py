@@ -62,6 +62,7 @@ class AgentLoop:
     _RUNTIME_CHECKPOINT_KEY = "_runtime_checkpoint"
     _AUTO_MAX_ROUNDS = 20
     _AUTO_GUARD_REPAIR_MAX = 1
+    _AUTO_CHECKPOINT_REPAIR_MAX = 1
     _AUTO_CONTINUE_MARKER = "[AUTO-CONTINUE-INTERNAL]"
 
     def __init__(
@@ -147,7 +148,9 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._session_run_modes: dict[str, str] = {}  # session_key -> manual|auto
         self._session_agent_profiles: dict[str, str] = {}  # session_key -> engineer|default|research
+        self._session_automation_policies: dict[str, dict[str, Any] | None] = {}
         self._last_task_plan_guard_issues: list[str] = []
+        self._last_loop_tokens_used: int = 0
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
         self._command_router = CommandRouter()
@@ -381,6 +384,58 @@ class AgentLoop:
                 return profile
         return None
 
+    @staticmethod
+    def _parse_automation_policy(value: object) -> dict[str, Any] | None:
+        """Parse automation policy, returning None when absent/invalid."""
+        if not isinstance(value, dict):
+            return None
+
+        logic_raw = value.get("logic")
+        logic = "AND"
+        if isinstance(logic_raw, str) and logic_raw.strip().upper() in {"AND", "OR"}:
+            logic = logic_raw.strip().upper()
+
+        goals: list[dict[str, Any]] = []
+        raw_goals = value.get("goals")
+        if isinstance(raw_goals, list):
+            for item in raw_goals:
+                if not isinstance(item, dict):
+                    continue
+                metric = item.get("metric")
+                operator = item.get("operator")
+                raw_target = item.get("value")
+                if not isinstance(metric, str) or not metric.strip():
+                    continue
+                if not isinstance(operator, str) or operator not in {">", ">=", "<", "<=", "=="}:
+                    continue
+                try:
+                    target = float(raw_target)
+                except (TypeError, ValueError):
+                    continue
+                goals.append({
+                    "metric": metric.strip(),
+                    "operator": operator,
+                    "value": target,
+                })
+
+        max_experiments = value.get("maxExperiments")
+        if not isinstance(max_experiments, int) or max_experiments <= 0:
+            max_experiments = None
+
+        max_tokens = value.get("maxTokens")
+        if not isinstance(max_tokens, int) or max_tokens <= 0:
+            max_tokens = None
+
+        if not goals and max_experiments is None and max_tokens is None:
+            return None
+
+        parsed: dict[str, Any] = {"logic": logic, "goals": goals}
+        if max_experiments is not None:
+            parsed["maxExperiments"] = max_experiments
+        if max_tokens is not None:
+            parsed["maxTokens"] = max_tokens
+        return parsed
+
     def _resolve_session_run_mode(self, session_key: str, inbound_value: object) -> str:
         """Resolve effective mode for a session, updating cache if explicitly provided."""
         explicit = self._parse_run_mode(inbound_value)
@@ -396,6 +451,18 @@ class AgentLoop:
             self._session_agent_profiles[session_key] = explicit
             return explicit
         return self._session_agent_profiles.get(session_key, "default")
+
+    def _resolve_session_automation_policy(
+        self,
+        session_key: str,
+        inbound_value: object,
+    ) -> dict[str, Any] | None:
+        """Resolve automation policy for a session, updating cache when provided."""
+        if inbound_value is not None:
+            parsed = self._parse_automation_policy(inbound_value)
+            self._session_automation_policies[session_key] = parsed
+            return parsed
+        return self._session_automation_policies.get(session_key)
 
     @staticmethod
     def _agent_profile_to_agents_filename(profile: str) -> str:
@@ -514,6 +581,178 @@ class AgentLoop:
             for exp in experiments
         )
 
+    @staticmethod
+    def _plan_experiment_index(plan: dict | None) -> dict[str, dict[str, Any]]:
+        """Build experiment lookup by id from task_plan payload."""
+        if not plan:
+            return {}
+        experiments = plan.get("experiments")
+        if not isinstance(experiments, list):
+            return {}
+
+        index: dict[str, dict[str, Any]] = {}
+        for exp in experiments:
+            if not isinstance(exp, dict):
+                continue
+            exp_id = exp.get("id")
+            if not isinstance(exp_id, str):
+                continue
+            normalized = exp_id.strip()
+            if not normalized:
+                continue
+            index[normalized] = exp
+        return index
+
+    @staticmethod
+    def _running_experiment_ids(plan: dict | None) -> list[str]:
+        """Return ids of currently running experiments."""
+        if not plan:
+            return []
+        experiments = plan.get("experiments")
+        if not isinstance(experiments, list):
+            return []
+
+        ids: list[str] = []
+        for exp in experiments:
+            if not isinstance(exp, dict) or exp.get("status") != "running":
+                continue
+            exp_id = exp.get("id")
+            if isinstance(exp_id, str) and exp_id.strip():
+                ids.append(exp_id.strip())
+        return ids
+
+    @classmethod
+    def _has_experiment_checkpoint_update(
+        cls,
+        before_plan: dict | None,
+        after_plan: dict | None,
+    ) -> bool:
+        """Check whether running experiments were persisted in task_plan this round."""
+        running_ids = cls._running_experiment_ids(before_plan)
+        if not running_ids:
+            return True
+
+        before_index = cls._plan_experiment_index(before_plan)
+        after_index = cls._plan_experiment_index(after_plan)
+
+        for exp_id in running_ids:
+            before_entry = before_index.get(exp_id)
+            after_entry = after_index.get(exp_id)
+            # Entry disappeared or changed => task plan checkpoint advanced.
+            if after_entry is None:
+                return True
+            if before_entry != after_entry:
+                return True
+        return False
+
+    @staticmethod
+    def _to_number(value: object) -> float | None:
+        """Convert metric value to float when possible."""
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _collect_latest_plan_metrics(cls, plan: dict | None) -> dict[str, float]:
+        """Collect latest numeric metrics from completed experiments."""
+        if not plan:
+            return {}
+        experiments = plan.get("experiments")
+        if not isinstance(experiments, list):
+            return {}
+
+        metrics: dict[str, float] = {}
+        for exp in experiments:
+            if not isinstance(exp, dict) or exp.get("status") != "completed":
+                continue
+            results = exp.get("results")
+            metric_map = results.get("metrics") if isinstance(results, dict) else None
+            if not isinstance(metric_map, dict):
+                continue
+            for metric_name, raw_value in metric_map.items():
+                if not isinstance(metric_name, str) or not metric_name.strip():
+                    continue
+                numeric = cls._to_number(raw_value)
+                if numeric is None:
+                    continue
+                metrics[metric_name.strip()] = numeric
+        return metrics
+
+    @staticmethod
+    def _count_completed_experiments(plan: dict | None) -> int:
+        """Count completed experiments in task plan."""
+        if not plan:
+            return 0
+        experiments = plan.get("experiments")
+        if not isinstance(experiments, list):
+            return 0
+        return sum(1 for exp in experiments if isinstance(exp, dict) and exp.get("status") == "completed")
+
+    @staticmethod
+    def _compare_goal(metric_value: float, operator: str, target: float) -> bool:
+        """Evaluate one metric threshold predicate."""
+        if operator == ">":
+            return metric_value > target
+        if operator == ">=":
+            return metric_value >= target
+        if operator == "<":
+            return metric_value < target
+        if operator == "<=":
+            return metric_value <= target
+        if operator == "==":
+            return abs(metric_value - target) <= 1e-9
+        return False
+
+    @classmethod
+    def _evaluate_automation_stop_policy(
+        cls,
+        policy: dict[str, Any] | None,
+        *,
+        plan: dict | None,
+        tokens_used: int,
+    ) -> str | None:
+        """Return stop reason if auto-stop policy threshold is reached."""
+        if not policy:
+            return None
+
+        goals = policy.get("goals") if isinstance(policy.get("goals"), list) else []
+        if goals:
+            metrics = cls._collect_latest_plan_metrics(plan)
+            evaluations: list[bool] = []
+            for goal in goals:
+                if not isinstance(goal, dict):
+                    continue
+                metric = goal.get("metric")
+                operator = goal.get("operator")
+                target = cls._to_number(goal.get("value"))
+                if not isinstance(metric, str) or not metric.strip() or not isinstance(operator, str) or target is None:
+                    continue
+                metric_value = metrics.get(metric.strip())
+                evaluations.append(
+                    metric_value is not None and cls._compare_goal(metric_value, operator, target)
+                )
+            if evaluations:
+                logic = str(policy.get("logic", "AND")).upper()
+                goals_met = all(evaluations) if logic == "AND" else any(evaluations)
+                if goals_met:
+                    return "automation goals reached"
+
+        max_experiments = policy.get("maxExperiments")
+        if isinstance(max_experiments, int) and max_experiments > 0:
+            completed = cls._count_completed_experiments(plan)
+            if completed >= max_experiments:
+                return f"max experiments reached ({completed}/{max_experiments})"
+
+        max_tokens = policy.get("maxTokens")
+        if isinstance(max_tokens, int) and max_tokens > 0 and tokens_used >= max_tokens:
+            return f"token budget reached ({tokens_used}/{max_tokens})"
+
+        return None
     def _guard_task_plan_structure(
         self, project_dir: str | None, profile: str | None = None
     ) -> bool:
@@ -551,8 +790,63 @@ class AgentLoop:
         )
         return (
             f"{runtime_ctx}\n\n{self._AUTO_CONTINUE_MARKER}\n"
-            "Continue automatically to the next pending experiment or stage. "
-            "Do not stop for confirmation unless user input is strictly required."
+            "Auto-run checkpoint requirements:\n"
+            "1) If you just finished an experiment, immediately update and write task_plan.json "
+            "(set status/results/conclusion/next for that experiment) BEFORE starting the next one.\n"
+            "2) Execute exactly ONE pending experiment in this round, then return control.\n"
+            "3) Do not stop for confirmation unless user input is strictly required."
+        )
+
+    def _build_auto_guardrail_repair_message(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        project_dir: str | None,
+        run_mode: str,
+        issues: list[str],
+    ) -> str:
+        """Build an internal message asking model to patch blocked plan fields."""
+        runtime_ctx = ContextBuilder._build_runtime_context(
+            channel,
+            chat_id,
+            project_dir,
+            run_mode=run_mode,
+        )
+        issue_lines = "\n".join(f"- {item}" for item in issues[:8]) if issues else "- unknown issue"
+        return (
+            f"{runtime_ctx}\n\n{self._AUTO_CONTINUE_MARKER}\n"
+            "Guardrail validation blocked task_plan progression. "
+            "Patch task_plan.json to satisfy the missing required fields only.\n"
+            "Do NOT rewrite prior conclusions or metrics unless logically necessary.\n"
+            f"Missing/invalid items:\n{issue_lines}"
+        )
+
+    def _build_auto_checkpoint_sync_message(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        project_dir: str | None,
+        run_mode: str,
+        running_ids: list[str],
+    ) -> str:
+        """Build an internal message that forces per-experiment task_plan checkpointing."""
+        runtime_ctx = ContextBuilder._build_runtime_context(
+            channel,
+            chat_id,
+            project_dir,
+            run_mode=run_mode,
+        )
+        items = "\n".join(f"- {item}" for item in running_ids[:8]) if running_ids else "- running experiment"
+        return (
+            f"{runtime_ctx}\n\n{self._AUTO_CONTINUE_MARKER}\n"
+            "Checkpoint barrier: task_plan.json still shows the same running experiment(s) as before this round.\n"
+            "Before any new work, update and write task_plan.json now for the current running experiment(s):\n"
+            "1) set final status (completed/failed/skipped) if finished;\n"
+            "2) persist results/conclusion/next (or progress if still running);\n"
+            "3) then stop this turn.\n"
+            f"Running experiments to sync:\n{items}"
         )
 
     def _build_auto_guardrail_repair_message(
@@ -634,6 +928,7 @@ class AgentLoop:
         tools_used: list[str] = []
         active_provider: LLMProvider | None = None
         active_route = None
+        loop_tokens_used = 0
         hook = getattr(self, "_hook", None)
 
         while iteration < self.max_iterations:
@@ -707,6 +1002,9 @@ class AgentLoop:
                     "completion_tokens": int(response.usage.get("completion_tokens", 0) or 0),
                     "cached_tokens": int(response.usage.get("cached_tokens", 0) or 0),
                 }
+                usage_total = response.usage.get("total_tokens")
+                if isinstance(usage_total, int) and usage_total > 0:
+                    loop_tokens_used += usage_total
             hook_ctx.response = response
             hook_ctx.usage = dict(response.usage or {})
             hook_ctx.tool_calls = list(response.tool_calls or [])
@@ -816,6 +1114,7 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
+        self._last_loop_tokens_used = loop_tokens_used
         return final_content, tools_used, messages
 
     async def run(self) -> None:
@@ -1018,6 +1317,10 @@ class AgentLoop:
         key = session_key or msg.session_key
         run_mode = self._resolve_session_run_mode(key, meta.get("run_mode"))
         agent_profile = self._resolve_session_agent_profile(key, meta.get("agent_profile"))
+        automation_policy = self._resolve_session_automation_policy(
+            key,
+            meta.get("automation_policy"),
+        )
         agents_filename = self._agent_profile_to_agents_filename(agent_profile)
         if project_dir:
             sessions_mgr = self._get_project_sessions(project_dir)
@@ -1053,6 +1356,7 @@ class AgentLoop:
             sessions_mgr.save(session)
             sessions_mgr.invalidate(session.key)
             self._session_model_runtimes.pop(session.key, None)
+            self._session_automation_policies.pop(session.key, None)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -1195,12 +1499,63 @@ class AgentLoop:
             run_kwargs["on_stream"] = on_stream
         if on_stream_end is not None:
             run_kwargs["on_stream_end"] = on_stream_end
+        round_plan_before = self._load_task_plan(project_dir) if msg.channel == "web" else None
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
+        total_tokens_used = self._last_loop_tokens_used
+        round_plan_after = self._load_task_plan(project_dir) if msg.channel == "web" else None
 
         auto_round = 0
         guard_repair_round = 0
+        checkpoint_repair_round = 0
         while True:
             current_mode = self._session_run_modes.get(key, run_mode)
+            automation_policy = self._resolve_session_automation_policy(key, None)
+            if msg.channel == "web" and current_mode == "auto":
+                if not self._has_experiment_checkpoint_update(round_plan_before, round_plan_after):
+                    if checkpoint_repair_round >= self._AUTO_CHECKPOINT_REPAIR_MAX:
+                        await progress_cb(
+                            "auto-run stop condition: task_plan checkpoint missing after experiment round"
+                        )
+                        break
+                    checkpoint_repair_round += 1
+                    auto_round += 1
+                    running_ids = self._running_experiment_ids(round_plan_before)
+                    await progress_cb(
+                        f"auto-run checkpoint repair {checkpoint_repair_round}: "
+                        "forcing task_plan sync for running experiment"
+                    )
+                    all_msgs.append({
+                        "role": "user",
+                        "content": self._build_auto_checkpoint_sync_message(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            project_dir=project_dir,
+                            run_mode=current_mode,
+                            running_ids=running_ids,
+                        ),
+                    })
+                    round_plan_before = round_plan_after
+                    final_content, _, all_msgs = await self._run_agent_loop(
+                        all_msgs,
+                        model_runtime=model_runtime,
+                        on_progress=progress_cb,
+                        audit_hook=audit_cb,
+                    )
+                    total_tokens_used += self._last_loop_tokens_used
+                    round_plan_after = self._load_task_plan(project_dir)
+                    continue
+
+            if msg.channel == "web" and current_mode == "auto":
+                current_plan = self._load_task_plan(project_dir)
+                stop_reason = self._evaluate_automation_stop_policy(
+                    automation_policy,
+                    plan=current_plan,
+                    tokens_used=total_tokens_used,
+                )
+                if stop_reason:
+                    await progress_cb(f"auto-run stop condition: {stop_reason}")
+                    break
+
             if not self._should_continue_auto_web(
                 channel=msg.channel,
                 run_mode=current_mode,
@@ -1234,12 +1589,8 @@ class AgentLoop:
                             issues=guard_issues,
                         ),
                     })
-                    final_content, _, all_msgs = await self._run_agent_loop(
-                        all_msgs,
-                        model_runtime=model_runtime,
-                        on_progress=progress_cb,
-                        audit_hook=audit_cb,
-                    )
+                    final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
+                    total_tokens_used += self._last_loop_tokens_used
                     continue
                 break
             run_mode = current_mode
@@ -1256,7 +1607,10 @@ class AgentLoop:
                     run_mode,
                 ),
             })
+            round_plan_before = round_plan_after
             final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
+            total_tokens_used += self._last_loop_tokens_used
+            round_plan_after = self._load_task_plan(project_dir)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
