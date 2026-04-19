@@ -948,7 +948,13 @@ class WebChannel(BaseChannel):
                 media = data.get("media", [])
                 run_mode = _normalize_run_mode(data.get("mode"))
                 agent_profile = _normalize_agent_profile(data.get("agent_profile"))
+                contract_version = (
+                    _normalize_contract_version(data.get("contract_version"))
+                    if "contract_version" in data
+                    else None
+                )
                 incoming_policy = _normalize_automation_policy(data.get("automation_policy"))
+                allow_result_write = bool(data.get("allow_result_write"))
 
                 if session_id is None:
                     await ws.send_json(
@@ -963,6 +969,7 @@ class WebChannel(BaseChannel):
                     project_dir_path,
                     run_mode=run_mode,
                     agent_profile=agent_profile,
+                    contract_version=contract_version,
                     automation_policy=incoming_policy,
                 )
                 effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
@@ -1006,8 +1013,12 @@ class WebChannel(BaseChannel):
                         "user_id": user_id,
                         "run_mode": run_mode,
                         "agent_profile": agent_profile,
+                        "contract_version": _normalize_contract_version(
+                            meta.get("contract_version")
+                        ),
                         "has_automation_policy": bool(effective_policy),
                         "goal_count": len(effective_policy.get("goals", [])) if effective_policy else 0,
+                        "allow_result_write": allow_result_write,
                         "content_preview": self._preview(content),
                         "media_count": len(media) if isinstance(media, list) else 0,
                     },
@@ -1024,6 +1035,10 @@ class WebChannel(BaseChannel):
                     "project_dir": project_dir,
                     "run_mode": run_mode,
                     "agent_profile": agent_profile,
+                    "contract_version": _normalize_contract_version(
+                        meta.get("contract_version")
+                    ),
+                    "_allow_result_write": allow_result_write,
                 }
                 if effective_policy:
                     metadata["automation_policy"] = effective_policy
@@ -1572,6 +1587,7 @@ class WebChannel(BaseChannel):
         *,
         run_mode: str,
         agent_profile: str,
+        contract_version: int | None,
         automation_policy: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Persist runtime preferences for websocket-driven project sessions."""
@@ -1585,6 +1601,11 @@ class WebChannel(BaseChannel):
         if meta.get("agent_profile") != agent_profile:
             meta["agent_profile"] = agent_profile
             changed = True
+        if contract_version is not None:
+            normalized_contract = _normalize_contract_version(contract_version)
+            if _normalize_contract_version(meta.get("contract_version")) != normalized_contract:
+                meta["contract_version"] = normalized_contract
+                changed = True
 
         normalized_policy = _normalize_automation_policy(automation_policy)
         if meta.get("automation_policy") != normalized_policy:

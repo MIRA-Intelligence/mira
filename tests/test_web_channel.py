@@ -1414,6 +1414,7 @@ async def test_ws_handler_message_and_set_mode_dispatch(
                     "user_id": "u1",
                     "mode": "AUTO",
                     "agent_profile": "engineer",
+                    "contract_version": 2,
                     "automation_policy": {
                         "logic": "AND",
                         "goals": [{"metric": "Dice", "operator": ">", "value": 0.8}],
@@ -1452,12 +1453,14 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert len(handled) == 2
     assert handled[0]["metadata"]["run_mode"] == "auto"
     assert handled[0]["metadata"]["agent_profile"] == "engineer"
+    assert handled[0]["metadata"]["contract_version"] == 2
     assert handled[0]["metadata"]["automation_policy"]["maxExperiments"] == 8
     assert "_ui_system_instructions" in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"
 
     meta_file = web_channel.projects_root / "PRJ-4001" / ".medpilot" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["contract_version"] == 2
     assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
 
 

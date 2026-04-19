@@ -37,7 +37,7 @@ from medpilot.bus.events import InboundMessage, OutboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.providers.base import LLMProvider
 from medpilot.session.manager import Session, SessionManager
-from medpilot.task_plan.guardrails import guard_task_plan_file
+from medpilot.task_plan.guardrails import get_task_plan_contract, guard_task_plan_file
 
 if TYPE_CHECKING:
     from medpilot.config.schema import ChannelsConfig, ExecToolConfig
@@ -150,6 +150,7 @@ class AgentLoop:
         self._session_agent_profiles: dict[str, str] = {}  # session_key -> engineer|default|research
         self._session_automation_policies: dict[str, dict[str, Any] | None] = {}
         self._last_task_plan_guard_issues: list[str] = []
+        self._last_task_plan_guard_fixed: bool = False
         self._last_loop_tokens_used: int = 0
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
@@ -645,6 +646,30 @@ class AgentLoop:
                 return True
         return False
 
+    @classmethod
+    def _experiments_crossed_boundary(
+        cls,
+        before_plan: dict | None,
+        after_plan: dict | None,
+    ) -> list[str]:
+        """Return experiment ids that moved from active to terminal in one round."""
+        before_index = cls._plan_experiment_index(before_plan)
+        after_index = cls._plan_experiment_index(after_plan)
+        terminal_statuses = {"completed", "failed", "skipped"}
+        active_statuses = {"pending", "running"}
+
+        crossed: list[str] = []
+        for exp_id, after_entry in after_index.items():
+            if not isinstance(after_entry, dict):
+                continue
+            after_status = after_entry.get("status")
+            if after_status not in terminal_statuses:
+                continue
+            before_entry = before_index.get(exp_id)
+            before_status = before_entry.get("status") if isinstance(before_entry, dict) else None
+            if before_status in active_statuses or before_status is None:
+                crossed.append(exp_id)
+        return crossed
     @staticmethod
     def _to_number(value: object) -> float | None:
         """Convert metric value to float when possible."""
@@ -753,16 +778,85 @@ class AgentLoop:
             return f"token budget reached ({tokens_used}/{max_tokens})"
 
         return None
+    @staticmethod
+    def _plan_result_state(plan: dict | None) -> tuple[bool, Any]:
+        """Return whether `result` exists and its payload."""
+        if not isinstance(plan, dict):
+            return False, None
+        if "result" not in plan:
+            return False, None
+        return True, plan.get("result")
+
+    @classmethod
+    def _has_result_section_update(
+        cls,
+        before_plan: dict | None,
+        after_plan: dict | None,
+    ) -> bool:
+        """Detect whether task_plan.result changed between rounds."""
+        return cls._plan_result_state(before_plan) != cls._plan_result_state(after_plan)
+
+    @staticmethod
+    def _looks_like_result_request(content: object, metadata: dict[str, Any] | None = None) -> bool:
+        """Detect explicit user intent to generate/export final deliverables."""
+        if isinstance(metadata, dict) and bool(metadata.get("_allow_result_write")):
+            return True
+        if not isinstance(content, str):
+            return False
+        lowered = content.lower()
+        if "manual export request for" in lowered:
+            return True
+        if "final deliverable" in lowered and "request" in lowered:
+            return True
+        if "导出" in content and ("报告" in content or "论文" in content or "结果" in content):
+            return True
+        return False
+
+    def _restore_result_section(
+        self,
+        project_dir: str | None,
+        *,
+        before_plan: dict | None,
+        after_plan: dict | None,
+    ) -> tuple[dict | None, bool]:
+        """Restore result section to previous state and persist task_plan."""
+        if not project_dir or not isinstance(after_plan, dict):
+            return after_plan, False
+        if not self._has_result_section_update(before_plan, after_plan):
+            return after_plan, False
+
+        has_before_result, before_result = self._plan_result_state(before_plan)
+        patched = json.loads(json.dumps(after_plan, ensure_ascii=False))
+        if has_before_result:
+            patched["result"] = before_result
+        else:
+            patched.pop("result", None)
+
+        plan_path = Path(project_dir) / "task_plan.json"
+        try:
+            plan_path.write_text(
+                json.dumps(patched, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            return after_plan, False
+        return patched, True
     def _guard_task_plan_structure(
-        self, project_dir: str | None, profile: str | None = None
+        self,
+        project_dir: str | None,
+        *,
+        auto_fix: bool = True,
+        profile: str | None = None,
     ) -> bool:
         """Apply task_plan guardrails before auto-continue rounds."""
         if not project_dir:
             self._last_task_plan_guard_issues = []
+            self._last_task_plan_guard_fixed = False
             return True
-        result = guard_task_plan_file(Path(project_dir), auto_fix=True, profile=profile)
+        result = guard_task_plan_file(Path(project_dir), auto_fix=auto_fix, profile=profile)
         issues = list(result.get("issues") or [])
         self._last_task_plan_guard_issues = issues
+        self._last_task_plan_guard_fixed = bool(result.get("fixed"))
         if result.get("fixed"):
             logger.info("task_plan guardrails auto-fixed {}", project_dir)
         if result.get("blocking"):
@@ -774,12 +868,81 @@ class AgentLoop:
             return False
         return True
 
+    @staticmethod
+    def _load_project_contract_version(project_dir: str | None) -> int:
+        """Load project contract version from .medpilot/project.json."""
+        if not project_dir:
+            return 1
+        meta_path = Path(project_dir) / ".medpilot" / "project.json"
+        if not meta_path.is_file():
+            return 1
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 1
+        if isinstance(payload, dict):
+            value = payload.get("contract_version")
+            if isinstance(value, int) and value in {1, 2}:
+                return value
+        return 1
+
+    def _build_task_plan_contract_hint(
+        self,
+        *,
+        project_dir: str | None,
+        agent_profile: str | None,
+    ) -> str:
+        """Build a concise contract hint for auto-run task_plan updates."""
+        profile = self._parse_agent_profile(agent_profile) or "default"
+        contract_version = self._load_project_contract_version(project_dir)
+        contract = get_task_plan_contract(
+            profile=profile,
+            contract_version=contract_version,
+        )
+        required_completed = contract.get("required_completed_fields") or []
+        required_falsify = contract.get("required_falsify_fields") or []
+
+        lines = [
+            "Task-plan contract requirements (enforce in this write):",
+            f"- profile={profile}, contract_version={contract_version}",
+        ]
+        if required_completed:
+            lines.append(
+                "- when setting status=completed, include required fields: "
+                + ", ".join(str(item) for item in required_completed)
+            )
+        if required_falsify:
+            lines.append(
+                "- when conclusion indicates rejection/failure, also include: "
+                + ", ".join(str(item) for item in required_falsify)
+            )
+        lines.append(
+            "- do not mark an experiment as completed unless required contract fields are present."
+        )
+        return "\n".join(lines)
+
+    def _is_strict_contract_enforced(
+        self, *, project_dir: str | None, agent_profile: str | None
+    ) -> bool:
+        """Whether current project is in strict contract mode with required fields."""
+        profile = self._parse_agent_profile(agent_profile) or "default"
+        contract_version = self._load_project_contract_version(project_dir)
+        contract = get_task_plan_contract(
+            profile=profile,
+            contract_version=contract_version,
+        )
+        return (
+            contract_version >= 2
+            and bool(contract.get("required_completed_fields"))
+        )
+
     def _build_auto_continue_message(
         self,
         channel: str,
         chat_id: str,
         project_dir: str | None,
         run_mode: str,
+        agent_profile: str | None = None,
     ) -> str:
         """Build the synthetic internal continue message for server-side auto mode."""
         runtime_ctx = ContextBuilder._build_runtime_context(
@@ -788,13 +951,18 @@ class AgentLoop:
             project_dir,
             run_mode=run_mode,
         )
+        contract_hint = self._build_task_plan_contract_hint(
+            project_dir=project_dir,
+            agent_profile=agent_profile,
+        )
         return (
             f"{runtime_ctx}\n\n{self._AUTO_CONTINUE_MARKER}\n"
             "Auto-run checkpoint requirements:\n"
             "1) If you just finished an experiment, immediately update and write task_plan.json "
             "(set status/results/conclusion/next for that experiment) BEFORE starting the next one.\n"
             "2) Execute exactly ONE pending experiment in this round, then return control.\n"
-            "3) Do not stop for confirmation unless user input is strictly required."
+            "3) Do not stop for confirmation unless user input is strictly required.\n\n"
+            f"{contract_hint}"
         )
 
     def _build_auto_guardrail_repair_message(
@@ -819,6 +987,8 @@ class AgentLoop:
             "Guardrail validation blocked task_plan progression. "
             "Patch task_plan.json to satisfy the missing required fields only.\n"
             "Do NOT rewrite prior conclusions or metrics unless logically necessary.\n"
+            "Use concrete evidence from experiment artifacts/results; "
+            "placeholder text like 'Guardrail auto-fill: ...' is invalid in strict mode.\n"
             f"Missing/invalid items:\n{issue_lines}"
         )
 
@@ -830,6 +1000,7 @@ class AgentLoop:
         project_dir: str | None,
         run_mode: str,
         running_ids: list[str],
+        agent_profile: str | None = None,
     ) -> str:
         """Build an internal message that forces per-experiment task_plan checkpointing."""
         runtime_ctx = ContextBuilder._build_runtime_context(
@@ -837,6 +1008,10 @@ class AgentLoop:
             chat_id,
             project_dir,
             run_mode=run_mode,
+        )
+        contract_hint = self._build_task_plan_contract_hint(
+            project_dir=project_dir,
+            agent_profile=agent_profile,
         )
         items = "\n".join(f"- {item}" for item in running_ids[:8]) if running_ids else "- running experiment"
         return (
@@ -846,7 +1021,8 @@ class AgentLoop:
             "1) set final status (completed/failed/skipped) if finished;\n"
             "2) persist results/conclusion/next (or progress if still running);\n"
             "3) then stop this turn.\n"
-            f"Running experiments to sync:\n{items}"
+            f"Running experiments to sync:\n{items}\n\n"
+            f"{contract_hint}"
         )
 
     def _build_auto_guardrail_repair_message(
@@ -871,6 +1047,8 @@ class AgentLoop:
             "Guardrail validation blocked task_plan progression. "
             "Patch task_plan.json to satisfy the missing required fields only.\n"
             "Do NOT rewrite prior conclusions or metrics unless logically necessary.\n"
+            "Use concrete evidence from experiment artifacts/results; "
+            "placeholder text like 'Guardrail auto-fill: ...' is invalid in strict mode.\n"
             f"Missing/invalid items:\n{issue_lines}"
         )
 
@@ -1469,6 +1647,7 @@ class AgentLoop:
         current_turn_skills: set[str] = set()
         audit_cb = None
         emit_audit_to_channel = msg.channel == "web" or bool(meta.get("_emit_skill_audit"))
+        allow_result_write = self._looks_like_result_request(msg.content, meta)
         if emit_audit_to_channel or audit_hook:
             async def _audit(details: dict[str, Any]) -> None:
                 skill_name = details.get("skill_name")
@@ -1503,6 +1682,16 @@ class AgentLoop:
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
         total_tokens_used = self._last_loop_tokens_used
         round_plan_after = self._load_task_plan(project_dir) if msg.channel == "web" else None
+        if msg.channel == "web" and not allow_result_write:
+            round_plan_after, restored = self._restore_result_section(
+                project_dir,
+                before_plan=round_plan_before,
+                after_plan=round_plan_after,
+            )
+            if restored:
+                await progress_cb(
+                    "auto-run guard: skipped task_plan.result update without explicit export request"
+                )
 
         auto_round = 0
         guard_repair_round = 0
@@ -1511,39 +1700,69 @@ class AgentLoop:
             current_mode = self._session_run_modes.get(key, run_mode)
             automation_policy = self._resolve_session_automation_policy(key, None)
             if msg.channel == "web" and current_mode == "auto":
+                crossed = self._experiments_crossed_boundary(round_plan_before, round_plan_after)
+                if len(crossed) > 1:
+                    await progress_cb(
+                        "auto-run guard warning: multiple experiments advanced in one round "
+                        f"({', '.join(crossed[:3])})"
+                    )
+                if crossed and project_dir:
+                    code_guard = self._guard_task_plan_structure(
+                        project_dir,
+                        auto_fix=True,
+                        profile=agent_profile,
+                    )
+                    if code_guard and self._last_task_plan_guard_fixed:
+                        await progress_cb(
+                            "auto-run guard: code-level contract normalization applied "
+                            "after experiment transition"
+                        )
+                        round_plan_after = self._load_task_plan(project_dir)
                 if not self._has_experiment_checkpoint_update(round_plan_before, round_plan_after):
                     if checkpoint_repair_round >= self._AUTO_CHECKPOINT_REPAIR_MAX:
                         await progress_cb(
-                            "auto-run stop condition: task_plan checkpoint missing after experiment round"
+                            "auto-run guard warning: task_plan checkpoint missing after experiment round; "
+                            "continuing due auto mode"
                         )
-                        break
-                    checkpoint_repair_round += 1
-                    auto_round += 1
-                    running_ids = self._running_experiment_ids(round_plan_before)
-                    await progress_cb(
-                        f"auto-run checkpoint repair {checkpoint_repair_round}: "
-                        "forcing task_plan sync for running experiment"
-                    )
-                    all_msgs.append({
-                        "role": "user",
-                        "content": self._build_auto_checkpoint_sync_message(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            project_dir=project_dir,
-                            run_mode=current_mode,
-                            running_ids=running_ids,
-                        ),
-                    })
-                    round_plan_before = round_plan_after
-                    final_content, _, all_msgs = await self._run_agent_loop(
-                        all_msgs,
-                        model_runtime=model_runtime,
-                        on_progress=progress_cb,
-                        audit_hook=audit_cb,
-                    )
-                    total_tokens_used += self._last_loop_tokens_used
-                    round_plan_after = self._load_task_plan(project_dir)
-                    continue
+                    else:
+                        checkpoint_repair_round += 1
+                        auto_round += 1
+                        running_ids = self._running_experiment_ids(round_plan_before)
+                        await progress_cb(
+                            f"auto-run checkpoint repair {checkpoint_repair_round}: "
+                            "forcing task_plan sync for running experiment"
+                        )
+                        all_msgs.append({
+                            "role": "user",
+                            "content": self._build_auto_checkpoint_sync_message(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                project_dir=project_dir,
+                                run_mode=current_mode,
+                                running_ids=running_ids,
+                                agent_profile=agent_profile,
+                            ),
+                        })
+                        round_plan_before = round_plan_after
+                        final_content, _, all_msgs = await self._run_agent_loop(
+                            all_msgs,
+                            model_runtime=model_runtime,
+                            on_progress=progress_cb,
+                            audit_hook=audit_cb,
+                        )
+                        total_tokens_used += self._last_loop_tokens_used
+                        round_plan_after = self._load_task_plan(project_dir)
+                        if msg.channel == "web" and not allow_result_write:
+                            round_plan_after, restored = self._restore_result_section(
+                                project_dir,
+                                before_plan=round_plan_before,
+                                after_plan=round_plan_after,
+                            )
+                            if restored:
+                                await progress_cb(
+                                    "auto-run guard: skipped task_plan.result update without explicit export request"
+                                )
+                        continue
 
             if msg.channel == "web" and current_mode == "auto":
                 current_plan = self._load_task_plan(project_dir)
@@ -1556,43 +1775,103 @@ class AgentLoop:
                     await progress_cb(f"auto-run stop condition: {stop_reason}")
                     break
 
-            if not self._should_continue_auto_web(
+            should_continue = self._should_continue_auto_web(
                 channel=msg.channel,
                 run_mode=current_mode,
                 project_dir=project_dir,
                 final_content=final_content,
                 auto_round=auto_round,
                 agent_profile=agent_profile,
-            ):
+            )
+            if not should_continue:
                 guard_issues = list(getattr(self, "_last_task_plan_guard_issues", []))
+                continue_despite_guard = False
                 if (
                     msg.channel == "web"
                     and current_mode == "auto"
                     and guard_issues
-                    and guard_repair_round < self._AUTO_GUARD_REPAIR_MAX
                     and not self._looks_like_failure_response(final_content)
                     and not self._looks_like_user_input_request(final_content)
                 ):
-                    guard_repair_round += 1
-                    auto_round += 1
-                    await progress_cb(
-                        f"auto-run guardrail repair {guard_repair_round}: "
-                        "filling required evidence fields"
+                    if guard_repair_round < self._AUTO_GUARD_REPAIR_MAX:
+                        guard_repair_round += 1
+                        auto_round += 1
+                        await progress_cb(
+                            f"auto-run guardrail repair {guard_repair_round}: "
+                            "filling required evidence fields"
+                        )
+                        all_msgs.append({
+                            "role": "user",
+                            "content": self._build_auto_guardrail_repair_message(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                project_dir=project_dir,
+                                run_mode=current_mode,
+                                issues=guard_issues,
+                            ),
+                        })
+                        guard_plan_before = round_plan_after if msg.channel == "web" else None
+                        final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
+                        total_tokens_used += self._last_loop_tokens_used
+                        round_plan_after = self._load_task_plan(project_dir)
+                        round_plan_before = guard_plan_before
+                        if msg.channel == "web" and not allow_result_write:
+                            round_plan_after, restored = self._restore_result_section(
+                                project_dir,
+                                before_plan=guard_plan_before,
+                                after_plan=round_plan_after,
+                            )
+                            if restored:
+                                await progress_cb(
+                                    "auto-run guard: skipped task_plan.result update without explicit export request"
+                                )
+                        continue
+                    has_pending = self._plan_has_pending_work(self._load_task_plan(project_dir))
+                    strict_contract = self._is_strict_contract_enforced(
+                        project_dir=project_dir,
+                        agent_profile=agent_profile,
                     )
-                    all_msgs.append({
-                        "role": "user",
-                        "content": self._build_auto_guardrail_repair_message(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            project_dir=project_dir,
-                            run_mode=current_mode,
-                            issues=guard_issues,
-                        ),
-                    })
-                    final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
-                    total_tokens_used += self._last_loop_tokens_used
-                    continue
-                break
+                    if strict_contract and has_pending and auto_round < self._AUTO_MAX_ROUNDS:
+                        guard_repair_round = 0
+                        auto_round += 1
+                        await progress_cb(
+                            "auto-run strict contract repair: required fields still missing; "
+                            "requesting targeted completion before next experiment"
+                        )
+                        all_msgs.append({
+                            "role": "user",
+                            "content": self._build_auto_guardrail_repair_message(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                project_dir=project_dir,
+                                run_mode=current_mode,
+                                issues=guard_issues,
+                            ),
+                        })
+                        guard_plan_before = round_plan_after if msg.channel == "web" else None
+                        final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
+                        total_tokens_used += self._last_loop_tokens_used
+                        round_plan_after = self._load_task_plan(project_dir)
+                        round_plan_before = guard_plan_before
+                        if msg.channel == "web" and not allow_result_write:
+                            round_plan_after, restored = self._restore_result_section(
+                                project_dir,
+                                before_plan=guard_plan_before,
+                                after_plan=round_plan_after,
+                            )
+                            if restored:
+                                await progress_cb(
+                                    "auto-run guard: skipped task_plan.result update without explicit export request"
+                                )
+                        continue
+                    if has_pending and auto_round < self._AUTO_MAX_ROUNDS:
+                        continue_despite_guard = True
+                        await progress_cb(
+                            "auto-run guard warning: contract issues remain after repair; "
+                            "continuing and deferring strict cleanup"
+                        )
+                if not continue_despite_guard:
+                    break
             run_mode = current_mode
             auto_round += 1
             await progress_cb(
@@ -1605,12 +1884,23 @@ class AgentLoop:
                     msg.chat_id,
                     project_dir,
                     run_mode,
+                    agent_profile,
                 ),
             })
             round_plan_before = round_plan_after
             final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
             total_tokens_used += self._last_loop_tokens_used
             round_plan_after = self._load_task_plan(project_dir)
+            if msg.channel == "web" and not allow_result_write:
+                round_plan_after, restored = self._restore_result_section(
+                    project_dir,
+                    before_plan=round_plan_before,
+                    after_plan=round_plan_after,
+                )
+                if restored:
+                    await progress_cb(
+                        "auto-run guard: skipped task_plan.result update without explicit export request"
+                    )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."

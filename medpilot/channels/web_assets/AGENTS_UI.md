@@ -56,6 +56,9 @@ Question → Hypothesis → Prediction → Experiment → Analysis → Conclusio
 - In `auto` mode: continue to the next pending experiment automatically. Only stop
   early when user input is strictly required, the project is blocked by an error,
   or there are no pending/running experiments left.
+- In `auto` mode: in a single assistant turn, you may transition AT MOST ONE
+  experiment to a terminal status (`completed`/`failed`/`skipped`). You may
+  create or queue many `pending` experiments, but finish only one per turn.
 
 ### Workflow for each experiment
 
@@ -139,6 +142,14 @@ When the user requests a final deliverable, populate the `result` section in
 - `output_path`: the file path to the generated deliverable (relative to project dir)
 - `output_type`: one of `paper`, `report`, `analysis`, `code`
 - `sections`: structured content sections (title + content pairs)
+
+## Response Language Policy
+
+- Default to the same language as the user's latest message.
+- For new-project kickoff messages that contain mixed-language scaffolding, use
+  the language in the user-provided research description as the primary reply
+  language.
+- Only switch languages when the user explicitly requests the switch.
 
 ### Additional rules
 
