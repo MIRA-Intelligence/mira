@@ -549,8 +549,34 @@ def onboard(
                 else:
                     selected_cfg = getattr(cfg.providers, selected.name, None)
                     if selected_cfg is not None:
-                        if selected.default_api_base and not selected_cfg.api_base:
-                            selected_cfg.api_base = selected.default_api_base
+                        # Custom provider requires explicit api_base configuration
+                        if selected.name == "custom":
+                            has_existing_base = bool(selected_cfg.api_base)
+                            if has_existing_base:
+                                base_action = typer.prompt(
+                                    "API Base URL",
+                                    type=typer.Choice(["update", "keep", "clear"]),
+                                    default="keep",
+                                )
+                                if base_action == "update":
+                                    api_base = typer.prompt(
+                                        "API Base URL (e.g., http://localhost:8000/v1)",
+                                        default=selected_cfg.api_base,
+                                    ).strip()
+                                    selected_cfg.api_base = api_base
+                                elif base_action == "clear":
+                                    selected_cfg.api_base = ""
+                            else:
+                                api_base = typer.prompt(
+                                    "API Base URL (required, e.g., http://localhost:8000/v1)",
+                                    default="",
+                                ).strip()
+                                selected_cfg.api_base = api_base
+                        else:
+                            # Other providers: use default api_base if available
+                            if selected.default_api_base and not selected_cfg.api_base:
+                                selected_cfg.api_base = selected.default_api_base
+                        
                         api_key = typer.prompt(
                             f"API key for {selected.label} (optional, hidden input)",
                             default=selected_cfg.api_key or "",
