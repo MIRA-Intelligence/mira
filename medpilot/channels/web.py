@@ -21,6 +21,7 @@ from medpilot.agent.skill_plugins import SkillPluginError, SkillPluginManager
 from medpilot.bus.events import OutboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.channels.base import BaseChannel
+from medpilot.config import loader as config_loader
 from medpilot.config.schema import WebChannelConfig
 from medpilot.session.manager import SessionManager
 from medpilot.task_plan.guardrails import (
@@ -457,7 +458,8 @@ class WebChannel(BaseChannel):
         self.config: WebChannelConfig = config
         self.workspace: Path | None = workspace
         self.restrict_to_workspace: bool = restrict_to_workspace
-        self.projects_root: Path = Path("~/.medpilot/workspace").expanduser()
+        default_root = workspace or Path("~/.medpilot/workspace")
+        self.projects_root: Path = default_root.expanduser().resolve()
         self._boot_ts: float = time.monotonic()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
@@ -1313,8 +1315,17 @@ class WebChannel(BaseChannel):
         except (json.JSONDecodeError, TypeError):
             return web.json_response({"error": "invalid JSON"}, status=400)
 
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        persisted = False
         if "projects_root" in body:
-            new_root = Path(body["projects_root"]).expanduser().resolve()
+            raw_root = body["projects_root"]
+            if not isinstance(raw_root, str):
+                return web.json_response(
+                    {"error": "projects_root must be a string"},
+                    status=400,
+                )
+
+            new_root = Path(raw_root).expanduser().resolve()
             current_root = self.projects_root.expanduser().resolve()
             if new_root != current_root:
                 self.projects_root = new_root
@@ -1325,9 +1336,38 @@ class WebChannel(BaseChannel):
                 )
                 logger.info("Projects root updated to {}", new_root)
 
+            try:
+                config_path = self._persist_projects_root_to_config(self.projects_root)
+                persisted = True
+            except OSError as exc:
+                logger.warning(
+                    "Failed to persist projects root {} to config {}: {}",
+                    self.projects_root,
+                    config_path,
+                    exc,
+                )
+                return web.json_response(
+                    {
+                        "error": f"failed to persist workspace config: {exc}",
+                        "projects_root": str(self.projects_root),
+                        "config_path": str(config_path),
+                    },
+                    status=500,
+                )
+
         return web.json_response({
             "projects_root": str(self.projects_root),
+            "config_path": str(config_path),
+            "persisted": persisted,
         })
+
+    def _persist_projects_root_to_config(self, projects_root: Path) -> Path:
+        """Persist workspace root to the active runtime config file."""
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        runtime_config = config_loader.load_config(config_path)
+        runtime_config.agents.defaults.workspace = str(projects_root)
+        config_loader.save_config(runtime_config, config_path)
+        return config_path
 
     def _workspace_root_for_access(self) -> Path:
         """Return the root path used for workspace access checks."""

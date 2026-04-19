@@ -69,6 +69,7 @@ _JSON_RESULT_HINT_KEYS = {
     "metrics",
     "findings",
     "artifacts",
+    "score",
     "mean_r",
     "mean_r2",
     "best_transform",

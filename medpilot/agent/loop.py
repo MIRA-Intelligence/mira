@@ -670,7 +670,6 @@ class AgentLoop:
             if before_status in active_statuses or before_status is None:
                 crossed.append(exp_id)
         return crossed
-
     @staticmethod
     def _to_number(value: object) -> float | None:
         """Convert metric value to float when possible."""
@@ -779,7 +778,6 @@ class AgentLoop:
             return f"token budget reached ({tokens_used}/{max_tokens})"
 
         return None
-
     @staticmethod
     def _plan_result_state(plan: dict | None) -> tuple[bool, Any]:
         """Return whether `result` exists and its payload."""
