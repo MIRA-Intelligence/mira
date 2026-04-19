@@ -718,6 +718,32 @@ def _configure_provider(config: Config, provider_name: str) -> None:
 
     console.print(Panel(_provider_usage_hint(provider_name), title=f"[bold]{display_name}[/bold]"))
 
+    # Custom provider requires explicit apiBase configuration
+    if provider_name == "custom":
+        has_existing_base = bool(provider_config.api_base)
+        if has_existing_base:
+            base_action = _get_questionary().select(
+                "API Base URL",
+                choices=["Update API base URL", "Keep existing API base URL", "Clear API base URL"],
+                default="Keep existing API base URL",
+            ).ask()
+            if base_action == "Update API base URL":
+                api_base = _get_questionary().text(
+                    "API Base URL (e.g., http://localhost:8000/v1):",
+                    default=provider_config.api_base or "",
+                ).ask()
+                if api_base is not None:
+                    provider_config.api_base = api_base.strip()
+            elif base_action == "Clear API base URL":
+                provider_config.api_base = ""
+        else:
+            api_base = _get_questionary().text(
+                "API Base URL (required, e.g., http://localhost:8000/v1):",
+                default="",
+            ).ask()
+            if api_base is not None:
+                provider_config.api_base = api_base.strip()
+
     # Ask API key last, as the main credential input step.
     has_existing_key = bool(provider_config.api_key)
     should_set_key = True

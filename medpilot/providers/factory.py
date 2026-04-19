@@ -32,9 +32,17 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
         return GitHubCopilotProvider(default_model=resolved_model)
 
     if provider_name == "custom":
+        api_base = config.get_api_base(resolved_model)
+        # Require explicit apiBase configuration for custom provider
+        if not api_base:
+            raise ValueError(
+                "Custom provider requires 'providers.custom.apiBase' to be configured. "
+                "Please set the API base URL (e.g., 'http://localhost:8000/v1' or 'https://api.example.com/v1') "
+                "in your config.json, or run 'medpilot onboard --wizard' to configure it interactively."
+            )
         return OpenAICompatProvider(
             api_key=provider_config.api_key if provider_config else "no-key",
-            api_base=config.get_api_base(resolved_model) or "http://localhost:8000/v1",
+            api_base=api_base,
             default_model=resolved_model,
             extra_headers=provider_config.extra_headers if provider_config else None,
             spec=find_by_name("custom"),
