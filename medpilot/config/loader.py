@@ -114,4 +114,16 @@ def _migrate_config(data: dict) -> dict:
         qq = channels.get("qq")
         if isinstance(qq, dict) and "msgFormat" not in qq:
             qq["msgFormat"] = "plain"
+        web = channels.get("web")
+        if isinstance(web, dict):
+            gateway = data.get("gateway")
+            if not isinstance(gateway, dict):
+                gateway = {}
+                data["gateway"] = gateway
+            if "host" in web and "host" not in gateway:
+                gateway["host"] = web["host"]
+            if "port" in web and "port" not in gateway:
+                gateway["port"] = web["port"]
+            web.pop("host", None)
+            web.pop("port", None)
     return data

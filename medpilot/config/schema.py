@@ -226,8 +226,6 @@ class WebChannelConfig(Base):
 
     enabled: bool = False
     allow_from: list[str] = Field(default_factory=list)
-    host: str = "127.0.0.1"
-    port: int = 18791
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
 
 

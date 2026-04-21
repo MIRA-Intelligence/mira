@@ -828,25 +828,9 @@ def gateway(
 
     if host is not None:
         config.gateway.host = host
-        web_cfg = getattr(config.channels, "web", None)
-        if isinstance(web_cfg, dict):
-            web_cfg["host"] = host
-        elif web_cfg is not None:
-            try:
-                web_cfg.host = host
-            except AttributeError:
-                pass
 
     if port is not None:
         config.gateway.port = port
-        web_cfg = getattr(config.channels, "web", None)
-        if isinstance(web_cfg, dict):
-            web_cfg["port"] = port
-        elif web_cfg is not None:
-            try:
-                web_cfg.port = port
-            except AttributeError:
-                pass
 
     gateway_host = config.gateway.host
     gateway_port = config.gateway.port

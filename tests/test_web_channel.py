@@ -1696,8 +1696,8 @@ async def test_handle_status_and_sessions_endpoints(web_channel: WebChannel) -> 
     ws = MagicMock()
     ws.closed = False
     web_channel._clients = {"PRJ-5001": ws}
-    web_channel.config.host = "127.0.0.1"
-    web_channel.config.port = 18790
+    web_channel.bind_host = "127.0.0.1"
+    web_channel.bind_port = 18790
     req = MagicMock(spec=web.Request)
 
     status = await web_channel._handle_status(req)

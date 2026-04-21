@@ -98,6 +98,8 @@ class ChannelManager:
                     kwargs["groq_api_key"] = getattr(self.config.providers.groq, "api_key", "")
                 if name == "web":
                     kwargs["workspace"] = self.config.workspace_path
+                    kwargs["bind_host"] = self.config.gateway.host
+                    kwargs["bind_port"] = self.config.gateway.port
                 self.channels[name] = cls(self._to_ns(section), self.bus, **kwargs)
                 logger.info("{} channel enabled", name)
             except ImportError as e:
