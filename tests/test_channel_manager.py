@@ -16,6 +16,7 @@ from medpilot.config.schema import Config
 class _DummyChannel(BaseChannel):
     def __init__(self, config, bus, **kwargs):
         super().__init__(config, bus)
+        self.init_kwargs = kwargs
         self.started = False
         self.stopped = False
         self.sent = []
@@ -103,6 +104,22 @@ def test_validate_allow_from_rejects_empty_lists() -> None:
         assert False, "Expected SystemExit"
     except SystemExit as exc:
         assert "empty allowFrom" in str(exc)
+
+
+def test_web_channel_receives_gateway_bind_host_port(monkeypatch) -> None:
+    _install_channel_module(monkeypatch, "medpilot.channels.web", "WebChannel")
+    cfg = Config()
+    cfg.channels.web.enabled = True
+    cfg.channels.web.allow_from = ["*"]
+    cfg.gateway.host = "127.0.0.2"
+    cfg.gateway.port = 19991
+
+    mgr = ChannelManager(cfg, MessageBus())
+    web = mgr.get_channel("web")
+    assert isinstance(web, _DummyChannel)
+    assert web.init_kwargs["workspace"] == cfg.workspace_path
+    assert web.init_kwargs["bind_host"] == "127.0.0.2"
+    assert web.init_kwargs["bind_port"] == 19991
 
 
 async def test_start_all_and_stop_all_with_channels(monkeypatch) -> None:

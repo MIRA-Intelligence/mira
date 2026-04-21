@@ -807,6 +807,39 @@ async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebC
     assert meta["contract_version"] == 1
 
 
+async def test_handle_list_projects_reconciles_completed_status_from_phase3_result(
+    web_channel: WebChannel,
+) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0999"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [{"id": "Exp001", "status": "running"}],
+                "result": {
+                    "output_path": "result/exports/presentation.pdf",
+                    "output_type": "presentation",
+                    "summary": "Export generated",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    resp = await web_channel._handle_list_projects(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    item = next(project for project in body["projects"] if project["id"] == "PRJ-0999")
+    assert item["status"] == "completed"
+
+    repaired = json.loads((project_dir / "task_plan.json").read_text(encoding="utf-8"))
+    assert repaired["status"] == "completed"
+    assert repaired["experiments"][0]["status"] == "running"
+
+
 async def test_handle_project_meta_updates_display_name(web_channel: WebChannel) -> None:
     project_dir = web_channel.projects_root / "PRJ-0001"
     project_dir.mkdir(parents=True)
@@ -1432,8 +1465,8 @@ async def test_handle_status_and_sessions_endpoints(web_channel: WebChannel) -> 
     ws = MagicMock()
     ws.closed = False
     web_channel._clients = {"PRJ-5001": ws}
-    web_channel.config.host = "127.0.0.1"
-    web_channel.config.port = 18790
+    web_channel.bind_host = "127.0.0.1"
+    web_channel.bind_port = 18790
     req = MagicMock(spec=web.Request)
 
     status = await web_channel._handle_status(req)

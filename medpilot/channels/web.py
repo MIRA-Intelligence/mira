@@ -321,11 +321,22 @@ class WebChannel(BaseChannel):
         config: WebChannelConfig,
         bus: MessageBus,
         workspace: Path | None = None,
+        bind_host: str | None = None,
+        bind_port: int | None = None,
         restrict_to_workspace: bool = True,
     ):
         super().__init__(config, bus)
         self.config: WebChannelConfig = config
         self.workspace: Path | None = workspace
+        legacy_host = getattr(config, "host", None)
+        legacy_port = getattr(config, "port", None)
+        self.bind_host: str = (
+            bind_host
+            or (legacy_host if isinstance(legacy_host, str) and legacy_host.strip() else "0.0.0.0")
+        )
+        self.bind_port: int = (
+            bind_port if bind_port is not None else (legacy_port if isinstance(legacy_port, int) else 18790)
+        )
         self.restrict_to_workspace: bool = restrict_to_workspace
         self.projects_root: Path = Path("~/.medpilot/workspace").expanduser()
         self._boot_ts: float = time.monotonic()
@@ -477,7 +488,7 @@ class WebChannel(BaseChannel):
         my_pid = os.getpid()
         try:
             result = subprocess.run(
-                ["lsof", "-ti", f":{self.config.port}"],
+                ["lsof", "-ti", f":{self.bind_port}"],
                 capture_output=True, text=True, timeout=5,
             )
             pids = {
@@ -488,7 +499,7 @@ class WebChannel(BaseChannel):
 
         for pid in pids:
             try:
-                logger.warning("Killing stale process {} on port {}", pid, self.config.port)
+                logger.warning("Killing stale process {} on port {}", pid, self.bind_port)
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
@@ -527,15 +538,15 @@ class WebChannel(BaseChannel):
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         self._site = web.TCPSite(
-            self._runner, self.config.host, self.config.port,
+            self._runner, self.bind_host, self.bind_port,
             reuse_address=True,
         )
         await self._site.start()
         self._running = True
         logger.info(
             "Web channel listening on {}:{}",
-            self.config.host,
-            self.config.port,
+            self.bind_host,
+            self.bind_port,
         )
 
         # Keep the channel alive until stopped
@@ -981,7 +992,7 @@ class WebChannel(BaseChannel):
             "channel": self.name,
             "running": self._running,
             "connected_clients": len(self._clients),
-            "uptime_host": f"{self.config.host}:{self.config.port}",
+            "uptime_host": f"{self.bind_host}:{self.bind_port}",
             "projects_root": str(self.projects_root),
         })
 
@@ -1409,12 +1420,22 @@ class WebChannel(BaseChannel):
             if plan_file.is_file():
                 try:
                     plan = json.loads(plan_file.read_text(encoding="utf-8"))
+                    if not isinstance(plan, dict):
+                        raise ValueError(f"Unexpected non-object JSON in {plan_file}")
+                    if self._reconcile_plan_data(d, plan):
+                        try:
+                            plan_file.write_text(
+                                json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
+                                encoding="utf-8",
+                            )
+                        except OSError as exc:
+                            logger.warning("Failed to write reconciled {}: {}", plan_file, exc)
                     info["title"] = plan.get("title", "")
                     info["status"] = plan.get("status", "in_progress")
                     info["core_question"] = plan.get("core_question", "")
                     info["started_at"] = plan.get("started_at", "")
                     info["has_plan"] = True
-                except (json.JSONDecodeError, OSError):
+                except (ValueError, json.JSONDecodeError, OSError):
                     info["has_plan"] = False
             else:
                 info["has_plan"] = False
