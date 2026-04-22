@@ -17,11 +17,15 @@ def mock_runtime_dir(tmp_path):
 def test_gateway_pid_lock_prevents_startup(mock_runtime_dir, monkeypatch):
     """测试：当 PID 文件存在且进程运行时，应触发退出"""
     pid_file = mock_runtime_dir / "gateway.pid"
-    current_pid = os.getpid()
-    pid_file.write_text(str(current_pid))
+    locked_pid = 123456
+    pid_file.write_text(str(locked_pid))
     
     # 劫持 Path.expanduser
     monkeypatch.setattr(Path, "expanduser", lambda self: pid_file if "gateway.pid" in str(self) else self)
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == locked_pid)
+    proc = MagicMock()
+    proc.cmdline.return_value = ["medpilot", "gateway"]
+    monkeypatch.setattr(psutil, "Process", lambda pid: proc)
     monkeypatch.setenv("MEDPILOT_SKIP_GATEWAY_FAILSAVE", "")
     
     with pytest.raises(typer.Exit) as exc:

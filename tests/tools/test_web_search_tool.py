@@ -1,6 +1,8 @@
 """Tests for multi-provider web search."""
 
 import asyncio
+import sys
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -18,6 +20,11 @@ def _response(status: int = 200, json: dict | None = None) -> httpx.Response:
     r = httpx.Response(status, json=json)
     r._request = httpx.Request("GET", "https://mock")
     return r
+
+
+def _install_mock_ddgs(monkeypatch, ddgs_cls) -> None:
+    """Install a lightweight ddgs module shim for environments without ddgs."""
+    monkeypatch.setitem(sys.modules, "ddgs", SimpleNamespace(DDGS=ddgs_cls))
 
 
 @pytest.mark.asyncio
@@ -78,9 +85,7 @@ async def test_duckduckgo_search(monkeypatch):
     monkeypatch.setattr("medpilot.agent.tools.web.DDGS", MockDDGS, raising=False)
     import medpilot.agent.tools.web as web_mod
     monkeypatch.setattr(web_mod, "DDGS", MockDDGS, raising=False)
-
-    from ddgs import DDGS
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    _install_mock_ddgs(monkeypatch, MockDDGS)
 
     tool = _tool(provider="duckduckgo")
     result = await tool.execute(query="hello")
@@ -96,7 +101,7 @@ async def test_brave_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def text(self, query, max_results=5):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    _install_mock_ddgs(monkeypatch, MockDDGS)
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
 
     tool = _tool(provider="brave", api_key="")
@@ -149,7 +154,7 @@ async def test_searxng_no_base_url_falls_back(monkeypatch):
         def text(self, query, max_results=5):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
 
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    _install_mock_ddgs(monkeypatch, MockDDGS)
     monkeypatch.delenv("SEARXNG_BASE_URL", raising=False)
 
     tool = _tool(provider="searxng", base_url="")
@@ -182,7 +187,7 @@ async def test_jina_422_falls_back_to_duckduckgo(monkeypatch):
         )
 
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    _install_mock_ddgs(monkeypatch, MockDDGS)
 
     tool = _tool(provider="jina", api_key="jina-key")
     result = await tool.execute(query="test")
@@ -221,7 +226,7 @@ async def test_duckduckgo_timeout_returns_error(monkeypatch):
             gate.wait(timeout=10)
             return []
 
-    monkeypatch.setattr("ddgs.DDGS", HangingDDGS)
+    _install_mock_ddgs(monkeypatch, HangingDDGS)
     tool = _tool(provider="duckduckgo")
     tool.config.timeout = 0.2
     result = await tool.execute(query="test")

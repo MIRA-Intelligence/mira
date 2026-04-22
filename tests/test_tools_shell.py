@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 
 from medpilot.agent.tools.shell import ExecTool
 
@@ -34,7 +35,9 @@ def test_guard_blocks_outside_workspace_and_traversal() -> None:
 
 async def test_execute_returns_output_and_stderr() -> None:
     tool = ExecTool(timeout=5)
-    output = await tool.execute("python -c \"import sys; print('ok'); print('err', file=sys.stderr)\"")
+    output = await tool.execute(
+        f"\"{sys.executable}\" -c \"import sys; print('ok'); print('err', file=sys.stderr)\""
+    )
     assert "ok" in output
     assert "STDERR:" in output
     assert "err" in output
@@ -42,19 +45,19 @@ async def test_execute_returns_output_and_stderr() -> None:
 
 async def test_execute_reports_nonzero_exit_code() -> None:
     tool = ExecTool(timeout=5)
-    output = await tool.execute("python -c \"import sys; sys.exit(3)\"")
+    output = await tool.execute(f"\"{sys.executable}\" -c \"import sys; sys.exit(3)\"")
     assert "Exit code: 3" in output
 
 
 async def test_execute_timeout_returns_error() -> None:
     tool = ExecTool(timeout=1)
-    output = await tool.execute("python -c \"import time; time.sleep(2)\"")
+    output = await tool.execute(f"\"{sys.executable}\" -c \"import time; time.sleep(2)\"")
     assert output == "Error: Command timed out after 1 seconds"
 
 
 async def test_execute_truncates_long_output() -> None:
     tool = ExecTool(timeout=5)
-    output = await tool.execute("python -c \"print('x'*11050)\"")
+    output = await tool.execute(f"\"{sys.executable}\" -c \"print('x'*11050)\"")
     assert "truncated" in output
 
 
