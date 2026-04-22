@@ -5,7 +5,7 @@ This guide is for advanced users and operators.
 Default user path remains:
 
 - Cloud hosted usage
-- Desktop local engine (`medpilot-agent`) without Docker
+- Desktop local engine (`mira-engine`) without Docker
 
 Use Docker only when you explicitly want self-hosted infrastructure management.
 
@@ -46,8 +46,8 @@ docker compose --profile self-hosted up -d
 ## 5) Rollback
 
 1. Pin previous image tags in `.env`:
-   - `MEDPILOT_AGENT_TAG=<previous_tag>`
-   - `MEDPILOT_UI_TAG=<previous_tag>`
+   - `MIRA_AGENT_TAG=<previous_tag>`
+   - `MIRA_UI_TAG=<previous_tag>`
 2. Recreate services:
 
 ```bash

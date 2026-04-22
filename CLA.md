@@ -12,7 +12,7 @@ You represent that:
 
 ## 2) License Grant
 
-You grant Project MedPilot and its maintainers a perpetual, worldwide, non-exclusive,
+You grant MIRA Intelligence and its maintainers a perpetual, worldwide, non-exclusive,
 royalty-free, irrevocable license to use, reproduce, modify, distribute, publicly
 display, publicly perform, sublicense, and create derivative works from your
 contribution.

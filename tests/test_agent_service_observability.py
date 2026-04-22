@@ -4,12 +4,12 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from medpilot.cli.agent_service import app
+from mira_engine.cli.agent_service import app
 
 
 def test_service_commands_emit_structured_jsonl_logs(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("MEDPILOT_AGENT_SERVICE_MODE", "local")
+    monkeypatch.setenv("MIRA_AGENT_SERVICE_MODE", "local")
     runner = CliRunner()
 
     runner.invoke(app, ["install-service"])
@@ -28,7 +28,7 @@ def test_service_commands_emit_structured_jsonl_logs(monkeypatch, tmp_path):
 
 def test_doctor_export_writes_diagnostics_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("MEDPILOT_AGENT_SERVICE_MODE", "local")
+    monkeypatch.setenv("MIRA_AGENT_SERVICE_MODE", "local")
     runner = CliRunner()
 
     runner.invoke(app, ["install-service"])

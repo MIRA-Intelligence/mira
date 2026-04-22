@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from medpilot.agent.tools.message import MessageTool
+from mira_engine.agent.tools.message import MessageTool
 
 
 async def test_message_tool_requires_target_context() -> None:

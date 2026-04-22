@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from medpilot.utils.restart import (
+from mira_engine.utils.restart import (
     RestartNotice,
     consume_restart_notice_from_env,
     format_restart_completed_message,
@@ -14,9 +14,9 @@ from medpilot.utils.restart import (
 
 
 def test_set_and_consume_restart_notice_env_roundtrip(monkeypatch):
-    monkeypatch.delenv("MEDPILOT_RESTART_NOTIFY_CHANNEL", raising=False)
-    monkeypatch.delenv("MEDPILOT_RESTART_NOTIFY_CHAT_ID", raising=False)
-    monkeypatch.delenv("MEDPILOT_RESTART_STARTED_AT", raising=False)
+    monkeypatch.delenv("MIRA_RESTART_NOTIFY_CHANNEL", raising=False)
+    monkeypatch.delenv("MIRA_RESTART_NOTIFY_CHAT_ID", raising=False)
+    monkeypatch.delenv("MIRA_RESTART_STARTED_AT", raising=False)
 
     set_restart_notice_to_env(channel="feishu", chat_id="oc_123")
 
@@ -28,13 +28,13 @@ def test_set_and_consume_restart_notice_env_roundtrip(monkeypatch):
 
     # Consumed values should be cleared from env.
     assert consume_restart_notice_from_env() is None
-    assert "MEDPILOT_RESTART_NOTIFY_CHANNEL" not in os.environ
-    assert "MEDPILOT_RESTART_NOTIFY_CHAT_ID" not in os.environ
-    assert "MEDPILOT_RESTART_STARTED_AT" not in os.environ
+    assert "MIRA_RESTART_NOTIFY_CHANNEL" not in os.environ
+    assert "MIRA_RESTART_NOTIFY_CHAT_ID" not in os.environ
+    assert "MIRA_RESTART_STARTED_AT" not in os.environ
 
 
 def test_format_restart_completed_message_with_elapsed(monkeypatch):
-    monkeypatch.setattr("medpilot.utils.restart.time.time", lambda: 102.0)
+    monkeypatch.setattr("mira_engine.utils.restart.time.time", lambda: 102.0)
     assert format_restart_completed_message("100.0") == "Restart completed in 2.0s."
 
 

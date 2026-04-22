@@ -1,21 +1,21 @@
 # Local Engine Upgrade Runbook
 
-This runbook defines the manual-safe upgrade process for `medpilot-agent` local deployments.
+This runbook defines the manual-safe upgrade process for `mira-engine` local deployments.
 
 ## Preconditions
 
-- `medpilot-agent install-service` has already been executed.
+- `mira-engine install-service` has already been executed.
 - Service status is healthy before upgrade:
 
 ```bash
-medpilot-agent status
-medpilot-agent doctor
+mira-engine status
+mira-engine doctor
 ```
 
 ## Standard Upgrade Flow
 
 ```bash
-medpilot-agent upgrade --package medpilot
+mira-engine upgrade --package mira
 ```
 
 The command performs:
@@ -37,15 +37,15 @@ If upgrade fails at any step:
 If automated rollback fails, run:
 
 ```bash
-medpilot-agent stop
-python -m pip install --upgrade medpilot==<previous_version>
-medpilot-agent start
-medpilot-agent status
-medpilot-agent doctor
+mira-engine stop
+python -m pip install --upgrade mira==<previous_version>
+mira-engine start
+mira-engine status
+mira-engine doctor
 ```
 
 ## Artifacts And Logs
 
-- Service state: `~/.medpilot/runtime/agent-service-state.json`
-- Upgrade backups: `~/.medpilot/runtime/backups/`
-- Service logs: `~/.medpilot/logs/agent-service.log`
+- Service state: `~/.mira/runtime/agent-service-state.json`
+- Upgrade backups: `~/.mira/runtime/backups/`
+- Service logs: `~/.mira/logs/agent-service.log`

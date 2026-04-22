@@ -1,15 +1,15 @@
 # Channel Plugin Guide
 
-Build a custom medpilot channel in three steps: subclass, package, install.
+Build a custom mira channel in three steps: subclass, package, install.
 
-> **Note:** We recommend developing channel plugins against a source checkout of medpilot (`pip install -e .`) rather than a PyPI release, so you always have access to the latest base-channel features and APIs.
+> **Note:** We recommend developing channel plugins against a source checkout of mira (`pip install -e .`) rather than a PyPI release, so you always have access to the latest base-channel features and APIs.
 
 ## How It Works
 
-medpilot discovers channel plugins via Python [entry points](https://packaging.python.org/en/latest/specifications/entry-points/). When `medpilot gateway` starts, it scans:
+mira discovers channel plugins via Python [entry points](https://packaging.python.org/en/latest/specifications/entry-points/). When `mira gateway` starts, it scans:
 
-1. Built-in channels in `medpilot/channels/`
-2. External packages registered under the `medpilot.channels` entry point group
+1. Built-in channels in `mira/channels/`
+2. External packages registered under the `mira_engine.channels` entry point group
 
 If a matching config section has `"enabled": true`, the channel is instantiated and started.
 
@@ -20,8 +20,8 @@ We'll build a minimal webhook channel that receives messages via HTTP POST and s
 ### Project Structure
 
 ```
-medpilot-channel-webhook/
-├── medpilot_channel_webhook/
+mira-channel-webhook/
+├── mira_channel_webhook/
 │   ├── __init__.py          # re-export WebhookChannel
 │   └── channel.py           # channel implementation
 └── pyproject.toml
@@ -30,14 +30,14 @@ medpilot-channel-webhook/
 ### 1. Create Your Channel
 
 ```python
-# medpilot_channel_webhook/__init__.py
-from medpilot_channel_webhook.channel import WebhookChannel
+# mira_channel_webhook/__init__.py
+from mira_channel_webhook.channel import WebhookChannel
 
 __all__ = ["WebhookChannel"]
 ```
 
 ```python
-# medpilot_channel_webhook/channel.py
+# mira_channel_webhook/channel.py
 import asyncio
 from typing import Any
 
@@ -45,10 +45,10 @@ from aiohttp import web
 from loguru import logger
 from pydantic import Field
 
-from medpilot.channels.base import BaseChannel
-from medpilot.bus.events import OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.config.schema import Base
+from mira_engine.channels.base import BaseChannel
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.config.schema import Base
 
 
 class WebhookConfig(Base):
@@ -133,12 +133,12 @@ class WebhookChannel(BaseChannel):
 ```toml
 # pyproject.toml
 [project]
-name = "medpilot-channel-webhook"
+name = "mira-channel-webhook"
 version = "0.1.0"
-dependencies = ["medpilot", "aiohttp"]
+dependencies = ["mira", "aiohttp"]
 
-[project.entry-points."medpilot.channels"]
-webhook = "medpilot_channel_webhook:WebhookChannel"
+[project.entry-points."mira_engine.channels"]
+webhook = "mira_channel_webhook:WebhookChannel"
 
 [build-system]
 requires = ["setuptools"]
@@ -151,11 +151,11 @@ The key (`webhook`) becomes the config section name. The value points to your `B
 
 ```bash
 pip install -e .
-medpilot plugins list      # verify "Webhook" shows as "plugin"
-medpilot onboard           # auto-adds default config for detected plugins
+mira plugins list      # verify "Webhook" shows as "plugin"
+mira onboard           # auto-adds default config for detected plugins
 ```
 
-Edit `~/.medpilot/config.json`:
+Edit `~/.mira/config.json`:
 
 ```json
 {
@@ -172,7 +172,7 @@ Edit `~/.medpilot/config.json`:
 ### 4. Run & Test
 
 ```bash
-medpilot gateway
+mira gateway
 ```
 
 In another terminal:
@@ -220,8 +220,8 @@ Channels that don't need interactive login (e.g. Telegram with bot token, Discor
 
 Users trigger interactive login via:
 ```bash
-medpilot channels login <channel_name>
-medpilot channels login <channel_name> --force  # re-authenticate
+mira channels login <channel_name>
+mira channels login <channel_name> --force  # re-authenticate
 ```
 
 ### Provided by Base
@@ -230,7 +230,7 @@ medpilot channels login <channel_name> --force  # re-authenticate
 |-------------------|-------------|
 | `_handle_message(sender_id, chat_id, content, media?, metadata?, session_key?)` | **Call this when you receive a message.** Checks `is_allowed()`, then publishes to the bus. Automatically sets `_wants_stream` if `supports_streaming` is true. |
 | `is_allowed(sender_id)` | Checks against `config.allow_from`; `"*"` allows all, `[]` denies all. |
-| `default_config()` (classmethod) | Returns default config dict for `medpilot onboard`. Override to declare your fields. |
+| `default_config()` (classmethod) | Returns default config dict for `mira onboard`. Override to declare your fields. |
 | `transcribe_audio(file_path)` | Transcribes audio via Groq Whisper (if configured). |
 | `supports_streaming` (property) | `True` when config has `"streaming": true` **and** subclass overrides `send_delta()`. |
 | `is_running` | Returns `self._running`. |
@@ -354,15 +354,15 @@ When `streaming` is `false` (default) or omitted, only `send()` is called — no
 
 `BaseChannel.is_allowed()` reads the permission list via `getattr(self.config, "allow_from", [])`. This works for Pydantic models where `allow_from` is a real Python attribute, but **fails silently for plain `dict`** — `dict` has no `allow_from` attribute, so `getattr` always returns the default `[]`, causing all messages to be denied.
 
-Built-in channels use Pydantic config models (subclassing `Base` from `medpilot.config.schema`). Plugin channels **must do the same**.
+Built-in channels use Pydantic config models (subclassing `Base` from `mira_engine.config.schema`). Plugin channels **must do the same**.
 
 ### Pattern
 
-1. Define a Pydantic model inheriting from `medpilot.config.schema.Base`:
+1. Define a Pydantic model inheriting from `mira_engine.config.schema.Base`:
 
 ```python
 from pydantic import Field
-from medpilot.config.schema import Base
+from mira_engine.config.schema import Base
 
 class WebhookConfig(Base):
     """Webhook channel configuration."""
@@ -377,7 +377,7 @@ class WebhookConfig(Base):
 
 ```python
 from typing import Any
-from medpilot.bus.queue import MessageBus
+from mira_engine.bus.queue import MessageBus
 
 class WebhookChannel(BaseChannel):
     def __init__(self, config: Any, bus: MessageBus):
@@ -396,7 +396,7 @@ async def start(self) -> None:
 
 `allowFrom` is handled automatically by `_handle_message()` — you don't need to check it yourself.
 
-Override `default_config()` so `medpilot onboard` auto-populates `config.json`:
+Override `default_config()` so `mira onboard` auto-populates `config.json`:
 
 ```python
 @classmethod
@@ -412,25 +412,25 @@ If not overridden, the base class returns `{"enabled": false}`.
 
 | What | Format | Example |
 |------|--------|---------|
-| PyPI package | `medpilot-channel-{name}` | `medpilot-channel-webhook` |
+| PyPI package | `mira-channel-{name}` | `mira-channel-webhook` |
 | Entry point key | `{name}` | `webhook` |
 | Config section | `channels.{name}` | `channels.webhook` |
-| Python package | `medpilot_channel_{name}` | `medpilot_channel_webhook` |
+| Python package | `mira_channel_{name}` | `mira_channel_webhook` |
 
 ## Local Development
 
 ```bash
-git clone https://github.com/you/medpilot-channel-webhook
-cd medpilot-channel-webhook
+git clone https://github.com/you/mira-channel-webhook
+cd mira-channel-webhook
 pip install -e .
-medpilot plugins list    # should show "Webhook" as "plugin"
-medpilot gateway         # test end-to-end
+mira plugins list    # should show "Webhook" as "plugin"
+mira gateway         # test end-to-end
 ```
 
 ## Verify
 
 ```bash
-$ medpilot plugins list
+$ mira plugins list
 
   Name       Source    Enabled
   telegram   builtin  yes

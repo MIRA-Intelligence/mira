@@ -2,14 +2,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from medpilot.agent.loop import AgentLoop
-import medpilot.agent.memory as memory_module
-from medpilot.bus.queue import MessageBus
-from medpilot.providers.base import LLMResponse
+from mira_engine.agent.loop import AgentLoop
+import mira_engine.agent.memory as memory_module
+from mira_engine.bus.queue import MessageBus
+from mira_engine.providers.base import LLMResponse
 
 
 def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -> AgentLoop:
-    from medpilot.providers.base import GenerationSettings
+    from mira_engine.providers.base import GenerationSettings
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     provider.generation = GenerationSettings(max_tokens=0)

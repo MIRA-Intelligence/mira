@@ -2,12 +2,12 @@ import json
 
 from typer.testing import CliRunner
 
-from medpilot.cli.agent_service import app
+from mira_engine.cli.agent_service import app
 
 
 def test_start_requires_install(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("MEDPILOT_AGENT_SERVICE_MODE", "local")
+    monkeypatch.setenv("MIRA_AGENT_SERVICE_MODE", "local")
     runner = CliRunner()
 
     result = runner.invoke(app, ["start"])
@@ -18,7 +18,7 @@ def test_start_requires_install(monkeypatch, tmp_path):
 
 def test_install_start_status_stop_flow(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("MEDPILOT_AGENT_SERVICE_MODE", "local")
+    monkeypatch.setenv("MIRA_AGENT_SERVICE_MODE", "local")
     runner = CliRunner()
 
     install = runner.invoke(app, ["install-service"])
@@ -42,7 +42,7 @@ def test_install_start_status_stop_flow(monkeypatch, tmp_path):
 
 def test_doctor_reports_health_payload(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("MEDPILOT_AGENT_SERVICE_MODE", "local")
+    monkeypatch.setenv("MIRA_AGENT_SERVICE_MODE", "local")
     runner = CliRunner()
 
     runner.invoke(app, ["install-service"])

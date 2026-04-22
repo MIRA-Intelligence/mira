@@ -12,11 +12,11 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel, Field
 
-from medpilot.cli import onboard as onboard_wizard
+from mira_engine.cli import onboard as onboard_wizard
 
 # Import functions to test
-from medpilot.cli.commands import _merge_missing_defaults
-from medpilot.cli.onboard import (
+from mira_engine.cli.commands import _merge_missing_defaults
+from mira_engine.cli.onboard import (
     _BACK_PRESSED,
     _configure_provider,
     _configure_pydantic_model,
@@ -25,8 +25,8 @@ from medpilot.cli.onboard import (
     _get_field_type_info,
     run_onboard,
 )
-from medpilot.config.schema import Config
-from medpilot.utils.helpers import sync_workspace_templates
+from mira_engine.config.schema import Config
+from mira_engine.utils.helpers import sync_workspace_templates
 
 
 class TestMergeMissingDefaults:
@@ -353,7 +353,7 @@ class TestProviderChannelInfo:
     """Tests for provider and channel info retrieval."""
 
     def test_get_provider_names_returns_dict(self):
-        from medpilot.cli.onboard import _get_provider_names
+        from mira_engine.cli.onboard import _get_provider_names
 
         names = _get_provider_names()
         assert isinstance(names, dict)
@@ -364,7 +364,7 @@ class TestProviderChannelInfo:
         assert "github_copilot" not in names
 
     def test_get_channel_names_returns_dict(self):
-        from medpilot.cli.onboard import _get_channel_names
+        from mira_engine.cli.onboard import _get_channel_names
 
         names = _get_channel_names()
         assert isinstance(names, dict)
@@ -372,7 +372,7 @@ class TestProviderChannelInfo:
         assert len(names) >= 0
 
     def test_get_provider_info_returns_valid_structure(self):
-        from medpilot.cli.onboard import _get_provider_info
+        from mira_engine.cli.onboard import _get_provider_info
 
         info = _get_provider_info()
         assert isinstance(info, dict)
@@ -561,17 +561,17 @@ class TestRunOnboardExitBehavior:
 
 class TestHandleModelField:
     def test_handle_model_field_prepends_prefix(self, monkeypatch):
-        from medpilot.cli.onboard import _handle_model_field
-        from medpilot.config.schema import AgentDefaults
+        from mira_engine.cli.onboard import _handle_model_field
+        from mira_engine.config.schema import AgentDefaults
 
         working_model = AgentDefaults(provider="openrouter")
 
         monkeypatch.setattr(
-            "medpilot.cli.onboard._input_model_with_autocomplete",
+            "mira_engine.cli.onboard._input_model_with_autocomplete",
             lambda display, current, provider: "claude-3-opus"
         )
         monkeypatch.setattr(
-            "medpilot.cli.onboard._try_auto_fill_context_window",
+            "mira_engine.cli.onboard._try_auto_fill_context_window",
             lambda *args: None
         )
 
@@ -580,17 +580,17 @@ class TestHandleModelField:
         assert working_model.model == "openrouter/claude-3-opus"
 
     def test_handle_model_field_skips_prefix_if_present(self, monkeypatch):
-        from medpilot.cli.onboard import _handle_model_field
-        from medpilot.config.schema import AgentDefaults
+        from mira_engine.cli.onboard import _handle_model_field
+        from mira_engine.config.schema import AgentDefaults
 
         working_model = AgentDefaults(provider="openrouter")
 
         monkeypatch.setattr(
-            "medpilot.cli.onboard._input_model_with_autocomplete",
+            "mira_engine.cli.onboard._input_model_with_autocomplete",
             lambda display, current, provider: "anthropic/claude-3-opus"
         )
         monkeypatch.setattr(
-            "medpilot.cli.onboard._try_auto_fill_context_window",
+            "mira_engine.cli.onboard._try_auto_fill_context_window",
             lambda *args: None
         )
 
@@ -599,17 +599,17 @@ class TestHandleModelField:
         assert working_model.model == "anthropic/claude-3-opus"
 
     def test_handle_model_field_skips_prefix_if_no_litellm_prefix(self, monkeypatch):
-        from medpilot.cli.onboard import _handle_model_field
-        from medpilot.config.schema import AgentDefaults
+        from mira_engine.cli.onboard import _handle_model_field
+        from mira_engine.config.schema import AgentDefaults
 
         working_model = AgentDefaults(provider="openai")
 
         monkeypatch.setattr(
-            "medpilot.cli.onboard._input_model_with_autocomplete",
+            "mira_engine.cli.onboard._input_model_with_autocomplete",
             lambda display, current, provider: "gpt-4o"
         )
         monkeypatch.setattr(
-            "medpilot.cli.onboard._try_auto_fill_context_window",
+            "mira_engine.cli.onboard._try_auto_fill_context_window",
             lambda *args: None
         )
 

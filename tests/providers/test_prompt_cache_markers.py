@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from medpilot.providers.anthropic_provider import AnthropicProvider
-from medpilot.providers.openai_compat_provider import OpenAICompatProvider
+from mira_engine.providers.anthropic_provider import AnthropicProvider
+from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
 
 
 def _openai_tools(*names: str) -> list[dict[str, Any]]:

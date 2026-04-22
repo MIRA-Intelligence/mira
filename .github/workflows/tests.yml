@@ -42,7 +42,7 @@ jobs:
       - name: Run tests with coverage
         run: |
           python -m pytest tests/ \
-            --cov=medpilot \
+            --cov=mira_engine \
             --cov-report=xml:coverage.xml \
             --cov-report=term-missing \
             -v

@@ -1,7 +1,7 @@
-"""Tests for tool hint formatting (medpilot.utils.tool_hints)."""
+"""Tests for tool hint formatting (mira_engine.utils.tool_hints)."""
 
-from medpilot.utils.tool_hints import format_tool_hints
-from medpilot.providers.base import ToolCallRequest
+from mira_engine.utils.tool_hints import format_tool_hints
+from mira_engine.providers.base import ToolCallRequest
 
 
 def _tc(name: str, args) -> ToolCallRequest:
@@ -21,7 +21,7 @@ class TestToolHintKnownTools:
         assert result == 'read foo.txt'
 
     def test_read_file_long_path(self):
-        result = _hint([_tc("read_file", {"path": "/home/user/.local/share/uv/tools/medpilot/agent/loop.py"})])
+        result = _hint([_tc("read_file", {"path": "/home/user/.local/share/uv/tools/mira/agent/loop.py"})])
         assert "loop.py" in result
         assert "read " in result
 
@@ -54,21 +54,21 @@ class TestToolHintKnownTools:
 
     def test_exec_abbreviates_paths_in_command(self):
         """Windows paths in exec commands should be folded, not blindly truncated."""
-        cmd = "cd D:\\Documents\\GitHub\\medpilot\\.worktree\\tomain\\medpilot && git diff origin/main...pr-2706 --name-only 2>&1"
+        cmd = "cd D:\\Documents\\GitHub\\mira-engine\\.worktree\\tomain\\mira-engine && git diff origin/main...pr-2706 --name-only 2>&1"
         result = _hint([_tc("exec", {"command": cmd})])
         assert "\u2026/" in result  # path should be folded with …/
         assert "worktree" not in result  # middle segments should be collapsed
 
     def test_exec_abbreviates_linux_paths(self):
         """Unix absolute paths in exec commands should be folded."""
-        cmd = "cd /home/user/projects/medpilot/.worktree/tomain && make build"
+        cmd = "cd /home/user/projects/mira-engine/.worktree/tomain && make build"
         result = _hint([_tc("exec", {"command": cmd})])
         assert "\u2026/" in result
         assert "projects" not in result
 
     def test_exec_abbreviates_home_paths(self):
         """~/ paths in exec commands should be folded."""
-        cmd = "cd ~/projects/medpilot/workspace && pytest tests/"
+        cmd = "cd ~/projects/mira-engine/workspace && pytest tests/"
         result = _hint([_tc("exec", {"command": cmd})])
         assert "\u2026/" in result
 

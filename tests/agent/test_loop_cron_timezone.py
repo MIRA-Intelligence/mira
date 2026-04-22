@@ -1,10 +1,10 @@
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from medpilot.agent.loop import AgentLoop
-from medpilot.agent.tools.cron import CronTool
-from medpilot.bus.queue import MessageBus
-from medpilot.cron.service import CronService
+from mira_engine.agent.loop import AgentLoop
+from mira_engine.agent.tools.cron import CronTool
+from mira_engine.bus.queue import MessageBus
+from mira_engine.cron.service import CronService
 
 
 def test_agent_loop_registers_cron_tool_with_configured_timezone(tmp_path: Path) -> None:

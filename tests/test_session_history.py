@@ -1,4 +1,4 @@
-from medpilot.session.manager import Session
+from mira_engine.session.manager import Session
 
 
 def test_get_history_returns_empty_when_window_has_no_user() -> None:

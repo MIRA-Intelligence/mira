@@ -1,6 +1,6 @@
 import pytest
 
-from medpilot.config.schema import AgentDefaults, normalize_model_candidates, primary_model_candidate
+from mira_engine.config.schema import AgentDefaults, normalize_model_candidates, primary_model_candidate
 
 
 @pytest.mark.parametrize(

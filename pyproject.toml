@@ -1,12 +1,12 @@
 [project]
-name = "medpilot"
+name = "mira-engine"
 version = "0.0.0"
 description = "A lightweight personal AI assistant framework"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "GPL-3.0-or-later"}
 authors = [
-    {name = "medpilot contributors"}
+    {name = "mira contributors"}
 ]
 keywords = ["ai", "agent", "chatbot"]
 classifiers = [
@@ -67,8 +67,8 @@ dev = [
 ]
 
 [project.scripts]
-medpilot = "medpilot.cli.commands:app"
-medpilot-agent = "medpilot.cli.agent_service:app"
+mira = "mira_engine.cli.commands:app"
+mira-engine = "mira_engine.cli.agent_service:app"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
@@ -83,23 +83,23 @@ fallback_version = "0.0.0"
 local_scheme = "no-local-version"
 
 [tool.hatch.build.targets.wheel]
-packages = ["medpilot"]
+packages = ["mira_engine"]
 
 [tool.hatch.build.targets.wheel.sources]
-"medpilot" = "medpilot"
+"mira_engine" = "mira_engine"
 
 # Include non-Python files in skills and templates
 [tool.hatch.build]
 include = [
-    "medpilot/**/*.py",
-    "medpilot/templates/**/*.md",
-    "medpilot/skills/**/*.md",
-    "medpilot/skills/**/*.sh",
+    "mira_engine/**/*.py",
+    "mira_engine/templates/**/*.md",
+    "mira_engine/skills/**/*.md",
+    "mira_engine/skills/**/*.sh",
 ]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "medpilot/",
+    "mira_engine/",
     "bridge/",
     "README.md",
     "LICENSE",
@@ -119,10 +119,10 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["medpilot"]
+source = ["mira_engine"]
 omit = [
-    "medpilot/skills/*",
-    "medpilot/cli/*",
+    "mira_engine/skills/*",
+    "mira_engine/cli/*",
 ]
 
 [tool.coverage.report]

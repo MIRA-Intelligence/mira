@@ -4,8 +4,8 @@ import pytest
 
 from unittest.mock import AsyncMock, MagicMock
 
-from medpilot.agent.memory import Dream, MemoryStore
-from medpilot.agent.runner import AgentRunResult
+from mira_engine.agent.memory import Dream, MemoryStore
+from mira_engine.agent.runner import AgentRunResult
 
 
 @pytest.fixture

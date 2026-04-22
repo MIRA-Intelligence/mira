@@ -1,6 +1,6 @@
 """Tests for LLMProvider._enforce_role_alternation."""
 
-from medpilot.providers.base import LLMProvider
+from mira_engine.providers.base import LLMProvider
 
 
 class TestEnforceRoleAlternation:

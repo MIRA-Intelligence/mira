@@ -9,10 +9,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from medpilot.agent.loop import AgentLoop
-from medpilot.agent.subagent import SubagentManager
-from medpilot.agent.tools.search import GlobTool, GrepTool
-from medpilot.bus.queue import MessageBus
+from mira_engine.agent.loop import AgentLoop
+from mira_engine.agent.subagent import SubagentManager
+from mira_engine.agent.tools.search import GlobTool, GrepTool
+from mira_engine.bus.queue import MessageBus
 
 
 @pytest.mark.asyncio

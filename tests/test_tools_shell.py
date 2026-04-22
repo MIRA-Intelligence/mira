@@ -6,7 +6,13 @@ import shlex
 import subprocess
 import sys
 
-from medpilot.agent.tools.shell import ExecTool
+from mira_engine.agent.tools.shell import ExecTool
+
+
+def _python_script_command(script_path: Path) -> str:
+    if sys.platform == "win32":
+        return subprocess.list2cmdline([sys.executable, str(script_path)])
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}"
 
 
 def _python_script_command(script_path: Path) -> str:

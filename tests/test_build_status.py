@@ -1,6 +1,6 @@
 """Tests for build_status_content cache hit rate display."""
 
-from medpilot.utils.helpers import build_status_content
+from mira_engine.utils.helpers import build_status_content
 
 
 def test_status_shows_cache_hit_rate():

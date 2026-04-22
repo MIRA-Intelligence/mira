@@ -1,16 +1,16 @@
-from medpilot.agent.loop import AgentLoop
+from mira_engine.agent.loop import AgentLoop
 
 
 def test_build_skill_invoked_event_for_skill_file_path() -> None:
     event = AgentLoop._build_skill_invoked_event(
         tool_name="read_file",
-        arguments={"path": "/Users/demo/.medpilot/skills/research/scientific-method/SKILL.md"},
+        arguments={"path": "/Users/demo/.mira/skills/research/scientific-method/SKILL.md"},
     )
 
     assert event == {
         "tool": "read_file",
         "skill_name": "scientific-method",
-        "path": "/Users/demo/.medpilot/skills/research/scientific-method/SKILL.md",
+        "path": "/Users/demo/.mira/skills/research/scientific-method/SKILL.md",
     }
 
 
@@ -21,7 +21,7 @@ def test_build_skill_invoked_event_ignores_non_skill_paths() -> None:
     )
     non_read_file = AgentLoop._build_skill_invoked_event(
         tool_name="write_file",
-        arguments={"path": "/Users/demo/.medpilot/skills/research/scientific-method/SKILL.md"},
+        arguments={"path": "/Users/demo/.mira/skills/research/scientific-method/SKILL.md"},
     )
 
     assert not_skill is None

@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from medpilot.bus.events import OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.channels.base import BaseChannel
-from medpilot.channels.manager import ChannelManager
-from medpilot.config.schema import ChannelsConfig
-from medpilot.utils.restart import RestartNotice
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.base import BaseChannel
+from mira_engine.channels.manager import ChannelManager
+from mira_engine.config.schema import ChannelsConfig
+from mira_engine.utils.restart import RestartNotice
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ _EP_TARGET = "importlib.metadata.entry_points"
 
 
 def test_discover_plugins_loads_entry_points():
-    from medpilot.channels.registry import discover_plugins
+    from mira_engine.channels.registry import discover_plugins
 
     ep = _make_entry_point("line", _FakePlugin)
     with patch(_EP_TARGET, return_value=[ep]):
@@ -111,7 +111,7 @@ def test_discover_plugins_loads_entry_points():
 
 
 def test_discover_plugins_handles_load_error():
-    from medpilot.channels.registry import discover_plugins
+    from mira_engine.channels.registry import discover_plugins
 
     def _boom():
         raise RuntimeError("broken")
@@ -128,7 +128,7 @@ def test_discover_plugins_handles_load_error():
 # ---------------------------------------------------------------------------
 
 def test_discover_all_includes_builtins():
-    from medpilot.channels.registry import discover_all, discover_channel_names
+    from mira_engine.channels.registry import discover_all, discover_channel_names
 
     with patch(_EP_TARGET, return_value=[]):
         result = discover_all()
@@ -141,7 +141,7 @@ def test_discover_all_includes_builtins():
 
 
 def test_discover_all_includes_external_plugin():
-    from medpilot.channels.registry import discover_all
+    from mira_engine.channels.registry import discover_all
 
     ep = _make_entry_point("line", _FakePlugin)
     with patch(_EP_TARGET, return_value=[ep]):
@@ -152,7 +152,7 @@ def test_discover_all_includes_external_plugin():
 
 
 def test_discover_all_builtin_shadows_plugin():
-    from medpilot.channels.registry import discover_all
+    from mira_engine.channels.registry import discover_all
 
     ep = _make_entry_point("telegram", _FakeTelegram)
     with patch(_EP_TARGET, return_value=[ep]):
@@ -169,7 +169,7 @@ def test_discover_all_builtin_shadows_plugin():
 @pytest.mark.asyncio
 async def test_manager_loads_plugin_from_dict_config():
     """ChannelManager should instantiate a plugin channel from a raw dict config."""
-    from medpilot.channels.manager import ChannelManager
+    from mira_engine.channels.manager import ChannelManager
 
     fake_config = SimpleNamespace(
         channels=ChannelsConfig.model_validate({
@@ -179,7 +179,7 @@ async def test_manager_loads_plugin_from_dict_config():
     )
 
     with patch(
-        "medpilot.channels.registry.discover_all",
+        "mira_engine.channels.registry.discover_all",
         return_value={"fakeplugin": _FakePlugin},
     ):
         mgr = ChannelManager.__new__(ChannelManager)
@@ -194,8 +194,8 @@ async def test_manager_loads_plugin_from_dict_config():
 
 
 def test_channels_login_uses_discovered_plugin_class(monkeypatch):
-    from medpilot.cli.commands import app
-    from medpilot.config.schema import Config
+    from mira_engine.cli.commands import app
+    from mira_engine.config.schema import Config
     from typer.testing import CliRunner
 
     runner = CliRunner()
@@ -209,9 +209,9 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
             seen["config"] = self.config
             return True
 
-    monkeypatch.setattr("medpilot.config.loader.load_config", lambda config_path=None: Config())
+    monkeypatch.setattr("mira_engine.config.loader.load_config", lambda config_path=None: Config())
     monkeypatch.setattr(
-        "medpilot.channels.registry.discover_all",
+        "mira_engine.channels.registry.discover_all",
         lambda: {"fakeplugin": _LoginPlugin},
     )
 
@@ -222,8 +222,8 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
 
 
 def test_channels_login_sets_custom_config_path(monkeypatch, tmp_path):
-    from medpilot.cli.commands import app
-    from medpilot.config.schema import Config
+    from mira_engine.cli.commands import app
+    from mira_engine.config.schema import Config
     from typer.testing import CliRunner
 
     runner = CliRunner()
@@ -234,13 +234,13 @@ def test_channels_login_sets_custom_config_path(monkeypatch, tmp_path):
         async def login(self, force: bool = False) -> bool:
             return True
 
-    monkeypatch.setattr("medpilot.config.loader.load_config", lambda config_path=None: Config())
+    monkeypatch.setattr("mira_engine.config.loader.load_config", lambda config_path=None: Config())
     monkeypatch.setattr(
-        "medpilot.config.loader.set_config_path",
+        "mira_engine.config.loader.set_config_path",
         lambda path: seen.__setitem__("config_path", path),
     )
     monkeypatch.setattr(
-        "medpilot.channels.registry.discover_all",
+        "mira_engine.channels.registry.discover_all",
         lambda: {"fakeplugin": _LoginPlugin},
     )
 
@@ -251,20 +251,20 @@ def test_channels_login_sets_custom_config_path(monkeypatch, tmp_path):
 
 
 def test_channels_status_sets_custom_config_path(monkeypatch, tmp_path):
-    from medpilot.cli.commands import app
-    from medpilot.config.schema import Config
+    from mira_engine.cli.commands import app
+    from mira_engine.config.schema import Config
     from typer.testing import CliRunner
 
     runner = CliRunner()
     seen: dict[str, object] = {}
     config_path = tmp_path / "custom-config.json"
 
-    monkeypatch.setattr("medpilot.config.loader.load_config", lambda config_path=None: Config())
+    monkeypatch.setattr("mira_engine.config.loader.load_config", lambda config_path=None: Config())
     monkeypatch.setattr(
-        "medpilot.config.loader.set_config_path",
+        "mira_engine.config.loader.set_config_path",
         lambda path: seen.__setitem__("config_path", path),
     )
-    monkeypatch.setattr("medpilot.channels.registry.discover_all", lambda: {})
+    monkeypatch.setattr("mira_engine.channels.registry.discover_all", lambda: {})
 
     result = runner.invoke(app, ["channels", "status", "--config", str(config_path)])
 
@@ -282,7 +282,7 @@ async def test_manager_skips_disabled_plugin():
     )
 
     with patch(
-        "medpilot.channels.registry.discover_all",
+        "mira_engine.channels.registry.discover_all",
         return_value={"fakeplugin": _FakePlugin},
     ):
         mgr = ChannelManager.__new__(ChannelManager)
@@ -301,7 +301,7 @@ async def test_manager_skips_disabled_plugin():
 
 def test_builtin_channel_default_config():
     """Built-in channels expose default_config() returning a dict with 'enabled': False."""
-    from medpilot.channels.telegram import TelegramChannel
+    from mira_engine.channels.telegram import TelegramChannel
     cfg = TelegramChannel.default_config()
     assert isinstance(cfg, dict)
     assert cfg["enabled"] is False
@@ -310,7 +310,7 @@ def test_builtin_channel_default_config():
 
 def test_builtin_channel_init_from_dict():
     """Built-in channels accept a raw dict and convert to Pydantic internally."""
-    from medpilot.channels.telegram import TelegramChannel
+    from mira_engine.channels.telegram import TelegramChannel
     bus = MessageBus()
     ch = TelegramChannel({"enabled": False, "token": "test-tok", "allowFrom": ["*"]}, bus)
     assert ch.config.token == "test-tok"
@@ -423,7 +423,7 @@ async def test_send_with_retry_retries_on_failure():
     msg = OutboundMessage(channel="failing", chat_id="123", content="test")
 
     # Patch asyncio.sleep to avoid actual delays
-    with patch("medpilot.channels.manager.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("mira_engine.channels.manager.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         await mgr._send_with_retry(mgr.channels["failing"], msg)
 
     assert call_count == 3  # 3 total attempts (initial + 2 retries)
@@ -463,7 +463,7 @@ async def test_send_with_retry_no_retry_when_max_is_zero():
 
     msg = OutboundMessage(channel="failing", chat_id="123", content="test")
 
-    with patch("medpilot.channels.manager.asyncio.sleep", new_callable=AsyncMock):
+    with patch("mira_engine.channels.manager.asyncio.sleep", new_callable=AsyncMock):
         await mgr._send_with_retry(mgr.channels["failing"], msg)
 
     assert call_count == 1  # Called once but no retry (max(0, 1) = 1)
@@ -627,7 +627,7 @@ async def test_send_with_retry_propagates_cancelled_error_during_sleep():
     async def cancel_during_sleep(_):
         raise asyncio.CancelledError("cancelled during sleep")
 
-    with patch("medpilot.channels.manager.asyncio.sleep", side_effect=cancel_during_sleep):
+    with patch("mira_engine.channels.manager.asyncio.sleep", side_effect=cancel_during_sleep):
         with pytest.raises(asyncio.CancelledError):
             await mgr._send_with_retry(mgr.channels["failing"], msg)
 
@@ -947,7 +947,7 @@ async def test_notify_restart_done_enqueues_outbound_message():
     mgr._send_with_retry = AsyncMock()
 
     notice = RestartNotice(channel="feishu", chat_id="oc_123", started_at_raw="100.0")
-    with patch("medpilot.channels.manager.consume_restart_notice_from_env", return_value=notice):
+    with patch("mira_engine.channels.manager.consume_restart_notice_from_env", return_value=notice):
         mgr._notify_restart_done_if_needed()
 
     await asyncio.sleep(0)

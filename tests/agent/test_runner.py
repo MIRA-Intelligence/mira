@@ -9,25 +9,25 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from medpilot.config.schema import AgentDefaults
-from medpilot.agent.tools.base import Tool
-from medpilot.agent.tools.registry import ToolRegistry
-from medpilot.providers.base import LLMResponse, ToolCallRequest
+from mira_engine.config.schema import AgentDefaults
+from mira_engine.agent.tools.base import Tool
+from mira_engine.agent.tools.registry import ToolRegistry
+from mira_engine.providers.base import LLMResponse, ToolCallRequest
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
 
 def _make_loop(tmp_path):
-    from medpilot.agent.loop import AgentLoop
-    from medpilot.bus.queue import MessageBus
+    from mira_engine.agent.loop import AgentLoop
+    from mira_engine.bus.queue import MessageBus
 
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
 
-    with patch("medpilot.agent.loop.ContextBuilder"), \
-         patch("medpilot.agent.loop.SessionManager"), \
-         patch("medpilot.agent.loop.SubagentManager") as MockSubMgr:
+    with patch("mira_engine.agent.loop.ContextBuilder"), \
+         patch("mira_engine.agent.loop.SessionManager"), \
+         patch("mira_engine.agent.loop.SubagentManager") as MockSubMgr:
         MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
     return loop
@@ -35,7 +35,7 @@ def _make_loop(tmp_path):
 
 @pytest.mark.asyncio
 async def test_runner_preserves_reasoning_fields_and_tool_results():
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     captured_second_call: list[dict] = []
@@ -92,8 +92,8 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 
 @pytest.mark.asyncio
 async def test_runner_calls_hooks_in_order():
-    from medpilot.agent.hook import AgentHook, AgentHookContext
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.hook import AgentHook, AgentHookContext
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     call_count = {"n": 0}
@@ -168,8 +168,8 @@ async def test_runner_calls_hooks_in_order():
 
 @pytest.mark.asyncio
 async def test_runner_streaming_hook_receives_deltas_and_end_signal():
-    from medpilot.agent.hook import AgentHook, AgentHookContext
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.hook import AgentHook, AgentHookContext
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     streamed: list[str] = []
@@ -213,7 +213,7 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
 
 @pytest.mark.asyncio
 async def test_runner_returns_max_iterations_fallback():
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -243,7 +243,7 @@ async def test_runner_returns_max_iterations_fallback():
 
 @pytest.mark.asyncio
 async def test_runner_returns_structured_tool_error():
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -274,7 +274,7 @@ async def test_runner_returns_structured_tool_error():
 
 @pytest.mark.asyncio
 async def test_runner_persists_large_tool_results_for_follow_up_calls(tmp_path):
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     captured_second_call: list[dict] = []
@@ -311,13 +311,13 @@ async def test_runner_persists_large_tool_results_for_follow_up_calls(tmp_path):
     tool_message = next(msg for msg in captured_second_call if msg.get("role") == "tool")
     assert "[tool output persisted]" in tool_message["content"]
     assert "tool-results" in tool_message["content"]
-    assert (tmp_path / ".medpilot" / "tool-results" / "test_runner" / "call_big.txt").exists()
+    assert (tmp_path / ".mira" / "tool-results" / "test_runner" / "call_big.txt").exists()
 
 
 def test_persist_tool_result_prunes_old_session_buckets(tmp_path):
-    from medpilot.utils.helpers import maybe_persist_tool_result
+    from mira_engine.utils.helpers import maybe_persist_tool_result
 
-    root = tmp_path / ".medpilot" / "tool-results"
+    root = tmp_path / ".mira" / "tool-results"
     old_bucket = root / "old_session"
     recent_bucket = root / "recent_session"
     old_bucket.mkdir(parents=True)
@@ -344,9 +344,9 @@ def test_persist_tool_result_prunes_old_session_buckets(tmp_path):
 
 
 def test_persist_tool_result_leaves_no_temp_files(tmp_path):
-    from medpilot.utils.helpers import maybe_persist_tool_result
+    from mira_engine.utils.helpers import maybe_persist_tool_result
 
-    root = tmp_path / ".medpilot" / "tool-results"
+    root = tmp_path / ".mira" / "tool-results"
     maybe_persist_tool_result(
         tmp_path,
         "current:session",
@@ -360,16 +360,16 @@ def test_persist_tool_result_leaves_no_temp_files(tmp_path):
 
 
 def test_persist_tool_result_logs_cleanup_failures(monkeypatch, tmp_path):
-    from medpilot.utils.helpers import maybe_persist_tool_result
+    from mira_engine.utils.helpers import maybe_persist_tool_result
 
     warnings: list[str] = []
 
     monkeypatch.setattr(
-        "medpilot.utils.helpers._cleanup_tool_result_buckets",
+        "mira_engine.utils.helpers._cleanup_tool_result_buckets",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("busy")),
     )
     monkeypatch.setattr(
-        "medpilot.utils.helpers.logger.warning",
+        "mira_engine.utils.helpers.logger.warning",
         lambda message, *args: warnings.append(message.format(*args)),
     )
 
@@ -387,7 +387,7 @@ def test_persist_tool_result_logs_cleanup_failures(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_runner_replaces_empty_tool_result_with_marker():
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     captured_second_call: list[dict] = []
@@ -425,7 +425,7 @@ async def test_runner_replaces_empty_tool_result_with_marker():
 
 @pytest.mark.asyncio
 async def test_runner_uses_raw_messages_when_context_governance_fails():
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     captured_messages: list[dict] = []
@@ -459,7 +459,7 @@ async def test_runner_uses_raw_messages_when_context_governance_fails():
 @pytest.mark.asyncio
 async def test_runner_retries_empty_final_response_with_summary_prompt():
     """Empty responses get 2 silent retries before finalization kicks in."""
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     calls: list[dict] = []
@@ -504,8 +504,8 @@ async def test_runner_retries_empty_final_response_with_summary_prompt():
 @pytest.mark.asyncio
 async def test_runner_uses_specific_message_after_empty_finalization_retry():
     """After silent retries + finalization all return empty, stop_reason is empty_final_response."""
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
-    from medpilot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
     provider = MagicMock()
 
@@ -536,7 +536,7 @@ async def test_runner_empty_response_does_not_break_tool_chain():
     Sequence: tool_call → empty → tool_call → final text.
     The runner should recover via silent retry and complete normally.
     """
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     call_count = 0
@@ -590,7 +590,7 @@ async def test_runner_empty_response_does_not_break_tool_chain():
 
 
 def test_snip_history_drops_orphaned_tool_results_from_trimmed_slice(monkeypatch):
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     tools = MagicMock()
@@ -617,7 +617,7 @@ def test_snip_history_drops_orphaned_tool_results_from_trimmed_slice(monkeypatch
         context_block_limit=100,
     )
 
-    monkeypatch.setattr("medpilot.agent.runner.estimate_prompt_tokens_chain", lambda *_args, **_kwargs: (500, None))
+    monkeypatch.setattr("mira_engine.agent.runner.estimate_prompt_tokens_chain", lambda *_args, **_kwargs: (500, None))
     token_sizes = {
         "old user": 120,
         "tool call": 120,
@@ -626,7 +626,7 @@ def test_snip_history_drops_orphaned_tool_results_from_trimmed_slice(monkeypatch
         "system": 0,
     }
     monkeypatch.setattr(
-        "medpilot.agent.runner.estimate_message_tokens",
+        "mira_engine.agent.runner.estimate_message_tokens",
         lambda msg: token_sizes.get(str(msg.get("content")), 40),
     )
 
@@ -640,7 +640,7 @@ def test_snip_history_drops_orphaned_tool_results_from_trimmed_slice(monkeypatch
 
 @pytest.mark.asyncio
 async def test_runner_keeps_going_when_tool_result_persistence_fails():
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     captured_second_call: list[dict] = []
@@ -663,7 +663,7 @@ async def test_runner_keeps_going_when_tool_result_persistence_fails():
     tools.execute = AsyncMock(return_value="tool result")
 
     runner = AgentRunner(provider)
-    with patch("medpilot.agent.runner.maybe_persist_tool_result", side_effect=RuntimeError("disk full")):
+    with patch("mira_engine.agent.runner.maybe_persist_tool_result", side_effect=RuntimeError("disk full")):
         result = await runner.run(AgentRunSpec(
             initial_messages=[{"role": "user", "content": "do task"}],
             tools=tools,
@@ -709,7 +709,7 @@ class _DelayTool(Tool):
 
 @pytest.mark.asyncio
 async def test_runner_batches_read_only_tools_before_exclusive_work():
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     tools = ToolRegistry()
     shared_events: list[str] = []
@@ -747,7 +747,7 @@ async def test_runner_batches_read_only_tools_before_exclusive_work():
 
 @pytest.mark.asyncio
 async def test_runner_blocks_repeated_external_fetches():
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     captured_final_call: list[dict] = []
@@ -857,7 +857,7 @@ async def test_loop_retries_think_only_final_response(tmp_path):
 
 @pytest.mark.asyncio
 async def test_runner_tool_error_sets_final_content():
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
 
@@ -889,8 +889,8 @@ async def test_runner_tool_error_sets_final_content():
 
 @pytest.mark.asyncio
 async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, monkeypatch):
-    from medpilot.agent.subagent import SubagentManager
-    from medpilot.bus.queue import MessageBus
+    from mira_engine.agent.subagent import SubagentManager
+    from mira_engine.bus.queue import MessageBus
 
     bus = MessageBus()
     provider = MagicMock()
@@ -910,7 +910,7 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     async def fake_execute(self, **kwargs):
         return "tool result"
 
-    monkeypatch.setattr("medpilot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
+    monkeypatch.setattr("mira_engine.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
     await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
 
@@ -924,7 +924,7 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
 async def test_runner_accumulates_usage_and_preserves_cached_tokens():
     """Runner should accumulate prompt/completion tokens across iterations
     and preserve cached_tokens from provider responses."""
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     call_count = {"n": 0}
@@ -966,8 +966,8 @@ async def test_runner_accumulates_usage_and_preserves_cached_tokens():
 @pytest.mark.asyncio
 async def test_runner_passes_cached_tokens_to_hook_context():
     """Hook context.usage should contain cached_tokens."""
-    from medpilot.agent.hook import AgentHook, AgentHookContext
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.hook import AgentHook, AgentHookContext
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     captured_usage: list[dict] = []
@@ -1010,7 +1010,7 @@ async def test_runner_passes_cached_tokens_to_hook_context():
 async def test_length_recovery_continues_from_truncated_output():
     """When finish_reason is 'length', runner should insert a continuation
     prompt and retry, stitching partial outputs into the final result."""
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     call_count = {"n": 0}
@@ -1049,8 +1049,8 @@ async def test_length_recovery_continues_from_truncated_output():
 async def test_length_recovery_streaming_calls_on_stream_end_with_resuming():
     """During length recovery with streaming, on_stream_end should be called
     with resuming=True so the hook knows the conversation is continuing."""
-    from medpilot.agent.hook import AgentHook, AgentHookContext
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner
+    from mira_engine.agent.hook import AgentHook, AgentHookContext
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
     call_count = {"n": 0}
@@ -1094,7 +1094,7 @@ async def test_length_recovery_streaming_calls_on_stream_end_with_resuming():
 @pytest.mark.asyncio
 async def test_length_recovery_gives_up_after_max_retries():
     """After _MAX_LENGTH_RECOVERIES attempts the runner should stop retrying."""
-    from medpilot.agent.runner import AgentRunSpec, AgentRunner, _MAX_LENGTH_RECOVERIES
+    from mira_engine.agent.runner import AgentRunSpec, AgentRunner, _MAX_LENGTH_RECOVERIES
 
     provider = MagicMock()
     call_count = {"n": 0}
@@ -1132,7 +1132,7 @@ async def test_length_recovery_gives_up_after_max_retries():
 @pytest.mark.asyncio
 async def test_backfill_missing_tool_results_inserts_error():
     """Orphaned tool_use (no matching tool_result) should get a synthetic error."""
-    from medpilot.agent.runner import AgentRunner, _BACKFILL_CONTENT
+    from mira_engine.agent.runner import AgentRunner, _BACKFILL_CONTENT
 
     messages = [
         {"role": "user", "content": "hi"},
@@ -1158,7 +1158,7 @@ async def test_backfill_missing_tool_results_inserts_error():
 @pytest.mark.asyncio
 async def test_backfill_noop_when_complete():
     """Complete message chains should not be modified."""
-    from medpilot.agent.runner import AgentRunner
+    from mira_engine.agent.runner import AgentRunner
 
     messages = [
         {"role": "user", "content": "hi"},
@@ -1184,7 +1184,7 @@ async def test_backfill_noop_when_complete():
 @pytest.mark.asyncio
 async def test_microcompact_replaces_old_tool_results():
     """Tool results beyond _MICROCOMPACT_KEEP_RECENT should be summarized."""
-    from medpilot.agent.runner import AgentRunner, _MICROCOMPACT_KEEP_RECENT
+    from mira_engine.agent.runner import AgentRunner, _MICROCOMPACT_KEEP_RECENT
 
     total = _MICROCOMPACT_KEEP_RECENT + 5
     long_content = "x" * 600
@@ -1212,7 +1212,7 @@ async def test_microcompact_replaces_old_tool_results():
 @pytest.mark.asyncio
 async def test_microcompact_preserves_short_results():
     """Short tool results (< _MICROCOMPACT_MIN_CHARS) should not be replaced."""
-    from medpilot.agent.runner import AgentRunner, _MICROCOMPACT_KEEP_RECENT
+    from mira_engine.agent.runner import AgentRunner, _MICROCOMPACT_KEEP_RECENT
 
     total = _MICROCOMPACT_KEEP_RECENT + 5
     messages: list[dict] = []
@@ -1234,7 +1234,7 @@ async def test_microcompact_preserves_short_results():
 @pytest.mark.asyncio
 async def test_microcompact_skips_non_compactable_tools():
     """Non-compactable tools (e.g. 'message') should never be replaced."""
-    from medpilot.agent.runner import AgentRunner, _MICROCOMPACT_KEEP_RECENT
+    from mira_engine.agent.runner import AgentRunner, _MICROCOMPACT_KEEP_RECENT
 
     total = _MICROCOMPACT_KEEP_RECENT + 5
     long_content = "y" * 1000

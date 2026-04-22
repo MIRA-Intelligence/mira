@@ -43,20 +43,20 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: python -m build
 
-      - name: Build standalone medpilot-agent executable
-        run: pyinstaller --onefile --name medpilot-agent scripts/medpilot_agent_entry.py
+      - name: Build standalone mira-engine executable
+        run: pyinstaller --onefile --name mira-engine scripts/mira_engine_entry.py
 
       - name: Collect release artifacts
         shell: bash
         run: |
           mkdir -p release-artifacts
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp dist/medpilot-agent.exe release-artifacts/medpilot-agent-windows-x86_64.exe
+            cp dist/mira-engine.exe release-artifacts/mira-engine-windows-x86_64.exe
           elif [ "${{ matrix.os }}" = "macos-latest" ]; then
             ARCH="$(uname -m)"
-            cp dist/medpilot-agent release-artifacts/medpilot-agent-macos-${ARCH}
+            cp dist/mira-engine release-artifacts/mira-engine-macos-${ARCH}
           else
-            cp dist/medpilot-agent release-artifacts/medpilot-agent-linux-x86_64
+            cp dist/mira-engine release-artifacts/mira-engine-linux-x86_64
           fi
           if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
             cp dist/*.whl release-artifacts/
@@ -81,7 +81,7 @@ jobs:
       - name: Upload per-OS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: medpilot-agent-${{ matrix.os }}
+          name: mira-engine-${{ matrix.os }}
           path: release-artifacts/*
 
   publish-pypi:
@@ -96,7 +96,7 @@ jobs:
       - name: Download linux artifacts
         uses: actions/download-artifact@v4
         with:
-          name: medpilot-agent-ubuntu-latest
+          name: mira-engine-ubuntu-latest
           path: pypi-artifacts
 
       - name: Keep only package files
@@ -123,7 +123,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: medpilot-agent-*
+          pattern: mira-engine-*
           merge-multiple: true
           path: release-assets
 

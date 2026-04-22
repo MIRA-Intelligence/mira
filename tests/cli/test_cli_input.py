@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from prompt_toolkit.formatted_text import HTML
 
-from medpilot.cli import commands
-from medpilot.cli import stream as stream_mod
+from mira_engine.cli import commands
+from mira_engine.cli import stream as stream_mod
 
 
 @pytest.fixture
@@ -13,8 +13,8 @@ def mock_prompt_session():
     """Mock the global prompt session."""
     mock_session = MagicMock()
     mock_session.prompt_async = AsyncMock()
-    with patch("medpilot.cli.commands._PROMPT_SESSION", mock_session), \
-         patch("medpilot.cli.commands.patch_stdout"):
+    with patch("mira_engine.cli.commands._PROMPT_SESSION", mock_session), \
+         patch("mira_engine.cli.commands.patch_stdout"):
         yield mock_session
 
 
@@ -45,8 +45,8 @@ def test_init_prompt_session_creates_session():
     # Ensure global is None before test
     commands._PROMPT_SESSION = None
     
-    with patch("medpilot.cli.commands.PromptSession") as MockSession, \
-         patch("medpilot.cli.commands.FileHistory") as MockHistory, \
+    with patch("mira_engine.cli.commands.PromptSession") as MockSession, \
+         patch("mira_engine.cli.commands.FileHistory") as MockHistory, \
          patch("pathlib.Path.home") as mock_home:
         
         mock_home.return_value = MagicMock()
@@ -109,7 +109,7 @@ async def test_print_interactive_progress_line_pauses_spinner_before_printing():
     async def fake_print(_text: str) -> None:
         order.append("print")
 
-    with patch("medpilot.cli.commands._print_interactive_line", side_effect=fake_print):
+    with patch("mira_engine.cli.commands._print_interactive_line", side_effect=fake_print):
         thinking = stream_mod.ThinkingSpinner(console=mock_console)
         with thinking:
             await commands._print_interactive_progress_line("tool running", thinking)
@@ -119,7 +119,7 @@ async def test_print_interactive_progress_line_pauses_spinner_before_printing():
 
 def test_response_renderable_uses_text_for_explicit_plain_rendering():
     status = (
-        "🐈 medpilot v0.1.4.post5\n"
+        "🐈 mira v0.1.4.post5\n"
         "🧠 Model: MiniMax-M2.7\n"
         "📊 Tokens: 20639 in / 29 out"
     )
@@ -140,7 +140,7 @@ def test_response_renderable_preserves_normal_markdown_rendering():
 
 
 def test_response_renderable_without_metadata_keeps_markdown_path():
-    help_text = "🐈 medpilot commands:\n/status — Show bot status\n/help — Show available commands"
+    help_text = "🐈 mira commands:\n/status — Show bot status\n/help — Show available commands"
 
     renderable = commands._response_renderable(help_text, render_markdown=True)
 

@@ -8,12 +8,12 @@ from unittest.mock import patch
 
 import pytest
 
-from medpilot.session.manager import Session, SessionManager
+from mira_engine.session.manager import Session, SessionManager
 
 
 @pytest.fixture
 def manager(tmp_path: Path) -> SessionManager:
-    with patch("medpilot.session.manager.get_legacy_sessions_dir", return_value=tmp_path / "legacy"):
+    with patch("mira_engine.session.manager.get_legacy_sessions_dir", return_value=tmp_path / "legacy"):
         return SessionManager(tmp_path)
 
 
@@ -148,7 +148,7 @@ def test_legacy_session_migrated(tmp_path: Path) -> None:
     legacy_dir = tmp_path / "legacy"
     legacy_dir.mkdir()
 
-    with patch("medpilot.session.manager.get_legacy_sessions_dir", return_value=legacy_dir):
+    with patch("mira_engine.session.manager.get_legacy_sessions_dir", return_value=legacy_dir):
         mgr = SessionManager(tmp_path)
 
     safe_key = "cli_migrate"

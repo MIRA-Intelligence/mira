@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from medpilot.agent.memory import MemoryStore
+from mira_engine.agent.memory import MemoryStore
 
 
 @pytest.fixture

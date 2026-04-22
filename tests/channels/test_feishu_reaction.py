@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from medpilot.bus.queue import MessageBus
-from medpilot.channels.feishu import FeishuChannel, FeishuConfig, _FeishuStreamBuf
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.feishu import FeishuChannel, FeishuConfig, _FeishuStreamBuf
 
 
 def _make_channel() -> FeishuChannel:

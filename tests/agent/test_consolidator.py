@@ -4,7 +4,7 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from medpilot.agent.memory import Consolidator, MemoryStore
+from mira_engine.agent.memory import Consolidator, MemoryStore
 
 
 @pytest.fixture
