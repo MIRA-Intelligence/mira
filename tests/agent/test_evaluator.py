@@ -1,7 +1,7 @@
 import pytest
 
-from medpilot.utils.evaluator import evaluate_response
-from medpilot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.utils.evaluator import evaluate_response
+from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
 class DummyProvider(LLMProvider):

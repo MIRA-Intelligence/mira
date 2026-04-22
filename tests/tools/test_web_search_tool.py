@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from medpilot.agent.tools.web import WebSearchTool
-from medpilot.config.schema import WebSearchConfig
+from mira_engine.agent.tools.web import WebSearchTool
+from mira_engine.config.schema import WebSearchConfig
 
 
 def _tool(provider: str = "brave", api_key: str = "", base_url: str = "") -> WebSearchTool:
@@ -33,13 +33,13 @@ async def test_brave_search(monkeypatch):
         assert "brave" in url
         assert kw["headers"]["X-Subscription-Token"] == "brave-key"
         return _response(json={
-            "web": {"results": [{"title": "MedPilot", "url": "https://example.com", "description": "AI assistant"}]}
+            "web": {"results": [{"title": "Mira", "url": "https://example.com", "description": "AI assistant"}]}
         })
 
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
     tool = _tool(provider="brave", api_key="brave-key")
-    result = await tool.execute(query="medpilot", count=1)
-    assert "MedPilot" in result
+    result = await tool.execute(query="mira", count=1)
+    assert "Mira" in result
     assert "https://example.com" in result
 
 
@@ -82,8 +82,8 @@ async def test_duckduckgo_search(monkeypatch):
         def text(self, query, max_results=5):
             return [{"title": "DDG Result", "href": "https://ddg.example", "body": "From DuckDuckGo"}]
 
-    monkeypatch.setattr("medpilot.agent.tools.web.DDGS", MockDDGS, raising=False)
-    import medpilot.agent.tools.web as web_mod
+    monkeypatch.setattr("mira_engine.agent.tools.web.DDGS", MockDDGS, raising=False)
+    import mira_engine.agent.tools.web as web_mod
     monkeypatch.setattr(web_mod, "DDGS", MockDDGS, raising=False)
     _install_mock_ddgs(monkeypatch, MockDDGS)
 

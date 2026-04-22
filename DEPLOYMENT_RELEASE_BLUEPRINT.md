@@ -1,11 +1,11 @@
-# MedPilot 发布与部署蓝图（可落地版）
+# Mira 发布与部署蓝图（可落地版）
 
 ## 1. 目标形态（北极星）
 
-- 普通用户默认走 `Web Hosted`：`app.medpilot.ai`，零安装。
+- 普通用户默认走 `Web Hosted`：`app.mira.ai`，零安装。
 - 需要本地/隐私的用户走 `Desktop` 一体包：安装一个 App，内部可切换 Cloud / Local Agent。
 - 开发者与机构用户走 `Self-hosted`：`docker compose` 一键起服务。
-- `MedPilot` 与 `MedPilotUI` 继续独立开发、独立测试、独立发版，但通过兼容矩阵绑定成“组合发行版”。
+- `Mira` 与 `MiraUI` 继续独立开发、独立测试、独立发版，但通过兼容矩阵绑定成“组合发行版”。
 
 ## 2. 三条发布通道（对外产品）
 
@@ -19,10 +19,10 @@
 
 | Repo | 主要职责 | 必发产物 |
 |---|---|---|
-| `MedPilot` | Agent 核心能力、API、任务执行 | PyPI 包、Docker 镜像、OpenAPI 规范 |
-| `MedPilotUI` | 前端交互、桌面壳、连接管理 | Web 静态构建、桌面安装包 |
+| `Mira` | Agent 核心能力、API、任务执行 | PyPI 包、Docker 镜像、OpenAPI 规范 |
+| `MiraUI` | 前端交互、桌面壳、连接管理 | Web 静态构建、桌面安装包 |
 
-建议新增一个轻量“编排层”（可新 repo：`medpilot-release`，也可放在 UI repo）：
+建议新增一个轻量“编排层”（可新 repo：`mira-release`，也可放在 UI repo）：
 
 - 维护 `compatibility.json`（UI 版本与 Agent 版本映射）
 - 维护自托管模板 `docker-compose.yml`
@@ -30,8 +30,8 @@
 
 ## 4. 版本与兼容策略（关键）
 
-- `MedPilot`：语义化版本（例如 `1.6.0`）
-- `MedPilotUI`：语义化版本（例如 `2.3.0`）
+- `Mira`：语义化版本（例如 `1.6.0`）
+- `MiraUI`：语义化版本（例如 `2.3.0`）
 - 对外定义“发行列车版本”（例如 `2026.04`），对应一组兼容组合
 
 建议增加兼容清单文件：`compatibility.json`
@@ -55,15 +55,15 @@ UI 启动时先校验版本兼容；不兼容时提示自动升级或一键修�
 
 ## 5. CI/CD 蓝图（可直接建 workflow）
 
-### 5.1 `MedPilot` CI/CD
+### 5.1 `Mira` CI/CD
 
 - PR：单元测试 + contract test（OpenAPI）
 - Tag（`v*`）：
-  - 构建并推送 `ghcr.io/<org>/medpilot-agent:<tag>` 与 `:latest`
-  - 发布 PyPI（`medpilot-agent`）
+  - 构建并推送 `ghcr.io/<org>/mira-engine:<tag>` 与 `:latest`
+  - 发布 PyPI（`mira-engine`）
   - 上传 `openapi.json` 到 Release artifact
 
-### 5.2 `MedPilotUI` CI/CD
+### 5.2 `MiraUI` CI/CD
 
 - PR：单元测试 + e2e（mock agent）
 - Tag（`v*`）：
@@ -71,7 +71,7 @@ UI 启动时先校验版本兼容；不兼容时提示自动升级或一键修�
   - 构建 Desktop（mac/win/linux）
   - 生成 auto-update 元数据（stable/beta channel）
 
-### 5.3 组合发布（`medpilot-release`）
+### 5.3 组合发布（`mira-release`）
 
 - 手动触发 `release_train`
   - 读取指定 UI tag + Agent tag
@@ -100,7 +100,7 @@ UI 启动时先校验版本兼容；不兼容时提示自动升级或一键修�
 目标：替代 `tmux + python gateway`，让普通用户不需要理解终端和进程管理。
 
 - 交付形态：
-  - 一个可执行的 `medpilot-engine`（由 Python 打包而来）
+  - 一个可执行的 `mira-engine`（由 Python 打包而来）
   - 一个用户态服务（开机自启、异常拉起、统一日志）
 - 服务托管方式：
   - macOS：`launchd`
@@ -111,23 +111,23 @@ UI 启动时先校验版本兼容；不兼容时提示自动升级或一键修�
   - Desktop 负责“探活 + 版本检查 + 引导升级”
   - Engine 负责真实任务执行，UI 不直接管理 Python 环境
 
-建议定义 `medpilot-agent` CLI（用于安装与运维）：
+建议定义 `mira-engine` CLI（用于安装与运维）：
 
 ```bash
-medpilot-agent install-service
-medpilot-agent start
-medpilot-agent stop
-medpilot-agent status
-medpilot-agent logs
-medpilot-agent doctor
-medpilot-agent uninstall-service
+mira-engine install-service
+mira-engine start
+mira-engine stop
+mira-engine status
+mira-engine logs
+mira-engine doctor
+mira-engine uninstall-service
 ```
 
 目录与运维约定（建议）：
 
-- 配置目录：`~/.medpilot/config/`
-- 数据目录：`~/.medpilot/data/`
-- 日志目录：`~/.medpilot/logs/`
+- 配置目录：`~/.mira/config/`
+- 数据目录：`~/.mira/data/`
+- 日志目录：`~/.mira/logs/`
 - 端口约定：默认 `127.0.0.1:46321`（可配置）
 - 健康检查：`GET /health`
 - 版本检查：`GET /version`
@@ -148,8 +148,8 @@ medpilot-agent uninstall-service
 
 提供官方 `docker-compose.yml`（最小可用）：
 
-- `medpilot-agent`
-- `medpilot-ui`（或 nginx 托管前端）
+- `mira-engine`
+- `mira-ui`（或 nginx 托管前端）
 
 并文档化三条基础命令：
 
@@ -158,7 +158,7 @@ cp .env.example .env
 docker compose pull
 docker compose up -d
 ```
-建议补充 `medpilot doctor`（脚本或 CLI）做环境检查，降低支持成本。
+建议补充 `mira doctor`（脚本或 CLI）做环境检查，降低支持成本。
 
 
 ---
@@ -179,11 +179,11 @@ docker compose up -d
 
 ### A3. 交付与运维
 
-- [ ] `medpilot-agent` CLI（install-service/start/stop/status/logs/doctor）
+- [ ] `mira-engine` CLI（install-service/start/stop/status/logs/doctor）
 - [ ] 三平台服务注册脚本（launchd/systemd user/Windows Service）
 - [ ] 本地引擎升级器（与 `compatibility.json` 联动）
 - [ ] 自托管 `docker-compose.yml` 与 `.env.example`
-- [ ] `medpilot doctor` 环境诊断工具
+- [ ] `mira doctor` 环境诊断工具
 - [ ] 回滚手册与值班排障手册
 
 ## 附录 B：决策记录（可持续补充）
@@ -191,5 +191,5 @@ docker compose up -d
 - Desktop 技术栈：`Electron`
 - 本地引擎默认方式：系统服务（非 Docker）
 - Docker 定位：高级/企业自托管可选项，不作为普通用户默认入口
-- 是否新建 `medpilot-release` repo：待评估（可先放 `MedPilotUI`）
+- 是否新建 `mira-release` repo：待评估（可先放 `MiraUI`）
 

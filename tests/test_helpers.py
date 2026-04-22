@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 import pytest
 
-from medpilot.utils import helpers
-from medpilot.utils.helpers import (
+from mira_engine.utils import helpers
+from mira_engine.utils.helpers import (
     detect_image_mime,
     ensure_dir,
     safe_filename,

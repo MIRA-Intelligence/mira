@@ -3,21 +3,21 @@ set -euo pipefail
 
 # Run scoped coverage for core modules (providers excluded by design).
 python -m pytest tests -q \
-  --cov=medpilot.agent.loop \
-  --cov=medpilot.agent.context \
-  --cov=medpilot.agent.memory \
-  --cov=medpilot.agent.routing \
-  --cov=medpilot.agent.tools.base \
-  --cov=medpilot.agent.tools.filesystem \
-  --cov=medpilot.agent.tools.shell \
-  --cov=medpilot.agent.tools.web \
-  --cov=medpilot.agent.tools.message \
-  --cov=medpilot.agent.tools.registry \
-  --cov=medpilot.agent.tools.spawn \
-  --cov=medpilot.agent.tools.cron \
-  --cov=medpilot.channels.manager \
-  --cov=medpilot.channels.web \
-  --cov=medpilot.config.loader \
-  --cov=medpilot.config.schema \
+  --cov=mira_engine.agent.loop \
+  --cov=mira_engine.agent.context \
+  --cov=mira_engine.agent.memory \
+  --cov=mira_engine.agent.routing \
+  --cov=mira_engine.agent.tools.base \
+  --cov=mira_engine.agent.tools.filesystem \
+  --cov=mira_engine.agent.tools.shell \
+  --cov=mira_engine.agent.tools.web \
+  --cov=mira_engine.agent.tools.message \
+  --cov=mira_engine.agent.tools.registry \
+  --cov=mira_engine.agent.tools.spawn \
+  --cov=mira_engine.agent.tools.cron \
+  --cov=mira_engine.channels.manager \
+  --cov=mira_engine.channels.web \
+  --cov=mira_engine.config.loader \
+  --cov=mira_engine.config.schema \
   --cov-report=term-missing \
   --cov-report=xml:coverage-core.xml

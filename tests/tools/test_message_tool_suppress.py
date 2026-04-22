@@ -5,11 +5,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from medpilot.agent.loop import AgentLoop
-from medpilot.agent.tools.message import MessageTool
-from medpilot.bus.events import InboundMessage, OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.providers.base import LLMResponse, ToolCallRequest
+from mira_engine.agent.loop import AgentLoop
+from mira_engine.agent.tools.message import MessageTool
+from mira_engine.bus.events import InboundMessage, OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.providers.base import LLMResponse, ToolCallRequest
 
 
 def _make_loop(tmp_path: Path) -> AgentLoop:

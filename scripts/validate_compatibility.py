@@ -84,7 +84,7 @@ def validate_file(path: Path) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate MedPilot compatibility.json")
+    parser = argparse.ArgumentParser(description="Validate Mira compatibility.json")
     parser.add_argument(
         "--file",
         type=Path,

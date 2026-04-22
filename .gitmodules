@@ -1,4 +1,4 @@
 [submodule "UI"]
 	path = UI
-	url = git@github.com:Project-MedPilot/MedPilotUI.git
+	url = git@github.com:MIRA-Intelligence/mira-ui.git
 	branch = dev

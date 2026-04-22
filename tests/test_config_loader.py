@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from medpilot.config import loader
-from medpilot.config.schema import Config
+from mira_engine.config import loader
+from mira_engine.config.schema import Config
 
 
 def test_get_and_set_config_path(tmp_path: Path, monkeypatch) -> None:
@@ -16,16 +16,16 @@ def test_get_and_set_config_path(tmp_path: Path, monkeypatch) -> None:
 
 def test_get_config_path_falls_back_to_default(monkeypatch) -> None:
     monkeypatch.setattr(loader, "_current_config_path", None)
-    monkeypatch.delenv("MEDPILOT_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("MIRA_CONFIG_PATH", raising=False)
     path = loader.get_config_path()
     assert path.name == "config.json"
-    assert path.parent.name == ".medpilot"
+    assert path.parent.name == ".mira"
 
 
 def test_get_config_path_uses_env_override(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(loader, "_current_config_path", None)
     custom = tmp_path / "custom-config.json"
-    monkeypatch.setenv("MEDPILOT_CONFIG_PATH", str(custom))
+    monkeypatch.setenv("MIRA_CONFIG_PATH", str(custom))
     assert loader.get_config_path() == custom
 
 

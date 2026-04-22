@@ -31,7 +31,7 @@ jobs:
       run: uv sync --all-extras
 
     - name: Lint with ruff
-      run: uv run ruff check medpilot --select F401,F841
+      run: uv run ruff check mira_engine --select F401,F841
 
     - name: Run tests
       run: uv run pytest tests/

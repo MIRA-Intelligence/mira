@@ -9,14 +9,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from medpilot.bus.events import InboundMessage, OutboundMessage
-from medpilot.providers.base import LLMResponse
+from mira_engine.bus.events import InboundMessage, OutboundMessage
+from mira_engine.providers.base import LLMResponse
 
 
 def _make_loop():
     """Create a minimal AgentLoop with mocked dependencies."""
-    from medpilot.agent.loop import AgentLoop
-    from medpilot.bus.queue import MessageBus
+    from mira_engine.agent.loop import AgentLoop
+    from mira_engine.bus.queue import MessageBus
 
     bus = MessageBus()
     provider = MagicMock()
@@ -24,9 +24,9 @@ def _make_loop():
     workspace = MagicMock()
     workspace.__truediv__ = MagicMock(return_value=MagicMock())
 
-    with patch("medpilot.agent.loop.ContextBuilder"), \
-         patch("medpilot.agent.loop.SessionManager"), \
-         patch("medpilot.agent.loop.SubagentManager"):
+    with patch("mira_engine.agent.loop.ContextBuilder"), \
+         patch("mira_engine.agent.loop.SessionManager"), \
+         patch("mira_engine.agent.loop.SubagentManager"):
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
     return loop, bus
 
@@ -35,9 +35,9 @@ class TestRestartCommand:
 
     @pytest.mark.asyncio
     async def test_restart_sends_message_and_calls_execv(self):
-        from medpilot.command.builtin import cmd_restart
-        from medpilot.command.router import CommandContext
-        from medpilot.utils.restart import (
+        from mira_engine.command.builtin import cmd_restart
+        from mira_engine.command.router import CommandContext
+        from mira_engine.utils.restart import (
             RESTART_NOTIFY_CHANNEL_ENV,
             RESTART_NOTIFY_CHAT_ID_ENV,
             RESTART_STARTED_AT_ENV,
@@ -48,7 +48,7 @@ class TestRestartCommand:
         ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/restart", loop=loop)
 
         with patch.dict(os.environ, {}, clear=False), \
-             patch("medpilot.command.builtin.os.execv") as mock_execv:
+             patch("mira_engine.command.builtin.os.execv") as mock_execv:
             out = await cmd_restart(ctx)
             assert "Restarting" in out.content
             assert os.environ.get(RESTART_NOTIFY_CHANNEL_ENV) == "cli"
@@ -65,7 +65,7 @@ class TestRestartCommand:
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/restart")
 
         with patch.object(loop, "_dispatch", new_callable=AsyncMock) as mock_dispatch, \
-             patch("medpilot.command.builtin.os.execv"):
+             patch("mira_engine.command.builtin.os.execv"):
             await bus.publish_inbound(msg)
 
             loop._running = True
@@ -103,7 +103,7 @@ class TestRestartCommand:
 
             mock_dispatch.assert_not_called()
             out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-            assert "medpilot" in out.content.lower() or "Model" in out.content
+            assert "mira" in out.content.lower() or "Model" in out.content
 
     @pytest.mark.asyncio
     async def test_run_propagates_external_cancellation(self):

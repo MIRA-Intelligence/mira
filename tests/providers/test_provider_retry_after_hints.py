@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 
-from medpilot.providers.anthropic_provider import AnthropicProvider
-from medpilot.providers.azure_openai_provider import AzureOpenAIProvider
-from medpilot.providers.openai_compat_provider import OpenAICompatProvider
+from mira_engine.providers.anthropic_provider import AnthropicProvider
+from mira_engine.providers.azure_openai_provider import AzureOpenAIProvider
+from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
 
 
 def test_openai_compat_error_captures_retry_after_from_headers() -> None:

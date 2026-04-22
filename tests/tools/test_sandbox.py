@@ -1,10 +1,10 @@
-"""Tests for medpilot.agent.tools.sandbox."""
+"""Tests for mira_engine.agent.tools.sandbox."""
 
 import shlex
 
 import pytest
 
-from medpilot.agent.tools.sandbox import wrap_command
+from mira_engine.agent.tools.sandbox import wrap_command
 
 
 def _parse(cmd: str) -> list[str]:
@@ -97,7 +97,7 @@ class TestBwrapBackend:
         fake_media = tmp_path / "media"
         fake_media.mkdir()
         monkeypatch.setattr(
-            "medpilot.agent.tools.sandbox.get_media_dir",
+            "mira_engine.agent.tools.sandbox.get_media_dir",
             lambda: fake_media,
         )
         ws = str(tmp_path / "project")

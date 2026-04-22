@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from medpilot.agent.tools.spawn import SpawnTool
+from mira_engine.agent.tools.spawn import SpawnTool
 
 
 class _FakeManager:

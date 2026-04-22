@@ -5,12 +5,12 @@ from __future__ import annotations
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from medpilot.utils.searchusage import (
+from mira_engine.utils.searchusage import (
     SearchUsageInfo,
     _parse_tavily_usage,
     fetch_search_usage,
 )
-from medpilot.utils.helpers import build_status_content
+from mira_engine.utils.helpers import build_status_content
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +281,7 @@ class TestBuildStatusContentWithSearchUsage:
         usage_text = "🔍 Web Search: duckduckgo\n   Usage tracking: not available"
         content = build_status_content(**self._BASE_KWARGS, search_usage_text=usage_text)
         # Original fields must still be present
-        assert "medpilot v0.1.0" in content
+        assert "mira v0.1.0" in content
         assert "claude-opus-4-5" in content
         assert "1000 in / 200 out" in content
         # New field appended

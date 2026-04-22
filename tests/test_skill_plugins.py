@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from medpilot.agent.skill_plugins import SkillPluginError, SkillPluginManager
-from medpilot.agent import skill_plugins as skill_plugins_mod
+from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
+from mira_engine.agent import skill_plugins as skill_plugins_mod
 
 
 def _write_skill(base: Path, name: str, body: str = "# skill\n") -> None:

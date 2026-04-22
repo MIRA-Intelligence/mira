@@ -90,7 +90,7 @@ export class WhatsAppClient {
       version,
       logger,
       printQRInTerminal: false,
-      browser: ['medpilot', 'cli', VERSION],
+      browser: ['mira', 'cli', VERSION],
       syncFullHistory: false,
       markOnlineOnConnect: false,
     });

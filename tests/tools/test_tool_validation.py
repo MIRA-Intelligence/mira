@@ -3,7 +3,7 @@ import subprocess
 import sys
 from typing import Any
 
-from medpilot.agent.tools import (
+from mira_engine.agent.tools import (
     ArraySchema,
     IntegerSchema,
     ObjectSchema,
@@ -12,9 +12,9 @@ from medpilot.agent.tools import (
     tool_parameters,
     tool_parameters_schema,
 )
-from medpilot.agent.tools.base import Tool
-from medpilot.agent.tools.registry import ToolRegistry
-from medpilot.agent.tools.shell import ExecTool
+from mira_engine.agent.tools.base import Tool
+from mira_engine.agent.tools.registry import ToolRegistry
+from mira_engine.agent.tools.shell import ExecTool
 
 
 class SampleTool(Tool):
@@ -226,28 +226,28 @@ def test_exec_extract_absolute_paths_captures_posix_absolute_paths() -> None:
 
 
 def test_exec_extract_absolute_paths_captures_home_paths() -> None:
-    cmd = "cat ~/.medpilot/config.json > ~/out.txt"
+    cmd = "cat ~/.mira/config.json > ~/out.txt"
     paths = ExecTool._extract_absolute_paths(cmd)
-    assert "~/.medpilot/config.json" in paths
+    assert "~/.mira/config.json" in paths
     assert "~/out.txt" in paths
 
 
 def test_exec_extract_absolute_paths_captures_quoted_paths() -> None:
-    cmd = 'cat "/tmp/data.txt" "~/.medpilot/config.json"'
+    cmd = 'cat "/tmp/data.txt" "~/.mira/config.json"'
     paths = ExecTool._extract_absolute_paths(cmd)
     assert "/tmp/data.txt" in paths
-    assert "~/.medpilot/config.json" in paths
+    assert "~/.mira/config.json" in paths
 
 
 def test_exec_guard_blocks_home_path_outside_workspace(tmp_path) -> None:
     tool = ExecTool(restrict_to_workspace=True)
-    error = tool._guard_command("cat ~/.medpilot/config.json", str(tmp_path))
+    error = tool._guard_command("cat ~/.mira/config.json", str(tmp_path))
     assert error == "Error: Command blocked by safety guard (path outside working dir)"
 
 
 def test_exec_guard_blocks_quoted_home_path_outside_workspace(tmp_path) -> None:
     tool = ExecTool(restrict_to_workspace=True)
-    error = tool._guard_command('cat "~/.medpilot/config.json"', str(tmp_path))
+    error = tool._guard_command('cat "~/.mira/config.json"', str(tmp_path))
     assert error == "Error: Command blocked by safety guard (path outside working dir)"
 
 
@@ -257,7 +257,7 @@ def test_exec_guard_allows_media_path_outside_workspace(tmp_path, monkeypatch) -
     media_file = media_dir / "photo.jpg"
     media_file.write_text("ok", encoding="utf-8")
 
-    monkeypatch.setattr("medpilot.agent.tools.shell.get_media_dir", lambda: media_dir)
+    monkeypatch.setattr("mira_engine.agent.tools.shell.get_media_dir", lambda: media_dir)
 
     tool = ExecTool(restrict_to_workspace=True)
     error = tool._guard_command(f'cat "{media_file}"', str(tmp_path / "workspace"))
@@ -265,7 +265,7 @@ def test_exec_guard_allows_media_path_outside_workspace(tmp_path, monkeypatch) -
 
 
 def test_exec_guard_blocks_windows_drive_root_outside_workspace(monkeypatch) -> None:
-    import medpilot.agent.tools.shell as shell_mod
+    import mira_engine.agent.tools.shell as shell_mod
 
     class FakeWindowsPath:
         def __init__(self, raw: str) -> None:

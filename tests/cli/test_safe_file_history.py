@@ -3,7 +3,7 @@
 Surrogate characters in CLI input must not crash history file writes.
 """
 
-from medpilot.cli.commands import SafeFileHistory
+from mira_engine.cli.commands import SafeFileHistory
 
 
 class TestSafeFileHistory:
@@ -25,9 +25,9 @@ class TestSafeFileHistory:
 
     def test_emoji_preserved(self, tmp_path):
         hist = SafeFileHistory(str(tmp_path / "history"))
-        hist.store_string("hello 🐈 medpilot")
+        hist.store_string("hello 🐈 mira")
         entries = list(hist.load_history_strings())
-        assert entries[0] == "hello 🐈 medpilot"
+        assert entries[0] == "hello 🐈 mira"
 
     def test_mixed_unicode_preserved(self, tmp_path):
         """CJK + emoji + latin should all pass through cleanly."""

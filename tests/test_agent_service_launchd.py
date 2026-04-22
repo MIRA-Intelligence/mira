@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from medpilot.cli.agent_service import (
+from mira_engine.cli.agent_service import (
     EXIT_OK,
     LAUNCHD_LABEL,
     AgentPaths,
@@ -25,7 +25,7 @@ def test_launchd_install_writes_plist_and_bootstraps(monkeypatch, tmp_path):
         calls.append(cmd)
         return _fake_completed(returncode=0)
 
-    monkeypatch.setattr("medpilot.cli.agent_service.subprocess.run", fake_run)
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
     manager = LaunchdServiceManager(AgentPaths.default())
 
     code, _ = manager.install_service()
@@ -48,7 +48,7 @@ def test_launchd_status_includes_launchd_metadata(monkeypatch, tmp_path):
             return _fake_completed(returncode=0)
         return _fake_completed(returncode=0)
 
-    monkeypatch.setattr("medpilot.cli.agent_service.subprocess.run", fake_run)
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
     manager = LaunchdServiceManager(AgentPaths.default())
     manager.install_service()
 

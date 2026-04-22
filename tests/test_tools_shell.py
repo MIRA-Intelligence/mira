@@ -6,7 +6,7 @@ import shlex
 import subprocess
 import sys
 
-from medpilot.agent.tools.shell import ExecTool
+from mira_engine.agent.tools.shell import ExecTool
 
 
 def _python_script_command(script_path: Path) -> str:

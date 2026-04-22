@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from medpilot.agent.tools.base import Tool
-from medpilot.agent.tools.registry import ToolRegistry
+from mira_engine.agent.tools.base import Tool
+from mira_engine.agent.tools.registry import ToolRegistry
 
 
 class _EchoTool(Tool):

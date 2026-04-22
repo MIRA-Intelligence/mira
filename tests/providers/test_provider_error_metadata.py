@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-from medpilot.providers.anthropic_provider import AnthropicProvider
-from medpilot.providers.openai_compat_provider import OpenAICompatProvider
+from mira_engine.providers.anthropic_provider import AnthropicProvider
+from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
 
 
 def _fake_response(

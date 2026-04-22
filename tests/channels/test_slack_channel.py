@@ -8,10 +8,10 @@ try:
 except ImportError:
     pytest.skip("Slack dependencies not installed (slack-sdk)", allow_module_level=True)
 
-from medpilot.bus.events import OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.channels.slack import SlackChannel
-from medpilot.channels.slack import SlackConfig
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.slack import SlackChannel
+from mira_engine.channels.slack import SlackConfig
 
 
 class _FakeAsyncWebClient:

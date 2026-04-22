@@ -6,18 +6,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from medpilot.agent.context import ContextBuilder
-from medpilot.agent.loop import AgentLoop
-from medpilot.agent.routing import RoutedModel
-from medpilot.agent.tools.base import Tool
-from medpilot.agent.tools.message import MessageTool
-from medpilot.agent.tools.registry import ToolRegistry
-from medpilot.bus.events import InboundMessage, OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.config.schema import ChannelsConfig, ExecToolConfig
-from medpilot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from medpilot.session.manager import Session, SessionManager
-from medpilot.agent.tools.filesystem import _resolve_path
+from mira_engine.agent.context import ContextBuilder
+from mira_engine.agent.loop import AgentLoop
+from mira_engine.agent.routing import RoutedModel
+from mira_engine.agent.tools.base import Tool
+from mira_engine.agent.tools.message import MessageTool
+from mira_engine.agent.tools.registry import ToolRegistry
+from mira_engine.bus.events import InboundMessage, OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.config.schema import ChannelsConfig, ExecToolConfig
+from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.session.manager import Session, SessionManager
+from mira_engine.agent.tools.filesystem import _resolve_path
 
 
 class _NoopProvider(LLMProvider):
@@ -101,10 +101,10 @@ def _make_real_loop(tmp_path: Path) -> AgentLoop:
     )
 
 
-def test_restrict_workspace_allows_nested_workspace_medpilot_skills_path(tmp_path: Path) -> None:
+def test_restrict_workspace_allows_nested_workspace_mira_skills_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
-    nested_skills = workspace / ".medpilot" / "skills" / "medical-imaging" / "medical-image-dl-pipeline"
+    nested_skills = workspace / ".mira" / "skills" / "medical-imaging" / "medical-image-dl-pipeline"
     nested_skills.mkdir(parents=True)
     skill_file = nested_skills / "SKILL.md"
     skill_file.write_text("# skill", encoding="utf-8")
@@ -163,8 +163,8 @@ def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
     assert loop._compose_extra_system("", "Guard notice") == "Guard notice"
     assert loop._compose_extra_system(None, None) is None
     project = tmp_path / "PRJ-9"
-    (project / ".medpilot").mkdir(parents=True)
-    (project / ".medpilot" / "project.json").write_text(
+    (project / ".mira").mkdir(parents=True)
+    (project / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "research", "contract_version": 2}),
         encoding="utf-8",
     )
@@ -457,7 +457,7 @@ async def test_dispatch_and_control_handlers(tmp_path: Path) -> None:
     await loop._dispatch(cli_err_msg)
     cli_err = await loop.bus.consume_outbound()
     assert "Sorry, I encountered an error." in cli_err.content
-    assert "medpilot agent --logs" in cli_err.content
+    assert "mira agent --logs" in cli_err.content
 
 
 def test_save_turn_and_project_session_cache(tmp_path: Path) -> None:
@@ -535,7 +535,7 @@ async def test_connect_and_close_mcp_paths(monkeypatch, tmp_path: Path) -> None:
     async def _ok_connect(servers, tools, stack):
         called["count"] += 1
 
-    monkeypatch.setattr("medpilot.agent.tools.mcp.connect_mcp_servers", _ok_connect)
+    monkeypatch.setattr("mira_engine.agent.tools.mcp.connect_mcp_servers", _ok_connect)
     await loop._connect_mcp()
     assert loop._mcp_connected is True
     assert loop._mcp_connecting is False
@@ -550,7 +550,7 @@ async def test_connect_and_close_mcp_paths(monkeypatch, tmp_path: Path) -> None:
     async def _boom_connect(*_args, **_kwargs):
         raise RuntimeError("mcp down")
 
-    monkeypatch.setattr("medpilot.agent.tools.mcp.connect_mcp_servers", _boom_connect)
+    monkeypatch.setattr("mira_engine.agent.tools.mcp.connect_mcp_servers", _boom_connect)
     await loop2._connect_mcp()
     assert loop2._mcp_connected is False
     assert loop2._mcp_connecting is False

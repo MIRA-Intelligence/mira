@@ -1,4 +1,4 @@
-"""Tests for medpilot.agent.skills.SkillsLoader."""
+"""Tests for mira_engine.agent.skills.SkillsLoader."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from medpilot.agent.skills import SkillsLoader
+from mira_engine.agent.skills import SkillsLoader
 
 
 def _write_skill(
@@ -17,12 +17,12 @@ def _write_skill(
     metadata_json: dict | None = None,
     body: str = "# Skill\n",
 ) -> Path:
-    """Create ``base / name / SKILL.md`` with optional medpilot metadata JSON."""
+    """Create ``base / name / SKILL.md`` with optional mira metadata JSON."""
     skill_dir = base / name
     skill_dir.mkdir(parents=True)
     lines = ["---"]
     if metadata_json is not None:
-        payload = json.dumps({"medpilot": metadata_json}, separators=(",", ":"))
+        payload = json.dumps({"mira": metadata_json}, separators=(",", ":"))
         lines.append(f'metadata: {payload}')
     lines.extend(["---", "", body])
     path = skill_dir / "SKILL.md"
@@ -133,17 +133,17 @@ def test_list_skills_filter_unavailable_excludes_unmet_bin_requirement(
     _write_skill(
         skills_root,
         "needs_bin",
-        metadata_json={"requires": {"bins": ["medpilot_test_fake_binary"]}},
+        metadata_json={"requires": {"bins": ["mira_test_fake_binary"]}},
     )
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
     def fake_which(cmd: str) -> str | None:
-        if cmd == "medpilot_test_fake_binary":
+        if cmd == "mira_test_fake_binary":
             return None
         return "/usr/bin/true"
 
-    monkeypatch.setattr("medpilot.agent.skills.shutil.which", fake_which)
+    monkeypatch.setattr("mira_engine.agent.skills.shutil.which", fake_which)
 
     loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
     assert loader.list_skills(filter_unavailable=True) == []
@@ -158,17 +158,17 @@ def test_list_skills_filter_unavailable_includes_when_bin_requirement_met(
     skill_path = _write_skill(
         skills_root,
         "has_bin",
-        metadata_json={"requires": {"bins": ["medpilot_test_fake_binary"]}},
+        metadata_json={"requires": {"bins": ["mira_test_fake_binary"]}},
     )
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
     def fake_which(cmd: str) -> str | None:
-        if cmd == "medpilot_test_fake_binary":
-            return "/fake/medpilot_test_fake_binary"
+        if cmd == "mira_test_fake_binary":
+            return "/fake/mira_test_fake_binary"
         return None
 
-    monkeypatch.setattr("medpilot.agent.skills.shutil.which", fake_which)
+    monkeypatch.setattr("mira_engine.agent.skills.shutil.which", fake_which)
 
     loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
     entries = loader.list_skills(filter_unavailable=True)
@@ -186,12 +186,12 @@ def test_list_skills_filter_unavailable_false_keeps_unmet_requirements(
     skill_path = _write_skill(
         skills_root,
         "blocked",
-        metadata_json={"requires": {"bins": ["medpilot_test_fake_binary"]}},
+        metadata_json={"requires": {"bins": ["mira_test_fake_binary"]}},
     )
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    monkeypatch.setattr("medpilot.agent.skills.shutil.which", lambda _cmd: None)
+    monkeypatch.setattr("mira_engine.agent.skills.shutil.which", lambda _cmd: None)
 
     loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
     entries = loader.list_skills(filter_unavailable=False)
@@ -202,7 +202,7 @@ def test_list_skills_filter_unavailable_false_keeps_unmet_requirements(
 
 def test_list_skills_discovers_nested_workspace_skill_directories(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
-    nested_root = workspace / ".medpilot" / "skills" / "medical-imaging"
+    nested_root = workspace / ".mira" / "skills" / "medical-imaging"
     nested_root.mkdir(parents=True)
     nested_skill = _write_skill(nested_root, "medical-image-dl-pipeline", body="# nested")
     builtin = tmp_path / "builtin"
@@ -226,12 +226,12 @@ def test_list_skills_filter_unavailable_excludes_unmet_env_requirement(
     _write_skill(
         skills_root,
         "needs_env",
-        metadata_json={"requires": {"env": ["MEDPILOT_SKILLS_TEST_ENV_VAR"]}},
+        metadata_json={"requires": {"env": ["MIRA_SKILLS_TEST_ENV_VAR"]}},
     )
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    monkeypatch.delenv("MEDPILOT_SKILLS_TEST_ENV_VAR", raising=False)
+    monkeypatch.delenv("MIRA_SKILLS_TEST_ENV_VAR", raising=False)
 
     loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
     assert loader.list_skills(filter_unavailable=True) == []
@@ -246,7 +246,7 @@ def test_list_skills_openclaw_metadata_parsed_for_requirements(
     skill_dir = skills_root / "openclaw_skill"
     skill_dir.mkdir(parents=True)
     skill_path = skill_dir / "SKILL.md"
-    oc_payload = json.dumps({"openclaw": {"requires": {"bins": ["medpilot_oc_bin"]}}}, separators=(",", ":"))
+    oc_payload = json.dumps({"openclaw": {"requires": {"bins": ["mira_oc_bin"]}}}, separators=(",", ":"))
     skill_path.write_text(
         "\n".join(["---", f"metadata: {oc_payload}", "---", "", "# OC"]),
         encoding="utf-8",
@@ -254,14 +254,14 @@ def test_list_skills_openclaw_metadata_parsed_for_requirements(
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    monkeypatch.setattr("medpilot.agent.skills.shutil.which", lambda _cmd: None)
+    monkeypatch.setattr("mira_engine.agent.skills.shutil.which", lambda _cmd: None)
 
     loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
     assert loader.list_skills(filter_unavailable=True) == []
 
     monkeypatch.setattr(
-        "medpilot.agent.skills.shutil.which",
-        lambda cmd: "/x" if cmd == "medpilot_oc_bin" else None,
+        "mira_engine.agent.skills.shutil.which",
+        lambda cmd: "/x" if cmd == "mira_oc_bin" else None,
     )
     entries = loader.list_skills(filter_unavailable=True)
     assert entries == [
@@ -271,7 +271,7 @@ def test_list_skills_openclaw_metadata_parsed_for_requirements(
 
 def test_suggest_skills_prefers_medical_dl_pipeline_for_medical_imaging_query(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
-    skills_root = workspace / ".medpilot" / "skills" / "medical-imaging"
+    skills_root = workspace / ".mira" / "skills" / "medical-imaging"
     skills_root.mkdir(parents=True)
     _write_skill(
         skills_root,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from medpilot.config.schema import Config
+from mira_engine.config.schema import Config
 
 
 def test_match_provider_respects_forced_provider() -> None:

@@ -2,16 +2,16 @@
 
 > **Note:** This interface is currently an experiment in the latest source code version and is planned to officially ship in `v0.1.5`.
 
-Use medpilot programmatically — load config, run the agent, get results.
+Use mira programmatically — load config, run the agent, get results.
 
 ## Quick Start
 
 ```python
 import asyncio
-from medpilot import MedPilot
+from mira_engine import Mira
 
 async def main():
-    bot = MedPilot.from_config()
+    bot = Mira.from_config()
     result = await bot.run("What time is it in Tokyo?")
     print(result.content)
 
@@ -20,13 +20,13 @@ asyncio.run(main())
 
 ## API
 
-### `MedPilot.from_config(config_path?, *, workspace?)`
+### `Mira.from_config(config_path?, *, workspace?)`
 
-Create a `MedPilot` from a config file.
+Create a `Mira` from a config file.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `config_path` | `str \| Path \| None` | `None` | Path to `config.json`. Defaults to `~/.medpilot/config.json`. |
+| `config_path` | `str \| Path \| None` | `None` | Path to `config.json`. Defaults to `~/.mira/config.json`. |
 | `workspace` | `str \| Path \| None` | `None` | Override workspace directory from config. |
 
 Raises `FileNotFoundError` if an explicit path doesn't exist.
@@ -73,7 +73,7 @@ Subclass `AgentHook` and override any method:
 ### Example: Audit Hook
 
 ```python
-from medpilot.agent import AgentHook, AgentHookContext
+from mira_engine.agent import AgentHook, AgentHookContext
 
 class AuditHook(AgentHook):
     def __init__(self):
@@ -113,8 +113,8 @@ class Censor(AgentHook):
 
 ```python
 import asyncio
-from medpilot import MedPilot
-from medpilot.agent import AgentHook, AgentHookContext
+from mira_engine import Mira
+from mira_engine.agent import AgentHook, AgentHookContext
 
 class TimingHook(AgentHook):
     async def before_iteration(self, ctx: AgentHookContext) -> None:
@@ -127,7 +127,7 @@ class TimingHook(AgentHook):
         print(f"[timing] iteration took {elapsed:.2f}s")
 
 async def main():
-    bot = MedPilot.from_config(workspace="/my/project")
+    bot = Mira.from_config(workspace="/my/project")
     result = await bot.run(
         "Explain the main function",
         hooks=[TimingHook()],

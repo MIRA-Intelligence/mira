@@ -4,11 +4,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from medpilot.bus.events import OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.channels.base import BaseChannel
-from medpilot.channels.manager import ChannelManager
-from medpilot.config.schema import Config
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.base import BaseChannel
+from mira_engine.channels.manager import ChannelManager
+from mira_engine.config.schema import Config
 
 
 class MockChannel(BaseChannel):

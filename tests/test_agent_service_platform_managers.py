@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from medpilot.cli.agent_service import (
+from mira_engine.cli.agent_service import (
     EXIT_OK,
     SYSTEMD_UNIT_NAME,
     WINDOWS_SERVICE_NAME,
@@ -24,7 +24,7 @@ def test_systemd_manager_install_and_status(monkeypatch, tmp_path):
             return _cp(returncode=0, stdout="active\n")
         return _cp(returncode=0)
 
-    monkeypatch.setattr("medpilot.cli.agent_service.subprocess.run", fake_run)
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
     manager = SystemdUserServiceManager(AgentPaths.default())
 
     code, _ = manager.install_service()
@@ -48,7 +48,7 @@ def test_windows_manager_install_and_status(monkeypatch, tmp_path):
             return _cp(returncode=0, stdout="STATE              : 4  RUNNING")
         return _cp(returncode=0)
 
-    monkeypatch.setattr("medpilot.cli.agent_service.subprocess.run", fake_run)
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
     manager = WindowsServiceManager(AgentPaths.default())
 
     code, _ = manager.install_service()
