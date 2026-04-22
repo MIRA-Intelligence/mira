@@ -63,6 +63,14 @@ _MAX_SAVE_MEMORY_ATTEMPTS = 3
 class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
 
+    @staticmethod
+    def _safe_backup_folder_component(name: str) -> str:
+        """Normalize workspace labels for cross-platform backup directory names."""
+        # Windows forbids <>:"/\|?* and control chars, and disallows trailing dots/spaces.
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name)
+        cleaned = re.sub(r"\s+", "_", cleaned).strip(" ._")
+        return cleaned or "workspace"
+
     def __init__(self, workspace: Path, max_history_entries: int = 1000):
         from medpilot.config.paths import get_workspace_path
         import hashlib
@@ -92,7 +100,8 @@ class MemoryStore:
 
         if workspace.resolve() != self.global_workspace.resolve():
             workspace_hash = hashlib.md5(str(workspace.resolve()).encode()).hexdigest()[:8]
-            backup_folder_name = f"{workspace.name}_{workspace_hash}"
+            workspace_label = self._safe_backup_folder_component(str(getattr(workspace, "name", "workspace")))
+            backup_folder_name = f"{workspace_label}_{workspace_hash}"
             self.backup_dir = ensure_dir(self.global_workspace / "project_backups" / backup_folder_name)
             self.memory_backup_file = self.backup_dir / "MEMORY.md"
             self.history_backup_file = self.backup_dir / "history.jsonl"
@@ -270,7 +279,8 @@ class MemoryStore:
 
         raw = self.legacy_history_file.read_bytes()
         text = raw.decode("utf-8", errors="replace")
-        self._legacy_history_backup_file.write_text(text, encoding="utf-8")
+        # Preserve legacy line endings exactly so migration backups are byte-stable across OSes.
+        self._legacy_history_backup_file.write_text(text, encoding="utf-8", newline="")
         fallback_ts = datetime.fromtimestamp(self._legacy_history_backup_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
 
         entries: list[dict[str, Any]] = []

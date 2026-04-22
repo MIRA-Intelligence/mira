@@ -168,8 +168,10 @@ async def test_grep_files_with_matches_mode_returns_unique_paths(tmp_path: Path)
 @pytest.mark.asyncio
 async def test_grep_files_with_matches_supports_head_limit_and_offset(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
-    for name in ("a.py", "b.py", "c.py"):
-        (tmp_path / "src" / name).write_text("needle\n", encoding="utf-8")
+    for idx, name in enumerate(("a.py", "b.py", "c.py"), start=1):
+        file_path = tmp_path / "src" / name
+        file_path.write_text("needle\n", encoding="utf-8")
+        os.utime(file_path, (idx, idx))
 
     tool = GrepTool(workspace=tmp_path, allowed_dir=tmp_path)
     result = await tool.execute(

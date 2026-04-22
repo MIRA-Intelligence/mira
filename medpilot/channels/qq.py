@@ -2,9 +2,11 @@
 
 import asyncio
 from collections import deque
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 from loguru import logger
 
@@ -204,7 +206,17 @@ class QQChannel(BaseChannel):
         path = media_path
         if media_path.startswith("file://"):
             parsed = urlparse(media_path)
-            path = unquote(parsed.path)
+            if parsed.netloc and not parsed.path:
+                # Handles non-standard forms like file://C:\Users\foo\bar.jpg
+                path = unquote(parsed.netloc)
+            else:
+                path_part = parsed.path
+                if parsed.netloc and parsed.netloc.lower() != "localhost":
+                    path_part = f"//{parsed.netloc}{path_part}"
+                path = unquote(url2pathname(path_part))
+            if os.name == "nt" and path.startswith("/") and len(path) > 2 and path[2] == ":":
+                # Normalize /C:/foo.jpg -> C:/foo.jpg
+                path = path[1:]
         fp = Path(path)
         if not fp.exists() or not fp.is_file():
             return None, None

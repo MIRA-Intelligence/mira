@@ -545,18 +545,19 @@ async def test_exec_always_returns_exit_code() -> None:
     assert "hello" in result
 
 
-async def test_exec_head_tail_truncation() -> None:
+async def test_exec_head_tail_truncation(tmp_path) -> None:
     """Long output should preserve both head and tail."""
     tool = ExecTool()
     # Generate output that exceeds _MAX_OUTPUT (10_000 chars)
-    # Use current interpreter (PATH may not have `python`). ExecTool uses
-    # create_subprocess_shell: POSIX needs shlex.quote; Windows uses cmd.exe
-    # rules, so list2cmdline is appropriate there.
-    script = "print('A' * 6000 + '\\n' + 'B' * 6000)"
+    script_path = tmp_path / "long_output.py"
+    script_path.write_text(
+        "print('A' * 6000 + '\\n' + 'B' * 6000)\n",
+        encoding="utf-8",
+    )
     if sys.platform == "win32":
-        command = subprocess.list2cmdline([sys.executable, "-c", script])
+        command = subprocess.list2cmdline([sys.executable, str(script_path)])
     else:
-        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}"
     result = await tool.execute(command=command)
     assert "chars truncated" in result
     # Head portion should start with As

@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+import shlex
+import subprocess
 import sys
 
 from medpilot.agent.tools.shell import ExecTool
+
+
+def _python_script_command(script_path: Path) -> str:
+    if sys.platform == "win32":
+        return subprocess.list2cmdline([sys.executable, str(script_path)])
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}"
 
 
 def test_guard_blocks_dangerous_patterns() -> None:
@@ -33,31 +42,40 @@ def test_guard_blocks_outside_workspace_and_traversal() -> None:
     assert tool._guard_command("cat ./local.txt", cwd) is None
 
 
-async def test_execute_returns_output_and_stderr() -> None:
+async def test_execute_returns_output_and_stderr(tmp_path) -> None:
     tool = ExecTool(timeout=5)
-    output = await tool.execute(
-        f"\"{sys.executable}\" -c \"import sys; print('ok'); print('err', file=sys.stderr)\""
+    script_path = tmp_path / "emit_stdout_stderr.py"
+    script_path.write_text(
+        "import sys\nprint('ok')\nprint('err', file=sys.stderr)\n",
+        encoding="utf-8",
     )
+    output = await tool.execute(_python_script_command(script_path))
     assert "ok" in output
     assert "STDERR:" in output
     assert "err" in output
 
 
-async def test_execute_reports_nonzero_exit_code() -> None:
+async def test_execute_reports_nonzero_exit_code(tmp_path) -> None:
     tool = ExecTool(timeout=5)
-    output = await tool.execute(f"\"{sys.executable}\" -c \"import sys; sys.exit(3)\"")
+    script_path = tmp_path / "exit_nonzero.py"
+    script_path.write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
+    output = await tool.execute(_python_script_command(script_path))
     assert "Exit code: 3" in output
 
 
-async def test_execute_timeout_returns_error() -> None:
+async def test_execute_timeout_returns_error(tmp_path) -> None:
     tool = ExecTool(timeout=1)
-    output = await tool.execute(f"\"{sys.executable}\" -c \"import time; time.sleep(2)\"")
+    script_path = tmp_path / "sleep_long.py"
+    script_path.write_text("import time\ntime.sleep(2)\n", encoding="utf-8")
+    output = await tool.execute(_python_script_command(script_path))
     assert output == "Error: Command timed out after 1 seconds"
 
 
-async def test_execute_truncates_long_output() -> None:
+async def test_execute_truncates_long_output(tmp_path) -> None:
     tool = ExecTool(timeout=5)
-    output = await tool.execute(f"\"{sys.executable}\" -c \"print('x'*11050)\"")
+    script_path = tmp_path / "long_output.py"
+    script_path.write_text("print('x' * 11050)\n", encoding="utf-8")
+    output = await tool.execute(_python_script_command(script_path))
     assert "truncated" in output
 
 
