@@ -33,7 +33,11 @@ class ToolRegistry:
 
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""
-        return [tool.to_schema() for tool in self._tools.values()]
+        names = sorted(
+            self._tools.keys(),
+            key=lambda name: (name.startswith("mcp_"), name),
+        )
+        return [self._tools[name].to_schema() for name in names]
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:
         """Execute a tool by name with given parameters."""

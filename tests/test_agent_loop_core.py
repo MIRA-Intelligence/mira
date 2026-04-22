@@ -17,6 +17,7 @@ from medpilot.bus.queue import MessageBus
 from medpilot.config.schema import ChannelsConfig, ExecToolConfig
 from medpilot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from medpilot.session.manager import Session, SessionManager
+from medpilot.agent.tools.filesystem import _resolve_path
 
 
 class _NoopProvider(LLMProvider):
@@ -100,6 +101,36 @@ def _make_real_loop(tmp_path: Path) -> AgentLoop:
     )
 
 
+def test_restrict_workspace_allows_nested_workspace_medpilot_skills_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    nested_skills = workspace / ".medpilot" / "skills" / "medical-imaging" / "medical-image-dl-pipeline"
+    nested_skills.mkdir(parents=True)
+    skill_file = nested_skills / "SKILL.md"
+    skill_file.write_text("# skill", encoding="utf-8")
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=_NoopProvider(),
+        workspace=workspace,
+        model="dummy/default",
+        channels_config=ChannelsConfig(),
+        exec_config=ExecToolConfig(timeout=5),
+        session_manager=SessionManager(workspace),
+        restrict_to_workspace=True,
+    )
+
+    read_tool = loop.tools.get("read_file")
+    assert read_tool is not None
+    resolved = _resolve_path(
+        str(skill_file),
+        workspace=read_tool._workspace,
+        allowed_dir=read_tool._allowed_dir,
+        extra_allowed_dirs=read_tool._extra_allowed_dirs,
+    )
+    assert resolved == skill_file.resolve()
+
+
 def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)
     assert AgentLoop._strip_think("<think>x</think>hello") == "hello"
@@ -127,6 +158,46 @@ def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
     assert loop._agent_profile_to_agents_filename("research") == "AGENTS_RS.md"
     assert loop._agent_profile_to_agents_filename("engineer") == "AGENTS_EG.md"
     assert loop._agent_profile_to_agents_filename("default") == "AGENTS.md"
+    merged = loop._compose_extra_system("UI rules", "Guard notice")
+    assert merged == "UI rules\n\nGuard notice"
+    assert loop._compose_extra_system("", "Guard notice") == "Guard notice"
+    assert loop._compose_extra_system(None, None) is None
+    project = tmp_path / "PRJ-9"
+    (project / ".medpilot").mkdir(parents=True)
+    (project / ".medpilot" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 2}),
+        encoding="utf-8",
+    )
+    auto_msg = loop._build_auto_continue_message(
+        channel="web",
+        chat_id="PRJ-9",
+        project_dir=str(project),
+        run_mode="auto",
+        agent_profile="research",
+    )
+    assert "Execute exactly ONE pending experiment in this round" in auto_msg
+    assert "immediately update and write task_plan.json" in auto_msg
+    assert "Task-plan contract requirements" in auto_msg
+    assert "theoretical_proof" in auto_msg
+    checkpoint_msg = loop._build_auto_checkpoint_sync_message(
+        channel="web",
+        chat_id="PRJ-9",
+        project_dir=str(project),
+        run_mode="auto",
+        running_ids=["Exp001"],
+        agent_profile="research",
+    )
+    assert "Checkpoint barrier" in checkpoint_msg
+    assert "Exp001" in checkpoint_msg
+    assert "do not mark an experiment as completed" in checkpoint_msg
+    assert loop._is_strict_contract_enforced(
+        project_dir=str(project),
+        agent_profile="research",
+    ) is True
+    assert loop._is_strict_contract_enforced(
+        project_dir=None,
+        agent_profile="default",
+    ) is False
 
 
 def test_auto_run_decision_helpers(tmp_path: Path) -> None:
@@ -143,6 +214,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     loaded = AgentLoop._load_task_plan(str(project))
     assert loaded is not None
     assert AgentLoop._plan_has_pending_work(loaded) is True
+    assert AgentLoop._running_experiment_ids(loaded) == []
 
     assert loop._should_continue_auto_web(
         channel="web",
@@ -166,6 +238,114 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         auto_round=0,
     ) is False
 
+    bad_project = tmp_path / "PRJ-bad"
+    bad_project.mkdir()
+    (bad_project / "task_plan.json").write_text("{", encoding="utf-8")
+    assert loop._should_continue_auto_web(
+        channel="web",
+        run_mode="auto",
+        project_dir=str(bad_project),
+        final_content="all good",
+        auto_round=0,
+    ) is False
+
+    before = {
+        "experiments": [
+            {"id": "Exp001", "status": "running", "results": {"metrics": {}}},
+            {"id": "Exp002", "status": "pending"},
+        ]
+    }
+    after_unchanged = {
+        "experiments": [
+            {"id": "Exp001", "status": "running", "results": {"metrics": {}}},
+            {"id": "Exp002", "status": "pending"},
+        ]
+    }
+    after_updated = {
+        "experiments": [
+            {"id": "Exp001", "status": "completed", "results": {"metrics": {"Dice": 0.8}}},
+            {"id": "Exp002", "status": "pending"},
+        ]
+    }
+    after_multi = {
+        "experiments": [
+            {"id": "Exp001", "status": "completed", "results": {"metrics": {"Dice": 0.8}}},
+            {"id": "Exp002", "status": "failed"},
+        ]
+    }
+    assert AgentLoop._has_experiment_checkpoint_update(before, after_unchanged) is False
+    assert AgentLoop._has_experiment_checkpoint_update(before, after_updated) is True
+    assert AgentLoop._experiments_crossed_boundary(before, after_updated) == ["Exp001"]
+    assert AgentLoop._experiments_crossed_boundary(before, after_multi) == ["Exp001", "Exp002"]
+
+    before_result = {"experiments": [], "result": {"summary": "keep me"}}
+    after_result = {
+        "experiments": [],
+        "result": {"summary": "auto generated", "output_path": "outputs/", "output_type": "analysis"},
+    }
+    assert AgentLoop._has_result_section_update(before_result, after_result) is True
+    assert AgentLoop._looks_like_result_request("Manual export request for PRJ-1.") is True
+    assert AgentLoop._looks_like_result_request("continue experiments") is False
+    assert AgentLoop._looks_like_result_request(
+        "continue experiments", {"_allow_result_write": True}
+    ) is True
+
+    plan_file = project / "task_plan.json"
+    plan_file.write_text(json.dumps(after_result), encoding="utf-8")
+    restored, changed = loop._restore_result_section(
+        str(project),
+        before_plan=before_result,
+        after_plan=after_result,
+    )
+    assert changed is True
+    assert isinstance(restored, dict)
+    assert restored.get("result") == before_result["result"]
+    persisted = json.loads(plan_file.read_text(encoding="utf-8"))
+    assert persisted.get("result") == before_result["result"]
+
+
+def test_automation_policy_helpers(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+
+    policy = loop._parse_automation_policy(
+        {
+            "logic": "OR",
+            "goals": [
+                {"metric": "Dice", "operator": ">", "value": 0.8},
+                {"metric": "HD95", "operator": "<", "value": 5.0},
+            ],
+            "maxExperiments": 8,
+            "maxTokens": 1000,
+        }
+    )
+    assert policy is not None
+    assert policy["logic"] == "OR"
+    assert len(policy["goals"]) == 2
+
+    plan = {
+        "experiments": [
+            {"status": "completed", "results": {"metrics": {"Dice": 0.82, "HD95": 6.1}}},
+            {"status": "pending", "results": {"metrics": {}}},
+        ]
+    }
+    stop_reason = AgentLoop._evaluate_automation_stop_policy(policy, plan=plan, tokens_used=100)
+    assert stop_reason == "automation goals reached"
+
+    strict_policy = loop._parse_automation_policy(
+        {
+            "logic": "AND",
+            "goals": [{"metric": "Dice", "operator": ">=", "value": 0.9}],
+            "maxExperiments": 1,
+        }
+    )
+    assert strict_policy is not None
+    exp_reason = AgentLoop._evaluate_automation_stop_policy(strict_policy, plan=plan, tokens_used=100)
+    assert "max experiments reached" in (exp_reason or "")
+
+    token_policy = loop._parse_automation_policy({"maxTokens": 200})
+    assert token_policy is not None
+    token_reason = AgentLoop._evaluate_automation_stop_policy(token_policy, plan=plan, tokens_used=250)
+    assert "token budget reached" in (token_reason or "")
 
 async def test_run_agent_loop_tool_call_and_finish(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)
@@ -271,6 +451,13 @@ async def test_dispatch_and_control_handlers(tmp_path: Path) -> None:
     await loop._dispatch(msg)
     err = await loop.bus.consume_outbound()
     assert err.content == "Sorry, I encountered an error."
+
+    cli_err_msg = InboundMessage(channel="cli", sender_id="u", chat_id="c", content="x")
+    loop._process_message = _boom
+    await loop._dispatch(cli_err_msg)
+    cli_err = await loop.bus.consume_outbound()
+    assert "Sorry, I encountered an error." in cli_err.content
+    assert "medpilot agent --logs" in cli_err.content
 
 
 def test_save_turn_and_project_session_cache(tmp_path: Path) -> None:
@@ -404,6 +591,50 @@ async def test_process_message_system_help_new_and_normal(monkeypatch, tmp_path:
     assert norm_resp.content == "done"
 
 
+async def test_process_message_updates_recent_skills_metadata(monkeypatch, tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        if audit_hook:
+            await audit_hook({"tool": "read_file", "skill_name": "medical-image-dl-pipeline", "path": "/tmp/SKILL.md"})
+        return "done", [], messages + [{"role": "assistant", "content": "done"}]
+
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+    msg = InboundMessage(channel="web", sender_id="u", chat_id="PRJ-7", content="继续之前任务")
+    out = await loop._process_message(msg)
+    assert out.content == "done"
+    session = loop.sessions.get_or_create("web:PRJ-7")
+    assert session.metadata.get("_recent_skills") == ["medical-image-dl-pipeline"]
+
+
+async def test_process_message_injects_active_skills_into_context(monkeypatch, tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+    captured: dict[str, Any] = {}
+
+    original_build_messages = loop.context.build_messages
+
+    def _capture_build_messages(*args, **kwargs):
+        captured["skill_names"] = kwargs.get("skill_names")
+        return original_build_messages(*args, **kwargs)
+
+    monkeypatch.setattr(loop.context, "build_messages", _capture_build_messages)
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        return "done", [], messages + [{"role": "assistant", "content": "done"}]
+
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+    msg = InboundMessage(
+        channel="web",
+        sender_id="u",
+        chat_id="PRJ-8",
+        content="继续之前的医学影像去伪影任务",
+    )
+    out = await loop._process_message(msg)
+    assert out.content == "done"
+    assert captured.get("skill_names")
+    assert "medical-image-dl-pipeline" in captured["skill_names"]
+
+
 async def test_process_message_new_failure_and_message_tool_short_circuit(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
     session = loop.sessions.get_or_create("web:PRJ-3")
@@ -463,6 +694,41 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     assert any("auto-run round 1" in item for item in progress_events)
 
 
+async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+    progress_events: list[str] = []
+    calls = {"n": 0, "decide": 0}
+
+    def _decide(**kwargs):
+        calls["decide"] += 1
+        if calls["decide"] == 1:
+            loop._last_task_plan_guard_issues = ["Exp001: missing theoretical_proof"]
+        else:
+            loop._last_task_plan_guard_issues = []
+        return False
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        calls["n"] += 1
+        return f"round-{calls['n']}", [], messages + [{"role": "assistant", "content": f"round-{calls['n']}"}]
+
+    async def _progress(msg: str) -> None:
+        progress_events.append(msg)
+
+    monkeypatch.setattr(loop, "_should_continue_auto_web", _decide)
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+
+    msg = InboundMessage(
+        channel="web",
+        sender_id="u",
+        chat_id="PRJ-7",
+        content="go",
+        metadata={"run_mode": "auto", "project_dir": str(tmp_path / "PRJ-7")},
+    )
+    out = await loop._process_message(msg, on_progress=_progress)
+    assert out.content == "round-2"
+    assert any("guardrail repair 1" in item for item in progress_events)
+
+
 async def test_run_main_loop_and_process_direct(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
 
@@ -500,13 +766,13 @@ async def test_run_main_loop_and_process_direct(monkeypatch, tmp_path: Path) -> 
     await runner
     assert loop._running is False
 
-    async def _proc_ok(msg, session_key=None, on_progress=None):
+    async def _proc_ok(msg, session_key=None, on_progress=None, audit_hook=None):
         return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="direct-ok")
 
     monkeypatch.setattr(loop, "_process_message", _proc_ok)
     assert await loop.process_direct("hello") == "direct-ok"
 
-    async def _proc_none(msg, session_key=None, on_progress=None):
+    async def _proc_none(msg, session_key=None, on_progress=None, audit_hook=None):
         return None
 
     monkeypatch.setattr(loop, "_process_message", _proc_none)

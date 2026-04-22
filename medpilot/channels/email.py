@@ -1,6 +1,7 @@
 """Email channel implementation using IMAP polling + SMTP replies."""
 
 import asyncio
+import fnmatch
 import html
 import imaplib
 import re
@@ -12,6 +13,7 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -19,6 +21,7 @@ from loguru import logger
 from medpilot.bus.events import OutboundMessage
 from medpilot.bus.queue import MessageBus
 from medpilot.channels.base import BaseChannel
+from medpilot.config.paths import get_media_dir
 from medpilot.config.schema import EmailConfig
 
 
@@ -233,91 +236,111 @@ class EmailChannel(BaseChannel):
         """Fetch messages by arbitrary IMAP search criteria."""
         messages: list[dict[str, Any]] = []
         mailbox = self.config.imap_mailbox or "INBOX"
-
-        if self.config.imap_use_ssl:
-            client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
-        else:
-            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
-
-        try:
-            client.login(self.config.imap_username, self.config.imap_password)
-            status, _ = client.select(mailbox)
-            if status != "OK":
-                return messages
-
-            status, data = client.search(None, *search_criteria)
-            if status != "OK" or not data:
-                return messages
-
-            ids = data[0].split()
-            if limit > 0 and len(ids) > limit:
-                ids = ids[-limit:]
-            for imap_id in ids:
-                status, fetched = client.fetch(imap_id, "(BODY.PEEK[] UID)")
-                if status != "OK" or not fetched:
-                    continue
-
-                raw_bytes = self._extract_message_bytes(fetched)
-                if raw_bytes is None:
-                    continue
-
-                uid = self._extract_uid(fetched)
-                if dedupe and uid and uid in self._processed_uids:
-                    continue
-
-                parsed = BytesParser(policy=policy.default).parsebytes(raw_bytes)
-                sender = parseaddr(parsed.get("From", ""))[1].strip().lower()
-                if not sender:
-                    continue
-
-                subject = self._decode_header_value(parsed.get("Subject", ""))
-                date_value = parsed.get("Date", "")
-                message_id = parsed.get("Message-ID", "").strip()
-                body = self._extract_text_body(parsed)
-
-                if not body:
-                    body = "(empty email body)"
-
-                body = body[: self.config.max_body_chars]
-                content = (
-                    f"Email received.\n"
-                    f"From: {sender}\n"
-                    f"Subject: {subject}\n"
-                    f"Date: {date_value}\n\n"
-                    f"{body}"
-                )
-
-                metadata = {
-                    "message_id": message_id,
-                    "subject": subject,
-                    "date": date_value,
-                    "sender_email": sender,
-                    "uid": uid,
-                }
-                messages.append(
-                    {
-                        "sender": sender,
-                        "subject": subject,
-                        "message_id": message_id,
-                        "content": content,
-                        "metadata": metadata,
-                    }
-                )
-
-                if dedupe and uid:
-                    self._processed_uids.add(uid)
-                    # mark_seen is the primary dedup; this set is a safety net
-                    if len(self._processed_uids) > self._MAX_PROCESSED_UIDS:
-                        # Evict a random half to cap memory; mark_seen is the primary dedup
-                        self._processed_uids = set(list(self._processed_uids)[len(self._processed_uids) // 2:])
-
-                if mark_seen:
-                    client.store(imap_id, "+FLAGS", "\\Seen")
-        finally:
+        retries_left = 1
+        while True:
+            if self.config.imap_use_ssl:
+                client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
+            else:
+                client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
             try:
-                client.logout()
-            except Exception:
-                pass
+                client.login(self.config.imap_username, self.config.imap_password)
+                status, _ = client.select(mailbox)
+                if status != "OK":
+                    return messages
+
+                status, data = client.search(None, *search_criteria)
+                if status != "OK" or not data:
+                    return messages
+
+                ids = data[0].split()
+                if limit > 0 and len(ids) > limit:
+                    ids = ids[-limit:]
+                for imap_id in ids:
+                    status, fetched = client.fetch(imap_id, "(BODY.PEEK[] UID)")
+                    if status != "OK" or not fetched:
+                        continue
+
+                    raw_bytes = self._extract_message_bytes(fetched)
+                    if raw_bytes is None:
+                        continue
+
+                    uid = self._extract_uid(fetched)
+                    if dedupe and uid and uid in self._processed_uids:
+                        continue
+
+                    parsed = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+                    sender = parseaddr(parsed.get("From", ""))[1].strip().lower()
+                    if not sender:
+                        continue
+
+                    spf_ok, dkim_ok = self._check_authentication_results(parsed)
+                    if self.config.verify_spf and not spf_ok:
+                        continue
+                    if self.config.verify_dkim and not dkim_ok:
+                        continue
+
+                    subject = self._decode_header_value(parsed.get("Subject", ""))
+                    date_value = parsed.get("Date", "")
+                    message_id = parsed.get("Message-ID", "").strip()
+                    body = self._extract_text_body(parsed) or "(empty email body)"
+                    body = body[: self.config.max_body_chars]
+
+                    media = self._extract_attachments(parsed, uid or "")
+                    attachment_note = ""
+                    if media:
+                        attachment_note = "\n" + "\n".join(
+                            f"[attachment: {Path(path).name}]" for path in media
+                        )
+
+                    content = (
+                        f"[EMAIL-CONTEXT]\n"
+                        f"Email received.\n"
+                        f"From: {sender}\n"
+                        f"Subject: {subject}\n"
+                        f"Date: {date_value}{attachment_note}\n\n"
+                        f"{body}"
+                    )
+
+                    metadata = {
+                        "message_id": message_id,
+                        "subject": subject,
+                        "date": date_value,
+                        "sender_email": sender,
+                        "uid": uid,
+                    }
+                    messages.append(
+                        {
+                            "sender": sender,
+                            "subject": subject,
+                            "message_id": message_id,
+                            "content": content,
+                            "metadata": metadata,
+                            "media": media,
+                        }
+                    )
+
+                    if dedupe and uid:
+                        self._processed_uids.add(uid)
+                        if len(self._processed_uids) > self._MAX_PROCESSED_UIDS:
+                            self._processed_uids = set(list(self._processed_uids)[len(self._processed_uids) // 2:])
+
+                    if mark_seen:
+                        client.store(imap_id, "+FLAGS", "\\Seen")
+                return messages
+            except imaplib.IMAP4.abort:
+                if retries_left <= 0:
+                    return messages
+                retries_left -= 1
+                continue
+            except imaplib.IMAP4.error as e:
+                if "mailbox" in str(e).lower() and "exist" in str(e).lower():
+                    return messages
+                raise
+            finally:
+                try:
+                    client.logout()
+                except Exception:
+                    pass
 
         return messages
 
@@ -406,3 +429,49 @@ class EmailChannel(BaseChannel):
         if subject.lower().startswith("re:"):
             return subject
         return f"{prefix}{subject}"
+
+    @staticmethod
+    def _check_authentication_results(msg: Any) -> tuple[bool, bool]:
+        header = " ".join(msg.get_all("Authentication-Results", []))
+        lowered = header.lower()
+        spf_ok = "spf=pass" in lowered
+        dkim_ok = "dkim=pass" in lowered
+        return spf_ok, dkim_ok
+
+    def _attachment_type_allowed(self, mime: str) -> bool:
+        allowed = self.config.allowed_attachment_types
+        if not allowed:
+            return False
+        if "*" in allowed:
+            return True
+        for pattern in allowed:
+            if fnmatch.fnmatch(mime, pattern):
+                return True
+        return False
+
+    def _extract_attachments(self, msg: Any, uid: str) -> list[str]:
+        saved: list[str] = []
+        max_count = max(0, int(self.config.max_attachments_per_email))
+        if max_count == 0:
+            return saved
+        media_dir = get_media_dir("email")
+        media_dir.mkdir(parents=True, exist_ok=True)
+
+        for part in msg.walk():
+            if part.get_content_disposition() != "attachment":
+                continue
+            if len(saved) >= max_count:
+                break
+            mime = part.get_content_type()
+            if not self._attachment_type_allowed(mime):
+                continue
+            payload = part.get_payload(decode=True) or b""
+            if len(payload) > int(self.config.max_attachment_size):
+                continue
+            name = part.get_filename() or "attachment.bin"
+            safe_name = Path(name).name.replace("/", "_").replace("\\", "_")
+            file_name = f"{uid or 'unknown'}_{safe_name}"
+            target = media_dir / file_name
+            target.write_bytes(payload)
+            saved.append(str(target))
+        return saved

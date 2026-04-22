@@ -117,6 +117,7 @@ class LocalServiceManager:
             "running": False,
             "service_mode": "local-skeleton",
             "platform": platform.system().lower(),
+            "host": "127.0.0.1",
             "port": DEFAULT_PORT,
             "installed_at": None,
             "last_started_at": None,
@@ -142,11 +143,15 @@ class LocalServiceManager:
             encoding="utf-8",
         )
 
-    def install_service(self) -> tuple[int, str]:
+    def install_service(self, host: str | None = None, port: int | None = None) -> tuple[int, str]:
         state = self.load_state()
         self.paths.ensure()
         state["installed"] = True
         state["installed_at"] = state.get("installed_at") or _now_iso()
+        if host is not None:
+            state["host"] = host
+        if port is not None:
+            state["port"] = port
         self.save_state(state)
         self._append_log("install_service", installed=True)
         return EXIT_OK, "service metadata installed"
@@ -252,7 +257,7 @@ class SystemdUserServiceManager(LocalServiceManager):
             check=False,
         )
 
-    def _write_unit(self, port: int) -> None:
+    def _write_unit(self, host: str, port: int) -> None:
         self.paths.systemd_unit.parent.mkdir(parents=True, exist_ok=True)
         content = f"""[Unit]
 Description=MedPilot Local Agent Service
@@ -260,7 +265,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={sys.executable} -m medpilot.cli.commands gateway --port {port}
+ExecStart={sys.executable} -m medpilot.cli.commands gateway --host {host} --port {port}
 Restart=always
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
@@ -272,12 +277,15 @@ WantedBy=default.target
 """
         self.paths.systemd_unit.write_text(content, encoding="utf-8")
 
-    def install_service(self) -> tuple[int, str]:
-        code, msg = super().install_service()
+    def install_service(self, host: str | None = None, port: int | None = None) -> tuple[int, str]:
+        code, msg = super().install_service(host, port)
         if code != EXIT_OK:
             return code, msg
         state = self.load_state()
-        self._write_unit(int(state.get("port", DEFAULT_PORT)))
+        self._write_unit(
+            str(state.get("host", "127.0.0.1")),
+            int(state.get("port", DEFAULT_PORT))
+        )
         self._run_systemctl("daemon-reload")
         enable = self._run_systemctl("enable", SYSTEMD_UNIT_NAME)
         if enable.returncode != 0:
@@ -348,12 +356,14 @@ class WindowsServiceManager(LocalServiceManager):
             check=False,
         )
 
-    def install_service(self) -> tuple[int, str]:
-        code, msg = super().install_service()
+    def install_service(self, host: str | None = None, port: int | None = None) -> tuple[int, str]:
+        code, msg = super().install_service(host, port)
         if code != EXIT_OK:
             return code, msg
         state = self.load_state()
-        bin_path = f"\"{sys.executable}\" -m medpilot.cli.commands gateway --port {int(state.get('port', DEFAULT_PORT))}"
+        h = str(state.get("host", "127.0.0.1"))
+        p = int(state.get("port", DEFAULT_PORT))
+        bin_path = f"\"{sys.executable}\" -m medpilot.cli.commands gateway --host {h} --port {p}"
         create = self._run_sc("create", WINDOWS_SERVICE_NAME, "binPath=", bin_path, "start=", "auto")
         if create.returncode != 0:
             return EXIT_ERROR, create.stderr.strip() or "failed to create Windows service"
@@ -429,7 +439,7 @@ class LaunchdServiceManager(LocalServiceManager):
             check=False,
         )
 
-    def _write_plist(self, port: int) -> None:
+    def _write_plist(self, host: str, port: int) -> None:
         self.paths.launchd_plist.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "Label": LAUNCHD_LABEL,
@@ -438,6 +448,8 @@ class LaunchdServiceManager(LocalServiceManager):
                 "-m",
                 "medpilot.cli.commands",
                 "gateway",
+                "--host",
+                host,
                 "--port",
                 str(port),
             ],
@@ -450,12 +462,15 @@ class LaunchdServiceManager(LocalServiceManager):
         with self.paths.launchd_plist.open("wb") as fp:
             plistlib.dump(payload, fp)
 
-    def install_service(self) -> tuple[int, str]:
-        code, msg = super().install_service()
+    def install_service(self, host: str | None = None, port: int | None = None) -> tuple[int, str]:
+        code, msg = super().install_service(host, port)
         if code != EXIT_OK:
             return code, msg
         state = self.load_state()
-        self._write_plist(int(state.get("port", DEFAULT_PORT)))
+        self._write_plist(
+            str(state.get("host", "127.0.0.1")),
+            int(state.get("port", DEFAULT_PORT))
+        )
         bootstrap = self._run_launchctl("bootstrap", self._domain, str(self.paths.launchd_plist))
         # launchd returns non-zero when already loaded; try cleanup then retry once.
         if bootstrap.returncode != 0:
@@ -580,8 +595,11 @@ def _health_check(port: int, timeout_s: float = 3.0) -> bool:
 
 
 @app.command("install-service")
-def install_service() -> None:
-    code, message = _manager().install_service()
+def install_service(
+    host: str = typer.Option("127.0.0.1", "--host", help="Gateway host"),
+    port: int = typer.Option(DEFAULT_PORT, "--port", "-p", help="Gateway port"),
+) -> None:
+    code, message = _manager().install_service(host=host, port=port)
     console.print(message)
     raise typer.Exit(code)
 

@@ -5,6 +5,16 @@ from typing import Literal
 
 
 @dataclass
+class CronRunRecord:
+    """One historical execution record for a cron job."""
+
+    run_at_ms: int
+    status: Literal["ok", "error", "skipped"]
+    duration_ms: int
+    error: str | None = None
+
+
+@dataclass
 class CronSchedule:
     """Schedule definition for a cron job."""
     kind: Literal["at", "every", "cron"]
@@ -36,6 +46,7 @@ class CronJobState:
     last_run_at_ms: int | None = None
     last_status: Literal["ok", "error", "skipped"] | None = None
     last_error: str | None = None
+    run_history: list[CronRunRecord] = field(default_factory=list)
 
 
 @dataclass

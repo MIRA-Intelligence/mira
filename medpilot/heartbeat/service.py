@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from loguru import logger
+from medpilot.utils.helpers import current_time_str
 
 if TYPE_CHECKING:
     from medpilot.providers.base import LLMProvider
@@ -87,11 +88,12 @@ class HeartbeatService:
 
         Returns (action, tasks) where action is 'skip' or 'run'.
         """
-        response = await self.provider.chat(
+        response = await self.provider.chat_with_retry(
             messages=[
                 {"role": "system", "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."},
                 {"role": "user", "content": (
                     "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
+                    f"Current Time: {current_time_str()}\n\n"
                     f"{content}"
                 )},
             ],
@@ -157,8 +159,17 @@ class HeartbeatService:
             if self.on_execute:
                 response = await self.on_execute(tasks)
                 if response and self.on_notify:
-                    logger.info("Heartbeat: completed, delivering response")
-                    await self.on_notify(response)
+                    from medpilot.utils import evaluator
+
+                    should_notify = await evaluator.evaluate_response(
+                        response=response,
+                        task_context=tasks or content,
+                        provider=self.provider,
+                        model=self.model,
+                    )
+                    if should_notify:
+                        logger.info("Heartbeat: completed, delivering response")
+                        await self.on_notify(response)
         except Exception:
             logger.exception("Heartbeat execution failed")
 

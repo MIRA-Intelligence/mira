@@ -93,6 +93,26 @@ class SlackChannel(BaseChannel):
                     thread_ts=thread_ts_param,
                 )
 
+            slack_event = slack_meta.get("event", {}) if isinstance(slack_meta, dict) else {}
+            event_ts = slack_event.get("ts")
+            if event_ts and msg.content:
+                try:
+                    await self._web_client.reactions_remove(
+                        channel=msg.chat_id,
+                        name=self.config.react_emoji,
+                        timestamp=event_ts,
+                    )
+                except Exception:
+                    pass
+                try:
+                    await self._web_client.reactions_add(
+                        channel=msg.chat_id,
+                        name="white_check_mark",
+                        timestamp=event_ts,
+                    )
+                except Exception:
+                    pass
+
             for media_path in msg.media or []:
                 try:
                     await self._web_client.files_upload_v2(

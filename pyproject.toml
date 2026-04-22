@@ -1,6 +1,6 @@
 [project]
 name = "medpilot"
-dynamic = ["version"]
+version = "0.0.0"
 description = "A lightweight personal AI assistant framework"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,6 +45,8 @@ dependencies = [
     "json-repair>=0.57.0,<1.0.0",
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
+    "ddgs>=9.0.0,<10.0.0",
+    "psutil>=6.0.0",
 ]
 
 [project.optional-dependencies]

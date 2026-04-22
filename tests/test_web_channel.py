@@ -1,5 +1,6 @@
 import json
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +17,11 @@ from medpilot.channels.web import (
     _API_CONTRACT_VERSION,
     PLAN_FILENAME,
     WebChannel,
+    _build_task_plan_guard_notice,
+    _detect_guard_id_reassignments,
+    _extract_plan_experiment_ids,
     _format_tool_call,
+    _normalize_contract_version,
     _load_ui_instructions,
     _normalize_agent_profile,
     _normalize_run_mode,
@@ -111,6 +116,45 @@ def test_normalize_agent_profile_falls_back_to_default() -> None:
     assert _normalize_agent_profile(None) == "default"
 
 
+def test_normalize_contract_version_accepts_known_values() -> None:
+    assert _normalize_contract_version(1) == 1
+    assert _normalize_contract_version(2) == 2
+
+
+def test_normalize_contract_version_falls_back_to_default() -> None:
+    assert _normalize_contract_version(9) == 1
+    assert _normalize_contract_version("2") == 1
+
+
+def test_guard_id_reassignment_helpers(tmp_path: Path) -> None:
+    project_dir = tmp_path / "PRJ-7001"
+    project_dir.mkdir(parents=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "experiments": [
+                    {"id": "Exp001"},
+                    {"id": "Exp003"},
+                    {"id": "Exp003"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before_ids = _extract_plan_experiment_ids(project_dir)
+    assert before_ids == ["Exp001", "Exp003", "Exp003"]
+
+    after_ids = ["Exp001", "Exp003", "Exp004"]
+    reassignments = _detect_guard_id_reassignments(before_ids, after_ids)
+    assert reassignments == [(3, "Exp003", "Exp004")]
+
+    notice = _build_task_plan_guard_notice(reassignments)
+    assert notice is not None
+    assert "Exp003 -> Exp004" in notice
+    assert _build_task_plan_guard_notice([]) is None
+
+
 async def test_handle_health_returns_machine_readable_payload(web_channel: WebChannel) -> None:
     web_channel._running = True
     web_channel._clients = {"s1": MagicMock(closed=False)}
@@ -184,6 +228,34 @@ async def test_handle_plan_missing_file(web_channel: WebChannel) -> None:
     assert json.loads(resp.text) is None
 
 
+async def test_handle_plan_contract_requires_session_id(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.query = {}
+    resp = await web_channel._handle_plan_contract(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "session_id required"}
+
+
+async def test_handle_plan_contract_returns_profile_rules(web_channel: WebChannel) -> None:
+    session = "PRJ-9015"
+    project_dir = web_channel.projects_root / session
+    (project_dir / ".medpilot").mkdir(parents=True)
+    (project_dir / ".medpilot" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 2}),
+        encoding="utf-8",
+    )
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    resp = await web_channel._handle_plan_contract(req)
+    body = json.loads(resp.text)
+
+    assert resp.status == 200
+    assert body["profile"] == "research"
+    assert body["contract_version"] == 2
+    assert "theoretical_proof" in body["required_completed_fields"]
+    assert "evidence_refs" in body["required_falsify_fields"]
+
+
 async def test_handle_plan_returns_json(web_channel: WebChannel) -> None:
     session = "sess-a"
     plan_dir = web_channel.projects_root / session
@@ -248,6 +320,181 @@ async def test_handle_plan_recovers_completed_experiment_from_outputs(web_channe
     assert exp004["results"]["metrics"] == {"score": 0.95}
     assert exp004["results"]["artifacts"] == ["outputs/exp004/results.json"]
     assert body["current_experiment"] == "Exp005"
+
+
+async def test_handle_plan_attaches_and_persists_completed_experiment_snapshot(
+    web_channel: WebChannel,
+) -> None:
+    session = "PRJ-9010"
+    project_dir = web_channel.projects_root / session
+    project_dir.mkdir(parents=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "completed",
+                "experiments": [
+                    {
+                        "id": "Exp001",
+                        "title": "baseline",
+                        "status": "completed",
+                        "results": {"findings": "initial findings"},
+                        "conclusion": "initial conclusion",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    first_resp = await web_channel._handle_plan(req)
+    first_body = json.loads(first_resp.text)
+    exp = first_body["experiments"][0]
+    assert exp["snapshot"]["conclusion"] == "initial conclusion"
+    assert exp["snapshot"]["results"]["findings"] == "initial findings"
+
+    saved_snapshot = (
+        project_dir / ".medpilot" / "snapshots" / "experiments" / "Exp001.json"
+    )
+    assert saved_snapshot.is_file()
+
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [
+                    {
+                        "id": "Exp001",
+                        "title": "baseline-updated",
+                        "status": "completed",
+                        "results": {"metrics": {"score": 0.1}},
+                        "conclusion": "Recovered completed experiment artifacts from workspace.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    second_resp = await web_channel._handle_plan(req)
+    second_body = json.loads(second_resp.text)
+    exp2 = second_body["experiments"][0]
+    assert exp2["conclusion"] == "Recovered completed experiment artifacts from workspace."
+    assert exp2["snapshot"]["conclusion"] == "initial conclusion"
+    assert exp2["snapshot"]["results"]["findings"] == "initial findings"
+
+
+async def test_handle_plan_recovers_snapshot_from_git_history_when_current_is_degraded(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = "PRJ-9011"
+    project_dir = web_channel.projects_root / session
+    project_dir.mkdir(parents=True)
+    (project_dir / ".git").mkdir(parents=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [
+                    {
+                        "id": "Exp001",
+                        "title": "degraded",
+                        "status": "completed",
+                        "results": {"metrics": {"score": 0.2}},
+                        "conclusion": "Recovered completed experiment artifacts from workspace.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        web_channel,
+        "_recover_snapshot_from_git_history",
+        lambda *_args, **_kwargs: {
+            "title": "historical",
+            "results": {"findings": "from git history"},
+            "conclusion": "historical conclusion",
+            "captured_at": "2026-04-09T00:00:00Z",
+            "source": "git:abc1234",
+        },
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    resp = await web_channel._handle_plan(req)
+    body = json.loads(resp.text)
+    exp = body["experiments"][0]
+    assert exp["snapshot"]["conclusion"] == "historical conclusion"
+    assert exp["snapshot"]["results"]["findings"] == "from git history"
+
+async def test_handle_plan_lint_auto_fixes_structure(web_channel: WebChannel) -> None:
+    session = "PRJ-9001"
+    project_dir = web_channel.projects_root / session
+    (project_dir / "experiments" / "exp001").mkdir(parents=True)
+    (project_dir / "experiments" / "exp001" / "metrics.json").write_text(
+        json.dumps({"overall_r2": 0.51}),
+        encoding="utf-8",
+    )
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [{"id": "exp1", "status": "completed"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    resp = await web_channel._handle_plan_lint(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["ok"] is True
+    assert body["fixed"] is True
+    assert body["issues"] == []
+
+    saved = json.loads((project_dir / PLAN_FILENAME).read_text(encoding="utf-8"))
+    exp = saved["experiments"][0]
+    assert exp["id"] == "Exp001"
+    assert exp["results"]["metrics"] == {"overall_r2": 0.51}
+    assert "experiments/exp001/metrics.json" in exp["results"]["artifacts"]
+
+
+async def test_handle_plan_auto_fixes_duplicate_experiment_ids(
+    web_channel: WebChannel,
+) -> None:
+    session = "PRJ-9002"
+    project_dir = web_channel.projects_root / session
+    project_dir.mkdir(parents=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "dup",
+                "status": "in_progress",
+                "experiments": [
+                    {"id": "Exp003", "status": "completed", "conclusion": "done"},
+                    {"id": "Exp003", "status": "pending"},
+                    {"id": "Exp004", "status": "pending"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    resp = await web_channel._handle_plan(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    ids = [exp["id"] for exp in body["experiments"]]
+    assert ids == ["Exp003", "Exp004", "Exp005"]
+    assert len(ids) == len(set(ids))
 
 
 async def test_handle_history_returns_entries(web_channel: WebChannel) -> None:
@@ -324,6 +571,114 @@ async def test_handle_history_missing_project_returns_empty(web_channel: WebChan
     assert json.loads(resp.text) == {"session_id": "missing", "entries": []}
 
 
+async def test_handle_history_merges_ui_chat_log_entries(web_channel: WebChannel) -> None:
+    session_id = "PRJ-0009"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+    manager = SessionManager(project_dir)
+    manager.append_ui_event(
+        key=f"web:{session_id}",
+        role="user",
+        content="from ui user",
+        msg_type="response",
+        metadata={"_user": True},
+        timestamp="2026-03-26T10:00:00",
+    )
+    manager.append_ui_event(
+        key=f"web:{session_id}",
+        role="assistant",
+        content="from ui assistant",
+        msg_type="response",
+        metadata={},
+        timestamp="2026-03-26T10:00:01",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": session_id}
+    resp = await web_channel._handle_history(req)
+    body = json.loads(resp.text)
+    contents = [entry["content"] for entry in body["entries"]]
+    assert "from ui user" in contents
+    assert "from ui assistant" in contents
+
+
+async def test_handle_history_uses_audit_fallback_when_session_sparse(web_channel: WebChannel) -> None:
+    session_id = "PRJ-0010"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+    audit_file = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    audit_file.write_text(
+        "\n".join(
+            [
+                json.dumps({
+                    "timestamp": "2026-03-26T09:00:00",
+                    "source": "ui",
+                    "action": "ws_message_received",
+                    "session_id": session_id,
+                    "details": {"content_preview": "audit user msg"},
+                }),
+                json.dumps({
+                    "timestamp": "2026-03-26T09:00:01",
+                    "source": "agent",
+                    "action": "ws_outbound_sent",
+                    "session_id": session_id,
+                    "details": {"type": "response", "content_preview": "audit assistant msg"},
+                }),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": session_id}
+    resp = await web_channel._handle_history(req)
+    body = json.loads(resp.text)
+    contents = [entry["content"] for entry in body["entries"]]
+    assert "audit user msg" in contents
+    assert "audit assistant msg" in contents
+
+
+async def test_handle_history_prefers_ui_entries_over_audit_preview_when_present(
+    web_channel: WebChannel,
+) -> None:
+    session_id = "PRJ-0011"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    manager = SessionManager(project_dir)
+    manager.append_ui_event(
+        key=f"web:{session_id}",
+        role="assistant",
+        content="full assistant message",
+        msg_type="response",
+        metadata={},
+        timestamp="2026-03-26T09:00:01",
+    )
+
+    audit_file = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    audit_file.write_text(
+        json.dumps({
+            "timestamp": "2026-03-26T09:00:01",
+            "source": "agent",
+            "action": "ws_outbound_sent",
+            "session_id": session_id,
+            "details": {"type": "response", "content_preview": "full assistant message"},
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": session_id}
+    resp = await web_channel._handle_history(req)
+    body = json.loads(resp.text)
+    contents = [entry["content"] for entry in body["entries"]]
+    assert contents.count("full assistant message") == 1
+
+
 async def test_handle_config_invalid_json(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(side_effect=json.JSONDecodeError("msg", "", 0))
@@ -335,13 +690,32 @@ async def test_handle_config_invalid_json(web_channel: WebChannel) -> None:
 async def test_handle_config_updates_projects_root(web_channel: WebChannel, tmp_path: Path) -> None:
     new_root = tmp_path / "projects"
     new_root.mkdir()
+    persisted_paths: list[Path] = []
+
+    def _persist(path: Path) -> Path:
+        persisted_paths.append(path)
+        return tmp_path / "config_a.json"
+
+    web_channel._persist_projects_root_to_config = _persist  # type: ignore[method-assign]
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"projects_root": str(new_root)})
     resp = await web_channel._handle_config(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["projects_root"] == str(new_root.resolve())
+    assert body["config_path"] == str((tmp_path / "config_a.json").resolve())
+    assert body["persisted"] is True
     assert web_channel.projects_root == new_root.resolve()
+    assert persisted_paths == [new_root.resolve()]
+
+
+async def test_handle_config_rejects_non_string_projects_root(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"projects_root": 123})
+    resp = await web_channel._handle_config(req)
+
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "projects_root must be a string"}
 
 
 async def test_handle_config_unchanged_without_key(web_channel: WebChannel, tmp_path: Path) -> None:
@@ -351,6 +725,91 @@ async def test_handle_config_unchanged_without_key(web_channel: WebChannel, tmp_
     resp = await web_channel._handle_config(req)
     assert resp.status == 200
     assert json.loads(resp.text)["projects_root"] == str(tmp_path)
+
+
+async def test_handle_config_skips_audit_when_projects_root_unchanged(
+    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path.resolve()
+    web_channel.projects_root = root
+    audit_calls: list[dict[str, object]] = []
+    persisted_paths: list[Path] = []
+
+    def _capture_audit(**kwargs: object) -> None:
+        audit_calls.append(kwargs)
+
+    def _persist(path: Path) -> Path:
+        persisted_paths.append(path)
+        return tmp_path / "config_b.json"
+
+    monkeypatch.setattr(web_channel, "_audit", _capture_audit)
+    monkeypatch.setattr(web_channel, "_persist_projects_root_to_config", _persist)
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"projects_root": str(root)})
+    resp = await web_channel._handle_config(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["projects_root"] == str(root)
+    assert body["config_path"] == str((tmp_path / "config_b.json").resolve())
+    assert body["persisted"] is True
+    assert audit_calls == []
+    assert persisted_paths == [root]
+
+
+async def test_handle_validate_data_path_requires_valid_json(web_channel: WebChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(side_effect=json.JSONDecodeError("msg", "", 0))
+    resp = await web_channel._handle_validate_data_path(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "invalid JSON"}
+
+
+async def test_handle_validate_data_path_success_and_missing(web_channel: WebChannel) -> None:
+    datasets = web_channel.projects_root / "datasets"
+    datasets.mkdir(parents=True)
+
+    req_ok = MagicMock(spec=web.Request)
+    req_ok.json = AsyncMock(return_value={"path": "datasets"})
+    ok_resp = await web_channel._handle_validate_data_path(req_ok)
+    ok_body = json.loads(ok_resp.text)
+    assert ok_resp.status == 200
+    assert ok_body["ok"] is True
+    assert ok_body["kind"] == "directory"
+
+    req_missing = MagicMock(spec=web.Request)
+    req_missing.json = AsyncMock(return_value={"path": "datasets/missing"})
+    missing_resp = await web_channel._handle_validate_data_path(req_missing)
+    missing_body = json.loads(missing_resp.text)
+    assert missing_resp.status == 200
+    assert missing_body["ok"] is False
+    assert missing_body["error"] == "path not found"
+
+
+async def test_handle_validate_data_path_enforces_workspace_boundary(web_channel: WebChannel, tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-datasets"
+    outside.mkdir(parents=True, exist_ok=True)
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"path": str(outside)})
+    resp = await web_channel._handle_validate_data_path(req)
+    body = json.loads(resp.text)
+    assert resp.status == 200
+    assert body["ok"] is False
+    assert "outside workspace" in body["error"]
+
+
+async def test_handle_validate_data_path_allows_outside_when_unrestricted(web_channel: WebChannel, tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-open-datasets"
+    outside.mkdir(parents=True, exist_ok=True)
+    web_channel.restrict_to_workspace = False
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"path": str(outside)})
+    resp = await web_channel._handle_validate_data_path(req)
+    body = json.loads(resp.text)
+    assert resp.status == 200
+    assert body["ok"] is True
+    assert body["kind"] == "directory"
 
 
 async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebChannel) -> None:
@@ -368,12 +827,14 @@ async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebC
     assert ids == ["PRJ-0001", "PRJ-0002"]
     assert [item["display_name"] for item in body["projects"]] == ["PRJ-0001", "PRJ-0002"]
     assert all(item["has_meta"] for item in body["projects"])
+    assert all(item["contract_version"] == 1 for item in body["projects"])
 
     meta_file = web_channel.projects_root / "PRJ-0001" / ".medpilot" / "project.json"
     assert meta_file.is_file()
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["id"] == "PRJ-0001"
     assert meta["display_name"] == "PRJ-0001"
+    assert meta["contract_version"] == 1
 
 
 async def test_handle_project_meta_updates_display_name(web_channel: WebChannel) -> None:
@@ -388,10 +849,92 @@ async def test_handle_project_meta_updates_display_name(web_channel: WebChannel)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["display_name"] == "Lung CT baseline"
+    assert body["run_mode"] == "auto"
+    assert body["agent_profile"] == "default"
+    assert body["contract_version"] == 1
 
     meta_file = project_dir / ".medpilot" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["display_name"] == "Lung CT baseline"
+    assert meta["run_mode"] == "auto"
+    assert meta["agent_profile"] == "default"
+    assert meta["contract_version"] == 1
+
+
+async def test_handle_project_meta_updates_run_mode_and_profile(
+    web_channel: WebChannel,
+) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0002"
+    project_dir.mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0002"}
+    req.json = AsyncMock(return_value={
+        "run_mode": "manual",
+        "agent_profile": "research",
+    })
+    resp = await web_channel._handle_project_meta(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["display_name"] == "PRJ-0002"
+    assert body["run_mode"] == "manual"
+    assert body["agent_profile"] == "research"
+    assert body["contract_version"] == 1
+
+    meta_file = project_dir / ".medpilot" / "project.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["run_mode"] == "manual"
+    assert meta["agent_profile"] == "research"
+    assert meta["contract_version"] == 1
+
+
+async def test_handle_project_meta_updates_contract_version(
+    web_channel: WebChannel,
+) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0003"
+    project_dir.mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0003"}
+    req.json = AsyncMock(return_value={"contract_version": 2})
+    resp = await web_channel._handle_project_meta(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["contract_version"] == 2
+
+    meta_file = project_dir / ".medpilot" / "project.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["contract_version"] == 2
+
+
+async def test_handle_project_meta_updates_automation_policy(
+    web_channel: WebChannel,
+) -> None:
+    project_dir = web_channel.projects_root / "PRJ-0008"
+    project_dir.mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0008"}
+    req.json = AsyncMock(return_value={
+        "automation_policy": {
+            "logic": "OR",
+            "goals": [{"metric": "Dice", "operator": ">", "value": 0.8}],
+            "maxExperiments": 12,
+            "maxTokens": 200000,
+        }
+    })
+    resp = await web_channel._handle_project_meta(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["automation_policy"]["logic"] == "OR"
+    assert body["automation_policy"]["maxExperiments"] == 12
+
+    meta_file = project_dir / ".medpilot" / "project.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
 
 
 async def test_cors_allows_patch_method(web_channel: WebChannel) -> None:
@@ -409,6 +952,7 @@ async def test_cors_allows_patch_method(web_channel: WebChannel) -> None:
 async def test_handle_upload_project_files_invalid_multipart(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {}
     req.multipart = AsyncMock(side_effect=RuntimeError("bad form"))
 
     resp = await web_channel._handle_upload_project_files(req)
@@ -419,6 +963,7 @@ async def test_handle_upload_project_files_invalid_multipart(web_channel: WebCha
 async def test_handle_upload_project_files_missing_files(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {}
     req.multipart = AsyncMock(return_value=_FakeMultipart([
         _FakePart(name="metadata", filename="ignored.txt", chunks=[b"abc"]),
     ]))
@@ -431,6 +976,7 @@ async def test_handle_upload_project_files_missing_files(web_channel: WebChannel
 async def test_handle_upload_project_files_writes_data_files(web_channel: WebChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {}
     req.multipart = AsyncMock(return_value=_FakeMultipart([
         _FakePart(name="files", filename="sample.csv", chunks=[b"a,", b"b\n"]),
         _FakePart(name="files", filename="sample.csv", chunks=[b"c,d\n"]),
@@ -440,14 +986,90 @@ async def test_handle_upload_project_files_writes_data_files(web_channel: WebCha
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["session_id"] == "PRJ-0001"
+    assert body["target"] == "data"
     assert body["uploaded"] == [
         {"name": "sample.csv", "path": "data/sample.csv", "size": 4},
         {"name": "sample_1.csv", "path": "data/sample_1.csv", "size": 4},
     ]
+    assert body["extracted"] == []
 
     data_dir = web_channel.projects_root / "PRJ-0001" / "data"
     assert (data_dir / "sample.csv").read_bytes() == b"a,b\n"
     assert (data_dir / "sample_1.csv").read_bytes() == b"c,d\n"
+
+
+async def test_handle_upload_project_files_references_extracts_zip(
+    web_channel: WebChannel,
+) -> None:
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        zf.writestr("papers/paper_a.pdf", b"%PDF-1.4")
+        zf.writestr("notes/summary.txt", b"ok")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0002"}
+    req.query = {"target": "references"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="seed.pdf", chunks=[b"%PDF-1.7"]),
+        _FakePart(name="files", filename="bundle.zip", chunks=[zip_buf.getvalue()]),
+    ]))
+
+    resp = await web_channel._handle_upload_project_files(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["session_id"] == "PRJ-0002"
+    assert body["target"] == "references"
+    assert body["uploaded"] == [
+        {"name": "seed.pdf", "path": "references/seed.pdf", "size": 8},
+        {"name": "bundle.zip", "path": "references/bundle.zip", "size": len(zip_buf.getvalue())},
+    ]
+    extracted_paths = {item["path"] for item in body["extracted"]}
+    assert extracted_paths == {
+        "references/bundle/papers/paper_a.pdf",
+        "references/bundle/notes/summary.txt",
+    }
+
+    refs_dir = web_channel.projects_root / "PRJ-0002" / "references"
+    assert (refs_dir / "seed.pdf").read_bytes() == b"%PDF-1.7"
+    assert (refs_dir / "bundle" / "papers" / "paper_a.pdf").read_bytes() == b"%PDF-1.4"
+    assert (refs_dir / "bundle" / "notes" / "summary.txt").read_bytes() == b"ok"
+
+
+async def test_handle_upload_project_files_references_rejects_non_pdf_zip(
+    web_channel: WebChannel,
+) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0003"}
+    req.query = {"target": "references"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="notes.txt", chunks=[b"hello"]),
+    ]))
+
+    resp = await web_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {
+        "error": "references uploads only support .pdf and .zip files"
+    }
+
+
+async def test_handle_upload_project_files_references_rejects_zip_slip(
+    web_channel: WebChannel,
+) -> None:
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        zf.writestr("../escape.txt", b"bad")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0004"}
+    req.query = {"target": "references"}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="unsafe.zip", chunks=[zip_buf.getvalue()]),
+    ]))
+
+    resp = await web_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert "unsafe zip entry" in json.loads(resp.text)["error"]
+    assert not (web_channel.projects_root / "escape.txt").exists()
 
 
 async def test_handle_project_artifact_serves_file(web_channel: WebChannel) -> None:
@@ -704,6 +1326,8 @@ def test_web_helpers_cover_normalization_and_formatting() -> None:
     assert _normalize_run_mode("unknown") == "manual"
     assert _normalize_agent_profile(" ENGINEER ") == "engineer"
     assert _normalize_agent_profile("bad") == "default"
+    assert _normalize_contract_version(2) == 2
+    assert _normalize_contract_version(None) == 1
     assert _safe_upload_name("../x.txt") == "x.txt"
     assert _stringify_history_content([{"type": "text", "text": "A"}, {"type": "image_url"}]) == "A\n[image]"
     assert _stringify_history_content({"k": 1}) == '{"k": 1}'
@@ -711,7 +1335,9 @@ def test_web_helpers_cover_normalization_and_formatting() -> None:
 
 
 def test_reconcile_plan_data_without_experiments_returns_false(web_channel: WebChannel, tmp_path: Path) -> None:
-    assert web_channel._reconcile_plan_data(tmp_path, {"title": "demo"}) is False
+    payload = {"title": "demo"}
+    assert web_channel._reconcile_plan_data(tmp_path, payload) is False
+    assert payload == {"title": "demo"}
 
 
 def test_load_plan_data_errors_and_reconcile_write_warning(
@@ -788,6 +1414,12 @@ async def test_ws_handler_message_and_set_mode_dispatch(
                     "user_id": "u1",
                     "mode": "AUTO",
                     "agent_profile": "engineer",
+                    "contract_version": 2,
+                    "automation_policy": {
+                        "logic": "AND",
+                        "goals": [{"metric": "Dice", "operator": ">", "value": 0.8}],
+                        "maxExperiments": 8,
+                    },
                     "content": "hello",
                     "media": ["a.png"],
                 }
@@ -821,16 +1453,251 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert len(handled) == 2
     assert handled[0]["metadata"]["run_mode"] == "auto"
     assert handled[0]["metadata"]["agent_profile"] == "engineer"
+    assert handled[0]["metadata"]["contract_version"] == 2
+    assert handled[0]["metadata"]["automation_policy"]["maxExperiments"] == 8
     assert "_ui_system_instructions" in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"
+
+    meta_file = web_channel.projects_root / "PRJ-4001" / ".medpilot" / "project.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert meta["contract_version"] == 2
+    assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
+
+
+async def test_ws_handler_injects_guard_notice_on_id_reassignment(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4012"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [
+                    {"id": "Exp003", "status": "pending"},
+                    {"id": "Exp003", "status": "pending"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "message",
+                    "session_id": session_id,
+                    "user_id": "u1",
+                    "mode": "auto",
+                    "agent_profile": "default",
+                    "content": "check latest exp ids",
+                    "media": [],
+                }
+            ),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    notice = captured.get("metadata", {}).get("_task_plan_guard_notice")
+    assert isinstance(notice, str)
+    assert "Exp003 -> Exp004" in notice
+
+    repaired = json.loads((project_dir / PLAN_FILENAME).read_text(encoding="utf-8"))
+    ids = [item.get("id") for item in repaired.get("experiments", [])]
+    assert ids == ["Exp003", "Exp004"]
+
+
+async def test_ws_handler_bind_registers_active_client(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (web_channel.projects_root / "PRJ-4011").mkdir(parents=True, exist_ok=True)
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "bind",
+                    "session_id": "PRJ-4011",
+                    "user_id": "u1",
+                }
+            ),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    assert "PRJ-4011" not in web_channel._clients
+    # Connection closes after handler loop exits; verify bind was accepted via audit entry.
+    audit_log = web_channel.projects_root / "PRJ-4011" / ".medpilot" / "logs" / "actions.jsonl"
+    assert audit_log.is_file()
+    lines = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(item.get("action") == "ws_bind_received" for item in lines)
+
+
+async def test_ws_handler_persists_ui_chat_user_entry(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4010"
+    (web_channel.projects_root / session_id).mkdir(parents=True)
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps({
+                "type": "message",
+                "session_id": session_id,
+                "user_id": "u1",
+                "content": "persist me",
+                "media": [],
+            }),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+
+    async def _handle_message(**kwargs):
+        return None
+
+    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    manager = SessionManager(web_channel.projects_root / session_id)
+    session = manager.get_or_create(f"web:{session_id}")
+    assert any(event.get("role") == "user" and event.get("content") == "persist me" for event in session.ui_events)
+
+
+async def test_ws_handler_injects_guard_notice_on_id_reassignment(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4012"
+    project_dir = web_channel.projects_root / session_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / PLAN_FILENAME).write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [
+                    {"id": "Exp003", "status": "pending"},
+                    {"id": "Exp003", "status": "pending"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "message",
+                    "session_id": session_id,
+                    "user_id": "u1",
+                    "mode": "auto",
+                    "agent_profile": "default",
+                    "content": "check latest exp ids",
+                    "media": [],
+                }
+            ),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    notice = captured.get("metadata", {}).get("_task_plan_guard_notice")
+    assert isinstance(notice, str)
+    assert "Exp003 -> Exp004" in notice
+
+    repaired = json.loads((project_dir / PLAN_FILENAME).read_text(encoding="utf-8"))
+    ids = [item.get("id") for item in repaired.get("experiments", [])]
+    assert ids == ["Exp003", "Exp004"]
+
+
+async def test_ws_handler_bind_registers_active_client(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (web_channel.projects_root / "PRJ-4011").mkdir(parents=True, exist_ok=True)
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "bind",
+                    "session_id": "PRJ-4011",
+                    "user_id": "u1",
+                }
+            ),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    assert "PRJ-4011" not in web_channel._clients
+    # Connection closes after handler loop exits; verify bind was accepted via audit entry.
+    audit_log = web_channel.projects_root / "PRJ-4011" / ".medpilot" / "logs" / "actions.jsonl"
+    assert audit_log.is_file()
+    lines = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(item.get("action") == "ws_bind_received" for item in lines)
+
+
+async def test_ws_handler_persists_ui_chat_user_entry(
+    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4010"
+    (web_channel.projects_root / session_id).mkdir(parents=True)
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps({
+                "type": "message",
+                "session_id": session_id,
+                "user_id": "u1",
+                "content": "persist me",
+                "media": [],
+            }),
+        ),
+    ])
+    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+
+    async def _handle_message(**kwargs):
+        return None
+
+    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    req = MagicMock(spec=web.Request)
+    await web_channel._ws_handler(req)
+
+    manager = SessionManager(web_channel.projects_root / session_id)
+    session = manager.get_or_create(f"web:{session_id}")
+    assert any(event.get("role") == "user" and event.get("content") == "persist me" for event in session.ui_events)
 
 
 async def test_handle_status_and_sessions_endpoints(web_channel: WebChannel) -> None:
     ws = MagicMock()
     ws.closed = False
     web_channel._clients = {"PRJ-5001": ws}
-    web_channel.config.host = "127.0.0.1"
-    web_channel.config.port = 18790
+    web_channel.bind_host = "127.0.0.1"
+    web_channel.bind_port = 18790
     req = MagicMock(spec=web.Request)
 
     status = await web_channel._handle_status(req)

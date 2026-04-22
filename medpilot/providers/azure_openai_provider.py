@@ -1,29 +1,27 @@
-"""Azure OpenAI provider implementation with API version 2024-10-21."""
+"""Azure OpenAI provider implementation via OpenAI Responses API SDK."""
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import urljoin
 
-import httpx
-import json_repair
+from openai import AsyncOpenAI
 
-from medpilot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from medpilot.providers.base import LLMProvider, LLMResponse
+from medpilot.providers.openai_responses import (
+    consume_sdk_stream,
+    convert_messages,
+    convert_tools,
+    parse_response_output,
+)
 
 _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 
 
 class AzureOpenAIProvider(LLMProvider):
     """
-    Azure OpenAI provider with API version 2024-10-21 compliance.
-    
-    Features:
-    - Hardcoded API version 2024-10-21
-    - Uses model field as Azure deployment name in URL path
-    - Uses api-key header instead of Authorization Bearer
-    - Uses max_completion_tokens instead of max_tokens
-    - Direct HTTP calls, bypasses LiteLLM
+    Azure OpenAI provider backed by the OpenAI SDK Responses API.
     """
 
     def __init__(
@@ -34,40 +32,23 @@ class AzureOpenAIProvider(LLMProvider):
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
-        self.api_version = "2024-10-21"
-        
-        # Validate required parameters
+
         if not api_key:
             raise ValueError("Azure OpenAI api_key is required")
         if not api_base:
             raise ValueError("Azure OpenAI api_base is required")
-        
-        # Ensure api_base ends with /
-        if not api_base.endswith('/'):
-            api_base += '/'
-        self.api_base = api_base
 
-    def _build_chat_url(self, deployment_name: str) -> str:
-        """Build the Azure OpenAI chat completions URL."""
-        # Azure OpenAI URL format:
-        # https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}
-        base_url = self.api_base
-        if not base_url.endswith('/'):
-            base_url += '/'
-        
-        url = urljoin(
-            base_url, 
-            f"openai/deployments/{deployment_name}/chat/completions"
+        normalized_base = api_base.rstrip("/") + "/"
+        self.api_base = normalized_base
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=f"{normalized_base}openai/v1/",
+            default_headers={
+                "api-key": api_key,
+                "x-session-affinity": uuid.uuid4().hex,
+            },
+            max_retries=0,
         )
-        return f"{url}?api-version={self.api_version}"
-
-    def _build_headers(self) -> dict[str, str]:
-        """Build headers for Azure OpenAI API with api-key header."""
-        return {
-            "Content-Type": "application/json",
-            "api-key": self.api_key,  # Azure OpenAI uses api-key header, not Authorization
-            "x-session-affinity": uuid.uuid4().hex,  # For cache locality
-        }
 
     @staticmethod
     def _supports_temperature(
@@ -80,36 +61,42 @@ class AzureOpenAIProvider(LLMProvider):
         name = deployment_name.lower()
         return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))
 
-    def _prepare_request_payload(
+    def _build_body(
         self,
-        deployment_name: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        tool_choice: Any | None = None,
+        model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        tool_choice: Any | None = None,
     ) -> dict[str, Any]:
-        """Prepare the request payload with Azure OpenAI 2024-10-21 compliance."""
-        payload: dict[str, Any] = {
-            "messages": self._sanitize_request_messages(
-                self._sanitize_empty_content(messages),
-                _AZURE_MSG_KEYS,
-            ),
-            "max_completion_tokens": max(1, max_tokens),  # Azure API 2024-10-21 uses max_completion_tokens
+        """Build OpenAI Responses API request body."""
+        deployment_name = model or self.default_model
+        prepared = self._sanitize_request_messages(
+            self._sanitize_empty_content(messages),
+            _AZURE_MSG_KEYS,
+        )
+        system_prompt, input_items = convert_messages(prepared)
+
+        body: dict[str, Any] = {
+            "model": deployment_name,
+            "input": input_items,
+            "max_output_tokens": max(1, max_tokens),
+            "store": False,
         }
+        if system_prompt:
+            body["instructions"] = system_prompt
 
         if self._supports_temperature(deployment_name, reasoning_effort):
-            payload["temperature"] = temperature
-
+            body["temperature"] = temperature
         if reasoning_effort:
-            payload["reasoning_effort"] = reasoning_effort
-
+            body["reasoning"] = {"effort": reasoning_effort}
+            body["include"] = ["reasoning.encrypted_content"]
         if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = tool_choice if tool_choice is not None else "auto"
-
-        return payload
+            body["tools"] = convert_tools(tools)
+            body["tool_choice"] = tool_choice if tool_choice is not None else "auto"
+        return body
 
     async def chat(
         self,
@@ -121,89 +108,83 @@ class AzureOpenAIProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
     ) -> LLMResponse:
-        """
-        Send a chat completion request to Azure OpenAI.
-
-        Args:
-            messages: List of message dicts with 'role' and 'content'.
-            tools: Optional list of tool definitions in OpenAI format.
-            model: Model identifier (used as deployment name).
-            max_tokens: Maximum tokens in response (mapped to max_completion_tokens).
-            temperature: Sampling temperature.
-            reasoning_effort: Optional reasoning effort parameter.
-
-        Returns:
-            LLMResponse with content and/or tool calls.
-        """
-        deployment_name = model or self.default_model
-        url = self._build_chat_url(deployment_name)
-        headers = self._build_headers()
-        payload = self._prepare_request_payload(
-            deployment_name, messages, tools, tool_choice, max_tokens, temperature, reasoning_effort
-        )
-
+        """Send a non-streaming chat request to Azure OpenAI."""
         try:
-            async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
-                response = await client.post(url, headers=headers, json=payload)
-                if response.status_code != 200:
-                    return LLMResponse(
-                        content=f"Azure OpenAI API Error {response.status_code}: {response.text}",
-                        finish_reason="error",
-                    )
-                
-                response_data = response.json()
-                return self._parse_response(response_data)
-
+            body = self._build_body(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                tool_choice=tool_choice,
+            )
+            return parse_response_output(await self._client.responses.create(**body))
         except Exception as e:
             return LLMResponse(
-                content=f"Error calling Azure OpenAI: {repr(e)}",
+                content=f"Error calling Azure OpenAI: {e}",
                 finish_reason="error",
             )
 
-    def _parse_response(self, response: dict[str, Any]) -> LLMResponse:
-        """Parse Azure OpenAI response into our standard format."""
+    @classmethod
+    def _handle_error(cls, e: Exception) -> LLMResponse:
+        response = getattr(e, "response", None)
+        headers = getattr(response, "headers", None)
+        body = (
+            getattr(e, "body", None)
+            or getattr(e, "doc", None)
+            or getattr(response, "text", None)
+        )
+        body_text = body if isinstance(body, str) else str(body) if body is not None else ""
+        msg = f"Error: {body_text.strip()[:500]}" if body_text.strip() else f"Error calling Azure OpenAI: {e}"
+        retry_after = cls._extract_retry_after_from_headers(headers)
+        if retry_after is None:
+            retry_after = cls._extract_retry_after(msg)
+        return LLMResponse(
+            content=msg,
+            finish_reason="error",
+            retry_after=retry_after,
+            error_retry_after_s=retry_after,
+        )
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: Any | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Send a streaming chat request to Azure OpenAI."""
         try:
-            choice = response["choices"][0]
-            message = choice["message"]
-
-            tool_calls = []
-            if message.get("tool_calls"):
-                for tc in message["tool_calls"]:
-                    # Parse arguments from JSON string if needed
-                    args = tc["function"]["arguments"]
-                    if isinstance(args, str):
-                        args = json_repair.loads(args)
-
-                    tool_calls.append(
-                        ToolCallRequest(
-                            id=tc["id"],
-                            name=tc["function"]["name"],
-                            arguments=args,
-                        )
-                    )
-
-            usage = {}
-            if response.get("usage"):
-                usage_data = response["usage"]
-                usage = {
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
-                    "total_tokens": usage_data.get("total_tokens", 0),
-                }
-
-            reasoning_content = message.get("reasoning_content") or None
-
+            body = self._build_body(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                tool_choice=tool_choice,
+            )
+            body["stream"] = True
+            stream = await self._client.responses.create(**body)
+            content, tool_calls, finish_reason, usage, reasoning_content = await consume_sdk_stream(
+                stream,
+                on_content_delta,
+            )
             return LLMResponse(
-                content=message.get("content"),
+                content=content or None,
                 tool_calls=tool_calls,
-                finish_reason=choice.get("finish_reason", "stop"),
+                finish_reason=finish_reason,
                 usage=usage,
                 reasoning_content=reasoning_content,
             )
-
-        except (KeyError, IndexError) as e:
+        except Exception as e:
             return LLMResponse(
-                content=f"Error parsing Azure OpenAI response: {str(e)}",
+                content=f"Error calling Azure OpenAI: {e}",
                 finish_reason="error",
             )
 

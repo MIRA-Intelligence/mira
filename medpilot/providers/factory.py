@@ -9,8 +9,9 @@ from medpilot.providers.base import LLMProvider
 def make_provider(config: Config, model: str | None = None) -> LLMProvider:
     """Create the appropriate provider for the given model."""
     from medpilot.providers.azure_openai_provider import AzureOpenAIProvider
-    from medpilot.providers.custom_provider import CustomProvider
+    from medpilot.providers.github_copilot_provider import GitHubCopilotProvider
     from medpilot.providers.litellm_provider import LiteLLMProvider
+    from medpilot.providers.openai_compat_provider import OpenAICompatProvider
     from medpilot.providers.openai_codex_provider import OpenAICodexProvider
     from medpilot.providers.registry import find_by_name
 
@@ -19,15 +20,32 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
         raise ValueError("No model configured. Set agents.defaults.model in config.json.")
     provider_name = config.get_provider_name(resolved_model)
     provider_config = config.get_provider(resolved_model)
+    if not provider_name:
+        raise ValueError(
+            f"Unable to match provider for model '{resolved_model}'. "
+            "Set agents.defaults.provider explicitly in config.json."
+        )
 
     if provider_name == "openai_codex" or resolved_model.startswith("openai-codex/"):
         return OpenAICodexProvider(default_model=resolved_model)
+    if provider_name == "github_copilot" or resolved_model.startswith("github-copilot/"):
+        return GitHubCopilotProvider(default_model=resolved_model)
 
     if provider_name == "custom":
-        return CustomProvider(
+        api_base = config.get_api_base(resolved_model)
+        # Require explicit apiBase configuration for custom provider
+        if not api_base:
+            raise ValueError(
+                "Custom provider requires 'providers.custom.apiBase' to be configured. "
+                "Please set the API base URL (e.g., 'http://localhost:8000/v1' or 'https://api.example.com/v1') "
+                "in your config.json, or run 'medpilot onboard --wizard' to configure it interactively."
+            )
+        return OpenAICompatProvider(
             api_key=provider_config.api_key if provider_config else "no-key",
-            api_base=config.get_api_base(resolved_model) or "http://localhost:8000/v1",
+            api_base=api_base,
             default_model=resolved_model,
+            extra_headers=provider_config.extra_headers if provider_config else None,
+            spec=find_by_name("custom"),
         )
 
     if provider_name == "azure_openai":

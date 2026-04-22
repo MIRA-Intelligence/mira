@@ -21,8 +21,8 @@ Adjust tags and ports in `.env` as needed.
 ## 2) Start stack
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose --profile self-hosted pull
+docker compose --profile self-hosted up -d
 ```
 
 ## 3) Verify services
@@ -39,8 +39,8 @@ UI default URL:
 ## 4) Upgrade
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose --profile self-hosted pull
+docker compose --profile self-hosted up -d
 ```
 
 ## 5) Rollback
@@ -51,12 +51,12 @@ docker compose up -d
 2. Recreate services:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose --profile self-hosted pull
+docker compose --profile self-hosted up -d
 ```
 
 ## 6) Stop stack
 
 ```bash
-docker compose down
+docker compose --profile self-hosted down
 ```
