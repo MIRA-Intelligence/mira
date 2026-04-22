@@ -2,8 +2,8 @@ import pytest
 import os
 import asyncio
 from pathlib import Path
-from medpilot.agent.tools.filesystem import ReadFileTool, WriteFileTool
-from medpilot.agent.skills import BUILTIN_SKILLS_DIR
+from mira_engine.agent.tools.filesystem import ReadFileTool, WriteFileTool
+from mira_engine.agent.skills import BUILTIN_SKILLS_DIR
 
 @pytest.mark.asyncio
 async def test_read_write_separation(tmp_path):

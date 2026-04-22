@@ -9,17 +9,17 @@ pytest.importorskip("nh3")
 pytest.importorskip("mistune")
 from nio import RoomSendResponse
 
-from medpilot.channels.matrix import _build_matrix_text_content
+from mira_engine.channels.matrix import _build_matrix_text_content
 
-import medpilot.channels.matrix as matrix_module
-from medpilot.bus.events import OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.channels.matrix import (
+import mira_engine.channels.matrix as matrix_module
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.matrix import (
     MATRIX_HTML_FORMAT,
     TYPING_NOTICE_TIMEOUT_MS,
     MatrixChannel,
 )
-from medpilot.channels.matrix import MatrixConfig
+from mira_engine.channels.matrix import MatrixConfig
 
 _ROOM_SEND_UNSET = object()
 
@@ -193,14 +193,14 @@ async def test_start_skips_load_store_when_device_id_missing(
         coro.close()
         return _DummyTask()
 
-    monkeypatch.setattr("medpilot.channels.matrix.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.matrix.get_data_dir", lambda: tmp_path)
     monkeypatch.setattr(
-        "medpilot.channels.matrix.AsyncClientConfig",
+        "mira_engine.channels.matrix.AsyncClientConfig",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
-    monkeypatch.setattr("medpilot.channels.matrix.AsyncClient", _fake_client)
+    monkeypatch.setattr("mira_engine.channels.matrix.AsyncClient", _fake_client)
     monkeypatch.setattr(
-        "medpilot.channels.matrix.asyncio.create_task", _fake_create_task
+        "mira_engine.channels.matrix.asyncio.create_task", _fake_create_task
     )
 
     channel = MatrixChannel(_make_config(device_id=""), MessageBus())
@@ -247,14 +247,14 @@ async def test_start_disables_e2ee_when_configured(
         coro.close()
         return _DummyTask()
 
-    monkeypatch.setattr("medpilot.channels.matrix.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.matrix.get_data_dir", lambda: tmp_path)
     monkeypatch.setattr(
-        "medpilot.channels.matrix.AsyncClientConfig",
+        "mira_engine.channels.matrix.AsyncClientConfig",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
-    monkeypatch.setattr("medpilot.channels.matrix.AsyncClient", _fake_client)
+    monkeypatch.setattr("mira_engine.channels.matrix.AsyncClient", _fake_client)
     monkeypatch.setattr(
-        "medpilot.channels.matrix.asyncio.create_task", _fake_create_task
+        "mira_engine.channels.matrix.asyncio.create_task", _fake_create_task
     )
 
     channel = MatrixChannel(_make_config(device_id="", e2ee_enabled=False), MessageBus())
@@ -575,7 +575,7 @@ async def test_on_message_sets_thread_metadata_when_threaded_event() -> None:
 async def test_on_media_message_downloads_attachment_and_sets_metadata(
     monkeypatch, tmp_path
 ) -> None:
-    monkeypatch.setattr("medpilot.channels.matrix.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.matrix.get_data_dir", lambda: tmp_path)
 
     channel = MatrixChannel(_make_config(), MessageBus())
     client = _FakeAsyncClient("", "", "", None)
@@ -628,7 +628,7 @@ async def test_on_media_message_downloads_attachment_and_sets_metadata(
 async def test_on_media_message_sets_thread_metadata_when_threaded_event(
     monkeypatch, tmp_path
 ) -> None:
-    monkeypatch.setattr("medpilot.channels.matrix.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.matrix.get_data_dir", lambda: tmp_path)
 
     channel = MatrixChannel(_make_config(), MessageBus())
     client = _FakeAsyncClient("", "", "", None)
@@ -673,7 +673,7 @@ async def test_on_media_message_sets_thread_metadata_when_threaded_event(
 async def test_on_media_message_respects_declared_size_limit(
     monkeypatch, tmp_path
 ) -> None:
-    monkeypatch.setattr("medpilot.channels.matrix.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.matrix.get_data_dir", lambda: tmp_path)
 
     channel = MatrixChannel(_make_config(max_media_bytes=3), MessageBus())
     client = _FakeAsyncClient("", "", "", None)
@@ -708,7 +708,7 @@ async def test_on_media_message_respects_declared_size_limit(
 async def test_on_media_message_uses_server_limit_when_smaller_than_local_limit(
     monkeypatch, tmp_path
 ) -> None:
-    monkeypatch.setattr("medpilot.channels.matrix.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.matrix.get_data_dir", lambda: tmp_path)
 
     channel = MatrixChannel(_make_config(max_media_bytes=10), MessageBus())
     client = _FakeAsyncClient("", "", "", None)
@@ -742,7 +742,7 @@ async def test_on_media_message_uses_server_limit_when_smaller_than_local_limit(
 
 @pytest.mark.asyncio
 async def test_on_media_message_handles_download_error(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr("medpilot.channels.matrix.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.matrix.get_data_dir", lambda: tmp_path)
 
     channel = MatrixChannel(_make_config(), MessageBus())
     client = _FakeAsyncClient("", "", "", None)
@@ -776,7 +776,7 @@ async def test_on_media_message_handles_download_error(monkeypatch, tmp_path) ->
 
 @pytest.mark.asyncio
 async def test_on_media_message_decrypts_encrypted_media(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr("medpilot.channels.matrix.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.matrix.get_data_dir", lambda: tmp_path)
     monkeypatch.setattr(
         matrix_module,
         "decrypt_attachment",
@@ -819,7 +819,7 @@ async def test_on_media_message_decrypts_encrypted_media(monkeypatch, tmp_path) 
 
 @pytest.mark.asyncio
 async def test_on_media_message_handles_decrypt_error(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr("medpilot.channels.matrix.get_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.matrix.get_data_dir", lambda: tmp_path)
 
     def _raise(*args, **kwargs):
         raise matrix_module.EncryptionError("boom")

@@ -1,7 +1,7 @@
 {
-  "name": "medpilot-whatsapp-bridge",
+  "name": "mira-whatsapp-bridge",
   "version": "0.1.0",
-  "description": "WhatsApp bridge for medpilot using Baileys",
+  "description": "WhatsApp bridge for mira using Baileys",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

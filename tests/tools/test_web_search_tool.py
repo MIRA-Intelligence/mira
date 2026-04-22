@@ -1,12 +1,14 @@
 """Tests for multi-provider web search."""
 
 import asyncio
+import sys
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from medpilot.agent.tools.web import WebSearchTool
-from medpilot.config.schema import WebSearchConfig
+from mira_engine.agent.tools.web import WebSearchTool
+from mira_engine.config.schema import WebSearchConfig
 
 
 def _tool(provider: str = "brave", api_key: str = "", base_url: str = "") -> WebSearchTool:
@@ -20,19 +22,24 @@ def _response(status: int = 200, json: dict | None = None) -> httpx.Response:
     return r
 
 
+def _install_mock_ddgs(monkeypatch, ddgs_cls) -> None:
+    """Install a lightweight ddgs module shim for environments without ddgs."""
+    monkeypatch.setitem(sys.modules, "ddgs", SimpleNamespace(DDGS=ddgs_cls))
+
+
 @pytest.mark.asyncio
 async def test_brave_search(monkeypatch):
     async def mock_get(self, url, **kw):
         assert "brave" in url
         assert kw["headers"]["X-Subscription-Token"] == "brave-key"
         return _response(json={
-            "web": {"results": [{"title": "MedPilot", "url": "https://example.com", "description": "AI assistant"}]}
+            "web": {"results": [{"title": "Mira", "url": "https://example.com", "description": "AI assistant"}]}
         })
 
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
     tool = _tool(provider="brave", api_key="brave-key")
-    result = await tool.execute(query="medpilot", count=1)
-    assert "MedPilot" in result
+    result = await tool.execute(query="mira", count=1)
+    assert "Mira" in result
     assert "https://example.com" in result
 
 
@@ -75,12 +82,10 @@ async def test_duckduckgo_search(monkeypatch):
         def text(self, query, max_results=5):
             return [{"title": "DDG Result", "href": "https://ddg.example", "body": "From DuckDuckGo"}]
 
-    monkeypatch.setattr("medpilot.agent.tools.web.DDGS", MockDDGS, raising=False)
-    import medpilot.agent.tools.web as web_mod
+    monkeypatch.setattr("mira_engine.agent.tools.web.DDGS", MockDDGS, raising=False)
+    import mira_engine.agent.tools.web as web_mod
     monkeypatch.setattr(web_mod, "DDGS", MockDDGS, raising=False)
-
-    from ddgs import DDGS
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    _install_mock_ddgs(monkeypatch, MockDDGS)
 
     tool = _tool(provider="duckduckgo")
     result = await tool.execute(query="hello")
@@ -96,7 +101,7 @@ async def test_brave_fallback_to_duckduckgo_when_no_key(monkeypatch):
         def text(self, query, max_results=5):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
 
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    _install_mock_ddgs(monkeypatch, MockDDGS)
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
 
     tool = _tool(provider="brave", api_key="")
@@ -149,7 +154,7 @@ async def test_searxng_no_base_url_falls_back(monkeypatch):
         def text(self, query, max_results=5):
             return [{"title": "Fallback", "href": "https://ddg.example", "body": "fallback"}]
 
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    _install_mock_ddgs(monkeypatch, MockDDGS)
     monkeypatch.delenv("SEARXNG_BASE_URL", raising=False)
 
     tool = _tool(provider="searxng", base_url="")
@@ -182,7 +187,7 @@ async def test_jina_422_falls_back_to_duckduckgo(monkeypatch):
         )
 
     monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    _install_mock_ddgs(monkeypatch, MockDDGS)
 
     tool = _tool(provider="jina", api_key="jina-key")
     result = await tool.execute(query="test")
@@ -221,7 +226,7 @@ async def test_duckduckgo_timeout_returns_error(monkeypatch):
             gate.wait(timeout=10)
             return []
 
-    monkeypatch.setattr("ddgs.DDGS", HangingDDGS)
+    _install_mock_ddgs(monkeypatch, HangingDDGS)
     tool = _tool(provider="duckduckgo")
     tool.config.timeout = 0.2
     result = await tool.execute(query="test")

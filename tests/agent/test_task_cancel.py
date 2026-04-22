@@ -8,15 +8,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from medpilot.config.schema import AgentDefaults
+from mira_engine.config.schema import AgentDefaults
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
 
 def _make_loop(*, exec_config=None):
     """Create a minimal AgentLoop with mocked dependencies."""
-    from medpilot.agent.loop import AgentLoop
-    from medpilot.bus.queue import MessageBus
+    from mira_engine.agent.loop import AgentLoop
+    from mira_engine.bus.queue import MessageBus
 
     bus = MessageBus()
     provider = MagicMock()
@@ -24,9 +24,9 @@ def _make_loop(*, exec_config=None):
     workspace = MagicMock()
     workspace.__truediv__ = MagicMock(return_value=MagicMock())
 
-    with patch("medpilot.agent.loop.ContextBuilder"), \
-         patch("medpilot.agent.loop.SessionManager"), \
-         patch("medpilot.agent.loop.SubagentManager") as MockSubMgr:
+    with patch("mira_engine.agent.loop.ContextBuilder"), \
+         patch("mira_engine.agent.loop.SessionManager"), \
+         patch("mira_engine.agent.loop.SubagentManager") as MockSubMgr:
         MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, exec_config=exec_config)
     return loop, bus
@@ -35,9 +35,9 @@ def _make_loop(*, exec_config=None):
 class TestHandleStop:
     @pytest.mark.asyncio
     async def test_stop_no_active_task(self):
-        from medpilot.bus.events import InboundMessage
-        from medpilot.command.builtin import cmd_stop
-        from medpilot.command.router import CommandContext
+        from mira_engine.bus.events import InboundMessage
+        from mira_engine.command.builtin import cmd_stop
+        from mira_engine.command.router import CommandContext
 
         loop, bus = _make_loop()
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/stop")
@@ -47,9 +47,9 @@ class TestHandleStop:
 
     @pytest.mark.asyncio
     async def test_stop_cancels_active_task(self):
-        from medpilot.bus.events import InboundMessage
-        from medpilot.command.builtin import cmd_stop
-        from medpilot.command.router import CommandContext
+        from mira_engine.bus.events import InboundMessage
+        from mira_engine.command.builtin import cmd_stop
+        from mira_engine.command.router import CommandContext
 
         loop, bus = _make_loop()
         cancelled = asyncio.Event()
@@ -74,9 +74,9 @@ class TestHandleStop:
 
     @pytest.mark.asyncio
     async def test_stop_cancels_multiple_tasks(self):
-        from medpilot.bus.events import InboundMessage
-        from medpilot.command.builtin import cmd_stop
-        from medpilot.command.router import CommandContext
+        from mira_engine.bus.events import InboundMessage
+        from mira_engine.command.builtin import cmd_stop
+        from mira_engine.command.router import CommandContext
 
         loop, bus = _make_loop()
         events = [asyncio.Event(), asyncio.Event()]
@@ -102,7 +102,7 @@ class TestHandleStop:
 
 class TestDispatch:
     def test_exec_tool_not_registered_when_disabled(self):
-        from medpilot.config.schema import ExecToolConfig
+        from mira_engine.config.schema import ExecToolConfig
 
         loop, _bus = _make_loop(exec_config=ExecToolConfig(enable=False))
 
@@ -110,7 +110,7 @@ class TestDispatch:
 
     @pytest.mark.asyncio
     async def test_dispatch_processes_and_publishes(self):
-        from medpilot.bus.events import InboundMessage, OutboundMessage
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
 
         loop, bus = _make_loop()
         msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="hello")
@@ -123,7 +123,7 @@ class TestDispatch:
 
     @pytest.mark.asyncio
     async def test_dispatch_streaming_preserves_message_metadata(self):
-        from medpilot.bus.events import InboundMessage
+        from mira_engine.bus.events import InboundMessage
 
         loop, bus = _make_loop()
         msg = InboundMessage(
@@ -160,7 +160,7 @@ class TestDispatch:
 
     @pytest.mark.asyncio
     async def test_processing_lock_serializes(self):
-        from medpilot.bus.events import InboundMessage, OutboundMessage
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
 
         loop, bus = _make_loop()
         order = []
@@ -184,8 +184,8 @@ class TestDispatch:
 class TestSubagentCancellation:
     @pytest.mark.asyncio
     async def test_cancel_by_session(self):
-        from medpilot.agent.subagent import SubagentManager
-        from medpilot.bus.queue import MessageBus
+        from mira_engine.agent.subagent import SubagentManager
+        from mira_engine.bus.queue import MessageBus
 
         bus = MessageBus()
         provider = MagicMock()
@@ -217,8 +217,8 @@ class TestSubagentCancellation:
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_no_tasks(self):
-        from medpilot.agent.subagent import SubagentManager
-        from medpilot.bus.queue import MessageBus
+        from mira_engine.agent.subagent import SubagentManager
+        from mira_engine.bus.queue import MessageBus
 
         bus = MessageBus()
         provider = MagicMock()
@@ -233,9 +233,9 @@ class TestSubagentCancellation:
 
     @pytest.mark.asyncio
     async def test_subagent_preserves_reasoning_fields_in_tool_turn(self, monkeypatch, tmp_path):
-        from medpilot.agent.subagent import SubagentManager
-        from medpilot.bus.queue import MessageBus
-        from medpilot.providers.base import LLMResponse, ToolCallRequest
+        from mira_engine.agent.subagent import SubagentManager
+        from mira_engine.bus.queue import MessageBus
+        from mira_engine.providers.base import LLMResponse, ToolCallRequest
 
         bus = MessageBus()
         provider = MagicMock()
@@ -267,7 +267,7 @@ class TestSubagentCancellation:
         async def fake_execute(self, **kwargs):
             return "tool result"
 
-        monkeypatch.setattr("medpilot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
+        monkeypatch.setattr("mira_engine.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
         await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
 
@@ -281,9 +281,9 @@ class TestSubagentCancellation:
 
     @pytest.mark.asyncio
     async def test_subagent_exec_tool_not_registered_when_disabled(self, tmp_path):
-        from medpilot.agent.subagent import SubagentManager
-        from medpilot.bus.queue import MessageBus
-        from medpilot.config.schema import ExecToolConfig
+        from mira_engine.agent.subagent import SubagentManager
+        from mira_engine.bus.queue import MessageBus
+        from mira_engine.config.schema import ExecToolConfig
 
         bus = MessageBus()
         provider = MagicMock()
@@ -315,9 +315,9 @@ class TestSubagentCancellation:
 
     @pytest.mark.asyncio
     async def test_subagent_announces_error_when_tool_execution_fails(self, monkeypatch, tmp_path):
-        from medpilot.agent.subagent import SubagentManager
-        from medpilot.bus.queue import MessageBus
-        from medpilot.providers.base import LLMResponse, ToolCallRequest
+        from mira_engine.agent.subagent import SubagentManager
+        from mira_engine.bus.queue import MessageBus
+        from mira_engine.providers.base import LLMResponse, ToolCallRequest
 
         bus = MessageBus()
         provider = MagicMock()
@@ -342,7 +342,7 @@ class TestSubagentCancellation:
                 return "first result"
             raise RuntimeError("boom")
 
-        monkeypatch.setattr("medpilot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
+        monkeypatch.setattr("mira_engine.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
         await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
 
@@ -356,9 +356,9 @@ class TestSubagentCancellation:
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):
-        from medpilot.agent.subagent import SubagentManager
-        from medpilot.bus.queue import MessageBus
-        from medpilot.providers.base import LLMResponse, ToolCallRequest
+        from mira_engine.agent.subagent import SubagentManager
+        from mira_engine.bus.queue import MessageBus
+        from mira_engine.providers.base import LLMResponse, ToolCallRequest
 
         bus = MessageBus()
         provider = MagicMock()
@@ -386,7 +386,7 @@ class TestSubagentCancellation:
                 cancelled.set()
                 raise
 
-        monkeypatch.setattr("medpilot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
+        monkeypatch.setattr("mira_engine.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
         task = asyncio.create_task(
             mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})

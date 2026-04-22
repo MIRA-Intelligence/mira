@@ -1,19 +1,19 @@
-# MedPilot 发布日操作清单
+# Mira 发布日操作清单
 
-本文面向发布操作者，覆盖 `MedPilot` 与 `MedPilotUI` 双仓发布。
+本文面向发布操作者，覆盖 `Mira` 与 `MiraUI` 双仓发布。
 
 ## 0) 发布范围确认
 
 - [ ] 确认目标版本：
-  - Agent tag: `vX.Y.Z`（`MedPilot`）
-  - UI tag: `vA.B.C`（`MedPilotUI`）
+  - Agent tag: `vX.Y.Z`（`Mira`）
+  - UI tag: `vA.B.C`（`MiraUI`）
 - [ ] 确认本次 release train 映射已更新：
   - `compatibility.json`
 - [ ] 确认里程碑与变更范围一致（只发已验收内容）
 
 ## 1) 发布前基线检查（T-1）
 
-### MedPilot
+### Mira
 
 - [ ] 在 `release` 分支同步最新代码
 - [ ] 本地回归：
@@ -28,7 +28,7 @@ python -m pytest tests -q
   - `.github/workflows/agent-release.yml`
   - `.github/workflows/release-train.yml`
 
-### MedPilotUI
+### MiraUI
 
 - [ ] 在 `release` 分支同步最新代码
 - [ ] 本地构建：
@@ -43,7 +43,7 @@ npm run build:electron
 
 ## 2) 版本打标（Release Day）
 
-### 2.1 Agent 仓库打 tag（MedPilot）
+### 2.1 Agent 仓库打 tag（Mira）
 
 ```bash
 git checkout release
@@ -54,7 +54,7 @@ git push origin vX.Y.Z
 
 预期：自动触发 `agent-release.yml`。
 
-### 2.2 UI 仓库打 tag（MedPilotUI）
+### 2.2 UI 仓库打 tag（MiraUI）
 
 ```bash
 git checkout release
@@ -67,16 +67,16 @@ git push origin vA.B.C
 
 ## 3) 流水线执行与产物验收
 
-### Agent Release (`MedPilot`)
+### Agent Release (`Mira`)
 
 - [ ] `agent-release.yml` 全绿
 - [ ] 检查 GitHub Release 产物：
   - wheel / sdist
-  - `medpilot-agent` 可执行文件（各平台）
+  - `mira-engine` 可执行文件（各平台）
   - `SHA256SUMS.txt`
 - [ ] 如启用 PyPI 发布，确认版本可见
 
-### Desktop Release (`MedPilotUI`)
+### Desktop Release (`MiraUI`)
 
 - [ ] `desktop-release.yml` 全绿
 - [ ] 检查 Release 产物：
@@ -85,7 +85,7 @@ git push origin vA.B.C
 
 ## 4) 组合发布验证（Release Train）
 
-在 `MedPilot` 手动触发 `release-train.yml`（workflow_dispatch）：
+在 `Mira` 手动触发 `release-train.yml`（workflow_dispatch）：
 
 - `agent_tag = vX.Y.Z`
 - `ui_tag = vA.B.C`
@@ -125,10 +125,10 @@ curl http://127.0.0.1:18790/version
 ### Agent 回滚
 
 ```bash
-medpilot-agent stop
-python -m pip install --upgrade medpilot==<previous_version>
-medpilot-agent start
-medpilot-agent doctor
+mira-engine stop
+python -m pip install --upgrade mira==<previous_version>
+mira-engine start
+mira-engine doctor
 ```
 
 ### UI 回滚

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from medpilot.config.schema import Config
-from medpilot.providers.factory import make_provider
+from mira_engine.config.schema import Config
+from mira_engine.providers.factory import make_provider
 
 
 def test_make_provider_raises_clear_error_when_provider_cannot_be_matched() -> None:

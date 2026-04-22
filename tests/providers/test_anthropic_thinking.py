@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from medpilot.providers.anthropic_provider import AnthropicProvider
+from mira_engine.providers.anthropic_provider import AnthropicProvider
 
 
 def _make_provider(model: str = "claude-sonnet-4-6") -> AnthropicProvider:

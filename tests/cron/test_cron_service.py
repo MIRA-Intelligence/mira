@@ -4,8 +4,8 @@ import time
 
 import pytest
 
-from medpilot.cron.service import CronService
-from medpilot.cron.types import CronJob, CronPayload, CronSchedule
+from mira_engine.cron.service import CronService
+from mira_engine.cron.types import CronJob, CronPayload, CronSchedule
 
 
 def test_add_job_rejects_unknown_timezone(tmp_path) -> None:

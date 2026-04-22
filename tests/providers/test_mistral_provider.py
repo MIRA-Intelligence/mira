@@ -1,7 +1,7 @@
 """Tests for the Mistral provider registration."""
 
-from medpilot.config.schema import ProvidersConfig
-from medpilot.providers.registry import PROVIDERS
+from mira_engine.config.schema import ProvidersConfig
+from mira_engine.providers.registry import PROVIDERS
 
 
 def test_mistral_config_field_exists():

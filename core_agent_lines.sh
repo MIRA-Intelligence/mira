@@ -36,18 +36,18 @@ print_row() {
   printf "  %-16s %6s lines\n" "$label" "$count"
 }
 
-echo "medpilot line count"
+echo "mira line count"
 echo "=================="
 echo ""
 
 echo "Core runtime"
 echo "------------"
-core_agent=$(count_top_level_py_lines "medpilot/agent")
-core_bus=$(count_top_level_py_lines "medpilot/bus")
-core_config=$(count_top_level_py_lines "medpilot/config")
-core_cron=$(count_top_level_py_lines "medpilot/cron")
-core_heartbeat=$(count_top_level_py_lines "medpilot/heartbeat")
-core_session=$(count_top_level_py_lines "medpilot/session")
+core_agent=$(count_top_level_py_lines "mira_engine/agent")
+core_bus=$(count_top_level_py_lines "mira_engine/bus")
+core_config=$(count_top_level_py_lines "mira_engine/config")
+core_cron=$(count_top_level_py_lines "mira_engine/cron")
+core_heartbeat=$(count_top_level_py_lines "mira_engine/heartbeat")
+core_session=$(count_top_level_py_lines "mira_engine/session")
 
 print_row "agent/" "$core_agent"
 print_row "bus/" "$core_bus"
@@ -61,12 +61,12 @@ core_total=$((core_agent + core_bus + core_config + core_cron + core_heartbeat +
 echo ""
 echo "Separate buckets"
 echo "----------------"
-extra_tools=$(count_recursive_py_lines "medpilot/agent/tools")
-extra_skills=$(count_skill_lines "medpilot/skills")
-extra_api=$(count_recursive_py_lines "medpilot/api")
-extra_cli=$(count_recursive_py_lines "medpilot/cli")
-extra_channels=$(count_recursive_py_lines "medpilot/channels")
-extra_utils=$(count_recursive_py_lines "medpilot/utils")
+extra_tools=$(count_recursive_py_lines "mira_engine/agent/tools")
+extra_skills=$(count_skill_lines "mira_engine/skills")
+extra_api=$(count_recursive_py_lines "mira_engine/api")
+extra_cli=$(count_recursive_py_lines "mira_engine/cli")
+extra_channels=$(count_recursive_py_lines "mira_engine/channels")
+extra_utils=$(count_recursive_py_lines "mira_engine/utils")
 
 print_row "tools/" "$extra_tools"
 print_row "skills/" "$extra_skills"
@@ -86,7 +86,7 @@ print_row "extra total" "$extra_total"
 echo ""
 echo "Notes"
 echo "-----"
-echo "  - agent/ only counts top-level Python files under medpilot/agent"
-echo "  - tools/ is counted separately from medpilot/agent/tools"
+echo "  - agent/ only counts top-level Python files under mira_engine/agent"
+echo "  - tools/ is counted separately from mira_engine/agent/tools"
 echo "  - skills/ counts .md, .py, and .sh files"
-echo "  - not included here: command/, providers/, security/, templates/, medpilot.py, root files"
+echo "  - not included here: command/, providers/, security/, templates/, mira_engine.py, root files"

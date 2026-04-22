@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 
-from medpilot.bus.events import OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.channels.base import BaseChannel
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.base import BaseChannel
 
 
 class _DummyChannel(BaseChannel):

@@ -1,11 +1,11 @@
-from medpilot.agent.context import ContextBuilder
-from medpilot.agent.loop import AgentLoop
-from medpilot.session.manager import Session
+from mira_engine.agent.context import ContextBuilder
+from mira_engine.agent.loop import AgentLoop
+from mira_engine.session.manager import Session
 
 
 def _mk_loop() -> AgentLoop:
     loop = AgentLoop.__new__(AgentLoop)
-    from medpilot.config.schema import AgentDefaults
+    from mira_engine.config.schema import AgentDefaults
 
     loop.max_tool_result_chars = AgentDefaults().max_tool_result_chars
     return loop

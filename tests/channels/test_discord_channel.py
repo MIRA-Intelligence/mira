@@ -7,10 +7,10 @@ from types import SimpleNamespace
 import pytest
 discord = pytest.importorskip("discord")
 
-from medpilot.bus.events import OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.channels.discord import MAX_MESSAGE_LEN, DiscordBotClient, DiscordChannel, DiscordConfig
-from medpilot.command.builtin import build_help_text
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.discord import MAX_MESSAGE_LEN, DiscordBotClient, DiscordChannel, DiscordConfig
+from mira_engine.command.builtin import build_help_text
 
 
 # Minimal Discord client test double used to control startup/readiness behavior.
@@ -195,7 +195,7 @@ async def test_start_returns_when_discord_dependency_missing(monkeypatch) -> Non
         DiscordConfig(enabled=True, token="token", allow_from=["*"]),
         MessageBus(),
     )
-    monkeypatch.setattr("medpilot.channels.discord.DISCORD_AVAILABLE", False)
+    monkeypatch.setattr("mira_engine.channels.discord.DISCORD_AVAILABLE", False)
 
     await channel.start()
 
@@ -214,7 +214,7 @@ async def test_start_handles_client_construction_failure(monkeypatch) -> None:
     def _boom(owner, *, intents):
         raise RuntimeError("bad client")
 
-    monkeypatch.setattr("medpilot.channels.discord.DiscordBotClient", _boom)
+    monkeypatch.setattr("mira_engine.channels.discord.DiscordBotClient", _boom)
 
     await channel.start()
 
@@ -232,7 +232,7 @@ async def test_start_handles_client_start_failure(monkeypatch) -> None:
 
     _FakeDiscordClient.instances.clear()
     _FakeDiscordClient.start_error = RuntimeError("connect failed")
-    monkeypatch.setattr("medpilot.channels.discord.DiscordBotClient", _FakeDiscordClient)
+    monkeypatch.setattr("mira_engine.channels.discord.DiscordBotClient", _FakeDiscordClient)
 
     await channel.start()
 
@@ -361,7 +361,7 @@ async def test_on_message_downloads_attachments(tmp_path, monkeypatch) -> None:
         handled.append(kwargs)
 
     channel._handle_message = capture_handle  # type: ignore[method-assign]
-    monkeypatch.setattr("medpilot.channels.discord.get_media_dir", lambda _name: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.discord.get_media_dir", lambda _name: tmp_path)
 
     await channel._on_message(
         _make_message(
@@ -385,7 +385,7 @@ async def test_on_message_marks_failed_attachment_download(tmp_path, monkeypatch
         handled.append(kwargs)
 
     channel._handle_message = capture_handle  # type: ignore[method-assign]
-    monkeypatch.setattr("medpilot.channels.discord.get_media_dir", lambda _name: tmp_path)
+    monkeypatch.setattr("mira_engine.channels.discord.get_media_dir", lambda _name: tmp_path)
 
     await channel._on_message(
         _make_message(
@@ -460,7 +460,7 @@ async def test_send_delta_streams_by_editing_message(monkeypatch) -> None:
     client.channels[123] = target
 
     times = iter([1.0, 3.0, 5.0])
-    monkeypatch.setattr("medpilot.channels.discord.time.monotonic", lambda: next(times, 5.0))
+    monkeypatch.setattr("mira_engine.channels.discord.time.monotonic", lambda: next(times, 5.0))
 
     await owner.send_delta("123", "hel", {"_stream_delta": True, "_stream_id": "s1"})
     await owner.send_delta("123", "lo", {"_stream_delta": True, "_stream_id": "s1"})
@@ -487,7 +487,7 @@ async def test_send_delta_stream_end_splits_oversized_reply(monkeypatch) -> None
     assert len(chunks) == 2
 
     times = iter([1.0, 3.0])
-    monkeypatch.setattr("medpilot.channels.discord.time.monotonic", lambda: next(times, 3.0))
+    monkeypatch.setattr("mira_engine.channels.discord.time.monotonic", lambda: next(times, 3.0))
 
     await owner.send_delta("123", prefix, {"_stream_delta": True, "_stream_id": "s1"})
     await owner.send_delta("123", suffix, {"_stream_delta": True, "_stream_id": "s1"})

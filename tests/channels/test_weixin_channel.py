@@ -8,9 +8,9 @@ from unittest.mock import AsyncMock
 import pytest
 import httpx
 
-import medpilot.channels.weixin as weixin_mod
-from medpilot.bus.queue import MessageBus
-from medpilot.channels.weixin import (
+import mira_engine.channels.weixin as weixin_mod
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.weixin import (
     ITEM_IMAGE,
     ITEM_TEXT,
     MESSAGE_TYPE_BOT,
@@ -28,7 +28,7 @@ def _make_channel() -> tuple[WeixinChannel, MessageBus]:
         WeixinConfig(
             enabled=True,
             allow_from=["*"],
-            state_dir=tempfile.mkdtemp(prefix="medpilot-weixin-test-"),
+            state_dir=tempfile.mkdtemp(prefix="mira-weixin-test-"),
         ),
         bus,
     )

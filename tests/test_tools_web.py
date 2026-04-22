@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import httpx
 
-from medpilot.agent.tools import web as web_mod
-from medpilot.agent.tools.web import WebFetchTool, WebSearchTool, _normalize, _strip_tags, _validate_url
+from mira_engine.agent.tools import web as web_mod
+from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool, _normalize, _strip_tags, _validate_url
 
 
 class _FakeResponse:
@@ -66,7 +66,7 @@ def test_validate_url_and_text_helpers() -> None:
 
 async def test_web_search_requires_api_key() -> None:
     tool = WebSearchTool(api_key="")
-    result = await tool.execute("medpilot")
+    result = await tool.execute("mira")
     assert "API key not configured" in result
 
 

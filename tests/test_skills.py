@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from medpilot.agent.skills import SkillsLoader
-from medpilot.agent.skill_plugins import SkillPluginManager
-from medpilot.agent import skill_plugins as skill_plugins_mod
+from mira_engine.agent.skills import SkillsLoader
+from mira_engine.agent.skill_plugins import SkillPluginManager
+from mira_engine.agent import skill_plugins as skill_plugins_mod
 
 
 def _write_skill(base: Path, name: str, body: str) -> Path:
@@ -60,7 +60,7 @@ def test_load_skills_for_context_strips_frontmatter(tmp_path: Path) -> None:
     _write_skill(
         ws / "skills",
         "one",
-        f"---\ndescription: D\nmetadata: '{json.dumps({'medpilot': {}})}'\n---\n\n{body}",
+        f"---\ndescription: D\nmetadata: '{json.dumps({'mira': {}})}'\n---\n\n{body}",
     )
     builtin = tmp_path / "empty_builtin"
     builtin.mkdir()
@@ -75,7 +75,7 @@ def test_build_skills_summary_xml_escape_and_requires(tmp_path: Path) -> None:
     ws = tmp_path / "ws"
     builtin = tmp_path / "builtin"
     bad_bin = "nonexistent_cli_skill_req_zzzzz"
-    meta = json.dumps({"medpilot": {"requires": {"bins": [bad_bin]}}})
+    meta = json.dumps({"mira": {"requires": {"bins": [bad_bin]}}})
     _write_skill(
         ws / "skills",
         "esc&me",
@@ -100,13 +100,13 @@ def test_strip_frontmatter(tmp_path: Path) -> None:
     assert loader._strip_frontmatter("no front") == "no front"
 
 
-def test_parse_medpilot_metadata() -> None:
+def test_parse_mira_metadata() -> None:
     loader = SkillsLoader(Path("/tmp"), builtin_skills_dir=None)
-    rb = json.dumps({"medpilot": {"always": True}})
-    assert loader._parse_medpilot_metadata(rb) == {"always": True}
+    rb = json.dumps({"mira": {"always": True}})
+    assert loader._parse_mira_metadata(rb) == {"always": True}
     oc = json.dumps({"openclaw": {"foo": 1}})
-    assert loader._parse_medpilot_metadata(oc) == {"foo": 1}
-    assert loader._parse_medpilot_metadata("not json") == {}
+    assert loader._parse_mira_metadata(oc) == {"foo": 1}
+    assert loader._parse_mira_metadata("not json") == {}
 
 
 def test_check_requirements() -> None:
@@ -133,7 +133,7 @@ def test_get_skill_metadata_frontmatter_and_plain(tmp_path: Path) -> None:
 
 def test_get_always_skills(tmp_path: Path) -> None:
     ws = tmp_path / "ws"
-    meta_always = json.dumps({"medpilot": {"always": True}})
+    meta_always = json.dumps({"mira": {"always": True}})
     _write_skill(
         ws / "skills",
         "always_rb",

@@ -1,6 +1,6 @@
 ## Related Issue
 
-- Closes #<issue-id> (or Implements Project-MedPilot/MedPilot#<issue-id> for cross-repo PRs)
+- Closes #<issue-id> (or Implements MIRA-Intelligence/mira#<issue-id> for cross-repo PRs)
 
 ## CLA Acknowledgement
 

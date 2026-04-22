@@ -2,7 +2,7 @@ import json
 from types import SimpleNamespace
 from pathlib import Path
 
-from medpilot.task_plan.guardrails import get_task_plan_contract, guard_task_plan_file
+from mira_engine.task_plan.guardrails import get_task_plan_contract, guard_task_plan_file
 
 
 def test_guard_task_plan_auto_fixes_ids_and_recovers_metrics(tmp_path: Path) -> None:
@@ -109,8 +109,8 @@ def test_guard_task_plan_strict_mode_requires_model_completion_for_recovered_exp
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "PRJ-0001D"
-    (project_dir / ".medpilot").mkdir(parents=True)
-    (project_dir / ".medpilot" / "project.json").write_text(
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "research", "contract_version": 2}),
         encoding="utf-8",
     )
@@ -154,8 +154,8 @@ def test_guard_task_plan_strict_mode_does_not_auto_fill_completed_fields(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "PRJ-0001F"
-    (project_dir / ".medpilot").mkdir(parents=True)
-    (project_dir / ".medpilot" / "project.json").write_text(
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "research", "contract_version": 2}),
         encoding="utf-8",
     )
@@ -196,8 +196,8 @@ def test_guard_task_plan_strict_mode_does_not_promote_artifact_only_experiment(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "PRJ-0001G"
-    (project_dir / ".medpilot").mkdir(parents=True)
-    (project_dir / ".medpilot" / "project.json").write_text(
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "research", "contract_version": 2}),
         encoding="utf-8",
     )
@@ -230,8 +230,8 @@ def test_guard_task_plan_strict_mode_rejects_guardrail_placeholder_fields(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "PRJ-0001H"
-    (project_dir / ".medpilot").mkdir(parents=True)
-    (project_dir / ".medpilot" / "project.json").write_text(
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "research", "contract_version": 2}),
         encoding="utf-8",
     )
@@ -296,7 +296,7 @@ def test_guard_task_plan_recovers_from_git_commit_when_no_metrics_json(
             return SimpleNamespace(stdout="data/fitted_params.csv\n", returncode=0)
         return SimpleNamespace(stdout="", returncode=0)
 
-    monkeypatch.setattr("medpilot.task_plan.guardrails.subprocess.run", fake_run)
+    monkeypatch.setattr("mira_engine.task_plan.guardrails.subprocess.run", fake_run)
 
     result = guard_task_plan_file(project_dir, auto_fix=True)
     assert result["ok"] is True
@@ -384,8 +384,8 @@ def test_guard_task_plan_allows_existing_noncanonical_artifacts(tmp_path: Path) 
 
 def test_guard_task_plan_research_profile_requires_evidence_fields(tmp_path: Path) -> None:
     project_dir = tmp_path / "PRJ-0100"
-    (project_dir / ".medpilot").mkdir(parents=True)
-    (project_dir / ".medpilot" / "project.json").write_text(
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "research"}),
         encoding="utf-8",
     )
@@ -419,8 +419,8 @@ def test_guard_task_plan_engineer_profile_requires_reproducibility_fields(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "PRJ-0101"
-    (project_dir / ".medpilot").mkdir(parents=True)
-    (project_dir / ".medpilot" / "project.json").write_text(
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "engineer"}),
         encoding="utf-8",
     )
@@ -454,8 +454,8 @@ def test_guard_task_plan_default_profile_requires_evidence_refs_for_rejection(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "PRJ-0102"
-    (project_dir / ".medpilot").mkdir(parents=True)
-    (project_dir / ".medpilot" / "project.json").write_text(
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "default"}),
         encoding="utf-8",
     )
@@ -487,8 +487,8 @@ def test_guard_task_plan_default_profile_contract_v2_requires_core_fields(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "PRJ-0103"
-    (project_dir / ".medpilot").mkdir(parents=True)
-    (project_dir / ".medpilot" / "project.json").write_text(
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "default", "contract_version": 2}),
         encoding="utf-8",
     )

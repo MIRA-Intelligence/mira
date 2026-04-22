@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from medpilot.agent.tools.cron import CronTool
-from medpilot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule
+from mira_engine.agent.tools.cron import CronTool
+from mira_engine.cron.types import CronJob, CronJobState, CronPayload, CronSchedule
 
 
 @dataclass

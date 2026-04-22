@@ -4,10 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from medpilot.bus.events import InboundMessage
-from medpilot.command.builtin import cmd_dream_log, cmd_dream_restore
-from medpilot.command.router import CommandContext
-from medpilot.utils.gitstore import CommitInfo
+from mira_engine.bus.events import InboundMessage
+from mira_engine.command.builtin import cmd_dream_log, cmd_dream_restore
+from mira_engine.command.router import CommandContext
+from mira_engine.utils.gitstore import CommitInfo
 
 
 class _FakeStore:

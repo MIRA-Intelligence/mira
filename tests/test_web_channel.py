@@ -7,13 +7,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 
-from medpilot import __version__
-from medpilot.agent import skill_plugins as skill_plugins_mod
-from medpilot.bus.events import OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.channels import web as web_channel_mod
-from medpilot.channels.base import BaseChannel
-from medpilot.channels.web import (
+from mira_engine import __version__
+from mira_engine.agent import skill_plugins as skill_plugins_mod
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels import web as web_channel_mod
+from mira_engine.channels.base import BaseChannel
+from mira_engine.channels.web import (
     _API_CONTRACT_VERSION,
     PLAN_FILENAME,
     WebChannel,
@@ -28,8 +28,8 @@ from medpilot.channels.web import (
     _safe_upload_name,
     _stringify_history_content,
 )
-from medpilot.config.schema import WebChannelConfig
-from medpilot.session.manager import SessionManager
+from mira_engine.config.schema import WebChannelConfig
+from mira_engine.session.manager import SessionManager
 
 
 def _minimal_base_init(self, config, bus) -> None:
@@ -165,7 +165,7 @@ async def test_handle_health_returns_machine_readable_payload(web_channel: WebCh
     assert resp.status == 200
     assert json.loads(resp.text) == {
         "status": "ok",
-        "service": "medpilot-gateway",
+        "service": "mira-gateway",
         "channel": "web",
         "running": True,
         "connected_clients": 1,
@@ -178,7 +178,7 @@ async def test_handle_version_returns_contract_payload(web_channel: WebChannel) 
     body = json.loads(resp.text)
 
     assert resp.status == 200
-    assert body["service"] == "medpilot-gateway"
+    assert body["service"] == "mira-gateway"
     assert body["agent_version"] == __version__
     assert body["api_contract"] == _API_CONTRACT_VERSION
     assert isinstance(body["uptime_seconds"], int)
@@ -199,7 +199,7 @@ def test_audit_writes_global_and_project_logs(web_channel: WebChannel) -> None:
     )
 
     global_log = web_channel.projects_root / "logs" / "project_actions.jsonl"
-    project_log = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    project_log = project_dir / ".mira" / "logs" / "actions.jsonl"
     assert global_log.is_file()
     assert project_log.is_file()
 
@@ -239,8 +239,8 @@ async def test_handle_plan_contract_requires_session_id(web_channel: WebChannel)
 async def test_handle_plan_contract_returns_profile_rules(web_channel: WebChannel) -> None:
     session = "PRJ-9015"
     project_dir = web_channel.projects_root / session
-    (project_dir / ".medpilot").mkdir(parents=True)
-    (project_dir / ".medpilot" / "project.json").write_text(
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "research", "contract_version": 2}),
         encoding="utf-8",
     )
@@ -355,7 +355,7 @@ async def test_handle_plan_attaches_and_persists_completed_experiment_snapshot(
     assert exp["snapshot"]["results"]["findings"] == "initial findings"
 
     saved_snapshot = (
-        project_dir / ".medpilot" / "snapshots" / "experiments" / "Exp001.json"
+        project_dir / ".mira" / "snapshots" / "experiments" / "Exp001.json"
     )
     assert saved_snapshot.is_file()
 
@@ -606,7 +606,7 @@ async def test_handle_history_uses_audit_fallback_when_session_sparse(web_channe
     session_id = "PRJ-0010"
     project_dir = web_channel.projects_root / session_id
     project_dir.mkdir(parents=True)
-    audit_file = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    audit_file = project_dir / ".mira" / "logs" / "actions.jsonl"
     audit_file.parent.mkdir(parents=True, exist_ok=True)
     audit_file.write_text(
         "\n".join(
@@ -657,7 +657,7 @@ async def test_handle_history_prefers_ui_entries_over_audit_preview_when_present
         timestamp="2026-03-26T09:00:01",
     )
 
-    audit_file = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    audit_file = project_dir / ".mira" / "logs" / "actions.jsonl"
     audit_file.parent.mkdir(parents=True, exist_ok=True)
     audit_file.write_text(
         json.dumps({
@@ -829,7 +829,7 @@ async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebC
     assert all(item["has_meta"] for item in body["projects"])
     assert all(item["contract_version"] == 1 for item in body["projects"])
 
-    meta_file = web_channel.projects_root / "PRJ-0001" / ".medpilot" / "project.json"
+    meta_file = web_channel.projects_root / "PRJ-0001" / ".mira" / "project.json"
     assert meta_file.is_file()
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["id"] == "PRJ-0001"
@@ -853,7 +853,7 @@ async def test_handle_project_meta_updates_display_name(web_channel: WebChannel)
     assert body["agent_profile"] == "default"
     assert body["contract_version"] == 1
 
-    meta_file = project_dir / ".medpilot" / "project.json"
+    meta_file = project_dir / ".mira" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["display_name"] == "Lung CT baseline"
     assert meta["run_mode"] == "auto"
@@ -882,7 +882,7 @@ async def test_handle_project_meta_updates_run_mode_and_profile(
     assert body["agent_profile"] == "research"
     assert body["contract_version"] == 1
 
-    meta_file = project_dir / ".medpilot" / "project.json"
+    meta_file = project_dir / ".mira" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["run_mode"] == "manual"
     assert meta["agent_profile"] == "research"
@@ -904,7 +904,7 @@ async def test_handle_project_meta_updates_contract_version(
     body = json.loads(resp.text)
     assert body["contract_version"] == 2
 
-    meta_file = project_dir / ".medpilot" / "project.json"
+    meta_file = project_dir / ".mira" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["contract_version"] == 2
 
@@ -932,7 +932,7 @@ async def test_handle_project_meta_updates_automation_policy(
     assert body["automation_policy"]["logic"] == "OR"
     assert body["automation_policy"]["maxExperiments"] == 12
 
-    meta_file = project_dir / ".medpilot" / "project.json"
+    meta_file = project_dir / ".mira" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
 
@@ -1260,7 +1260,7 @@ async def test_send_writes_project_audit_entry(web_channel: WebChannel) -> None:
     )
     await web_channel.send(msg)
 
-    project_log = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    project_log = project_dir / ".mira" / "logs" / "actions.jsonl"
     assert project_log.is_file()
     entry = json.loads(project_log.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert entry["source"] == "agent"
@@ -1290,7 +1290,7 @@ async def test_send_audit_only_skill_event_writes_project_log(web_channel: WebCh
     )
     await web_channel.send(msg)
 
-    project_log = project_dir / ".medpilot" / "logs" / "actions.jsonl"
+    project_log = project_dir / ".mira" / "logs" / "actions.jsonl"
     assert project_log.is_file()
     entry = json.loads(project_log.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert entry["source"] == "agent"
@@ -1458,7 +1458,7 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert "_ui_system_instructions" in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"
 
-    meta_file = web_channel.projects_root / "PRJ-4001" / ".medpilot" / "project.json"
+    meta_file = web_channel.projects_root / "PRJ-4001" / ".mira" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["contract_version"] == 2
     assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
@@ -1541,7 +1541,7 @@ async def test_ws_handler_bind_registers_active_client(
 
     assert "PRJ-4011" not in web_channel._clients
     # Connection closes after handler loop exits; verify bind was accepted via audit entry.
-    audit_log = web_channel.projects_root / "PRJ-4011" / ".medpilot" / "logs" / "actions.jsonl"
+    audit_log = web_channel.projects_root / "PRJ-4011" / ".mira" / "logs" / "actions.jsonl"
     assert audit_log.is_file()
     lines = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert any(item.get("action") == "ws_bind_received" for item in lines)
@@ -1655,7 +1655,7 @@ async def test_ws_handler_bind_registers_active_client(
 
     assert "PRJ-4011" not in web_channel._clients
     # Connection closes after handler loop exits; verify bind was accepted via audit entry.
-    audit_log = web_channel.projects_root / "PRJ-4011" / ".medpilot" / "logs" / "actions.jsonl"
+    audit_log = web_channel.projects_root / "PRJ-4011" / ".mira" / "logs" / "actions.jsonl"
     assert audit_log.is_file()
     lines = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert any(item.get("action") == "ws_bind_received" for item in lines)

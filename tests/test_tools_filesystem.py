@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from medpilot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from mira_engine.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 
 
 async def test_read_file_success_and_missing(tmp_path: Path) -> None:
@@ -51,9 +51,9 @@ async def test_edit_file_success_and_not_found_paths(tmp_path: Path) -> None:
 
     f = tmp_path / "f.txt"
     f.write_text("hello world", encoding="utf-8")
-    ok = await tool.execute("f.txt", "world", "medpilot")
+    ok = await tool.execute("f.txt", "world", "mira")
     assert ok.startswith("Successfully edited")
-    assert f.read_text(encoding="utf-8") == "hello medpilot"
+    assert f.read_text(encoding="utf-8") == "hello mira"
 
 
 async def test_edit_file_warns_when_multiple_occurrences(tmp_path: Path) -> None:

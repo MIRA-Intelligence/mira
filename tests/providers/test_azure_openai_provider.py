@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from medpilot.providers.azure_openai_provider import AzureOpenAIProvider
-from medpilot.providers.base import LLMResponse
+from mira_engine.providers.azure_openai_provider import AzureOpenAIProvider
+from mira_engine.providers.base import LLMResponse
 
 
 # ---------------------------------------------------------------------------

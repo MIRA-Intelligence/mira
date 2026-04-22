@@ -8,7 +8,7 @@
       "largeModel": "anthropic/claude-opus-4-5",
       "routeByComplexity": false,
       "provider": "openrouter",
-      "workspace": "~/.medpilot/workspace"
+      "workspace": "~/.mira/workspace"
     }
   },
   "tools": {

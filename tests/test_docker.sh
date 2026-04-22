@@ -2,19 +2,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-IMAGE_NAME="medpilot-test"
+IMAGE_NAME="mira-test"
 
 echo "=== Building Docker image ==="
 docker build -t "$IMAGE_NAME" -f deploy/Dockerfile .
 
 echo ""
-echo "=== Running 'medpilot onboard' ==="
-docker run --name medpilot-test-run "$IMAGE_NAME" onboard
+echo "=== Running 'mira onboard' ==="
+docker run --name mira-test-run "$IMAGE_NAME" onboard
 
 echo ""
-echo "=== Running 'medpilot status' ==="
-STATUS_OUTPUT=$(docker commit medpilot-test-run medpilot-test-onboarded > /dev/null && \
-    docker run --rm medpilot-test-onboarded status 2>&1) || true
+echo "=== Running 'mira status' ==="
+STATUS_OUTPUT=$(docker commit mira-test-run mira-test-onboarded > /dev/null && \
+    docker run --rm mira-test-onboarded status 2>&1) || true
 
 echo "$STATUS_OUTPUT"
 
@@ -31,7 +31,7 @@ check() {
     fi
 }
 
-check "medpilot Status"
+check "mira Status"
 check "Config:"
 check "Workspace:"
 check "Model:"
@@ -50,7 +50,7 @@ fi
 # Cleanup
 echo ""
 echo "=== Cleanup ==="
-docker rm -f medpilot-test-run 2>/dev/null || true
-docker rmi -f medpilot-test-onboarded 2>/dev/null || true
+docker rm -f mira-test-run 2>/dev/null || true
+docker rmi -f mira-test-onboarded 2>/dev/null || true
 docker rmi -f "$IMAGE_NAME" 2>/dev/null || true
 echo "Done."

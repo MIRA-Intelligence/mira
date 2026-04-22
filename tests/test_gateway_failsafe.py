@@ -5,24 +5,28 @@ import psutil
 import typer
 from unittest.mock import MagicMock, patch
 from pathlib import Path
-from medpilot.cli.commands import _gateway_failsafe_check
+from mira_engine.cli.commands import _gateway_failsafe_check
 
 @pytest.fixture
 def mock_runtime_dir(tmp_path):
-    """模拟 ~/.medpilot/runtime 目录"""
-    runtime_dir = tmp_path / ".medpilot" / "runtime"
+    """模拟 ~/.mira/runtime 目录"""
+    runtime_dir = tmp_path / ".mira" / "runtime"
     runtime_dir.mkdir(parents=True)
     return runtime_dir
 
 def test_gateway_pid_lock_prevents_startup(mock_runtime_dir, monkeypatch):
     """测试：当 PID 文件存在且进程运行时，应触发退出"""
     pid_file = mock_runtime_dir / "gateway.pid"
-    current_pid = os.getpid()
-    pid_file.write_text(str(current_pid))
+    locked_pid = 123456
+    pid_file.write_text(str(locked_pid))
     
     # 劫持 Path.expanduser
     monkeypatch.setattr(Path, "expanduser", lambda self: pid_file if "gateway.pid" in str(self) else self)
-    monkeypatch.setenv("MEDPILOT_SKIP_GATEWAY_FAILSAVE", "")
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == locked_pid)
+    proc = MagicMock()
+    proc.cmdline.return_value = ["mira", "gateway"]
+    monkeypatch.setattr(psutil, "Process", lambda pid: proc)
+    monkeypatch.setenv("MIRA_SKIP_GATEWAY_FAILSAVE", "")
     
     with pytest.raises(typer.Exit) as exc:
         _gateway_failsafe_check("127.0.0.1", 9999)
@@ -35,7 +39,7 @@ def test_gateway_port_conflict_prevents_startup(mock_runtime_dir, monkeypatch):
         pid_file.unlink()
 
     monkeypatch.setattr(Path, "expanduser", lambda self: pid_file if "gateway.pid" in str(self) else self)
-    monkeypatch.setenv("MEDPILOT_SKIP_GATEWAY_FAILSAVE", "")
+    monkeypatch.setenv("MIRA_SKIP_GATEWAY_FAILSAVE", "")
 
     # 模拟一个正在监听的端口 (connect_ex 返回 0 表示成功连接，即端口被占用)
     class MockSocket:
@@ -59,7 +63,7 @@ def test_gateway_creates_pid_file(mock_runtime_dir, monkeypatch):
         pid_file.unlink()
     
     monkeypatch.setattr(Path, "expanduser", lambda self: pid_file if "gateway.pid" in str(self) else self)
-    monkeypatch.setenv("MEDPILOT_SKIP_GATEWAY_FAILSAVE", "")
+    monkeypatch.setenv("MIRA_SKIP_GATEWAY_FAILSAVE", "")
 
     # 模拟一个没有被占用的端口 (connect_ex 返回非 0)
     class MockSocket:

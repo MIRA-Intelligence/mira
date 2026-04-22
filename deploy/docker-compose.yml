@@ -3,7 +3,7 @@ x-common-config: &common-config
     context: ..
     dockerfile: deploy/Dockerfile
   volumes:
-    - ~/.medpilot:/home/medpilot/.medpilot
+    - ~/.mira:/home/mira/.mira
   cap_drop:
     - ALL
   cap_add:
@@ -14,8 +14,8 @@ x-common-config: &common-config
 
 services:
   # Local build/run stack (uses repository Dockerfile)
-  medpilot-gateway:
-    container_name: medpilot-gateway
+  mira-gateway:
+    container_name: mira-gateway
     <<: *common-config
     command: ["gateway"]
     restart: unless-stopped
@@ -30,11 +30,11 @@ services:
           cpus: "0.25"
           memory: 256M
 
-  medpilot-api:
-    container_name: medpilot-api
+  mira-api:
+    container_name: mira-api
     <<: *common-config
     command:
-      ["serve", "--host", "0.0.0.0", "-w", "/home/medpilot/.medpilot/api-workspace"]
+      ["serve", "--host", "0.0.0.0", "-w", "/home/mira/.mira/api-workspace"]
     restart: unless-stopped
     ports:
       - 127.0.0.1:8900:8900
@@ -47,7 +47,7 @@ services:
           cpus: "0.25"
           memory: 256M
 
-  medpilot-cli:
+  mira-cli:
     <<: *common-config
     build:
       context: ..
@@ -56,10 +56,10 @@ services:
         BUILD_BRIDGE: "0"
     user: "479001138:479001138"
     environment:
-      - MEDPILOT_CONFIG_PATH=/home/medpilot/.medpilot/config.json
-      - XDG_CONFIG_HOME=/home/medpilot/.medpilot/.config
-      - XDG_DATA_HOME=/home/medpilot/.medpilot/.local/share
-      - XDG_CACHE_HOME=/home/medpilot/.medpilot/.cache
+      - MIRA_CONFIG_PATH=/home/mira/.mira/config.json
+      - XDG_CONFIG_HOME=/home/mira/.mira/.config
+      - XDG_DATA_HOME=/home/mira/.mira/.local/share
+      - XDG_CACHE_HOME=/home/mira/.mira/.cache
     profiles:
       - cli
     command: ["status"]
@@ -67,33 +67,33 @@ services:
     tty: true
 
   # Optional self-hosted release stack
-  medpilot-agent:
-    image: ghcr.io/project-medpilot/medpilot-agent:${MEDPILOT_AGENT_TAG:-latest}
-    container_name: medpilot-agent
+  mira-engine:
+    image: ghcr.io/mira-intelligence/mira-engine:${MIRA_AGENT_TAG:-latest}
+    container_name: mira-engine
     profiles:
       - self-hosted
     restart: unless-stopped
-    command: ["medpilot", "gateway", "--port", "18790"]
+    command: ["mira", "gateway", "--port", "18790"]
     ports:
-      - "${MEDPILOT_AGENT_PORT:-18790}:18790"
+      - "${MIRA_AGENT_PORT:-18790}:18790"
     volumes:
-      - medpilot_data:/root/.medpilot
+      - mira_data:/root/.mira
     environment:
-      - MEDPILOT_CONFIG_PATH=/root/.medpilot/config.json
+      - MIRA_CONFIG_PATH=/root/.mira/config.json
 
-  medpilot-ui:
-    image: ghcr.io/project-medpilot/medpilot-ui:${MEDPILOT_UI_TAG:-latest}
-    container_name: medpilot-ui
+  mira-ui:
+    image: ghcr.io/mira-intelligence/mira-ui:${MIRA_UI_TAG:-latest}
+    container_name: mira-ui
     profiles:
       - self-hosted
     restart: unless-stopped
     depends_on:
-      - medpilot-agent
+      - mira-engine
     ports:
-      - "${MEDPILOT_UI_PORT:-8080}:80"
+      - "${MIRA_UI_PORT:-8080}:80"
     environment:
-      - VITE_API_URL=${MEDPILOT_API_URL:-http://localhost:18790/api}
-      - VITE_WS_URL=${MEDPILOT_WS_URL:-ws://localhost:18790/ws}
+      - VITE_API_URL=${MIRA_API_URL:-http://localhost:18790/api}
+      - VITE_WS_URL=${MIRA_WS_URL:-ws://localhost:18790/ws}
 
 volumes:
-  medpilot_data:
+  mira_data:

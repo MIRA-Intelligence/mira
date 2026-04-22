@@ -19,14 +19,14 @@ def test_source_checkout_import_uses_pyproject_version_without_metadata() -> Non
         import types
 
         sys.path.insert(0, {str(repo_root)!r})
-        fake = types.ModuleType("medpilot.medpilot")
-        fake.MedPilot = object
+        fake = types.ModuleType("mira_engine.mira_engine")
+        fake.Mira = object
         fake.RunResult = object
-        sys.modules["medpilot.medpilot"] = fake
+        sys.modules["mira_engine.mira_engine"] = fake
 
-        import medpilot
+        import mira_engine
 
-        print(medpilot.__version__)
+        print(mira_engine.__version__)
         """
     )
 

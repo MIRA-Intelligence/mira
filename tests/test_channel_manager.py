@@ -6,11 +6,11 @@ import types
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from medpilot.bus.events import OutboundMessage
-from medpilot.bus.queue import MessageBus
-from medpilot.channels.base import BaseChannel
-from medpilot.channels.manager import ChannelManager
-from medpilot.config.schema import Config
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.base import BaseChannel
+from mira_engine.channels.manager import ChannelManager
+from mira_engine.config.schema import Config
 
 
 class _DummyChannel(BaseChannel):
@@ -64,17 +64,17 @@ def _enable_all_channels(cfg: Config) -> None:
 
 def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
     for module_name, cls_name in (
-        ("medpilot.channels.telegram", "TelegramChannel"),
-        ("medpilot.channels.whatsapp", "WhatsAppChannel"),
-        ("medpilot.channels.discord", "DiscordChannel"),
-        ("medpilot.channels.feishu", "FeishuChannel"),
-        ("medpilot.channels.mochat", "MochatChannel"),
-        ("medpilot.channels.dingtalk", "DingTalkChannel"),
-        ("medpilot.channels.email", "EmailChannel"),
-        ("medpilot.channels.slack", "SlackChannel"),
-        ("medpilot.channels.qq", "QQChannel"),
-        ("medpilot.channels.matrix", "MatrixChannel"),
-        ("medpilot.channels.web", "WebChannel"),
+        ("mira_engine.channels.telegram", "TelegramChannel"),
+        ("mira_engine.channels.whatsapp", "WhatsAppChannel"),
+        ("mira_engine.channels.discord", "DiscordChannel"),
+        ("mira_engine.channels.feishu", "FeishuChannel"),
+        ("mira_engine.channels.mochat", "MochatChannel"),
+        ("mira_engine.channels.dingtalk", "DingTalkChannel"),
+        ("mira_engine.channels.email", "EmailChannel"),
+        ("mira_engine.channels.slack", "SlackChannel"),
+        ("mira_engine.channels.qq", "QQChannel"),
+        ("mira_engine.channels.matrix", "MatrixChannel"),
+        ("mira_engine.channels.web", "WebChannel"),
     ):
         _install_channel_module(monkeypatch, module_name, cls_name)
 
@@ -107,7 +107,7 @@ def test_validate_allow_from_rejects_empty_lists() -> None:
 
 
 def test_web_channel_receives_gateway_bind_host_port(monkeypatch) -> None:
-    _install_channel_module(monkeypatch, "medpilot.channels.web", "WebChannel")
+    _install_channel_module(monkeypatch, "mira_engine.channels.web", "WebChannel")
     cfg = Config()
     cfg.channels.web.enabled = True
     cfg.channels.web.allow_from = ["*"]
@@ -123,7 +123,7 @@ def test_web_channel_receives_gateway_bind_host_port(monkeypatch) -> None:
 
 
 async def test_start_all_and_stop_all_with_channels(monkeypatch) -> None:
-    _install_channel_module(monkeypatch, "medpilot.channels.telegram", "TelegramChannel")
+    _install_channel_module(monkeypatch, "mira_engine.channels.telegram", "TelegramChannel")
     cfg = Config()
     cfg.channels.telegram.enabled = True
     cfg.channels.telegram.allow_from = ["*"]

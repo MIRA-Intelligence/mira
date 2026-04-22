@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * medpilot WhatsApp Bridge
+ * mira WhatsApp Bridge
  * 
- * This bridge connects WhatsApp Web to medpilot's Python backend
+ * This bridge connects WhatsApp Web to mira's Python backend
  * via WebSocket. It handles authentication, message forwarding,
  * and reconnection logic.
  * 
@@ -10,7 +10,7 @@
  *   npm run build && npm start
  *   
  * Or with custom settings:
- *   BRIDGE_PORT=3001 AUTH_DIR=~/.medpilot/whatsapp npm start
+ *   BRIDGE_PORT=3001 AUTH_DIR=~/.mira/whatsapp npm start
  */
 
 // Polyfill crypto for Baileys in ESM
@@ -24,15 +24,15 @@ import { homedir } from 'os';
 import { join } from 'path';
 
 const PORT = parseInt(process.env.BRIDGE_PORT || '3001', 10);
-const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.medpilot', 'whatsapp-auth');
+const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.mira', 'whatsapp-auth');
 const TOKEN = process.env.BRIDGE_TOKEN?.trim();
 
 if (!TOKEN) {
-  console.error('BRIDGE_TOKEN is required. Start the bridge via medpilot so it can provision a local secret automatically.');
+  console.error('BRIDGE_TOKEN is required. Start the bridge via mira so it can provision a local secret automatically.');
   process.exit(1);
 }
 
-console.log('🐈 medpilot WhatsApp Bridge');
+console.log('🐈 mira WhatsApp Bridge');
 console.log('========================\n');
 
 const server = new BridgeServer(PORT, AUTH_DIR, TOKEN);
