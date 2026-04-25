@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import plistlib
+import shlex
 import subprocess
 import sys
 import urllib.error
@@ -37,7 +38,7 @@ EXIT_NOT_INSTALLED = 2
 LAUNCHD_LABEL = "com.projectmira.engine"
 SYSTEMD_UNIT_NAME = "mira-engine.service"
 WINDOWS_SERVICE_NAME = "MiraEngine"
-DEFAULT_PORT = 46321
+DEFAULT_PORT = 18790
 LOG_ROTATE_BYTES = 1_000_000
 LOG_ROTATE_FILES = 3
 DIAGNOSTICS_LOG_TAIL_LINES = 200
@@ -263,13 +264,14 @@ class SystemdUserServiceManager(LocalServiceManager):
 
     def _write_unit(self, host: str, port: int) -> None:
         self.paths.systemd_unit.parent.mkdir(parents=True, exist_ok=True)
+        exec_start = _gateway_service_command(host, port)
         content = f"""[Unit]
 Description=Mira Local Agent Service
 After=network.target
 
 [Service]
 Type=simple
-ExecStart={sys.executable} -m mira_engine.cli.commands gateway --host {host} --port {port}
+ExecStart={exec_start}
 Restart=always
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
@@ -367,7 +369,7 @@ class WindowsServiceManager(LocalServiceManager):
         state = self.load_state()
         h = str(state.get("host", "127.0.0.1"))
         p = int(state.get("port", DEFAULT_PORT))
-        bin_path = f"\"{sys.executable}\" -m mira_engine.cli.commands gateway --host {h} --port {p}"
+        bin_path = _gateway_service_command(h, p)
         create = self._run_sc("create", WINDOWS_SERVICE_NAME, "binPath=", bin_path, "start=", "auto")
         if create.returncode != 0:
             return EXIT_ERROR, create.stderr.strip() or "failed to create Windows service"
@@ -447,16 +449,7 @@ class LaunchdServiceManager(LocalServiceManager):
         self.paths.launchd_plist.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "Label": LAUNCHD_LABEL,
-            "ProgramArguments": [
-                sys.executable,
-                "-m",
-                "mira_engine.cli.commands",
-                "gateway",
-                "--host",
-                host,
-                "--port",
-                str(port),
-            ],
+            "ProgramArguments": _gateway_service_args(host, port),
             "RunAtLoad": True,
             "KeepAlive": True,
             "StandardOutPath": str(self.paths.log_file),
@@ -575,6 +568,35 @@ def _current_version(package: str) -> str | None:
         return importlib_metadata.version(package)
     except importlib_metadata.PackageNotFoundError:
         return None
+
+
+def _gateway_service_args(host: str, port: int) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [
+            sys.executable,
+            "run-gateway",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
+    return [
+        sys.executable,
+        "-m",
+        "mira_engine.cli.commands",
+        "gateway",
+        "--host",
+        host,
+        "--port",
+        str(port),
+    ]
+
+
+def _gateway_service_command(host: str, port: int) -> str:
+    args = _gateway_service_args(host, port)
+    if platform.system().lower() == "windows":
+        return subprocess.list2cmdline(args)
+    return shlex.join(args)
 
 
 def _pip_upgrade(package_spec: str) -> tuple[int, str]:
@@ -716,6 +738,16 @@ def upgrade(
     new_version = _current_version(package)
     console.print(f"Upgrade successful: {prev_version or 'unknown'} -> {new_version or 'unknown'}")
     raise typer.Exit(EXIT_OK)
+
+
+@app.command("run-gateway", hidden=True)
+def run_gateway(
+    host: str = typer.Option("127.0.0.1", "--host", help="Gateway host"),
+    port: int = typer.Option(DEFAULT_PORT, "--port", "-p", help="Gateway port"),
+) -> None:
+    from mira_engine.cli.commands import gateway as gateway_cmd
+
+    gateway_cmd(host=host, port=port, workspace=None, verbose=False, config=None)
 
 
 if __name__ == "__main__":
