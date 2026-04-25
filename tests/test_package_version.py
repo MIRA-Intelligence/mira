@@ -8,11 +8,29 @@ from pathlib import Path
 import tomllib
 
 
-def test_source_checkout_import_uses_pyproject_version_without_metadata() -> None:
+def _expected_source_checkout_version(repo_root: Path) -> str:
+    pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    project = pyproject["project"]
+
+    if "version" in project:
+        return project["version"]
+
+    if "version" in project.get("dynamic", []):
+        return (
+            pyproject.get("tool", {})
+            .get("hatch", {})
+            .get("version", {})
+            .get("raw-options", {})
+            .get("fallback_version", "0.0.0")
+        )
+
+    msg = "pyproject.toml does not declare a source checkout version"
+    raise AssertionError(msg)
+
+
+def test_source_checkout_import_uses_declared_version_without_metadata() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    expected = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))["project"][
-        "version"
-    ]
+    expected = _expected_source_checkout_version(repo_root)
     script = textwrap.dedent(
         f"""
         import sys
