@@ -30,6 +30,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Ensure git tags are available for versioning
+        shell: bash
+        run: git fetch --force --tags
+
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
@@ -43,8 +47,172 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: python -m build
 
+      - name: Verify built package versions (linux only)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+
+          packages = sorted(p.name for p in Path("dist").glob("mira_engine-*"))
+          if not packages:
+              raise SystemExit("No wheel/sdist artifacts were produced in dist/")
+          bad = [name for name in packages if "0.0.0" in name]
+          if bad:
+              raise SystemExit(f"Build produced versionless package artifacts: {bad}")
+          print("Built package artifacts:")
+          for name in packages:
+              print(f" - {name}")
+          PY
+
+      - name: Verify release metadata version
+        shell: bash
+        run: |
+          python <<'PY'
+          from importlib import metadata as importlib_metadata
+
+          version = importlib_metadata.version("mira-engine")
+          if version == "0.0.0":
+              raise SystemExit("mira-engine metadata version resolved to 0.0.0")
+          print(f"Resolved mira-engine metadata version: {version}")
+          PY
+
       - name: Build standalone mira-engine executable
-        run: pyinstaller --onefile --name mira-engine scripts/mira_engine_entry.py
+        run: pyinstaller --clean mira-engine.spec
+
+      - name: Smoke test standalone mira-engine executable
+        shell: bash
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import platform
+          import subprocess
+          import tempfile
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          import websocket
+
+          port = 18790
+          exe_name = "mira-engine.exe" if platform.system() == "Windows" else "mira-engine"
+          exe_path = Path("dist") / exe_name
+          if not exe_path.exists():
+              raise SystemExit(f"standalone executable missing: {exe_path}")
+
+          tmp_root = Path(tempfile.mkdtemp(prefix="mira-release-smoke-")).resolve()
+          workspace = tmp_root / "workspace"
+          workspace.mkdir(parents=True, exist_ok=True)
+          log_path = tmp_root / "gateway.log"
+          config_path = tmp_root / "config.json"
+          config = {
+              "agents": {
+                  "defaults": {
+                      "workspace": str(workspace),
+                      "provider": "custom",
+                      "model": "custom/test-model",
+                  }
+              },
+              "providers": {
+                  "custom": {
+                      "apiBase": "http://127.0.0.1:9/v1",
+                      "apiKey": "dummy-key",
+                  }
+              },
+              "channels": {
+                  "web": {
+                      "enabled": True,
+                      "allowFrom": ["*"],
+                      "corsOrigins": ["*"],
+                  }
+              },
+          }
+          config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+          env = os.environ.copy()
+          env["MIRA_CONFIG_PATH"] = str(config_path)
+          env["HOME"] = str(tmp_root)
+          env["USERPROFILE"] = str(tmp_root)
+
+          with log_path.open("w", encoding="utf-8") as log_file:
+              proc = subprocess.Popen(
+                  [str(exe_path), "run-gateway", "--host", "127.0.0.1", "--port", str(port)],
+                  stdout=log_file,
+                  stderr=subprocess.STDOUT,
+                  env=env,
+              )
+
+          base_url = f"http://127.0.0.1:{port}"
+          ws_url = f"ws://127.0.0.1:{port}/ws"
+
+          def fetch_json(url: str) -> dict:
+              with urllib.request.urlopen(url, timeout=5) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          try:
+              deadline = time.time() + 60
+              last_error = None
+              while time.time() < deadline:
+                  if proc.poll() is not None:
+                      break
+                  try:
+                      health = fetch_json(f"{base_url}/health")
+                      if health.get("status") == "ok":
+                          break
+                  except Exception as exc:  # noqa: BLE001
+                      last_error = exc
+                  time.sleep(1)
+              else:
+                  raise RuntimeError(f"gateway did not become healthy in time: {last_error}")
+
+              if proc.poll() is not None:
+                  raise RuntimeError(f"gateway exited early with code {proc.returncode}")
+
+              version_payload = fetch_json(f"{base_url}/version")
+              agent_version = version_payload.get("agent_version")
+              if not agent_version or agent_version == "0.0.0":
+                  raise RuntimeError(f"unexpected standalone version payload: {version_payload}")
+              if version_payload.get("api_contract") != "v1":
+                  raise RuntimeError(f"unexpected api contract payload: {version_payload}")
+
+              config_payload = fetch_json(f"{base_url}/api/config")
+              if "runtime" not in config_payload or "providers" not in config_payload:
+                  raise RuntimeError(f"unexpected config payload: {config_payload}")
+
+              ws = websocket.create_connection(ws_url, timeout=10)
+              try:
+                  ws.send(json.dumps({
+                      "type": "message",
+                      "session_id": "PRJ-0001",
+                      "user_id": "ui_user",
+                      "content": "standalone smoke test",
+                      "media": [],
+                      "mode": "manual",
+                  }))
+                  raw = ws.recv()
+              finally:
+                  ws.close()
+
+              payload = json.loads(raw)
+              if payload.get("type") not in {"response", "progress"}:
+                  raise RuntimeError(f"unexpected websocket payload: {payload}")
+          except Exception:
+              try:
+                  print("------ standalone gateway log ------")
+                  print(log_path.read_text(encoding="utf-8"))
+              except Exception:
+                  pass
+              raise
+          finally:
+              if proc.poll() is None:
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+                      proc.wait(timeout=10)
+          PY
 
       - name: Collect release artifacts
         shell: bash
