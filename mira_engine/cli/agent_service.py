@@ -9,6 +9,7 @@ import plistlib
 import shlex
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -86,6 +87,8 @@ class AgentPaths:
 class LocalServiceManager:
     """File-backed lifecycle manager used as the portable default."""
 
+    SERVICE_MODE = "local-skeleton"
+
     def __init__(self, paths: AgentPaths) -> None:
         self.paths = paths
 
@@ -120,13 +123,14 @@ class LocalServiceManager:
         return {
             "installed": False,
             "running": False,
-            "service_mode": "local-skeleton",
+            "service_mode": self.SERVICE_MODE,
             "platform": platform.system().lower(),
             "host": "127.0.0.1",
             "port": DEFAULT_PORT,
             "installed_at": None,
             "last_started_at": None,
             "last_stopped_at": None,
+            "pid": None,
         }
 
     def load_state(self) -> dict[str, Any]:
@@ -254,6 +258,8 @@ class LocalServiceManager:
 class SystemdUserServiceManager(LocalServiceManager):
     """Linux systemd --user manager."""
 
+    SERVICE_MODE = "systemd-user"
+
     def _run_systemctl(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["systemctl", "--user", *args],
@@ -352,38 +358,51 @@ WantedBy=default.target
 
 
 class WindowsServiceManager(LocalServiceManager):
-    """Windows Service manager."""
+    """Windows detached background-process manager."""
 
-    def _run_sc(self, *args: str) -> subprocess.CompletedProcess[str]:
+    SERVICE_MODE = "windows-background"
+
+    def _run_windows_tool(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["sc", *args],
+            list(args),
             capture_output=True,
             text=True,
             check=False,
         )
+
+    def _is_pid_running(self, pid: int | None) -> bool:
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        result = self._run_windows_tool("tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH")
+        if result.returncode != 0:
+            return False
+        output = result.stdout.strip()
+        return bool(output) and "No tasks are running" not in output
+
+    def _terminate_pid(self, pid: int) -> subprocess.CompletedProcess[str]:
+        return self._run_windows_tool("taskkill", "/PID", str(pid), "/T", "/F")
 
     def install_service(self, host: str | None = None, port: int | None = None) -> tuple[int, str]:
         code, msg = super().install_service(host, port)
         if code != EXIT_OK:
             return code, msg
         state = self.load_state()
-        h = str(state.get("host", "127.0.0.1"))
-        p = int(state.get("port", DEFAULT_PORT))
-        bin_path = _gateway_service_command(h, p)
-        create = self._run_sc("create", WINDOWS_SERVICE_NAME, "binPath=", bin_path, "start=", "auto")
-        if create.returncode != 0:
-            return EXIT_ERROR, create.stderr.strip() or "failed to create Windows service"
-        state["service_mode"] = "windows-service"
+        state["service_mode"] = self.SERVICE_MODE
+        state["pid"] = None
         self.save_state(state)
-        self._append_log("windows_install_service", service=WINDOWS_SERVICE_NAME)
-        return EXIT_OK, f"Windows service installed ({WINDOWS_SERVICE_NAME})"
+        self._append_log("windows_install_service", mode="background-process")
+        return EXIT_OK, "Windows background service metadata installed"
 
     def uninstall_service(self) -> tuple[int, str]:
-        self._run_sc("stop", WINDOWS_SERVICE_NAME)
-        delete = self._run_sc("delete", WINDOWS_SERVICE_NAME)
-        if delete.returncode != 0:
-            return EXIT_ERROR, delete.stderr.strip() or "failed to delete Windows service"
+        state = self.load_state()
+        pid = state.get("pid")
+        if isinstance(pid, int) and pid > 0 and self._is_pid_running(pid):
+            self._terminate_pid(pid)
         code, msg = super().uninstall_service()
+        state = self.load_state()
+        state["pid"] = None
+        state["service_mode"] = self.SERVICE_MODE
+        self.save_state(state)
         self._append_log("windows_uninstall_service", service=WINDOWS_SERVICE_NAME)
         return code, msg
 
@@ -391,43 +410,94 @@ class WindowsServiceManager(LocalServiceManager):
         state = self.load_state()
         if not state.get("installed"):
             return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
-        result = self._run_sc("start", WINDOWS_SERVICE_NAME)
-        if result.returncode != 0:
-            self._append_log("windows_start_failed", error=result.stderr.strip())
-            return EXIT_ERROR, result.stderr.strip() or "failed to start Windows service"
+
+        existing_pid = state.get("pid")
+        if isinstance(existing_pid, int) and self._is_pid_running(existing_pid):
+            state["running"] = True
+            state["service_mode"] = self.SERVICE_MODE
+            self.save_state(state)
+            return EXIT_OK, "Windows background gateway already running"
+
+        host = str(state.get("host", "127.0.0.1"))
+        port = int(state.get("port", DEFAULT_PORT))
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+        log_fp = self.paths.log_file.open("a", encoding="utf-8")
+        try:
+            proc = subprocess.Popen(
+                _gateway_service_args(host, port),
+                stdout=log_fp,
+                stderr=log_fp,
+                stdin=subprocess.DEVNULL,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                close_fds=True,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            log_fp.close()
+            self._append_log("windows_start_failed", error=str(exc))
+            return EXIT_ERROR, str(exc)
+        finally:
+            log_fp.close()
+
+        time.sleep(0.3)
+        if proc.poll() is not None:
+            error = ""
+            if self.paths.log_file.exists():
+                lines = self.paths.log_file.read_text(encoding="utf-8").splitlines()
+                error = lines[-1] if lines else ""
+            self._append_log("windows_start_failed", error=error)
+            return EXIT_ERROR, error or "failed to launch Windows background gateway"
+
         state["running"] = True
+        state["pid"] = proc.pid
+        state["service_mode"] = self.SERVICE_MODE
         state["last_started_at"] = _now_iso()
         self.save_state(state)
-        self._append_log("windows_start_service", running=True)
-        return EXIT_OK, "Windows service started"
+        self._append_log("windows_start_service", running=True, pid=proc.pid)
+        return EXIT_OK, "Windows background gateway started"
 
     def stop(self) -> tuple[int, str]:
         state = self.load_state()
         if not state.get("installed"):
             return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
-        result = self._run_sc("stop", WINDOWS_SERVICE_NAME)
-        if result.returncode != 0:
-            self._append_log("windows_stop_failed", error=result.stderr.strip())
-            return EXIT_ERROR, result.stderr.strip() or "failed to stop Windows service"
+
+        pid = state.get("pid")
+        if isinstance(pid, int) and pid > 0 and self._is_pid_running(pid):
+            result = self._terminate_pid(pid)
+            if result.returncode != 0 and self._is_pid_running(pid):
+                self._append_log("windows_stop_failed", error=result.stderr.strip())
+                return EXIT_ERROR, result.stderr.strip() or "failed to stop Windows background gateway"
+
         state["running"] = False
+        state["pid"] = None
+        state["service_mode"] = self.SERVICE_MODE
         state["last_stopped_at"] = _now_iso()
         self.save_state(state)
         self._append_log("windows_stop_service", running=False)
-        return EXIT_OK, "Windows service stopped"
+        return EXIT_OK, "Windows background gateway stopped"
 
     def status(self) -> tuple[int, dict[str, Any]]:
         base_code, payload = super().status()
-        result = self._run_sc("query", WINDOWS_SERVICE_NAME)
-        payload["running"] = "RUNNING" in result.stdout.upper()
-        payload["service_mode"] = "windows-service"
+        state = self.load_state()
+        pid = state.get("pid")
+        running = self._is_pid_running(pid if isinstance(pid, int) else None)
+        if state.get("running") != running or (not running and pid):
+            state["running"] = running
+            if not running:
+                state["pid"] = None
+            self.save_state(state)
+            pid = state.get("pid")
+        payload["running"] = running
+        payload["service_mode"] = state.get("service_mode", self.SERVICE_MODE)
         payload["windows_service"] = WINDOWS_SERVICE_NAME
-        if result.returncode != 0 and payload.get("installed"):
-            payload["last_sc_error"] = result.stderr.strip()
+        payload["windows_pid"] = pid
         return base_code, payload
 
 
 class LaunchdServiceManager(LocalServiceManager):
     """macOS launchd-backed lifecycle manager."""
+
+    SERVICE_MODE = "launchd"
 
     @property
     def _domain(self) -> str:

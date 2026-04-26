@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import mock_open
 
 from mira_engine.cli.agent_service import (
     EXIT_OK,
@@ -41,21 +42,33 @@ def test_systemd_manager_install_and_status(monkeypatch, tmp_path):
 def test_windows_manager_install_and_status(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     calls = []
+    running_pids = {4321}
 
     def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
         calls.append(cmd)
-        if cmd[1:3] == ["query", WINDOWS_SERVICE_NAME]:
-            return _cp(returncode=0, stdout="STATE              : 4  RUNNING")
+        if cmd[:2] == ["tasklist", "/FI"]:
+            pid = int(cmd[2].split()[-1])
+            if pid in running_pids:
+                return _cp(returncode=0, stdout=f'"mira-engine.exe","{pid}","Console","1","12,000 K"')
+            return _cp(returncode=0, stdout="INFO: No tasks are running which match the specified criteria.")
         return _cp(returncode=0)
 
+    fake_proc = SimpleNamespace(pid=4321, poll=lambda: None)
     monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.Popen", lambda *args, **kwargs: fake_proc)
+    monkeypatch.setattr("mira_engine.cli.agent_service.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("builtins.open", mock_open())
     manager = WindowsServiceManager(AgentPaths.default())
 
     code, _ = manager.install_service()
     assert code == EXIT_OK
 
+    start_code, _ = manager.start()
+    assert start_code == EXIT_OK
+
     status_code, payload = manager.status()
     assert status_code == EXIT_OK
-    assert payload["service_mode"] == "windows-service"
+    assert payload["service_mode"] == "windows-background"
     assert payload["running"] is True
-    assert any(cmd[1:3] == ["create", WINDOWS_SERVICE_NAME] for cmd in calls)
+    assert payload["windows_pid"] == 4321
+    assert any(cmd[:2] == ["tasklist", "/FI"] for cmd in calls)
