@@ -6,3 +6,4 @@ htmlcov/
 build/
 dist/
 *.spec
+!mira-engine.spec
