@@ -3,3 +3,7 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
+build/
+dist/
+*.spec
+!mira-engine.spec
