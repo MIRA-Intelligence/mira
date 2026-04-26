@@ -23,6 +23,7 @@ from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.config import loader as config_loader
 from mira_engine.config.schema import WebChannelConfig
+from mira_engine.config.ui_runtime import apply_ui_runtime_update, build_ui_runtime_payload
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
     get_task_plan_contract,
@@ -655,6 +656,7 @@ class WebChannel(BaseChannel):
         self._app.router.add_get("/api/plan", self._handle_plan)
         self._app.router.add_get("/api/plan/contract", self._handle_plan_contract)
         self._app.router.add_get("/api/plan/lint", self._handle_plan_lint)
+        self._app.router.add_get("/api/config", self._handle_get_config)
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
@@ -1319,41 +1321,58 @@ class WebChannel(BaseChannel):
             "entries": self._load_history_entries(session_id),
         })
 
+    async def _handle_get_config(self, _request: web.Request) -> web.Response:
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        runtime_config = config_loader.load_config(config_path)
+        return web.json_response(
+            build_ui_runtime_payload(
+                runtime_config,
+                projects_root=self.projects_root,
+                config_path=config_path,
+                persisted=False,
+            )
+        )
+
     async def _handle_config(self, request: web.Request) -> web.Response:
-        """Allow the UI to configure the projects root path."""
+        """Allow the UI to inspect and update the active runtime config."""
         try:
             body = await request.json()
         except (json.JSONDecodeError, TypeError):
             return web.json_response({"error": "invalid JSON"}, status=400)
 
+        if not isinstance(body, dict):
+            return web.json_response({"error": "config payload must be an object"}, status=400)
+
         config_path = config_loader.get_config_path().expanduser().resolve()
+        runtime_config = config_loader.load_config(config_path)
+        previous_root = self.projects_root.expanduser().resolve()
+
+        try:
+            next_root, changed = apply_ui_runtime_update(
+                runtime_config,
+                body,
+                current_projects_root=previous_root,
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        if next_root != previous_root:
+            self.projects_root = next_root
+            self._audit(
+                source="ui",
+                action="api_projects_root_updated",
+                details={"projects_root": str(next_root)},
+            )
+            logger.info("Projects root updated to {}", next_root)
+
         persisted = False
-        if "projects_root" in body:
-            raw_root = body["projects_root"]
-            if not isinstance(raw_root, str):
-                return web.json_response(
-                    {"error": "projects_root must be a string"},
-                    status=400,
-                )
-
-            new_root = Path(raw_root).expanduser().resolve()
-            current_root = self.projects_root.expanduser().resolve()
-            if new_root != current_root:
-                self.projects_root = new_root
-                self._audit(
-                    source="ui",
-                    action="api_projects_root_updated",
-                    details={"projects_root": str(new_root)},
-                )
-                logger.info("Projects root updated to {}", new_root)
-
+        if changed:
             try:
-                config_path = self._persist_projects_root_to_config(self.projects_root)
+                config_loader.save_config(runtime_config, config_path)
                 persisted = True
             except OSError as exc:
                 logger.warning(
-                    "Failed to persist projects root {} to config {}: {}",
-                    self.projects_root,
+                    "Failed to persist runtime config {}: {}",
                     config_path,
                     exc,
                 )
@@ -1366,19 +1385,14 @@ class WebChannel(BaseChannel):
                     status=500,
                 )
 
-        return web.json_response({
-            "projects_root": str(self.projects_root),
-            "config_path": str(config_path),
-            "persisted": persisted,
-        })
-
-    def _persist_projects_root_to_config(self, projects_root: Path) -> Path:
-        """Persist workspace root to the active runtime config file."""
-        config_path = config_loader.get_config_path().expanduser().resolve()
-        runtime_config = config_loader.load_config(config_path)
-        runtime_config.agents.defaults.workspace = str(projects_root)
-        config_loader.save_config(runtime_config, config_path)
-        return config_path
+        return web.json_response(
+            build_ui_runtime_payload(
+                runtime_config,
+                projects_root=self.projects_root,
+                config_path=config_path,
+                persisted=persisted,
+            )
+        )
 
     def _workspace_root_for_access(self) -> Path:
         """Return the root path used for workspace access checks."""

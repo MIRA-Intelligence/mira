@@ -28,7 +28,7 @@ from mira_engine.channels.web import (
     _safe_upload_name,
     _stringify_history_content,
 )
-from mira_engine.config.schema import WebChannelConfig
+from mira_engine.config.schema import Config, WebChannelConfig
 from mira_engine.session.manager import SessionManager
 
 
@@ -687,26 +687,31 @@ async def test_handle_config_invalid_json(web_channel: WebChannel) -> None:
     assert json.loads(resp.text) == {"error": "invalid JSON"}
 
 
-async def test_handle_config_updates_projects_root(web_channel: WebChannel, tmp_path: Path) -> None:
+async def test_handle_config_updates_projects_root(
+    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     new_root = tmp_path / "projects"
     new_root.mkdir()
-    persisted_paths: list[Path] = []
-
-    def _persist(path: Path) -> Path:
-        persisted_paths.append(path)
-        return tmp_path / "config_a.json"
-
-    web_channel._persist_projects_root_to_config = _persist  # type: ignore[method-assign]
+    saved_configs: list[Config] = []
+    config = Config()
+    config_path = tmp_path / "config_a.json"
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"projects_root": str(new_root)})
+    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(
+        web_channel_mod.config_loader,
+        "save_config",
+        lambda cfg, _path=None: saved_configs.append(cfg.model_copy(deep=True)),
+    )
     resp = await web_channel._handle_config(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["projects_root"] == str(new_root.resolve())
-    assert body["config_path"] == str((tmp_path / "config_a.json").resolve())
+    assert body["config_path"] == str(config_path.resolve())
     assert body["persisted"] is True
     assert web_channel.projects_root == new_root.resolve()
-    assert persisted_paths == [new_root.resolve()]
+    assert saved_configs[-1].agents.defaults.workspace == str(new_root.resolve())
 
 
 async def test_handle_config_rejects_non_string_projects_root(web_channel: WebChannel) -> None:
@@ -718,13 +723,22 @@ async def test_handle_config_rejects_non_string_projects_root(web_channel: WebCh
     assert json.loads(resp.text) == {"error": "projects_root must be a string"}
 
 
-async def test_handle_config_unchanged_without_key(web_channel: WebChannel, tmp_path: Path) -> None:
+async def test_handle_config_unchanged_without_key(
+    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     web_channel.projects_root = tmp_path
+    config = Config()
+    config_path = tmp_path / "config_a.json"
+    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={})
     resp = await web_channel._handle_config(req)
     assert resp.status == 200
-    assert json.loads(resp.text)["projects_root"] == str(tmp_path)
+    body = json.loads(resp.text)
+    assert body["projects_root"] == str(tmp_path)
+    assert body["persisted"] is False
+    assert body["runtime"]["workspace"] == str(tmp_path)
 
 
 async def test_handle_config_skips_audit_when_projects_root_unchanged(
@@ -733,17 +747,21 @@ async def test_handle_config_skips_audit_when_projects_root_unchanged(
     root = tmp_path.resolve()
     web_channel.projects_root = root
     audit_calls: list[dict[str, object]] = []
-    persisted_paths: list[Path] = []
+    saved_configs: list[Config] = []
+    config = Config()
+    config_path = tmp_path / "config_b.json"
 
     def _capture_audit(**kwargs: object) -> None:
         audit_calls.append(kwargs)
 
-    def _persist(path: Path) -> Path:
-        persisted_paths.append(path)
-        return tmp_path / "config_b.json"
-
     monkeypatch.setattr(web_channel, "_audit", _capture_audit)
-    monkeypatch.setattr(web_channel, "_persist_projects_root_to_config", _persist)
+    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(
+        web_channel_mod.config_loader,
+        "save_config",
+        lambda cfg, _path=None: saved_configs.append(cfg.model_copy(deep=True)),
+    )
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"projects_root": str(root)})
     resp = await web_channel._handle_config(req)
@@ -751,10 +769,87 @@ async def test_handle_config_skips_audit_when_projects_root_unchanged(
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["projects_root"] == str(root)
-    assert body["config_path"] == str((tmp_path / "config_b.json").resolve())
+    assert body["config_path"] == str(config_path.resolve())
     assert body["persisted"] is True
     assert audit_calls == []
-    assert persisted_paths == [root]
+    assert saved_configs[-1].agents.defaults.workspace == str(root)
+
+
+async def test_handle_get_config_returns_runtime_payload(
+    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config.agents.defaults.provider = "openrouter"
+    config.agents.defaults.model = "anthropic/claude-sonnet-4-5"
+    config.agents.defaults.reasoning_effort = "adaptive"
+    config.agents.defaults.max_tool_iterations = 88
+    config.providers.openrouter.api_key = "sk-test-key"
+    config.providers.openrouter.api_base = "https://openrouter.ai/api/v1"
+    config.tools.restrict_to_workspace = True
+    config_path = tmp_path / "config_get.json"
+    web_channel.projects_root = (tmp_path / "projects").resolve()
+
+    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    resp = await web_channel._handle_get_config(MagicMock(spec=web.Request))
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["projects_root"] == str(web_channel.projects_root)
+    assert body["runtime"]["workspace"] == str(web_channel.projects_root)
+    assert body["runtime"]["provider"] == "openrouter"
+    assert body["runtime"]["reasoning_effort"] == "adaptive"
+    assert body["runtime"]["max_tool_iterations"] == 88
+    assert body["runtime"]["restrict_to_workspace"] is True
+    assert body["providers"]["openrouter"]["api_key_configured"] is True
+    assert body["providers"]["openrouter"]["api_key_preview"] == "sk-t...ey"
+
+
+async def test_handle_config_updates_runtime_fields_and_provider_secrets(
+    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config_runtime.json"
+    saved_configs: list[Config] = []
+
+    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(
+        web_channel_mod.config_loader,
+        "save_config",
+        lambda cfg, _path=None: saved_configs.append(cfg.model_copy(deep=True)),
+    )
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={
+        "runtime": {
+            "workspace": str(tmp_path / "bundle-workspace"),
+            "provider": "custom",
+            "model": "custom/qwen2.5-72b",
+            "reasoning_effort": "high",
+            "max_tool_iterations": 64,
+            "restrict_to_workspace": True,
+        },
+        "providers": {
+            "custom": {
+                "api_key": "custom-secret",
+                "api_base": "https://llm.example.com/v1",
+            }
+        },
+    })
+    resp = await web_channel._handle_config(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["persisted"] is True
+    assert body["runtime"]["provider"] == "custom"
+    assert body["runtime"]["model"] == "custom/qwen2.5-72b"
+    assert body["runtime"]["reasoning_effort"] == "high"
+    assert body["runtime"]["max_tool_iterations"] == 64
+    assert body["runtime"]["restrict_to_workspace"] is True
+    assert body["providers"]["custom"]["api_key_configured"] is True
+    assert body["providers"]["custom"]["api_key_preview"] == "cust...et"
+    assert saved_configs[-1].providers.custom.api_key == "custom-secret"
+    assert saved_configs[-1].providers.custom.api_base == "https://llm.example.com/v1"
 
 
 async def test_handle_validate_data_path_requires_valid_json(web_channel: WebChannel) -> None:

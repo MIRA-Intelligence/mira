@@ -15,6 +15,12 @@ def _python_script_command(script_path: Path) -> str:
     return f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}"
 
 
+def _python_script_command(script_path: Path) -> str:
+    if sys.platform == "win32":
+        return subprocess.list2cmdline([sys.executable, str(script_path)])
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}"
+
+
 def test_guard_blocks_dangerous_patterns() -> None:
     tool = ExecTool()
     msg = tool._guard_command("rm -rf /tmp/demo", "/tmp")
