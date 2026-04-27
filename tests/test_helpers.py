@@ -133,6 +133,12 @@ def test_sync_workspace_templates_skips_bootstrap_md(tmp_path: Path) -> None:
         assert not (tmp_path / name).exists()
 
 
+def test_sync_workspace_templates_skips_profile_agents_templates(tmp_path: Path) -> None:
+    sync_workspace_templates(tmp_path, silent=True)
+    assert not (tmp_path / "AGENTS_EG.md").exists()
+    assert not (tmp_path / "AGENTS_RS.md").exists()
+
+
 def test_sync_workspace_templates_does_not_overwrite_existing(tmp_path: Path) -> None:
     hb = tmp_path / "HEARTBEAT.md"
     hb.write_text("user-owned\n", encoding="utf-8")
