@@ -428,7 +428,7 @@ class WindowsServiceManager(LocalServiceManager):
                 stdout=log_fp,
                 stderr=log_fp,
                 stdin=subprocess.DEVNULL,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=_independent_subprocess_env(PYTHONUNBUFFERED="1"),
                 close_fds=True,
                 creationflags=creationflags,
             )
@@ -660,6 +660,14 @@ def _gateway_service_args(host: str, port: int) -> list[str]:
         "--port",
         str(port),
     ]
+
+
+def _independent_subprocess_env(**extra: str) -> dict[str, str]:
+    env = {**os.environ, **extra}
+    if getattr(sys, "frozen", False):
+        # Give long-lived children their own PyInstaller onefile extraction dir.
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
 
 
 def _gateway_service_command(host: str, port: int) -> str:
