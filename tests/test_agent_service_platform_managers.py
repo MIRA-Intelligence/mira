@@ -40,8 +40,11 @@ def test_systemd_manager_install_and_status(monkeypatch, tmp_path):
 
 
 def test_windows_manager_install_and_status(monkeypatch, tmp_path):
+    import mira_engine.cli.agent_service as agent_service
+
     monkeypatch.setenv("HOME", str(tmp_path))
     calls = []
+    popen_calls = []
     running_pids = {4321}
 
     def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
@@ -54,8 +57,14 @@ def test_windows_manager_install_and_status(monkeypatch, tmp_path):
         return _cp(returncode=0)
 
     fake_proc = SimpleNamespace(pid=4321, poll=lambda: None)
+    monkeypatch.setattr(agent_service.sys, "frozen", True, raising=False)
     monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
-    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.Popen", lambda *args, **kwargs: fake_proc)
+
+    def fake_popen(*args, **kwargs):  # noqa: ANN001
+        popen_calls.append((args, kwargs))
+        return fake_proc
+
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.Popen", fake_popen)
     monkeypatch.setattr("mira_engine.cli.agent_service.time.sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("builtins.open", mock_open())
     manager = WindowsServiceManager(AgentPaths.default())
@@ -71,4 +80,7 @@ def test_windows_manager_install_and_status(monkeypatch, tmp_path):
     assert payload["service_mode"] == "windows-background"
     assert payload["running"] is True
     assert payload["windows_pid"] == 4321
+    assert popen_calls
+    assert popen_calls[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert popen_calls[0][1]["env"]["PYTHONUNBUFFERED"] == "1"
     assert any(cmd[:2] == ["tasklist", "/FI"] for cmd in calls)
