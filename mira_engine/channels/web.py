@@ -22,6 +22,7 @@ from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.config import loader as config_loader
+from mira_engine.config.paths import get_runtime_subdir
 from mira_engine.config.schema import WebChannelConfig
 from mira_engine.config.ui_runtime import apply_ui_runtime_update, build_ui_runtime_payload
 from mira_engine.session.manager import SessionManager
@@ -44,6 +45,7 @@ _ASSETS_DIR = Path(__file__).parent / "web_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".mira") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
 _PROJECT_EXPERIMENT_SNAPSHOT_REL_DIR = Path(".mira") / "snapshots" / "experiments"
+_PROJECT_DIR_INDEX_FILENAME = "project-dirs.json"
 _RECOVERED_CONCLUSION_PLACEHOLDER = "Recovered completed experiment artifacts from workspace."
 _API_CONTRACT_VERSION = "v1"
 
@@ -472,12 +474,19 @@ class WebChannel(BaseChannel):
         self.restrict_to_workspace: bool = restrict_to_workspace
         default_root = workspace or Path("~/.mira/workspace")
         self.projects_root: Path = default_root.expanduser().resolve()
+        self._project_dir_index_path: Path = (
+            get_runtime_subdir("web") / _PROJECT_DIR_INDEX_FILENAME
+        )
+        self._project_dirs: dict[str, Path] = {}
+        self._known_project_roots: set[Path] = {self.projects_root}
         self._boot_ts: float = time.monotonic()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
+        self._load_project_dir_index()
+        self._register_projects_under_root(self.projects_root)
         self._migrate_global_to_project()
 
     @staticmethod
@@ -514,6 +523,129 @@ class WebChannel(BaseChannel):
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    def _remember_projects_root(self, root: Path) -> Path:
+        normalized = root.expanduser().resolve()
+        self._known_project_roots.add(normalized)
+        return normalized
+
+    def _load_project_dir_index(self) -> None:
+        if not self._project_dir_index_path.is_file():
+            return
+        try:
+            payload = json.loads(
+                self._project_dir_index_path.read_text(encoding="utf-8")
+            )
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "Failed to load project-dir index {}: {}",
+                self._project_dir_index_path,
+                exc,
+            )
+            return
+        if not isinstance(payload, dict):
+            return
+        for session_id, raw_path in payload.items():
+            if not isinstance(session_id, str) or not session_id.strip():
+                continue
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            project_dir = Path(raw_path).expanduser().resolve()
+            if project_dir.name != session_id or not project_dir.is_dir():
+                continue
+            self._project_dirs[session_id] = project_dir
+            self._remember_projects_root(project_dir.parent)
+
+    def _save_project_dir_index(self) -> None:
+        payload = {
+            session_id: str(project_dir)
+            for session_id, project_dir in sorted(self._project_dirs.items())
+            if project_dir.name == session_id and project_dir.is_dir()
+        }
+        try:
+            self._project_dir_index_path.parent.mkdir(parents=True, exist_ok=True)
+            self._project_dir_index_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning(
+                "Failed to persist project-dir index {}: {}",
+                self._project_dir_index_path,
+                exc,
+            )
+
+    def _register_project_dir(
+        self,
+        session_id: str,
+        project_dir: Path,
+        *,
+        persist: bool = True,
+    ) -> Path:
+        normalized = project_dir.expanduser().resolve()
+        existing = self._project_dirs.get(session_id)
+        self._project_dirs[session_id] = normalized
+        self._remember_projects_root(normalized.parent)
+        if persist and existing != normalized:
+            self._save_project_dir_index()
+        return normalized
+
+    def _drop_project_dir_registration(
+        self, session_id: str, *, persist: bool = True
+    ) -> None:
+        if self._project_dirs.pop(session_id, None) is not None and persist:
+            self._save_project_dir_index()
+
+    def _register_projects_under_root(self, root: Path) -> None:
+        normalized_root = self._remember_projects_root(root)
+        if not normalized_root.is_dir():
+            return
+        changed = False
+        for candidate in normalized_root.iterdir():
+            if not self._is_project_dir(candidate):
+                continue
+            existing = self._project_dirs.get(candidate.name)
+            normalized_candidate = candidate.expanduser().resolve()
+            self._project_dirs[candidate.name] = normalized_candidate
+            if existing != normalized_candidate:
+                changed = True
+        if changed:
+            self._save_project_dir_index()
+
+    def _resolve_project_dir(
+        self,
+        session_id: str,
+        *,
+        create: bool = False,
+    ) -> Path | None:
+        session_key = session_id.strip()
+        if not session_key:
+            return None
+
+        cached = self._project_dirs.get(session_key)
+        if cached is not None:
+            if cached.is_dir():
+                return self._register_project_dir(
+                    session_key, cached, persist=False
+                )
+            self._drop_project_dir_registration(session_key)
+
+        current_candidate = (self.projects_root / session_key).expanduser().resolve()
+        if current_candidate.is_dir():
+            return self._register_project_dir(session_key, current_candidate)
+
+        for root in self._known_project_roots:
+            if root == self.projects_root:
+                continue
+            candidate = (root / session_key).expanduser().resolve()
+            if candidate.is_dir():
+                return self._register_project_dir(session_key, candidate)
+
+        if not create:
+            return None
+
+        current_candidate.mkdir(parents=True, exist_ok=True)
+        return self._register_project_dir(session_key, current_candidate)
+
     def _audit(
         self,
         *,
@@ -531,10 +663,13 @@ class WebChannel(BaseChannel):
             "session_id": session_id,
             "details": self._sanitize_details(details),
         }
+        resolved_project_dir = project_dir
+        if resolved_project_dir is None and session_id:
+            resolved_project_dir = self._resolve_project_dir(session_id)
         if project_dir is not None:
             entry["project_dir"] = str(project_dir)
-        elif session_id:
-            entry["project_dir"] = str(self.projects_root / session_id)
+        elif resolved_project_dir is not None:
+            entry["project_dir"] = str(resolved_project_dir)
 
         try:
             global_log = self.projects_root / "logs" / _GLOBAL_AUDIT_FILENAME
@@ -542,9 +677,7 @@ class WebChannel(BaseChannel):
         except OSError as exc:
             logger.warning("Failed to append global audit log: {}", exc)
 
-        target = project_dir
-        if target is None and session_id:
-            target = self.projects_root / session_id
+        target = resolved_project_dir
         if target and target.is_dir():
             try:
                 self._append_jsonl(target / _PROJECT_AUDIT_REL_PATH, entry)
@@ -728,16 +861,15 @@ class WebChannel(BaseChannel):
             "tool_hint": bool(metadata.get("_tool_hint", False)),
             "content_preview": self._preview(msg.content),
         }
-        if msg.chat_id:
-            project_dir = self.projects_root / msg.chat_id
-            if project_dir.is_dir():
-                SessionManager(project_dir).append_ui_event(
-                    key=f"web:{msg.chat_id}",
-                    role="assistant",
-                    content=msg.content,
-                    msg_type=msg_type,
-                    metadata=metadata,
-                )
+        project_dir = self._resolve_project_dir(msg.chat_id) if msg.chat_id else None
+        if project_dir and project_dir.is_dir():
+            SessionManager(project_dir).append_ui_event(
+                key=f"web:{msg.chat_id}",
+                role="assistant",
+                content=msg.content,
+                msg_type=msg_type,
+                metadata=metadata,
+            )
         if ws is None or ws.closed:
             self._audit(
                 source="agent",
@@ -886,7 +1018,9 @@ class WebChannel(BaseChannel):
                 item["snapshot"] = snapshot
 
     def _load_plan_data(self, session_id: str, *, reconcile: bool = True) -> dict[str, Any] | None:
-        project_dir = self.projects_root / session_id
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None:
+            return None
         plan_path = project_dir / PLAN_FILENAME
         if not plan_path.is_file():
             return None
@@ -976,8 +1110,15 @@ class WebChannel(BaseChannel):
                     continue
 
                 self._clients[session_id] = ws
-                project_dir = str(self.projects_root / session_id)
-                project_dir_path = Path(project_dir)
+                project_dir_path = self._resolve_project_dir(
+                    session_id, create=True
+                )
+                if project_dir_path is None:
+                    await ws.send_json(
+                        {"type": "error", "content": "project_dir resolution failed"}
+                    )
+                    continue
+                project_dir = str(project_dir_path)
                 meta = self._persist_project_runtime_preferences(
                     project_dir_path,
                     run_mode=run_mode,
@@ -1036,7 +1177,7 @@ class WebChannel(BaseChannel):
                         "media_count": len(media) if isinstance(media, list) else 0,
                     },
                 )
-                SessionManager(Path(project_dir)).append_ui_event(
+                SessionManager(project_dir_path).append_ui_event(
                     key=f"web:{session_id}",
                     role="user",
                     content=content,
@@ -1079,12 +1220,20 @@ class WebChannel(BaseChannel):
                     continue
 
                 self._clients[session_id] = ws
-                project_dir = str(self.projects_root / session_id)
+                project_dir_path = self._resolve_project_dir(
+                    session_id, create=True
+                )
+                if project_dir_path is None:
+                    await ws.send_json(
+                        {"type": "error", "content": "project_dir resolution failed"}
+                    )
+                    continue
+                project_dir = str(project_dir_path)
                 self._audit(
                     source="ui",
                     action="ws_set_mode_received",
                     session_id=session_id,
-                    project_dir=Path(project_dir),
+                    project_dir=project_dir_path,
                     details={
                         "user_id": user_id,
                         "run_mode": run_mode,
@@ -1113,12 +1262,12 @@ class WebChannel(BaseChannel):
                     )
                     continue
                 self._clients[session_id] = ws
-                project_dir = str(self.projects_root / session_id)
+                project_dir_path = self._resolve_project_dir(session_id)
                 self._audit(
                     source="ui",
                     action="ws_bind_received",
                     session_id=session_id,
-                    project_dir=Path(project_dir),
+                    project_dir=project_dir_path,
                     details={"user_id": user_id},
                 )
 
@@ -1185,7 +1334,9 @@ class WebChannel(BaseChannel):
 
     def _load_audit_history_entries(self, session_id: str) -> list[dict[str, Any]]:
         """Best-effort fallback for older sessions missing persisted chat messages."""
-        project_dir = self.projects_root / session_id
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None:
+            return []
         audit_file = project_dir / _PROJECT_AUDIT_REL_PATH
         if not audit_file.is_file():
             return []
@@ -1226,8 +1377,8 @@ class WebChannel(BaseChannel):
         return rows
 
     def _load_history_entries(self, session_id: str) -> list[dict[str, Any]]:
-        project_dir = self.projects_root / session_id
-        if not project_dir.is_dir():
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not project_dir.is_dir():
             return []
 
         manager = SessionManager(project_dir)
@@ -1357,7 +1508,10 @@ class WebChannel(BaseChannel):
             return web.json_response({"error": str(exc)}, status=400)
 
         if next_root != previous_root:
+            self._register_projects_under_root(previous_root)
             self.projects_root = next_root
+            self._remember_projects_root(next_root)
+            self._register_projects_under_root(next_root)
             self._audit(
                 source="ui",
                 action="api_projects_root_updated",
@@ -1499,8 +1653,8 @@ class WebChannel(BaseChannel):
         session_id = (request.query.get("session_id") or "").strip()
         if not session_id:
             return web.json_response({"error": "session_id required"}, status=400)
-        project_dir = self.projects_root / session_id
-        if not project_dir.is_dir():
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not project_dir.is_dir():
             return web.json_response({"error": "project not found"}, status=404)
 
         meta = self._ensure_project_meta(project_dir)
@@ -1518,8 +1672,8 @@ class WebChannel(BaseChannel):
             return web.json_response({"error": "session_id required"}, status=400)
 
         auto_fix = (request.query.get("auto_fix", "1") or "1").strip().lower() not in {"0", "false", "no"}
-        project_dir = self.projects_root / session_id
-        if not project_dir.is_dir():
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not project_dir.is_dir():
             return web.json_response({"error": "project not found"}, status=404)
 
         result = guard_task_plan_file(project_dir, auto_fix=auto_fix)
@@ -1556,10 +1710,12 @@ class WebChannel(BaseChannel):
             pass
         return {}
 
-    def _default_project_meta(self, project_id: str) -> dict[str, Any]:
+    def _default_project_meta(self, project_dir: Path) -> dict[str, Any]:
+        project_id = project_dir.name
         now = f"{datetime.utcnow().isoformat()}Z"
         return {
             "id": project_id,
+            "project_dir": str(project_dir.expanduser().resolve()),
             "display_name": project_id,
             "run_mode": PROJECT_META_DEFAULT_RUN_MODE,
             "agent_profile": PROJECT_META_DEFAULT_AGENT_PROFILE,
@@ -1576,9 +1732,10 @@ class WebChannel(BaseChannel):
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _ensure_project_meta(self, project_dir: Path) -> dict[str, Any]:
+        project_dir = project_dir.expanduser().resolve()
         project_id = project_dir.name
         current = self._load_project_meta(project_dir)
-        baseline = self._default_project_meta(project_id)
+        baseline = self._default_project_meta(project_dir)
         meta = {**baseline, **current}
 
         display_name = meta.get("display_name")
@@ -1589,6 +1746,7 @@ class WebChannel(BaseChannel):
 
         if meta.get("id") != project_id:
             meta["id"] = project_id
+        meta["project_dir"] = str(project_dir)
 
         meta["run_mode"] = _normalize_run_mode(meta.get("run_mode"))
         meta["agent_profile"] = _normalize_agent_profile(meta.get("agent_profile"))
@@ -1616,6 +1774,7 @@ class WebChannel(BaseChannel):
         automation_policy: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Persist runtime preferences for websocket-driven project sessions."""
+        project_dir = self._register_project_dir(project_dir.name, project_dir)
         project_dir.mkdir(parents=True, exist_ok=True)
         meta = self._ensure_project_meta(project_dir)
         changed = False
@@ -1647,6 +1806,7 @@ class WebChannel(BaseChannel):
         if not self.projects_root.is_dir():
             return web.json_response({"projects": []})
 
+        self._register_projects_under_root(self.projects_root)
         projects: list[dict[str, Any]] = []
         for d in sorted(self.projects_root.iterdir()):
             if not self._is_project_dir(d):
@@ -1700,8 +1860,8 @@ class WebChannel(BaseChannel):
         if not session_id:
             return web.json_response({"error": "session_id required"}, status=400)
 
-        project_dir = self.projects_root / session_id
-        if not self._is_project_dir(project_dir):
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not self._is_project_dir(project_dir):
             return web.json_response({"error": "project not found"}, status=404)
 
         try:
@@ -1806,8 +1966,8 @@ class WebChannel(BaseChannel):
         if not session_id:
             return web.json_response({"error": "session_id required"}, status=400)
 
-        project_dir = self.projects_root / session_id
-        if not project_dir.is_dir():
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not project_dir.is_dir():
             self._audit(
                 source="ui",
                 action="api_delete_project_missing",
@@ -1824,6 +1984,7 @@ class WebChannel(BaseChannel):
                 project_dir=project_dir,
             )
             shutil.rmtree(project_dir)
+            self._drop_project_dir_registration(session_id)
             self._audit(
                 source="ui",
                 action="api_delete_project_completed",
@@ -1857,7 +2018,9 @@ class WebChannel(BaseChannel):
         except Exception:
             return web.json_response({"error": "expected multipart/form-data"}, status=400)
 
-        project_dir = self.projects_root / session_id
+        project_dir = self._resolve_project_dir(session_id, create=True)
+        if project_dir is None:
+            return web.json_response({"error": "project not found"}, status=404)
         upload_dir = project_dir / target
         try:
             upload_dir.mkdir(parents=True, exist_ok=True)
@@ -1962,8 +2125,8 @@ class WebChannel(BaseChannel):
         if not rel_path:
             return web.json_response({"error": "path required"}, status=400)
 
-        project_dir = (self.projects_root / session_id).resolve()
-        if not project_dir.is_dir():
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not project_dir.is_dir():
             return web.json_response({"error": "project not found"}, status=404)
 
         candidate = (project_dir / rel_path).resolve()
@@ -1978,8 +2141,9 @@ class WebChannel(BaseChannel):
         return web.FileResponse(candidate)
 
     def _skill_plugin_manager(self, session_id: str) -> SkillPluginManager:
-        project_dir = self.projects_root / session_id
-        project_dir.mkdir(parents=True, exist_ok=True)
+        project_dir = self._resolve_project_dir(session_id, create=True)
+        if project_dir is None:
+            raise SkillPluginError(f"project not found: {session_id}")
         return SkillPluginManager(project_dir)
 
     async def _handle_skill_plugins_list(self, request: web.Request) -> web.Response:
