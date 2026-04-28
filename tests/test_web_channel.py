@@ -84,11 +84,17 @@ def web_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebChannel:
     bus = MagicMock(spec=MessageBus)
     global_workspace = tmp_path / "global-workspace"
     global_workspace.mkdir(parents=True)
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(parents=True)
     monkeypatch.setattr(skill_plugins_mod, "get_workspace_path", lambda _workspace: global_workspace)
+    monkeypatch.setattr(
+        web_channel_mod,
+        "get_runtime_subdir",
+        lambda name: (runtime_root / name).mkdir(parents=True, exist_ok=True) or (runtime_root / name),
+    )
     with patch.object(BaseChannel, "__init__", _minimal_base_init):
         with patch.object(web_channel_mod, "_load_ui_instructions", return_value=""):
-            ch = WebChannel(config, bus)
-            ch.projects_root = tmp_path
+            ch = WebChannel(config, bus, workspace=tmp_path)
             return ch
 
 
@@ -677,6 +683,101 @@ async def test_handle_history_prefers_ui_entries_over_audit_preview_when_present
     body = json.loads(resp.text)
     contents = [entry["content"] for entry in body["entries"]]
     assert contents.count("full assistant message") == 1
+
+
+async def test_handle_history_uses_bound_project_dir_after_projects_root_change(
+    web_channel: WebChannel,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_root = tmp_path / "old-root"
+    new_root = tmp_path / "new-root"
+    session_id = "PRJ-4220"
+    project_dir = old_root / session_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    web_channel.projects_root = old_root.resolve()
+    web_channel._known_project_roots = {old_root.resolve()}
+    web_channel._persist_project_runtime_preferences(
+        project_dir,
+        run_mode="auto",
+        agent_profile="default",
+        contract_version=1,
+        automation_policy=None,
+    )
+    SessionManager(project_dir).append_ui_event(
+        key=f"web:{session_id}",
+        role="assistant",
+        content="persisted in old root",
+        msg_type="response",
+        metadata={},
+    )
+
+    config = Config()
+    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(web_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
+
+    config_req = MagicMock(spec=web.Request)
+    config_req.json = AsyncMock(return_value={"projects_root": str(new_root)})
+    config_resp = await web_channel._handle_config(config_req)
+    assert config_resp.status == 200
+    assert web_channel.projects_root == new_root.resolve()
+
+    history_req = MagicMock(spec=web.Request)
+    history_req.match_info = {"session_id": session_id}
+    history_resp = await web_channel._handle_history(history_req)
+    assert history_resp.status == 200
+    body = json.loads(history_resp.text)
+    assert [entry["content"] for entry in body["entries"]] == ["persisted in old root"]
+
+
+async def test_project_dir_index_survives_channel_restart_after_root_change(
+    web_channel: WebChannel,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_root = tmp_path / "old-root"
+    new_root = tmp_path / "new-root"
+    session_id = "PRJ-4221"
+    project_dir = old_root / session_id
+    artifact = project_dir / "results" / "report.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("hello", encoding="utf-8")
+
+    web_channel.projects_root = old_root.resolve()
+    web_channel._known_project_roots = {old_root.resolve()}
+    web_channel._persist_project_runtime_preferences(
+        project_dir,
+        run_mode="auto",
+        agent_profile="default",
+        contract_version=1,
+        automation_policy=None,
+    )
+
+    config = Config()
+    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(web_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
+
+    config_req = MagicMock(spec=web.Request)
+    config_req.json = AsyncMock(return_value={"projects_root": str(new_root)})
+    config_resp = await web_channel._handle_config(config_req)
+    assert config_resp.status == 200
+
+    with patch.object(BaseChannel, "__init__", _minimal_base_init):
+        with patch.object(web_channel_mod, "_load_ui_instructions", return_value=""):
+            restarted = WebChannel(
+                MagicMock(spec=WebChannelConfig),
+                MagicMock(spec=MessageBus),
+                workspace=new_root,
+            )
+
+    artifact_req = MagicMock(spec=web.Request)
+    artifact_req.match_info = {"session_id": session_id}
+    artifact_req.query = {"path": "results/report.txt"}
+    artifact_resp = await restarted._handle_project_artifact(artifact_req)
+    assert isinstance(artifact_resp, web.FileResponse)
+    assert artifact_resp.status == 200
+    assert Path(artifact_resp._path) == artifact
 
 
 async def test_handle_config_invalid_json(web_channel: WebChannel) -> None:
