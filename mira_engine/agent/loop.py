@@ -152,6 +152,12 @@ class AgentLoop:
         self._last_task_plan_guard_issues: list[str] = []
         self._last_task_plan_guard_fixed: bool = False
         self._last_loop_tokens_used: int = 0
+        # Cumulative tokens consumed by each session, surfaced to UI clients
+        # via progress / response metadata so users can monitor usage against
+        # their automation token budget. Cleared when the session is reset
+        # (e.g. via the /new slash command). Lives in memory only; restoring
+        # a session after engine restart starts the counter back at zero.
+        self._session_tokens_used: dict[str, int] = {}
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
         self._command_router = CommandRouter()
@@ -464,6 +470,23 @@ class AgentLoop:
             self._session_automation_policies[session_key] = parsed
             return parsed
         return self._session_automation_policies.get(session_key)
+
+    def _accumulate_session_tokens(self, session_key: str, delta: int) -> int:
+        """Add `delta` to the session's running token total and return the new total."""
+        if delta <= 0:
+            return self._session_tokens_used.get(session_key, 0)
+        new_total = self._session_tokens_used.get(session_key, 0) + delta
+        self._session_tokens_used[session_key] = new_total
+        return new_total
+
+    def _max_tokens_from_policy(self, policy: dict[str, Any] | None) -> int | None:
+        """Return the auto-stop token budget if configured as a positive int."""
+        if not isinstance(policy, dict):
+            return None
+        value = policy.get("maxTokens")
+        if isinstance(value, int) and value > 0:
+            return value
+        return None
 
     @staticmethod
     def _agent_profile_to_agents_filename(profile: str) -> str:
@@ -1522,6 +1545,7 @@ class AgentLoop:
                 sessions_mgr.save(session)
                 sessions_mgr.invalidate(session.key)
                 self._session_model_runtimes.pop(session.key, None)
+                self._session_tokens_used.pop(session.key, None)
                 if snapshot:
                     self._schedule_background(self.consolidator.archive(snapshot))
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
@@ -1535,6 +1559,7 @@ class AgentLoop:
             sessions_mgr.invalidate(session.key)
             self._session_model_runtimes.pop(session.key, None)
             self._session_automation_policies.pop(session.key, None)
+            self._session_tokens_used.pop(session.key, None)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -1639,6 +1664,10 @@ class AgentLoop:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            meta["tokens_used_session"] = self._session_tokens_used.get(key, 0)
+            max_tokens = self._max_tokens_from_policy(automation_policy)
+            if max_tokens is not None:
+                meta["max_tokens"] = max_tokens
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
@@ -1681,6 +1710,7 @@ class AgentLoop:
         round_plan_before = self._load_task_plan(project_dir) if msg.channel == "web" else None
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
         total_tokens_used = self._last_loop_tokens_used
+        self._accumulate_session_tokens(key, self._last_loop_tokens_used)
         round_plan_after = self._load_task_plan(project_dir) if msg.channel == "web" else None
         if msg.channel == "web" and not allow_result_write:
             round_plan_after, restored = self._restore_result_section(
@@ -1751,6 +1781,7 @@ class AgentLoop:
                             audit_hook=audit_cb,
                         )
                         total_tokens_used += self._last_loop_tokens_used
+                        self._accumulate_session_tokens(key, self._last_loop_tokens_used)
                         round_plan_after = self._load_task_plan(project_dir)
                         if msg.channel == "web" and not allow_result_write:
                             round_plan_after, restored = self._restore_result_section(
@@ -1813,6 +1844,7 @@ class AgentLoop:
                         guard_plan_before = round_plan_after if msg.channel == "web" else None
                         final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
                         total_tokens_used += self._last_loop_tokens_used
+                        self._accumulate_session_tokens(key, self._last_loop_tokens_used)
                         round_plan_after = self._load_task_plan(project_dir)
                         round_plan_before = guard_plan_before
                         if msg.channel == "web" and not allow_result_write:
@@ -1851,6 +1883,7 @@ class AgentLoop:
                         guard_plan_before = round_plan_after if msg.channel == "web" else None
                         final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
                         total_tokens_used += self._last_loop_tokens_used
+                        self._accumulate_session_tokens(key, self._last_loop_tokens_used)
                         round_plan_after = self._load_task_plan(project_dir)
                         round_plan_before = guard_plan_before
                         if msg.channel == "web" and not allow_result_write:
@@ -1890,6 +1923,7 @@ class AgentLoop:
             round_plan_before = round_plan_after
             final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
             total_tokens_used += self._last_loop_tokens_used
+            self._accumulate_session_tokens(key, self._last_loop_tokens_used)
             round_plan_after = self._load_task_plan(project_dir)
             if msg.channel == "web" and not allow_result_write:
                 round_plan_after, restored = self._restore_result_section(
@@ -1925,9 +1959,14 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        response_metadata = dict(msg.metadata or {})
+        response_metadata["tokens_used_session"] = self._session_tokens_used.get(key, 0)
+        max_tokens = self._max_tokens_from_policy(automation_policy)
+        if max_tokens is not None:
+            response_metadata["max_tokens"] = max_tokens
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            metadata=response_metadata,
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:

@@ -729,6 +729,99 @@ async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path
     assert any("guardrail repair 1" in item for item in progress_events)
 
 
+async def test_process_message_broadcasts_token_usage_and_resets_on_new(
+    monkeypatch, tmp_path: Path
+) -> None:
+    loop = _make_real_loop(tmp_path)
+
+    token_script = iter([1500, 700, 0])
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        loop._last_loop_tokens_used = next(token_script)
+        if on_progress is not None:
+            await on_progress("midway-progress")
+        return "done", [], messages + [{"role": "assistant", "content": "done"}]
+
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+
+    msg1 = InboundMessage(
+        channel="web",
+        sender_id="u",
+        chat_id="PRJ-T1",
+        content="first",
+        metadata={"automation_policy": {"maxTokens": 50000}},
+    )
+    out1 = await loop._process_message(msg1)
+    assert out1.metadata["tokens_used_session"] == 1500
+    assert out1.metadata["max_tokens"] == 50000
+    assert loop._session_tokens_used["web:PRJ-T1"] == 1500
+
+    first_progress: list[OutboundMessage] = []
+    while loop.bus.outbound_size:
+        first_progress.append(await loop.bus.consume_outbound())
+    # Progress fires inside the first loop, before the post-loop accumulator
+    # has run, so the cumulative figure here is the *pre-loop* total (0).
+    assert any(
+        m.metadata.get("_progress") is True
+        and m.metadata.get("tokens_used_session") == 0
+        and m.metadata.get("max_tokens") == 50000
+        for m in first_progress
+    )
+
+    msg2 = InboundMessage(
+        channel="web",
+        sender_id="u",
+        chat_id="PRJ-T1",
+        content="second",
+    )
+    out2 = await loop._process_message(msg2)
+    assert out2.metadata["tokens_used_session"] == 2200
+    assert out2.metadata["max_tokens"] == 50000
+    assert loop._session_tokens_used["web:PRJ-T1"] == 2200
+
+    # Progress emitted during the second message picks up the cumulative
+    # total carried over from the previous message.
+    second_progress: list[OutboundMessage] = []
+    while loop.bus.outbound_size:
+        second_progress.append(await loop.bus.consume_outbound())
+    assert any(
+        m.metadata.get("_progress") is True
+        and m.metadata.get("tokens_used_session") == 1500
+        for m in second_progress
+    )
+
+    async def _consolidate(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(loop, "_consolidate_memory", _consolidate)
+    new_resp = await loop._process_message(
+        InboundMessage(channel="web", sender_id="u", chat_id="PRJ-T1", content="/new")
+    )
+    assert new_resp.content == "New session started."
+    assert "web:PRJ-T1" not in loop._session_tokens_used
+
+
+async def test_accumulate_session_tokens_helper() -> None:
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._session_tokens_used = {}
+    assert loop._accumulate_session_tokens("k", 100) == 100
+    assert loop._accumulate_session_tokens("k", 50) == 150
+    assert loop._accumulate_session_tokens("k", 0) == 150
+    assert loop._accumulate_session_tokens("k", -10) == 150
+    assert loop._accumulate_session_tokens("other", 25) == 25
+    assert loop._session_tokens_used == {"k": 150, "other": 25}
+
+
+def test_max_tokens_from_policy_helper() -> None:
+    loop = AgentLoop.__new__(AgentLoop)
+    assert loop._max_tokens_from_policy(None) is None
+    assert loop._max_tokens_from_policy({}) is None
+    assert loop._max_tokens_from_policy({"maxTokens": 0}) is None
+    assert loop._max_tokens_from_policy({"maxTokens": -5}) is None
+    assert loop._max_tokens_from_policy({"maxTokens": "1000"}) is None
+    assert loop._max_tokens_from_policy({"maxTokens": 50_000}) == 50_000
+
+
 async def test_run_main_loop_and_process_direct(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
 
