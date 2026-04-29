@@ -176,6 +176,7 @@ def test_parse_and_route_helper_methods(tmp_path: Path) -> None:
         agent_profile="research",
     )
     assert "Execute exactly ONE pending experiment in this round" in auto_msg
+    assert "If no pending experiment exists but automation goals are still unmet" in auto_msg
     assert "immediately update and write task_plan.json" in auto_msg
     assert "Task-plan contract requirements" in auto_msg
     assert "theoretical_proof" in auto_msg
@@ -249,6 +250,55 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         auto_round=0,
     ) is False
 
+    exhausted_policy = loop._parse_automation_policy(
+        {
+            "logic": "AND",
+            "goals": [{"metric": "Dice", "operator": ">=", "value": 0.9}],
+            "maxExperiments": 8,
+        }
+    )
+    assert exhausted_policy is not None
+    (project / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "experiments": [
+                    {"status": "completed", "results": {"metrics": {"Dice": 0.78}}}
+                    for _ in range(7)
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert loop._should_continue_auto_web(
+        channel="web",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=0,
+        automation_policy=exhausted_policy,
+        tokens_used=100,
+    ) is True
+    (project / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "experiments": [
+                    {"status": "completed", "results": {"metrics": {"Dice": 0.78}}}
+                    for _ in range(8)
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert loop._should_continue_auto_web(
+        channel="web",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=0,
+        automation_policy=exhausted_policy,
+        tokens_used=100,
+    ) is False
+
     before = {
         "experiments": [
             {"id": "Exp001", "status": "running", "results": {"metrics": {}}},
@@ -302,6 +352,21 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert restored.get("result") == before_result["result"]
     persisted = json.loads(plan_file.read_text(encoding="utf-8"))
     assert persisted.get("result") == before_result["result"]
+
+    after_completed = {
+        "status": "completed",
+        "experiments": [{"id": "Exp001", "status": "completed"}],
+    }
+    plan_file.write_text(json.dumps(after_completed), encoding="utf-8")
+    status_restored, status_changed = loop._restore_completion_status(
+        str(project),
+        after_plan=after_completed,
+    )
+    assert status_changed is True
+    assert isinstance(status_restored, dict)
+    assert status_restored.get("status") == "in_progress"
+    persisted = json.loads(plan_file.read_text(encoding="utf-8"))
+    assert persisted.get("status") == "in_progress"
 
 
 def test_automation_policy_helpers(tmp_path: Path) -> None:

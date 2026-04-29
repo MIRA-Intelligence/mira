@@ -96,6 +96,32 @@ def _normalize_contract_version(contract_version: object) -> int:
     return DEFAULT_CONTRACT_VERSION
 
 
+def plan_has_final_result_output(result: object) -> bool:
+    """Return whether task_plan.result contains a user-visible final deliverable."""
+    if not isinstance(result, dict):
+        return False
+    output_path = result.get("output_path")
+    output_type = result.get("output_type")
+    summary = result.get("summary")
+    sections = result.get("sections")
+    if isinstance(output_path, str) and output_path.strip():
+        return True
+    if isinstance(output_type, str) and output_type.strip():
+        return True
+    if isinstance(summary, str) and summary.strip():
+        return True
+    return isinstance(sections, list) and any(
+        isinstance(section, dict)
+        and (
+            isinstance(section.get("title"), str)
+            and section.get("title").strip()
+            or isinstance(section.get("content"), str)
+            and section.get("content").strip()
+        )
+        for section in sections
+    )
+
+
 def _required_completed_fields_for_profile(
     profile: str, contract_version: int
 ) -> tuple[str, ...]:
@@ -859,6 +885,14 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
         or (not has_running and current_status in {"completed", "failed", "skipped"})
     ):
         normalized["current_experiment"] = first_pending
+        changed = True
+
+    if normalized.get("status") == "completed" and (
+        has_running
+        or first_pending is not None
+        or not plan_has_final_result_output(normalized.get("result"))
+    ):
+        normalized["status"] = "in_progress"
         changed = True
 
     return normalized, changed

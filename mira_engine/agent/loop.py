@@ -37,7 +37,11 @@ from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
-from mira_engine.task_plan.guardrails import get_task_plan_contract, guard_task_plan_file
+from mira_engine.task_plan.guardrails import (
+    get_task_plan_contract,
+    guard_task_plan_file,
+    plan_has_final_result_output,
+)
 
 if TYPE_CHECKING:
     from mira_engine.config.schema import ChannelsConfig, ExecToolConfig
@@ -801,6 +805,24 @@ class AgentLoop:
             return f"token budget reached ({tokens_used}/{max_tokens})"
 
         return None
+
+    @classmethod
+    def _should_replan_exhausted_queue(
+        cls,
+        policy: dict[str, Any] | None,
+        *,
+        plan: dict | None,
+        tokens_used: int,
+    ) -> bool:
+        """Continue auto mode when the queue is empty but experiment budget remains."""
+        if not policy or cls._plan_has_pending_work(plan):
+            return False
+        max_experiments = policy.get("maxExperiments")
+        if not isinstance(max_experiments, int) or max_experiments <= 0:
+            return False
+        if cls._evaluate_automation_stop_policy(policy, plan=plan, tokens_used=tokens_used):
+            return False
+        return cls._count_completed_experiments(plan) < max_experiments
     @staticmethod
     def _plan_result_state(plan: dict | None) -> tuple[bool, Any]:
         """Return whether `result` exists and its payload."""
@@ -855,6 +877,32 @@ class AgentLoop:
         else:
             patched.pop("result", None)
 
+        plan_path = Path(project_dir) / "task_plan.json"
+        try:
+            plan_path.write_text(
+                json.dumps(patched, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            return after_plan, False
+        return patched, True
+
+    def _restore_completion_status(
+        self,
+        project_dir: str | None,
+        *,
+        after_plan: dict | None,
+    ) -> tuple[dict | None, bool]:
+        """Keep project status in progress until a final result is explicitly available."""
+        if not project_dir or not isinstance(after_plan, dict):
+            return after_plan, False
+        if after_plan.get("status") != "completed":
+            return after_plan, False
+        if plan_has_final_result_output(after_plan.get("result")) and not self._plan_has_pending_work(after_plan):
+            return after_plan, False
+
+        patched = json.loads(json.dumps(after_plan, ensure_ascii=False))
+        patched["status"] = "in_progress"
         plan_path = Path(project_dir) / "task_plan.json"
         try:
             plan_path.write_text(
@@ -983,7 +1031,10 @@ class AgentLoop:
             "Auto-run checkpoint requirements:\n"
             "1) If you just finished an experiment, immediately update and write task_plan.json "
             "(set status/results/conclusion/next for that experiment) BEFORE starting the next one.\n"
-            "2) Execute exactly ONE pending experiment in this round, then return control.\n"
+            "2) Execute exactly ONE pending experiment in this round, then return control. "
+            "If no pending experiment exists but automation goals are still unmet and "
+            "maxExperiments budget remains, first append the next sequential pending "
+            "experiment(s) to task_plan.json, execute exactly ONE of them, then return control.\n"
             "3) Do not stop for confirmation unless user input is strictly required.\n\n"
             f"{contract_hint}"
         )
@@ -1084,6 +1135,8 @@ class AgentLoop:
         final_content: str | None,
         auto_round: int,
         agent_profile: str | None = None,
+        automation_policy: dict[str, Any] | None = None,
+        tokens_used: int = 0,
     ) -> bool:
         """Decide whether to schedule another internal auto-run cycle."""
         if channel != "web" or run_mode != "auto":
@@ -1098,7 +1151,13 @@ class AgentLoop:
         if self._looks_like_user_input_request(final_content):
             return False
         plan = self._load_task_plan(project_dir)
-        return self._plan_has_pending_work(plan)
+        if self._plan_has_pending_work(plan):
+            return True
+        return self._should_replan_exhausted_queue(
+            automation_policy,
+            plan=plan,
+            tokens_used=tokens_used,
+        )
 
     def _get_model_runtime(self, session_key: str) -> RoutedProviderManager:
         """Return the session-local model runtime, creating it on demand."""
@@ -1722,6 +1781,14 @@ class AgentLoop:
                 await progress_cb(
                     "auto-run guard: skipped task_plan.result update without explicit export request"
                 )
+            round_plan_after, status_restored = self._restore_completion_status(
+                project_dir,
+                after_plan=round_plan_after,
+            )
+            if status_restored:
+                await progress_cb(
+                    "auto-run guard: kept task_plan.status=in_progress until explicit export request"
+                )
 
         auto_round = 0
         guard_repair_round = 0
@@ -1793,6 +1860,14 @@ class AgentLoop:
                                 await progress_cb(
                                     "auto-run guard: skipped task_plan.result update without explicit export request"
                                 )
+                            round_plan_after, status_restored = self._restore_completion_status(
+                                project_dir,
+                                after_plan=round_plan_after,
+                            )
+                            if status_restored:
+                                await progress_cb(
+                                    "auto-run guard: kept task_plan.status=in_progress until explicit export request"
+                                )
                         continue
 
             if msg.channel == "web" and current_mode == "auto":
@@ -1813,6 +1888,8 @@ class AgentLoop:
                 final_content=final_content,
                 auto_round=auto_round,
                 agent_profile=agent_profile,
+                automation_policy=automation_policy,
+                tokens_used=total_tokens_used,
             )
             if not should_continue:
                 guard_issues = list(getattr(self, "_last_task_plan_guard_issues", []))
@@ -1857,6 +1934,14 @@ class AgentLoop:
                                 await progress_cb(
                                     "auto-run guard: skipped task_plan.result update without explicit export request"
                                 )
+                            round_plan_after, status_restored = self._restore_completion_status(
+                                project_dir,
+                                after_plan=round_plan_after,
+                            )
+                            if status_restored:
+                                await progress_cb(
+                                    "auto-run guard: kept task_plan.status=in_progress until explicit export request"
+                                )
                         continue
                     has_pending = self._plan_has_pending_work(self._load_task_plan(project_dir))
                     strict_contract = self._is_strict_contract_enforced(
@@ -1896,6 +1981,14 @@ class AgentLoop:
                                 await progress_cb(
                                     "auto-run guard: skipped task_plan.result update without explicit export request"
                                 )
+                            round_plan_after, status_restored = self._restore_completion_status(
+                                project_dir,
+                                after_plan=round_plan_after,
+                            )
+                            if status_restored:
+                                await progress_cb(
+                                    "auto-run guard: kept task_plan.status=in_progress until explicit export request"
+                                )
                         continue
                     if has_pending and auto_round < self._AUTO_MAX_ROUNDS:
                         continue_despite_guard = True
@@ -1908,7 +2001,7 @@ class AgentLoop:
             run_mode = current_mode
             auto_round += 1
             await progress_cb(
-                f"auto-run round {auto_round}: continuing to next pending experiment"
+                f"auto-run round {auto_round}: continuing to next experiment cycle"
             )
             all_msgs.append({
                 "role": "user",
@@ -1934,6 +2027,14 @@ class AgentLoop:
                 if restored:
                     await progress_cb(
                         "auto-run guard: skipped task_plan.result update without explicit export request"
+                    )
+                round_plan_after, status_restored = self._restore_completion_status(
+                    project_dir,
+                    after_plan=round_plan_after,
+                )
+                if status_restored:
+                    await progress_cb(
+                        "auto-run guard: kept task_plan.status=in_progress until explicit export request"
                     )
 
         if final_content is None:
