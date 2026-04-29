@@ -24,8 +24,9 @@ switch between:
 
 Populate the `research` section early when you are surveying the literature.
 After research, initialize the `experiments` array with the planned experiment
-sequence so the dashboard can show the queue before execution begins. Fill in
-`result` when generating final output.
+sequence so the dashboard can show the queue before execution begins.
+Do NOT fill in `result` just because experiments finished; only populate
+`result` after the user explicitly requests export or another final deliverable.
 
 ## Research Phase
 
@@ -54,8 +55,10 @@ Question → Hypothesis → Prediction → Experiment → Analysis → Conclusio
   STOP and return a summary. Do NOT proceed until the user explicitly says
   "continue" or gives further instructions.
 - In `auto` mode: continue to the next pending experiment automatically. Only stop
-  early when user input is strictly required, the project is blocked by an error,
-  or there are no pending/running experiments left.
+  early when user input is strictly required or the project is blocked by an error.
+- In `auto` mode: if there are no pending/running experiments left but the
+  automation goals are still unmet and `maxExperiments` budget remains, you MUST
+  re-plan by appending the next sequential experiment(s) instead of stopping.
 - In `auto` mode: in a single assistant turn, you may transition AT MOST ONE
   experiment to a terminal status (`completed`/`failed`/`skipped`). You may
   create or queue many `pending` experiments, but finish only one per turn.
@@ -130,18 +133,24 @@ When the user asks to re-plan based on completed experiments and current
 - Append a new batch with next sequential IDs (`Exp00X` ...), usually as
   `pending`, and set `current_experiment` to the first new candidate when
   appropriate.
+- If `automation_policy.maxExperiments` is set and the project has not met its
+  goal metrics yet, do not stop early with spare budget. Append at least one new
+  `pending` experiment whenever the queue is exhausted and the completed count is
+  still below `maxExperiments`.
 - Set project `status` to `in_progress` when new experiments are proposed.
 - Write the full updated `task_plan.json` before sending the final reply so the
   dashboard can immediately render the new queue.
 
 ## Result Phase
 
-When the user requests a final deliverable, populate the `result` section in
-`task_plan.json`:
+When the user explicitly requests export or another final deliverable, populate
+the `result` section in `task_plan.json`:
 - `summary`: a concise summary of all findings
 - `output_path`: the file path to the generated deliverable (relative to project dir)
 - `output_type`: one of `paper`, `report`, `analysis`, `code`
 - `sections`: structured content sections (title + content pairs)
+- Do NOT mark the top-level project `status` as `completed` unless this explicit
+  export/final-deliverable request is being fulfilled.
 
 ## Response Language Policy
 
