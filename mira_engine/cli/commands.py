@@ -1075,6 +1075,26 @@ def serve(
 # ============================================================================
 
 
+def _configure_cli_logging(logs_mode: bool) -> None:
+    """Toggle loguru sinks for the interactive CLI.
+
+    ``logger.disable(name)`` only matches loggers whose ``__name__`` equals
+    ``name`` or starts with ``name + "."``. Mira engine modules emit under
+    the ``mira_engine`` namespace (no dot suffix from ``mira``), so we must
+    disable both prefixes explicitly to keep the prompt clean. Same on the
+    enable path so ``--logs`` actually surfaces every engine line.
+    """
+    from loguru import logger
+
+    namespaces = ("mira", "mira_engine")
+    if logs_mode:
+        for ns in namespaces:
+            logger.enable(ns)
+    else:
+        for ns in namespaces:
+            logger.disable(ns)
+
+
 def _build_agent_loop_kwargs(
     *,
     bus,
@@ -1359,8 +1379,6 @@ def agent(
     debug: bool = typer.Option(False, "--debug/--no-debug", help="Alias of --verbose"),
 ):
     """Interact with the general-purpose agent (no research orchestration)."""
-    from loguru import logger
-
     from mira_engine.agent.base_loop import BaseAgentLoop
     from mira_engine.bus.queue import MessageBus
     from mira_engine.cron.service import CronService
@@ -1388,10 +1406,7 @@ def agent(
     # Keep --debug useful (skill/tool visibility) without TTY log interleaving.
     logs_mode = logs or (debug and message is not None)
 
-    if logs_mode:
-        logger.enable("mira")
-    else:
-        logger.disable("mira")
+    _configure_cli_logging(logs_mode)
 
     agent_loop = BaseAgentLoop(
         **_build_agent_loop_kwargs(
@@ -1426,7 +1441,7 @@ def research(
         "--mode",
         "-m",
         case_sensitive=False,
-        help="Run mode: manual | auto. (auto-continue rounds are honoured by the web channel.)",
+        help="Run mode: manual | auto. (auto-continue rounds are honoured by the ui channel.)",
     ),
     profile: str = typer.Option(
         "default",
@@ -1456,8 +1471,6 @@ def research(
     debug: bool = typer.Option(False, "--debug/--no-debug", help="Alias of --verbose"),
 ):
     """Interact with the research-flavoured agent (auto-mode, profiles, contracts)."""
-    from loguru import logger
-
     from mira_engine.agent.research_loop import ResearchAgentLoop
     from mira_engine.bus.queue import MessageBus
     from mira_engine.cron.service import CronService
@@ -1502,10 +1515,7 @@ def research(
 
     verbose_mode = verbose or debug
     logs_mode = logs or (debug and message is not None)
-    if logs_mode:
-        logger.enable("mira")
-    else:
-        logger.disable("mira")
+    _configure_cli_logging(logs_mode)
 
     agent_loop = ResearchAgentLoop(
         **_build_agent_loop_kwargs(
@@ -1572,7 +1582,7 @@ def channels_status(
 
     names: set[str] = set(discover_all().keys())
     names.update(getattr(cfg.channels, "model_extra", {}).keys())
-    names.update(("telegram", "whatsapp", "discord", "feishu", "mochat", "dingtalk", "email", "slack", "qq", "matrix", "web"))
+    names.update(("telegram", "whatsapp", "discord", "feishu", "mochat", "dingtalk", "email", "slack", "qq", "matrix", "ui"))
 
     for name in sorted(names):
         section = getattr(cfg.channels, name, None)
@@ -1672,7 +1682,7 @@ def channels_login(
     kwargs: dict[str, object] = {}
     if channel in {"telegram", "feishu"}:
         kwargs["groq_api_key"] = getattr(cfg.providers.groq, "api_key", "")
-    if channel == "web":
+    if channel == "ui":
         kwargs["workspace"] = cfg.workspace_path
     inst = cls(section, bus, **kwargs)
     if not hasattr(inst, "login"):

@@ -54,7 +54,7 @@ def _enable_all_channels(cfg: Config) -> None:
         "slack",
         "qq",
         "matrix",
-        "web",
+        "ui",
     ):
         ch = getattr(cfg.channels, name)
         ch.enabled = True
@@ -74,7 +74,7 @@ def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
         ("mira_engine.channels.slack", "SlackChannel"),
         ("mira_engine.channels.qq", "QQChannel"),
         ("mira_engine.channels.matrix", "MatrixChannel"),
-        ("mira_engine.channels.web", "WebChannel"),
+        ("mira_engine.channels.ui", "UiChannel"),
     ):
         _install_channel_module(monkeypatch, module_name, cls_name)
 
@@ -92,7 +92,7 @@ def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
         "slack",
         "qq",
         "matrix",
-        "web",
+        "ui",
     }
 
 
@@ -106,20 +106,20 @@ def test_validate_allow_from_rejects_empty_lists() -> None:
         assert "empty allowFrom" in str(exc)
 
 
-def test_web_channel_receives_gateway_bind_host_port(monkeypatch) -> None:
-    _install_channel_module(monkeypatch, "mira_engine.channels.web", "WebChannel")
+def test_ui_channel_receives_gateway_bind_host_port(monkeypatch) -> None:
+    _install_channel_module(monkeypatch, "mira_engine.channels.ui", "UiChannel")
     cfg = Config()
-    cfg.channels.web.enabled = True
-    cfg.channels.web.allow_from = ["*"]
+    cfg.channels.ui.enabled = True
+    cfg.channels.ui.allow_from = ["*"]
     cfg.gateway.host = "127.0.0.2"
     cfg.gateway.port = 19991
 
     mgr = ChannelManager(cfg, MessageBus())
-    web = mgr.get_channel("web")
-    assert isinstance(web, _DummyChannel)
-    assert web.init_kwargs["workspace"] == cfg.workspace_path
-    assert web.init_kwargs["bind_host"] == "127.0.0.2"
-    assert web.init_kwargs["bind_port"] == 19991
+    ui = mgr.get_channel("ui")
+    assert isinstance(ui, _DummyChannel)
+    assert ui.init_kwargs["workspace"] == cfg.workspace_path
+    assert ui.init_kwargs["bind_host"] == "127.0.0.2"
+    assert ui.init_kwargs["bind_port"] == 19991
 
 
 async def test_start_all_and_stop_all_with_channels(monkeypatch) -> None:
@@ -154,13 +154,13 @@ async def test_dispatch_outbound_filters_progress_messages() -> None:
     bus = MessageBus()
     mgr = ChannelManager(cfg, bus)
     ch = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
-    mgr.channels = {"web": ch}
+    mgr.channels = {"ui": ch}
 
     task = asyncio.create_task(mgr._dispatch_outbound())
-    await bus.publish_outbound(OutboundMessage("web", "x", "normal"))
-    await bus.publish_outbound(OutboundMessage("web", "x", "progress", metadata={"_progress": True}))
+    await bus.publish_outbound(OutboundMessage("ui", "x", "normal"))
+    await bus.publish_outbound(OutboundMessage("ui", "x", "progress", metadata={"_progress": True}))
     await bus.publish_outbound(
-        OutboundMessage("web", "x", "hint", metadata={"_progress": True, "_tool_hint": True})
+        OutboundMessage("ui", "x", "hint", metadata={"_progress": True, "_tool_hint": True})
     )
     await asyncio.sleep(0.1)
     task.cancel()
@@ -179,10 +179,10 @@ async def test_dispatch_outbound_handles_unknown_channel_and_send_errors() -> No
         raise RuntimeError("send fail")
 
     bad.send = _boom
-    mgr.channels = {"web": bad}
+    mgr.channels = {"ui": bad}
 
     task = asyncio.create_task(mgr._dispatch_outbound())
-    await bus.publish_outbound(OutboundMessage("web", "x", "one"))
+    await bus.publish_outbound(OutboundMessage("ui", "x", "one"))
     await bus.publish_outbound(OutboundMessage("missing", "x", "two"))
     await asyncio.sleep(0.1)
     task.cancel()
@@ -195,7 +195,7 @@ async def test_stop_all_continues_when_channel_stop_fails() -> None:
     mgr = ChannelManager(cfg, bus)
     bad = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
     bad.fail_on_stop = True
-    mgr.channels = {"web": bad}
+    mgr.channels = {"ui": bad}
     mgr._dispatch_task = asyncio.create_task(asyncio.sleep(5))
     await mgr.stop_all()
 
@@ -206,8 +206,8 @@ def test_status_and_get_channel_helpers() -> None:
     mgr = ChannelManager(cfg, bus)
     ch = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
     ch._running = True
-    mgr.channels = {"web": ch}
+    mgr.channels = {"ui": ch}
 
-    assert mgr.get_channel("web") is ch
+    assert mgr.get_channel("ui") is ch
     assert mgr.get_channel("missing") is None
-    assert mgr.get_status() == {"web": {"enabled": True, "running": True}}
+    assert mgr.get_status() == {"ui": {"enabled": True, "running": True}}

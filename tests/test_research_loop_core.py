@@ -88,7 +88,7 @@ def test_run_mode_profile_and_contract_helpers(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     auto_msg = loop._build_auto_continue_message(
-        channel="web",
+        channel="ui",
         chat_id="PRJ-9",
         project_dir=str(project),
         run_mode="auto",
@@ -101,7 +101,7 @@ def test_run_mode_profile_and_contract_helpers(tmp_path: Path) -> None:
     assert "theoretical_proof" in auto_msg
 
     checkpoint_msg = loop._build_auto_checkpoint_sync_message(
-        channel="web",
+        channel="ui",
         chat_id="PRJ-9",
         project_dir=str(project),
         run_mode="auto",
@@ -138,22 +138,22 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert ResearchAgentLoop._plan_has_pending_work(loaded) is True
     assert ResearchAgentLoop._running_experiment_ids(loaded) == []
 
-    assert loop._should_continue_auto_web(
-        channel="web",
+    assert loop._should_continue_auto_ui(
+        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
         auto_round=0,
     ) is True
-    assert loop._should_continue_auto_web(
+    assert loop._should_continue_auto_ui(
         channel="cli",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
         auto_round=0,
     ) is False
-    assert loop._should_continue_auto_web(
-        channel="web",
+    assert loop._should_continue_auto_ui(
+        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="please confirm",
@@ -163,8 +163,8 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     bad_project = tmp_path / "PRJ-bad"
     bad_project.mkdir()
     (bad_project / "task_plan.json").write_text("{", encoding="utf-8")
-    assert loop._should_continue_auto_web(
-        channel="web",
+    assert loop._should_continue_auto_ui(
+        channel="ui",
         run_mode="auto",
         project_dir=str(bad_project),
         final_content="all good",
@@ -190,8 +190,8 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    assert loop._should_continue_auto_web(
-        channel="web",
+    assert loop._should_continue_auto_ui(
+        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
@@ -210,8 +210,8 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    assert loop._should_continue_auto_web(
-        channel="web",
+    assert loop._should_continue_auto_ui(
+        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
@@ -339,7 +339,7 @@ async def test_handle_set_mode_control_message(tmp_path: Path) -> None:
     loop.bus = MessageBus()
     await loop._handle_set_mode(
         InboundMessage(
-            channel="web",
+            channel="ui",
             sender_id="u",
             chat_id="c",
             content="",
@@ -356,7 +356,7 @@ async def test_handle_control_routes_set_mode(tmp_path: Path) -> None:
     loop.bus = MessageBus()
     handled = await loop._handle_control(
         InboundMessage(
-            channel="web",
+            channel="ui",
             sender_id="u",
             chat_id="c",
             content="",
@@ -367,7 +367,7 @@ async def test_handle_control_routes_set_mode(tmp_path: Path) -> None:
     assert handled is True
     # Unknown control falls back to base (no-op, returns False).
     assert await loop._handle_control(
-        InboundMessage(channel="web", sender_id="u", chat_id="c", content=""),
+        InboundMessage(channel="ui", sender_id="u", chat_id="c", content=""),
         "unknown_control",
     ) is False
 
@@ -388,11 +388,11 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     async def _progress(msg: str) -> None:
         progress_events.append(msg)
 
-    monkeypatch.setattr(loop, "_should_continue_auto_web", _decide)
+    monkeypatch.setattr(loop, "_should_continue_auto_ui", _decide)
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
 
     msg = InboundMessage(
-        channel="web",
+        channel="ui",
         sender_id="u",
         chat_id="PRJ-5",
         content="go",
@@ -423,11 +423,11 @@ async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path
     async def _progress(msg: str) -> None:
         progress_events.append(msg)
 
-    monkeypatch.setattr(loop, "_should_continue_auto_web", _decide)
+    monkeypatch.setattr(loop, "_should_continue_auto_ui", _decide)
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
 
     msg = InboundMessage(
-        channel="web",
+        channel="ui",
         sender_id="u",
         chat_id="PRJ-7",
         content="go",
@@ -454,7 +454,7 @@ async def test_process_message_broadcasts_token_usage_and_resets_on_new(
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
 
     msg1 = InboundMessage(
-        channel="web",
+        channel="ui",
         sender_id="u",
         chat_id="PRJ-T1",
         content="first",
@@ -463,7 +463,7 @@ async def test_process_message_broadcasts_token_usage_and_resets_on_new(
     out1 = await loop._process_message(msg1)
     assert out1.metadata["tokens_used_session"] == 1500
     assert out1.metadata["max_tokens"] == 50000
-    assert loop._session_tokens_used["web:PRJ-T1"] == 1500
+    assert loop._session_tokens_used["ui:PRJ-T1"] == 1500
 
     first_progress: list[OutboundMessage] = []
     while loop.bus.outbound_size:
@@ -478,7 +478,7 @@ async def test_process_message_broadcasts_token_usage_and_resets_on_new(
     )
 
     msg2 = InboundMessage(
-        channel="web",
+        channel="ui",
         sender_id="u",
         chat_id="PRJ-T1",
         content="second",
@@ -486,7 +486,7 @@ async def test_process_message_broadcasts_token_usage_and_resets_on_new(
     out2 = await loop._process_message(msg2)
     assert out2.metadata["tokens_used_session"] == 2200
     assert out2.metadata["max_tokens"] == 50000
-    assert loop._session_tokens_used["web:PRJ-T1"] == 2200
+    assert loop._session_tokens_used["ui:PRJ-T1"] == 2200
 
     # Progress emitted during the second message picks up the cumulative
     # total carried over from the previous message.
@@ -504,10 +504,10 @@ async def test_process_message_broadcasts_token_usage_and_resets_on_new(
 
     monkeypatch.setattr(loop, "_consolidate_memory", _consolidate)
     new_resp = await loop._process_message(
-        InboundMessage(channel="web", sender_id="u", chat_id="PRJ-T1", content="/new")
+        InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-T1", content="/new")
     )
     assert new_resp.content == "New session started."
-    assert "web:PRJ-T1" not in loop._session_tokens_used
+    assert "ui:PRJ-T1" not in loop._session_tokens_used
 
 
 async def test_accumulate_session_tokens_helper() -> None:
@@ -557,7 +557,7 @@ async def test_run_main_loop_dispatches_set_mode_control(monkeypatch, tmp_path: 
     runner = asyncio.create_task(loop.run())
     await loop.bus.publish_inbound(
         InboundMessage(
-            channel="web",
+            channel="ui",
             sender_id="u",
             chat_id="PRJ-6",
             content="",
@@ -565,10 +565,10 @@ async def test_run_main_loop_dispatches_set_mode_control(monkeypatch, tmp_path: 
         )
     )
     await loop.bus.publish_inbound(
-        InboundMessage(channel="web", sender_id="u", chat_id="PRJ-6", content="normal message")
+        InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-6", content="normal message")
     )
     await loop.bus.publish_inbound(
-        InboundMessage(channel="web", sender_id="u", chat_id="PRJ-6", content="/stop")
+        InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-6", content="/stop")
     )
     await runner
     assert loop._running is False
@@ -578,15 +578,15 @@ async def test_run_main_loop_dispatches_set_mode_control(monkeypatch, tmp_path: 
 
 async def test_session_reset_drops_research_state(tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
-    loop._session_run_modes["web:PRJ-X"] = "auto"
-    loop._session_agent_profiles["web:PRJ-X"] = "research"
-    loop._session_automation_policies["web:PRJ-X"] = {"logic": "AND", "goals": []}
-    loop._session_tokens_used["web:PRJ-X"] = 1234
+    loop._session_run_modes["ui:PRJ-X"] = "auto"
+    loop._session_agent_profiles["ui:PRJ-X"] = "research"
+    loop._session_automation_policies["ui:PRJ-X"] = {"logic": "AND", "goals": []}
+    loop._session_tokens_used["ui:PRJ-X"] = 1234
 
-    loop._on_session_reset("web:PRJ-X")
-    assert "web:PRJ-X" not in loop._session_automation_policies
-    assert "web:PRJ-X" not in loop._session_tokens_used
+    loop._on_session_reset("ui:PRJ-X")
+    assert "ui:PRJ-X" not in loop._session_automation_policies
+    assert "ui:PRJ-X" not in loop._session_tokens_used
     # Run modes / profiles are intentionally retained across /new so the next
     # turn keeps using the same UI selection unless the user toggles it.
-    assert loop._session_run_modes.get("web:PRJ-X") == "auto"
-    assert loop._session_agent_profiles.get("web:PRJ-X") == "research"
+    assert loop._session_run_modes.get("ui:PRJ-X") == "auto"
+    assert loop._session_agent_profiles.get("ui:PRJ-X") == "research"

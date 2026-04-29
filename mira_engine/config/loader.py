@@ -114,16 +114,27 @@ def _migrate_config(data: dict) -> dict:
         qq = channels.get("qq")
         if isinstance(qq, dict) and "msgFormat" not in qq:
             qq["msgFormat"] = "plain"
-        web = channels.get("web")
-        if isinstance(web, dict):
+        # The "web" channel was renamed to "ui" for clarity. Preserve any
+        # existing user config by promoting "web" -> "ui" when "ui" isn't
+        # already present, then merge any straggler fields.
+        legacy_web = channels.pop("web", None) if "web" in channels else None
+        if isinstance(legacy_web, dict):
+            existing_ui = channels.get("ui")
+            if isinstance(existing_ui, dict):
+                for k, v in legacy_web.items():
+                    existing_ui.setdefault(k, v)
+            else:
+                channels["ui"] = legacy_web
+        ui = channels.get("ui")
+        if isinstance(ui, dict):
             gateway = data.get("gateway")
             if not isinstance(gateway, dict):
                 gateway = {}
                 data["gateway"] = gateway
-            if "host" in web and "host" not in gateway:
-                gateway["host"] = web["host"]
-            if "port" in web and "port" not in gateway:
-                gateway["port"] = web["port"]
-            web.pop("host", None)
-            web.pop("port", None)
+            if "host" in ui and "host" not in gateway:
+                gateway["host"] = ui["host"]
+            if "port" in ui and "port" not in gateway:
+                gateway["port"] = ui["port"]
+            ui.pop("host", None)
+            ui.pop("port", None)
     return data

@@ -957,7 +957,7 @@ class BaseAgentLoop:
         progress_cb = on_progress or _bus_progress
         current_turn_skills: set[str] = set()
         audit_cb = None
-        emit_audit_to_channel = msg.channel == "web" or bool(meta.get("_emit_skill_audit"))
+        emit_audit_to_channel = msg.channel == "ui" or bool(meta.get("_emit_skill_audit"))
         if emit_audit_to_channel or audit_hook:
             async def _audit(details: dict[str, Any]) -> None:
                 skill_name = details.get("skill_name")

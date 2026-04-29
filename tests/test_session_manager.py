@@ -103,7 +103,7 @@ def test_save_appends_events_without_rewriting(manager: SessionManager) -> None:
 
 def test_append_ui_event_round_trip(manager: SessionManager) -> None:
     manager.append_ui_event(
-        key="web:PRJ-0001",
+        key="ui:PRJ-0001",
         role="user",
         content="hello ui",
         msg_type="response",
@@ -111,7 +111,7 @@ def test_append_ui_event_round_trip(manager: SessionManager) -> None:
         timestamp="2026-03-24T12:00:00",
     )
     manager.append_ui_event(
-        key="web:PRJ-0001",
+        key="ui:PRJ-0001",
         role="assistant",
         content="hello back",
         msg_type="response",
@@ -119,7 +119,7 @@ def test_append_ui_event_round_trip(manager: SessionManager) -> None:
         timestamp="2026-03-24T12:00:01",
     )
 
-    entries = manager.get_ui_history("web:PRJ-0001")
+    entries = manager.get_ui_history("ui:PRJ-0001")
     assert entries[0]["content"] == "hello ui"
     assert entries[0]["metadata"]["_user"] is True
     assert entries[1]["content"] == "hello back"

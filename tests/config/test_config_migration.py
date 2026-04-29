@@ -183,9 +183,13 @@ def test_load_config_migrates_legacy_web_host_port_into_gateway(tmp_path) -> Non
 
     assert cfg.gateway.host == "127.0.0.2"
     assert cfg.gateway.port == 19876
-    web_dump = cfg.model_dump(by_alias=True)["channels"]["web"]
-    assert "host" not in web_dump
-    assert "port" not in web_dump
+    channels_dump = cfg.model_dump(by_alias=True)["channels"]
+    # Legacy "web" key was migrated to "ui" by the loader.
+    assert "web" not in channels_dump
+    ui_dump = channels_dump["ui"]
+    assert ui_dump.get("enabled") is True
+    assert "host" not in ui_dump
+    assert "port" not in ui_dump
 
 
 def test_load_config_prefers_existing_gateway_over_legacy_web_host_port(tmp_path) -> None:
@@ -212,6 +216,68 @@ def test_load_config_prefers_existing_gateway_over_legacy_web_host_port(tmp_path
 
     assert cfg.gateway.host == "0.0.0.0"
     assert cfg.gateway.port == 18790
-    web_dump = cfg.model_dump(by_alias=True)["channels"]["web"]
-    assert "host" not in web_dump
-    assert "port" not in web_dump
+    channels_dump = cfg.model_dump(by_alias=True)["channels"]
+    assert "web" not in channels_dump
+    ui_dump = channels_dump["ui"]
+    assert "host" not in ui_dump
+    assert "port" not in ui_dump
+
+
+def test_load_config_renames_legacy_web_channel_block_to_ui(tmp_path) -> None:
+    """Users on older releases keep their channel section under the new name."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "web": {
+                        "enabled": True,
+                        "allowFrom": ["*"],
+                        "corsOrigins": ["https://example.com"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_path)
+
+    channels_dump = cfg.model_dump(by_alias=True)["channels"]
+    assert "web" not in channels_dump
+    assert channels_dump["ui"] == {
+        "enabled": True,
+        "allowFrom": ["*"],
+        "corsOrigins": ["https://example.com"],
+    }
+
+
+def test_load_config_merges_legacy_web_into_existing_ui_section(tmp_path) -> None:
+    """When both 'web' and 'ui' are present 'ui' wins, legacy fields fill gaps."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "web": {
+                        "enabled": True,
+                        "corsOrigins": ["https://legacy.example"],
+                    },
+                    "ui": {
+                        "enabled": False,
+                        "allowFrom": ["alice"],
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_path)
+
+    channels_dump = cfg.model_dump(by_alias=True)["channels"]
+    assert "web" not in channels_dump
+    ui_dump = channels_dump["ui"]
+    assert ui_dump["enabled"] is False
+    assert ui_dump["allowFrom"] == ["alice"]
+    assert ui_dump["corsOrigins"] == ["https://legacy.example"]
