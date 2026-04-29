@@ -275,11 +275,11 @@ def _make_loop(tmp_path, hooks=None):
     provider.get_default_model.return_value = "test-model"
     provider.generation.max_tokens = 4096
 
-    with patch("mira_engine.agent.loop.ContextBuilder"), \
-         patch("mira_engine.agent.loop.SessionManager"), \
-         patch("mira_engine.agent.loop.SubagentManager") as mock_sub_mgr, \
-         patch("mira_engine.agent.loop.Consolidator"), \
-         patch("mira_engine.agent.loop.Dream"):
+    with patch("mira_engine.agent.base_loop.ContextBuilder"), \
+         patch("mira_engine.agent.base_loop.SessionManager"), \
+         patch("mira_engine.agent.base_loop.SubagentManager") as mock_sub_mgr, \
+         patch("mira_engine.agent.base_loop.Consolidator"), \
+         patch("mira_engine.agent.base_loop.Dream"):
         mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(
             bus=bus, provider=provider, workspace=tmp_path, hooks=hooks,

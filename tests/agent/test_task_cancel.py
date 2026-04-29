@@ -24,9 +24,9 @@ def _make_loop(*, exec_config=None):
     workspace = MagicMock()
     workspace.__truediv__ = MagicMock(return_value=MagicMock())
 
-    with patch("mira_engine.agent.loop.ContextBuilder"), \
-         patch("mira_engine.agent.loop.SessionManager"), \
-         patch("mira_engine.agent.loop.SubagentManager") as MockSubMgr:
+    with patch("mira_engine.agent.base_loop.ContextBuilder"), \
+         patch("mira_engine.agent.base_loop.SessionManager"), \
+         patch("mira_engine.agent.base_loop.SubagentManager") as MockSubMgr:
         MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, exec_config=exec_config)
     return loop, bus
