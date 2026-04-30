@@ -30,6 +30,7 @@ from mira_engine.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from mira_engine.agent.memory import Consolidator, Dream, MemoryStore
 from mira_engine.agent.routing import ModelRouter, RoutedProviderManager
 from mira_engine.agent.subagent import SubagentManager
+from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
 from mira_engine.agent.tools.cron import CronTool
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
@@ -163,6 +164,10 @@ class BaseAgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._last_loop_tokens_used: int = 0
         self._processing_lock = asyncio.Lock()
+        # Shared registry for `exec(background=true)` jobs. Lives for the whole
+        # loop lifetime so the agent can monitor jobs across many iterations,
+        # and is drained on shutdown so we don't leak processes.
+        self._bg_registry = BackgroundJobRegistry()
         self._register_default_tools()
         self._command_router = CommandRouter()
         from mira_engine.command.builtin import register_builtin_commands
@@ -241,7 +246,10 @@ class BaseAgentLoop:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
+                background_registry=self._bg_registry,
+                enable_background=True,
             ))
+            self.tools.register(BgTool(registry=self._bg_registry))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
@@ -757,6 +765,13 @@ class BaseAgentLoop:
             except (RuntimeError, BaseExceptionGroup):
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
             self._mcp_stack = None
+        # Drain background jobs alongside MCP because every shutdown path that
+        # cares about clean teardown already calls ``close_mcp``. Best-effort:
+        # we never let a stuck child block engine exit.
+        try:
+            await self._bg_registry.shutdown()
+        except Exception:
+            logger.exception("Failed to shut down background job registry")
 
     def stop(self) -> None:
         """Stop the agent loop."""
