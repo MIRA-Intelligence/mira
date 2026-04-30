@@ -61,7 +61,7 @@ async def test_cron_add_requires_context_and_message() -> None:
 async def test_cron_add_valid_every_and_list_and_remove() -> None:
     svc = _FakeCronService()
     tool = CronTool(svc)
-    tool.set_context("web", "PRJ-1")
+    tool.set_context("ui", "PRJ-1")
 
     created = await tool.execute(action="add", message="ping", every_seconds=3)
     assert "Created job 'ping'" in created
@@ -79,7 +79,7 @@ async def test_cron_add_valid_every_and_list_and_remove() -> None:
 
 async def test_cron_add_rejects_invalid_tz_and_at() -> None:
     tool = CronTool(_FakeCronService())
-    tool.set_context("web", "PRJ-1")
+    tool.set_context("ui", "PRJ-1")
     assert await tool.execute(action="add", message="x", tz="UTC") == "Error: tz can only be used with cron_expr"
     assert "unknown timezone" in await tool.execute(
         action="add", message="x", cron_expr="* * * * *", tz="Not/AZone"
@@ -92,7 +92,7 @@ async def test_cron_add_rejects_invalid_tz_and_at() -> None:
 
 async def test_cron_add_inside_cron_context_is_blocked() -> None:
     tool = CronTool(_FakeCronService())
-    tool.set_context("web", "PRJ-1")
+    tool.set_context("ui", "PRJ-1")
     token = tool.set_cron_context(True)
     try:
         result = await tool.execute(action="add", message="x", every_seconds=1)

@@ -338,6 +338,25 @@ class SessionManager:
                 except Exception:
                     logger.exception("Failed to migrate session {}", key)
 
+        if not path.exists() and key.startswith("ui:"):
+            # Channel renamed from "web" to "ui" – pull forward any prior session
+            # state stored under the legacy "web:" prefix so existing projects
+            # keep their conversation history after upgrading.
+            legacy_prefix_key = "web:" + key[len("ui:"):]
+            legacy_prefix_path = self._get_session_path(legacy_prefix_key)
+            if legacy_prefix_path.exists():
+                try:
+                    shutil.move(str(legacy_prefix_path), str(path))
+                    logger.info(
+                        "Migrated session {} from legacy 'web:' prefix at {}",
+                        key,
+                        legacy_prefix_path,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to migrate legacy 'web:' session for {}", key
+                    )
+
         if not path.exists():
             return None
 

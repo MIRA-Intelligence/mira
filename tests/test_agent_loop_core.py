@@ -179,7 +179,7 @@ def test_base_loop_omits_research_state() -> None:
         "_resolve_session_automation_policy",
         "_evaluate_automation_stop_policy",
         "_load_task_plan",
-        "_should_continue_auto_web",
+        "_should_continue_auto_ui",
         "_guard_task_plan_structure",
         "_build_auto_continue_message",
         "_accumulate_session_tokens",
@@ -253,7 +253,7 @@ async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
     loop.subagents = SimpleNamespace(cancel_by_session=lambda _k: asyncio.sleep(0, result=1))
     loop._active_tasks = {}
 
-    msg = InboundMessage(channel="web", sender_id="u", chat_id="c", content="x")
+    msg = InboundMessage(channel="ui", sender_id="u", chat_id="c", content="x")
 
     running = asyncio.create_task(asyncio.sleep(10))
     loop._active_tasks[msg.session_key] = [running]
@@ -262,7 +262,7 @@ async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
     assert "Stopped" in stopped.content
 
     async def _ok(_msg):
-        return OutboundMessage(channel="web", chat_id="c", content="ok")
+        return OutboundMessage(channel="ui", chat_id="c", content="ok")
 
     loop._process_message = _ok
     await loop._dispatch(msg)
@@ -296,7 +296,7 @@ async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
 
 def test_save_turn_and_project_session_cache(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)
-    session = Session(key="web:c")
+    session = Session(key="ui:c")
     runtime_tag = ContextBuilder._RUNTIME_CONTEXT_TAG
     long_tool = "x" * 80
     messages = [
@@ -339,10 +339,10 @@ def test_set_tool_context_calls_supported_tools(tmp_path: Path) -> None:
 
     tools = {"message": _CtxTool("message"), "spawn": _CtxTool("spawn"), "cron": _CtxTool("cron")}
     loop.tools = SimpleNamespace(get=lambda name: tools.get(name))
-    loop._set_tool_context("web", "chat-1", "msg-9")
-    assert ("message", ("web", "chat-1", "msg-9")) in calls
-    assert ("spawn", ("web", "chat-1")) in calls
-    assert ("cron", ("web", "chat-1")) in calls
+    loop._set_tool_context("ui", "chat-1", "msg-9")
+    assert ("message", ("ui", "chat-1", "msg-9")) in calls
+    assert ("spawn", ("ui", "chat-1")) in calls
+    assert ("cron", ("ui", "chat-1")) in calls
 
 
 def test_real_loop_initialization_registers_default_tools(tmp_path: Path) -> None:
@@ -398,17 +398,17 @@ async def test_process_message_system_help_new_and_normal(monkeypatch, tmp_path:
 
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
 
-    system = InboundMessage(channel="system", sender_id="s", chat_id="web:PRJ-1", content="hello")
+    system = InboundMessage(channel="system", sender_id="s", chat_id="ui:PRJ-1", content="hello")
     sys_resp = await loop._process_message(system)
-    assert sys_resp.channel == "web"
+    assert sys_resp.channel == "ui"
     assert sys_resp.chat_id == "PRJ-1"
     assert sys_resp.content == "done"
 
-    help_msg = InboundMessage(channel="web", sender_id="u", chat_id="PRJ-1", content="/help")
+    help_msg = InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-1", content="/help")
     help_resp = await loop._process_message(help_msg)
     assert "/new" in help_resp.content
 
-    session = loop.sessions.get_or_create("web:PRJ-1")
+    session = loop.sessions.get_or_create("ui:PRJ-1")
     session.messages = [{"role": "user", "content": "old"}]
     loop.sessions.save(session)
 
@@ -416,11 +416,11 @@ async def test_process_message_system_help_new_and_normal(monkeypatch, tmp_path:
         return True
 
     monkeypatch.setattr(loop, "_consolidate_memory", _consolidate)
-    new_msg = InboundMessage(channel="web", sender_id="u", chat_id="PRJ-1", content="/new")
+    new_msg = InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-1", content="/new")
     new_resp = await loop._process_message(new_msg)
     assert new_resp.content == "New session started."
 
-    normal = InboundMessage(channel="web", sender_id="u", chat_id="PRJ-2", content="hi")
+    normal = InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-2", content="hi")
     norm_resp = await loop._process_message(normal)
     assert norm_resp.content == "done"
 
@@ -434,10 +434,10 @@ async def test_process_message_updates_recent_skills_metadata(monkeypatch, tmp_p
         return "done", [], messages + [{"role": "assistant", "content": "done"}]
 
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
-    msg = InboundMessage(channel="web", sender_id="u", chat_id="PRJ-7", content="继续之前任务")
+    msg = InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-7", content="继续之前任务")
     out = await loop._process_message(msg)
     assert out.content == "done"
-    session = loop.sessions.get_or_create("web:PRJ-7")
+    session = loop.sessions.get_or_create("ui:PRJ-7")
     assert session.metadata.get("_recent_skills") == ["medical-image-dl-pipeline"]
 
 
@@ -458,7 +458,7 @@ async def test_process_message_injects_active_skills_into_context(monkeypatch, t
 
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
     msg = InboundMessage(
-        channel="web",
+        channel="ui",
         sender_id="u",
         chat_id="PRJ-8",
         content="继续之前的医学影像去伪影任务",
@@ -471,7 +471,7 @@ async def test_process_message_injects_active_skills_into_context(monkeypatch, t
 
 async def test_process_message_new_failure_and_message_tool_short_circuit(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
-    session = loop.sessions.get_or_create("web:PRJ-3")
+    session = loop.sessions.get_or_create("ui:PRJ-3")
     session.messages = [{"role": "user", "content": "old"}]
     loop.sessions.save(session)
 
@@ -480,7 +480,7 @@ async def test_process_message_new_failure_and_message_tool_short_circuit(monkey
 
     monkeypatch.setattr(loop, "_consolidate_memory", _fail_consolidate)
     failed = await loop._process_message(
-        InboundMessage(channel="web", sender_id="u", chat_id="PRJ-3", content="/new")
+        InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-3", content="/new")
     )
     assert "Memory archival failed" in failed.content
 
@@ -492,7 +492,7 @@ async def test_process_message_new_failure_and_message_tool_short_circuit(monkey
 
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
     no_outbound = await loop._process_message(
-        InboundMessage(channel="web", sender_id="u", chat_id="PRJ-4", content="send via tool")
+        InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-4", content="send via tool")
     )
     assert no_outbound is None
 
@@ -515,9 +515,9 @@ async def test_run_main_loop_and_process_direct(monkeypatch, tmp_path: Path) -> 
 
     runner = asyncio.create_task(loop.run())
     await loop.bus.publish_inbound(
-        InboundMessage(channel="web", sender_id="u", chat_id="PRJ-6", content="normal message")
+        InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-6", content="normal message")
     )
-    await loop.bus.publish_inbound(InboundMessage(channel="web", sender_id="u", chat_id="PRJ-6", content="/stop"))
+    await loop.bus.publish_inbound(InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-6", content="/stop"))
     await runner
     assert loop._running is False
 

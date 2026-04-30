@@ -68,7 +68,7 @@ class ChannelsConfig(Base):
             "slack",
             "qq",
             "matrix",
-            "web",
+            "ui",
         )
 
     def _ensure_builtin(self, name: str) -> Any:
@@ -90,7 +90,7 @@ class ChannelsConfig(Base):
             "slack": SlackConfig(),
             "qq": QQConfig(),
             "matrix": MatrixConfig(),
-            "web": WebChannelConfig(),
+            "ui": UiChannelConfig(),
         }
         value = defaults[name]
         extras[name] = value
@@ -221,12 +221,17 @@ class MatrixConfig(ChannelConfig):
     streaming: bool = False
 
 
-class WebChannelConfig(Base):
-    """Web channel runtime configuration."""
+class UiChannelConfig(Base):
+    """UI channel runtime configuration (WebSocket + HTTP for desktop/browser clients)."""
 
     enabled: bool = False
     allow_from: list[str] = Field(default_factory=list)
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+
+
+# Legacy alias kept for downstream imports that reference the previous name.
+# New code should use ``UiChannelConfig`` directly.
+WebChannelConfig = UiChannelConfig
 
 
 class DreamConfig(Base):

@@ -13,13 +13,13 @@ a = Analysis(
             'mira_engine',
             includes=[
                 'templates/**/*',
-                'channels/web_assets/**/*',
+                'channels/ui_assets/**/*',
                 'skills/**/*',
             ],
         )
         + copy_metadata('mira-engine')
     ),
-    hiddenimports=['mira_engine.channels.web', 'tiktoken_ext.openai_public'],
+    hiddenimports=['mira_engine.channels.ui', 'tiktoken_ext.openai_public'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

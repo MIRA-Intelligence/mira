@@ -71,12 +71,15 @@ class ChannelManager:
     def _iter_channel_sections(self) -> dict[str, Any]:
         channels = self.config.channels
         sections: dict[str, Any] = {}
-        builtin_names = ("telegram", "whatsapp", "discord", "feishu", "mochat", "dingtalk", "email", "slack", "qq", "matrix", "web")
+        builtin_names = ("telegram", "whatsapp", "discord", "feishu", "mochat", "dingtalk", "email", "slack", "qq", "matrix", "ui")
         for name in builtin_names:
             if hasattr(channels, name):
                 sections[name] = getattr(channels, name)
         extras = getattr(channels, "model_extra", None) or {}
         for name, section in extras.items():
+            if name == "web" and "ui" in sections:
+                # Already migrated by the config loader; ignore stale alias.
+                continue
             if name not in sections:
                 sections[name] = section
         return sections
@@ -96,7 +99,7 @@ class ChannelManager:
                 kwargs: dict[str, Any] = {}
                 if name in {"telegram", "feishu"}:
                     kwargs["groq_api_key"] = getattr(self.config.providers.groq, "api_key", "")
-                if name == "web":
+                if name == "ui":
                     kwargs["workspace"] = self.config.workspace_path
                     kwargs["bind_host"] = self.config.gateway.host
                     kwargs["bind_port"] = self.config.gateway.port

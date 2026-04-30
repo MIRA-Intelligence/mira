@@ -16,7 +16,7 @@ python -m pytest tests -q \
   --cov=mira_engine.agent.tools.spawn \
   --cov=mira_engine.agent.tools.cron \
   --cov=mira_engine.channels.manager \
-  --cov=mira_engine.channels.web \
+  --cov=mira_engine.channels.ui \
   --cov=mira_engine.config.loader \
   --cov=mira_engine.config.schema \
   --cov-report=term-missing \

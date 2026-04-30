@@ -2,6 +2,7 @@ import json
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,24 +12,24 @@ from mira_engine import __version__
 from mira_engine.agent import skill_plugins as skill_plugins_mod
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
-from mira_engine.channels import web as web_channel_mod
+from mira_engine.channels import ui as ui_channel_mod
 from mira_engine.channels.base import BaseChannel
-from mira_engine.channels.web import (
+from mira_engine.channels.ui import (
     _API_CONTRACT_VERSION,
     PLAN_FILENAME,
-    WebChannel,
+    UiChannel,
     _build_task_plan_guard_notice,
     _detect_guard_id_reassignments,
     _extract_plan_experiment_ids,
     _format_tool_call,
-    _normalize_contract_version,
     _load_ui_instructions,
     _normalize_agent_profile,
+    _normalize_contract_version,
     _normalize_run_mode,
     _safe_upload_name,
     _stringify_history_content,
 )
-from mira_engine.config.schema import Config, WebChannelConfig
+from mira_engine.config.schema import Config, UiChannelConfig
 from mira_engine.session.manager import SessionManager
 
 
@@ -79,8 +80,8 @@ def _create_plugin_source(base: Path, plugin_id: str = "plugin-pack") -> Path:
 
 
 @pytest.fixture
-def web_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebChannel:
-    config = MagicMock(spec=WebChannelConfig)
+def ui_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> UiChannel:
+    config = MagicMock(spec=UiChannelConfig)
     bus = MagicMock(spec=MessageBus)
     global_workspace = tmp_path / "global-workspace"
     global_workspace.mkdir(parents=True)
@@ -88,25 +89,25 @@ def web_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebChannel:
     runtime_root.mkdir(parents=True)
     monkeypatch.setattr(skill_plugins_mod, "get_workspace_path", lambda _workspace: global_workspace)
     monkeypatch.setattr(
-        web_channel_mod,
+        ui_channel_mod,
         "get_runtime_subdir",
         lambda name: (runtime_root / name).mkdir(parents=True, exist_ok=True) or (runtime_root / name),
     )
     with patch.object(BaseChannel, "__init__", _minimal_base_init):
-        with patch.object(web_channel_mod, "_load_ui_instructions", return_value=""):
-            ch = WebChannel(config, bus, workspace=tmp_path)
+        with patch.object(ui_channel_mod, "_load_ui_instructions", return_value=""):
+            ch = UiChannel(config, bus, workspace=tmp_path)
             return ch
 
 
 def test_load_ui_instructions_joins_present_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(web_channel_mod, "_ASSETS_DIR", tmp_path)
+    monkeypatch.setattr(ui_channel_mod, "_ASSETS_DIR", tmp_path)
     (tmp_path / "AGENTS_UI.md").write_text("alpha", encoding="utf-8")
     (tmp_path / "SKILL_UI.md").write_text("beta", encoding="utf-8")
     assert _load_ui_instructions() == "alpha\n\n---\n\nbeta"
 
 
 def test_load_ui_instructions_skips_missing_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(web_channel_mod, "_ASSETS_DIR", tmp_path)
+    monkeypatch.setattr(ui_channel_mod, "_ASSETS_DIR", tmp_path)
     (tmp_path / "AGENTS_UI.md").write_text("only", encoding="utf-8")
     assert _load_ui_instructions() == "only"
 
@@ -161,26 +162,26 @@ def test_guard_id_reassignment_helpers(tmp_path: Path) -> None:
     assert _build_task_plan_guard_notice([]) is None
 
 
-async def test_handle_health_returns_machine_readable_payload(web_channel: WebChannel) -> None:
-    web_channel._running = True
-    web_channel._clients = {"s1": MagicMock(closed=False)}
+async def test_handle_health_returns_machine_readable_payload(ui_channel: UiChannel) -> None:
+    ui_channel._running = True
+    ui_channel._clients = {"s1": MagicMock(closed=False)}
 
     req = MagicMock(spec=web.Request)
-    resp = await web_channel._handle_health(req)
+    resp = await ui_channel._handle_health(req)
 
     assert resp.status == 200
     assert json.loads(resp.text) == {
         "status": "ok",
         "service": "mira-gateway",
-        "channel": "web",
+        "channel": "ui",
         "running": True,
         "connected_clients": 1,
     }
 
 
-async def test_handle_version_returns_contract_payload(web_channel: WebChannel) -> None:
+async def test_handle_version_returns_contract_payload(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
-    resp = await web_channel._handle_version(req)
+    resp = await ui_channel._handle_version(req)
     body = json.loads(resp.text)
 
     assert resp.status == 200
@@ -191,12 +192,12 @@ async def test_handle_version_returns_contract_payload(web_channel: WebChannel) 
     assert body["uptime_seconds"] >= 0
 
 
-def test_audit_writes_global_and_project_logs(web_channel: WebChannel) -> None:
+def test_audit_writes_global_and_project_logs(ui_channel: UiChannel) -> None:
     session_id = "PRJ-LOG"
-    project_dir = web_channel.projects_root / session_id
+    project_dir = ui_channel.projects_root / session_id
     project_dir.mkdir(parents=True)
 
-    web_channel._audit(
+    ui_channel._audit(
         source="ui",
         action="ws_message_received",
         session_id=session_id,
@@ -204,7 +205,7 @@ def test_audit_writes_global_and_project_logs(web_channel: WebChannel) -> None:
         details={"content_preview": "hello"},
     )
 
-    global_log = web_channel.projects_root / "logs" / "project_actions.jsonl"
+    global_log = ui_channel.projects_root / "logs" / "project_actions.jsonl"
     project_log = project_dir / ".mira" / "logs" / "actions.jsonl"
     assert global_log.is_file()
     assert project_log.is_file()
@@ -218,33 +219,33 @@ def test_audit_writes_global_and_project_logs(web_channel: WebChannel) -> None:
     assert project_entry == global_entry
 
 
-async def test_handle_plan_no_session_id(web_channel: WebChannel) -> None:
+async def test_handle_plan_no_session_id(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.query = {}
-    resp = await web_channel._handle_plan(req)
+    resp = await ui_channel._handle_plan(req)
     assert resp.status == 200
     assert json.loads(resp.text) is None
 
 
-async def test_handle_plan_missing_file(web_channel: WebChannel) -> None:
+async def test_handle_plan_missing_file(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.query = {"session_id": "s1"}
-    resp = await web_channel._handle_plan(req)
+    resp = await ui_channel._handle_plan(req)
     assert resp.status == 200
     assert json.loads(resp.text) is None
 
 
-async def test_handle_plan_contract_requires_session_id(web_channel: WebChannel) -> None:
+async def test_handle_plan_contract_requires_session_id(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.query = {}
-    resp = await web_channel._handle_plan_contract(req)
+    resp = await ui_channel._handle_plan_contract(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "session_id required"}
 
 
-async def test_handle_plan_contract_returns_profile_rules(web_channel: WebChannel) -> None:
+async def test_handle_plan_contract_returns_profile_rules(ui_channel: UiChannel) -> None:
     session = "PRJ-9015"
-    project_dir = web_channel.projects_root / session
+    project_dir = ui_channel.projects_root / session
     (project_dir / ".mira").mkdir(parents=True)
     (project_dir / ".mira" / "project.json").write_text(
         json.dumps({"agent_profile": "research", "contract_version": 2}),
@@ -252,7 +253,7 @@ async def test_handle_plan_contract_returns_profile_rules(web_channel: WebChanne
     )
     req = MagicMock(spec=web.Request)
     req.query = {"session_id": session}
-    resp = await web_channel._handle_plan_contract(req)
+    resp = await ui_channel._handle_plan_contract(req)
     body = json.loads(resp.text)
 
     assert resp.status == 200
@@ -262,35 +263,35 @@ async def test_handle_plan_contract_returns_profile_rules(web_channel: WebChanne
     assert "evidence_refs" in body["required_falsify_fields"]
 
 
-async def test_handle_plan_returns_json(web_channel: WebChannel) -> None:
+async def test_handle_plan_returns_json(ui_channel: UiChannel) -> None:
     session = "sess-a"
-    plan_dir = web_channel.projects_root / session
+    plan_dir = ui_channel.projects_root / session
     plan_dir.mkdir(parents=True)
     data = {"steps": [{"id": 1}]}
     (plan_dir / PLAN_FILENAME).write_text(json.dumps(data), encoding="utf-8")
     req = MagicMock(spec=web.Request)
     req.query = {"session_id": session}
-    resp = await web_channel._handle_plan(req)
+    resp = await ui_channel._handle_plan(req)
     assert resp.status == 200
     assert json.loads(resp.text) == data
 
 
-async def test_handle_plan_invalid_json_returns_500(web_channel: WebChannel) -> None:
+async def test_handle_plan_invalid_json_returns_500(ui_channel: UiChannel) -> None:
     session = "bad-json"
-    plan_dir = web_channel.projects_root / session
+    plan_dir = ui_channel.projects_root / session
     plan_dir.mkdir(parents=True)
     (plan_dir / PLAN_FILENAME).write_text("{", encoding="utf-8")
     req = MagicMock(spec=web.Request)
     req.query = {"session_id": session}
-    resp = await web_channel._handle_plan(req)
+    resp = await ui_channel._handle_plan(req)
     assert resp.status == 500
     body = json.loads(resp.text)
     assert "error" in body
 
 
-async def test_handle_plan_recovers_completed_experiment_from_outputs(web_channel: WebChannel) -> None:
+async def test_handle_plan_recovers_completed_experiment_from_outputs(ui_channel: UiChannel) -> None:
     session = "PRJ-0001"
-    project_dir = web_channel.projects_root / session
+    project_dir = ui_channel.projects_root / session
     (project_dir / "outputs" / "exp004").mkdir(parents=True)
     (project_dir / "outputs" / "exp004" / "results.json").write_text(
         json.dumps({"score": 0.95}),
@@ -317,7 +318,7 @@ async def test_handle_plan_recovers_completed_experiment_from_outputs(web_channe
 
     req = MagicMock(spec=web.Request)
     req.query = {"session_id": session}
-    resp = await web_channel._handle_plan(req)
+    resp = await ui_channel._handle_plan(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -329,10 +330,10 @@ async def test_handle_plan_recovers_completed_experiment_from_outputs(web_channe
 
 
 async def test_handle_plan_attaches_and_persists_completed_experiment_snapshot(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
 ) -> None:
     session = "PRJ-9010"
-    project_dir = web_channel.projects_root / session
+    project_dir = ui_channel.projects_root / session
     project_dir.mkdir(parents=True)
     (project_dir / PLAN_FILENAME).write_text(
         json.dumps(
@@ -354,7 +355,7 @@ async def test_handle_plan_attaches_and_persists_completed_experiment_snapshot(
     )
     req = MagicMock(spec=web.Request)
     req.query = {"session_id": session}
-    first_resp = await web_channel._handle_plan(req)
+    first_resp = await ui_channel._handle_plan(req)
     first_body = json.loads(first_resp.text)
     exp = first_body["experiments"][0]
     assert exp["snapshot"]["conclusion"] == "initial conclusion"
@@ -383,7 +384,7 @@ async def test_handle_plan_attaches_and_persists_completed_experiment_snapshot(
         ),
         encoding="utf-8",
     )
-    second_resp = await web_channel._handle_plan(req)
+    second_resp = await ui_channel._handle_plan(req)
     second_body = json.loads(second_resp.text)
     exp2 = second_body["experiments"][0]
     assert exp2["conclusion"] == "Recovered completed experiment artifacts from workspace."
@@ -392,10 +393,10 @@ async def test_handle_plan_attaches_and_persists_completed_experiment_snapshot(
 
 
 async def test_handle_plan_recovers_snapshot_from_git_history_when_current_is_degraded(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session = "PRJ-9011"
-    project_dir = web_channel.projects_root / session
+    project_dir = ui_channel.projects_root / session
     project_dir.mkdir(parents=True)
     (project_dir / ".git").mkdir(parents=True)
     (project_dir / PLAN_FILENAME).write_text(
@@ -417,7 +418,7 @@ async def test_handle_plan_recovers_snapshot_from_git_history_when_current_is_de
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        web_channel,
+        ui_channel,
         "_recover_snapshot_from_git_history",
         lambda *_args, **_kwargs: {
             "title": "historical",
@@ -430,15 +431,15 @@ async def test_handle_plan_recovers_snapshot_from_git_history_when_current_is_de
 
     req = MagicMock(spec=web.Request)
     req.query = {"session_id": session}
-    resp = await web_channel._handle_plan(req)
+    resp = await ui_channel._handle_plan(req)
     body = json.loads(resp.text)
     exp = body["experiments"][0]
     assert exp["snapshot"]["conclusion"] == "historical conclusion"
     assert exp["snapshot"]["results"]["findings"] == "from git history"
 
-async def test_handle_plan_lint_auto_fixes_structure(web_channel: WebChannel) -> None:
+async def test_handle_plan_lint_auto_fixes_structure(ui_channel: UiChannel) -> None:
     session = "PRJ-9001"
-    project_dir = web_channel.projects_root / session
+    project_dir = ui_channel.projects_root / session
     (project_dir / "experiments" / "exp001").mkdir(parents=True)
     (project_dir / "experiments" / "exp001" / "metrics.json").write_text(
         json.dumps({"overall_r2": 0.51}),
@@ -457,7 +458,7 @@ async def test_handle_plan_lint_auto_fixes_structure(web_channel: WebChannel) ->
 
     req = MagicMock(spec=web.Request)
     req.query = {"session_id": session}
-    resp = await web_channel._handle_plan_lint(req)
+    resp = await ui_channel._handle_plan_lint(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["ok"] is True
@@ -472,10 +473,10 @@ async def test_handle_plan_lint_auto_fixes_structure(web_channel: WebChannel) ->
 
 
 async def test_handle_plan_auto_fixes_duplicate_experiment_ids(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
 ) -> None:
     session = "PRJ-9002"
-    project_dir = web_channel.projects_root / session
+    project_dir = ui_channel.projects_root / session
     project_dir.mkdir(parents=True)
     (project_dir / PLAN_FILENAME).write_text(
         json.dumps(
@@ -494,7 +495,7 @@ async def test_handle_plan_auto_fixes_duplicate_experiment_ids(
 
     req = MagicMock(spec=web.Request)
     req.query = {"session_id": session}
-    resp = await web_channel._handle_plan(req)
+    resp = await ui_channel._handle_plan(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -503,13 +504,13 @@ async def test_handle_plan_auto_fixes_duplicate_experiment_ids(
     assert len(ids) == len(set(ids))
 
 
-async def test_handle_history_returns_entries(web_channel: WebChannel) -> None:
+async def test_handle_history_returns_entries(ui_channel: UiChannel) -> None:
     session_id = "PRJ-0001"
-    project_dir = web_channel.projects_root / session_id
+    project_dir = ui_channel.projects_root / session_id
     project_dir.mkdir(parents=True)
 
     manager = SessionManager(project_dir)
-    session = manager.get_or_create(f"web:{session_id}")
+    session = manager.get_or_create(f"ui:{session_id}")
     session.messages = [
         {"role": "user", "content": "hello", "timestamp": "2026-03-26T10:00:00"},
         {
@@ -531,7 +532,7 @@ async def test_handle_history_returns_entries(web_channel: WebChannel) -> None:
 
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": session_id}
-    resp = await web_channel._handle_history(req)
+    resp = await ui_channel._handle_history(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -568,22 +569,22 @@ async def test_handle_history_returns_entries(web_channel: WebChannel) -> None:
     ]
 
 
-async def test_handle_history_missing_project_returns_empty(web_channel: WebChannel) -> None:
+async def test_handle_history_missing_project_returns_empty(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "missing"}
-    resp = await web_channel._handle_history(req)
+    resp = await ui_channel._handle_history(req)
 
     assert resp.status == 200
     assert json.loads(resp.text) == {"session_id": "missing", "entries": []}
 
 
-async def test_handle_history_merges_ui_chat_log_entries(web_channel: WebChannel) -> None:
+async def test_handle_history_merges_ui_chat_log_entries(ui_channel: UiChannel) -> None:
     session_id = "PRJ-0009"
-    project_dir = web_channel.projects_root / session_id
+    project_dir = ui_channel.projects_root / session_id
     project_dir.mkdir(parents=True)
     manager = SessionManager(project_dir)
     manager.append_ui_event(
-        key=f"web:{session_id}",
+        key=f"ui:{session_id}",
         role="user",
         content="from ui user",
         msg_type="response",
@@ -591,7 +592,7 @@ async def test_handle_history_merges_ui_chat_log_entries(web_channel: WebChannel
         timestamp="2026-03-26T10:00:00",
     )
     manager.append_ui_event(
-        key=f"web:{session_id}",
+        key=f"ui:{session_id}",
         role="assistant",
         content="from ui assistant",
         msg_type="response",
@@ -601,16 +602,16 @@ async def test_handle_history_merges_ui_chat_log_entries(web_channel: WebChannel
 
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": session_id}
-    resp = await web_channel._handle_history(req)
+    resp = await ui_channel._handle_history(req)
     body = json.loads(resp.text)
     contents = [entry["content"] for entry in body["entries"]]
     assert "from ui user" in contents
     assert "from ui assistant" in contents
 
 
-async def test_handle_history_uses_audit_fallback_when_session_sparse(web_channel: WebChannel) -> None:
+async def test_handle_history_uses_audit_fallback_when_session_sparse(ui_channel: UiChannel) -> None:
     session_id = "PRJ-0010"
-    project_dir = web_channel.projects_root / session_id
+    project_dir = ui_channel.projects_root / session_id
     project_dir.mkdir(parents=True)
     audit_file = project_dir / ".mira" / "logs" / "actions.jsonl"
     audit_file.parent.mkdir(parents=True, exist_ok=True)
@@ -639,7 +640,7 @@ async def test_handle_history_uses_audit_fallback_when_session_sparse(web_channe
 
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": session_id}
-    resp = await web_channel._handle_history(req)
+    resp = await ui_channel._handle_history(req)
     body = json.loads(resp.text)
     contents = [entry["content"] for entry in body["entries"]]
     assert "audit user msg" in contents
@@ -647,15 +648,15 @@ async def test_handle_history_uses_audit_fallback_when_session_sparse(web_channe
 
 
 async def test_handle_history_prefers_ui_entries_over_audit_preview_when_present(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
 ) -> None:
     session_id = "PRJ-0011"
-    project_dir = web_channel.projects_root / session_id
+    project_dir = ui_channel.projects_root / session_id
     project_dir.mkdir(parents=True)
 
     manager = SessionManager(project_dir)
     manager.append_ui_event(
-        key=f"web:{session_id}",
+        key=f"ui:{session_id}",
         role="assistant",
         content="full assistant message",
         msg_type="response",
@@ -679,14 +680,14 @@ async def test_handle_history_prefers_ui_entries_over_audit_preview_when_present
 
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": session_id}
-    resp = await web_channel._handle_history(req)
+    resp = await ui_channel._handle_history(req)
     body = json.loads(resp.text)
     contents = [entry["content"] for entry in body["entries"]]
     assert contents.count("full assistant message") == 1
 
 
 async def test_handle_history_uses_bound_project_dir_after_projects_root_change(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -696,9 +697,9 @@ async def test_handle_history_uses_bound_project_dir_after_projects_root_change(
     project_dir = old_root / session_id
     project_dir.mkdir(parents=True, exist_ok=True)
 
-    web_channel.projects_root = old_root.resolve()
-    web_channel._known_project_roots = {old_root.resolve()}
-    web_channel._persist_project_runtime_preferences(
+    ui_channel.projects_root = old_root.resolve()
+    ui_channel._known_project_roots = {old_root.resolve()}
+    ui_channel._persist_project_runtime_preferences(
         project_dir,
         run_mode="auto",
         agent_profile="default",
@@ -706,7 +707,7 @@ async def test_handle_history_uses_bound_project_dir_after_projects_root_change(
         automation_policy=None,
     )
     SessionManager(project_dir).append_ui_event(
-        key=f"web:{session_id}",
+        key=f"ui:{session_id}",
         role="assistant",
         content="persisted in old root",
         msg_type="response",
@@ -714,25 +715,25 @@ async def test_handle_history_uses_bound_project_dir_after_projects_root_change(
     )
 
     config = Config()
-    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
-    monkeypatch.setattr(web_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
 
     config_req = MagicMock(spec=web.Request)
     config_req.json = AsyncMock(return_value={"projects_root": str(new_root)})
-    config_resp = await web_channel._handle_config(config_req)
+    config_resp = await ui_channel._handle_config(config_req)
     assert config_resp.status == 200
-    assert web_channel.projects_root == new_root.resolve()
+    assert ui_channel.projects_root == new_root.resolve()
 
     history_req = MagicMock(spec=web.Request)
     history_req.match_info = {"session_id": session_id}
-    history_resp = await web_channel._handle_history(history_req)
+    history_resp = await ui_channel._handle_history(history_req)
     assert history_resp.status == 200
     body = json.loads(history_resp.text)
     assert [entry["content"] for entry in body["entries"]] == ["persisted in old root"]
 
 
 async def test_project_dir_index_survives_channel_restart_after_root_change(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -744,9 +745,9 @@ async def test_project_dir_index_survives_channel_restart_after_root_change(
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text("hello", encoding="utf-8")
 
-    web_channel.projects_root = old_root.resolve()
-    web_channel._known_project_roots = {old_root.resolve()}
-    web_channel._persist_project_runtime_preferences(
+    ui_channel.projects_root = old_root.resolve()
+    ui_channel._known_project_roots = {old_root.resolve()}
+    ui_channel._persist_project_runtime_preferences(
         project_dir,
         run_mode="auto",
         agent_profile="default",
@@ -755,18 +756,18 @@ async def test_project_dir_index_survives_channel_restart_after_root_change(
     )
 
     config = Config()
-    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
-    monkeypatch.setattr(web_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
 
     config_req = MagicMock(spec=web.Request)
     config_req.json = AsyncMock(return_value={"projects_root": str(new_root)})
-    config_resp = await web_channel._handle_config(config_req)
+    config_resp = await ui_channel._handle_config(config_req)
     assert config_resp.status == 200
 
     with patch.object(BaseChannel, "__init__", _minimal_base_init):
-        with patch.object(web_channel_mod, "_load_ui_instructions", return_value=""):
-            restarted = WebChannel(
-                MagicMock(spec=WebChannelConfig),
+        with patch.object(ui_channel_mod, "_load_ui_instructions", return_value=""):
+            restarted = UiChannel(
+                MagicMock(spec=UiChannelConfig),
                 MagicMock(spec=MessageBus),
                 workspace=new_root,
             )
@@ -780,16 +781,16 @@ async def test_project_dir_index_survives_channel_restart_after_root_change(
     assert Path(artifact_resp._path) == artifact
 
 
-async def test_handle_config_invalid_json(web_channel: WebChannel) -> None:
+async def test_handle_config_invalid_json(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(side_effect=json.JSONDecodeError("msg", "", 0))
-    resp = await web_channel._handle_config(req)
+    resp = await ui_channel._handle_config(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "invalid JSON"}
 
 
 async def test_handle_config_updates_projects_root(
-    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     new_root = tmp_path / "projects"
     new_root.mkdir()
@@ -798,43 +799,43 @@ async def test_handle_config_updates_projects_root(
     config_path = tmp_path / "config_a.json"
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"projects_root": str(new_root)})
-    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
-    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
     monkeypatch.setattr(
-        web_channel_mod.config_loader,
+        ui_channel_mod.config_loader,
         "save_config",
         lambda cfg, _path=None: saved_configs.append(cfg.model_copy(deep=True)),
     )
-    resp = await web_channel._handle_config(req)
+    resp = await ui_channel._handle_config(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["projects_root"] == str(new_root.resolve())
     assert body["config_path"] == str(config_path.resolve())
     assert body["persisted"] is True
-    assert web_channel.projects_root == new_root.resolve()
+    assert ui_channel.projects_root == new_root.resolve()
     assert saved_configs[-1].agents.defaults.workspace == str(new_root.resolve())
 
 
-async def test_handle_config_rejects_non_string_projects_root(web_channel: WebChannel) -> None:
+async def test_handle_config_rejects_non_string_projects_root(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"projects_root": 123})
-    resp = await web_channel._handle_config(req)
+    resp = await ui_channel._handle_config(req)
 
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "projects_root must be a string"}
 
 
 async def test_handle_config_unchanged_without_key(
-    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    web_channel.projects_root = tmp_path
+    ui_channel.projects_root = tmp_path
     config = Config()
     config_path = tmp_path / "config_a.json"
-    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
-    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={})
-    resp = await web_channel._handle_config(req)
+    resp = await ui_channel._handle_config(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["projects_root"] == str(tmp_path)
@@ -843,10 +844,10 @@ async def test_handle_config_unchanged_without_key(
 
 
 async def test_handle_config_skips_audit_when_projects_root_unchanged(
-    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path.resolve()
-    web_channel.projects_root = root
+    ui_channel.projects_root = root
     audit_calls: list[dict[str, object]] = []
     saved_configs: list[Config] = []
     config = Config()
@@ -855,17 +856,17 @@ async def test_handle_config_skips_audit_when_projects_root_unchanged(
     def _capture_audit(**kwargs: object) -> None:
         audit_calls.append(kwargs)
 
-    monkeypatch.setattr(web_channel, "_audit", _capture_audit)
-    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
-    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel, "_audit", _capture_audit)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
     monkeypatch.setattr(
-        web_channel_mod.config_loader,
+        ui_channel_mod.config_loader,
         "save_config",
         lambda cfg, _path=None: saved_configs.append(cfg.model_copy(deep=True)),
     )
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"projects_root": str(root)})
-    resp = await web_channel._handle_config(req)
+    resp = await ui_channel._handle_config(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -877,7 +878,7 @@ async def test_handle_config_skips_audit_when_projects_root_unchanged(
 
 
 async def test_handle_get_config_returns_runtime_payload(
-    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = Config()
     config.agents.defaults.provider = "openrouter"
@@ -888,16 +889,16 @@ async def test_handle_get_config_returns_runtime_payload(
     config.providers.openrouter.api_base = "https://openrouter.ai/api/v1"
     config.tools.restrict_to_workspace = True
     config_path = tmp_path / "config_get.json"
-    web_channel.projects_root = (tmp_path / "projects").resolve()
+    ui_channel.projects_root = (tmp_path / "projects").resolve()
 
-    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
-    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
-    resp = await web_channel._handle_get_config(MagicMock(spec=web.Request))
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    resp = await ui_channel._handle_get_config(MagicMock(spec=web.Request))
 
     assert resp.status == 200
     body = json.loads(resp.text)
-    assert body["projects_root"] == str(web_channel.projects_root)
-    assert body["runtime"]["workspace"] == str(web_channel.projects_root)
+    assert body["projects_root"] == str(ui_channel.projects_root)
+    assert body["runtime"]["workspace"] == str(ui_channel.projects_root)
     assert body["runtime"]["provider"] == "openrouter"
     assert body["runtime"]["reasoning_effort"] == "adaptive"
     assert body["runtime"]["max_tool_iterations"] == 88
@@ -907,16 +908,16 @@ async def test_handle_get_config_returns_runtime_payload(
 
 
 async def test_handle_config_updates_runtime_fields_and_provider_secrets(
-    web_channel: WebChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = Config()
     config_path = tmp_path / "config_runtime.json"
     saved_configs: list[Config] = []
 
-    monkeypatch.setattr(web_channel_mod.config_loader, "get_config_path", lambda: config_path)
-    monkeypatch.setattr(web_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
     monkeypatch.setattr(
-        web_channel_mod.config_loader,
+        ui_channel_mod.config_loader,
         "save_config",
         lambda cfg, _path=None: saved_configs.append(cfg.model_copy(deep=True)),
     )
@@ -937,7 +938,7 @@ async def test_handle_config_updates_runtime_fields_and_provider_secrets(
             }
         },
     })
-    resp = await web_channel._handle_config(req)
+    resp = await ui_channel._handle_config(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -953,21 +954,21 @@ async def test_handle_config_updates_runtime_fields_and_provider_secrets(
     assert saved_configs[-1].providers.custom.api_base == "https://llm.example.com/v1"
 
 
-async def test_handle_validate_data_path_requires_valid_json(web_channel: WebChannel) -> None:
+async def test_handle_validate_data_path_requires_valid_json(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(side_effect=json.JSONDecodeError("msg", "", 0))
-    resp = await web_channel._handle_validate_data_path(req)
+    resp = await ui_channel._handle_validate_data_path(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "invalid JSON"}
 
 
-async def test_handle_validate_data_path_success_and_missing(web_channel: WebChannel) -> None:
-    datasets = web_channel.projects_root / "datasets"
+async def test_handle_validate_data_path_success_and_missing(ui_channel: UiChannel) -> None:
+    datasets = ui_channel.projects_root / "datasets"
     datasets.mkdir(parents=True)
 
     req_ok = MagicMock(spec=web.Request)
     req_ok.json = AsyncMock(return_value={"path": "datasets"})
-    ok_resp = await web_channel._handle_validate_data_path(req_ok)
+    ok_resp = await ui_channel._handle_validate_data_path(req_ok)
     ok_body = json.loads(ok_resp.text)
     assert ok_resp.status == 200
     assert ok_body["ok"] is True
@@ -975,47 +976,47 @@ async def test_handle_validate_data_path_success_and_missing(web_channel: WebCha
 
     req_missing = MagicMock(spec=web.Request)
     req_missing.json = AsyncMock(return_value={"path": "datasets/missing"})
-    missing_resp = await web_channel._handle_validate_data_path(req_missing)
+    missing_resp = await ui_channel._handle_validate_data_path(req_missing)
     missing_body = json.loads(missing_resp.text)
     assert missing_resp.status == 200
     assert missing_body["ok"] is False
     assert missing_body["error"] == "path not found"
 
 
-async def test_handle_validate_data_path_enforces_workspace_boundary(web_channel: WebChannel, tmp_path: Path) -> None:
+async def test_handle_validate_data_path_enforces_workspace_boundary(ui_channel: UiChannel, tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside-datasets"
     outside.mkdir(parents=True, exist_ok=True)
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"path": str(outside)})
-    resp = await web_channel._handle_validate_data_path(req)
+    resp = await ui_channel._handle_validate_data_path(req)
     body = json.loads(resp.text)
     assert resp.status == 200
     assert body["ok"] is False
     assert "outside workspace" in body["error"]
 
 
-async def test_handle_validate_data_path_allows_outside_when_unrestricted(web_channel: WebChannel, tmp_path: Path) -> None:
+async def test_handle_validate_data_path_allows_outside_when_unrestricted(ui_channel: UiChannel, tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside-open-datasets"
     outside.mkdir(parents=True, exist_ok=True)
-    web_channel.restrict_to_workspace = False
+    ui_channel.restrict_to_workspace = False
 
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"path": str(outside)})
-    resp = await web_channel._handle_validate_data_path(req)
+    resp = await ui_channel._handle_validate_data_path(req)
     body = json.loads(resp.text)
     assert resp.status == 200
     assert body["ok"] is True
     assert body["kind"] == "directory"
 
 
-async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebChannel) -> None:
-    (web_channel.projects_root / "PRJ-0001").mkdir(parents=True)
-    (web_channel.projects_root / "PRJ-0002").mkdir(parents=True)
-    (web_channel.projects_root / "skills").mkdir(parents=True)
-    (web_channel.projects_root / "random-folder").mkdir(parents=True)
+async def test_handle_list_projects_only_returns_prj_with_meta(ui_channel: UiChannel) -> None:
+    (ui_channel.projects_root / "PRJ-0001").mkdir(parents=True)
+    (ui_channel.projects_root / "PRJ-0002").mkdir(parents=True)
+    (ui_channel.projects_root / "skills").mkdir(parents=True)
+    (ui_channel.projects_root / "random-folder").mkdir(parents=True)
 
     req = MagicMock(spec=web.Request)
-    resp = await web_channel._handle_list_projects(req)
+    resp = await ui_channel._handle_list_projects(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -1025,7 +1026,7 @@ async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebC
     assert all(item["has_meta"] for item in body["projects"])
     assert all(item["contract_version"] == 1 for item in body["projects"])
 
-    meta_file = web_channel.projects_root / "PRJ-0001" / ".mira" / "project.json"
+    meta_file = ui_channel.projects_root / "PRJ-0001" / ".mira" / "project.json"
     assert meta_file.is_file()
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["id"] == "PRJ-0001"
@@ -1033,14 +1034,14 @@ async def test_handle_list_projects_only_returns_prj_with_meta(web_channel: WebC
     assert meta["contract_version"] == 1
 
 
-async def test_handle_project_meta_updates_display_name(web_channel: WebChannel) -> None:
-    project_dir = web_channel.projects_root / "PRJ-0001"
+async def test_handle_project_meta_updates_display_name(ui_channel: UiChannel) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
     project_dir.mkdir(parents=True)
 
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
     req.json = AsyncMock(return_value={"display_name": "Lung CT baseline"})
-    resp = await web_channel._handle_project_meta(req)
+    resp = await ui_channel._handle_project_meta(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -1058,9 +1059,9 @@ async def test_handle_project_meta_updates_display_name(web_channel: WebChannel)
 
 
 async def test_handle_project_meta_updates_run_mode_and_profile(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
 ) -> None:
-    project_dir = web_channel.projects_root / "PRJ-0002"
+    project_dir = ui_channel.projects_root / "PRJ-0002"
     project_dir.mkdir(parents=True)
 
     req = MagicMock(spec=web.Request)
@@ -1069,7 +1070,7 @@ async def test_handle_project_meta_updates_run_mode_and_profile(
         "run_mode": "manual",
         "agent_profile": "research",
     })
-    resp = await web_channel._handle_project_meta(req)
+    resp = await ui_channel._handle_project_meta(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -1086,15 +1087,15 @@ async def test_handle_project_meta_updates_run_mode_and_profile(
 
 
 async def test_handle_project_meta_updates_contract_version(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
 ) -> None:
-    project_dir = web_channel.projects_root / "PRJ-0003"
+    project_dir = ui_channel.projects_root / "PRJ-0003"
     project_dir.mkdir(parents=True)
 
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0003"}
     req.json = AsyncMock(return_value={"contract_version": 2})
-    resp = await web_channel._handle_project_meta(req)
+    resp = await ui_channel._handle_project_meta(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -1106,9 +1107,9 @@ async def test_handle_project_meta_updates_contract_version(
 
 
 async def test_handle_project_meta_updates_automation_policy(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
 ) -> None:
-    project_dir = web_channel.projects_root / "PRJ-0008"
+    project_dir = ui_channel.projects_root / "PRJ-0008"
     project_dir.mkdir(parents=True)
 
     req = MagicMock(spec=web.Request)
@@ -1121,7 +1122,7 @@ async def test_handle_project_meta_updates_automation_policy(
             "maxTokens": 200000,
         }
     })
-    resp = await web_channel._handle_project_meta(req)
+    resp = await ui_channel._handle_project_meta(req)
 
     assert resp.status == 200
     body = json.loads(resp.text)
@@ -1133,30 +1134,30 @@ async def test_handle_project_meta_updates_automation_policy(
     assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
 
 
-async def test_cors_allows_patch_method(web_channel: WebChannel) -> None:
-    web_channel.config.cors_origins = ["*"]
+async def test_cors_allows_patch_method(ui_channel: UiChannel) -> None:
+    ui_channel.config.cors_origins = ["*"]
     req = MagicMock(spec=web.Request)
     req.method = "OPTIONS"
     req.headers = {"Origin": "http://localhost:5173"}
 
-    resp = await web_channel._cors_middleware(req, AsyncMock())
+    resp = await ui_channel._cors_middleware(req, AsyncMock())
     assert resp.status == 204
     assert resp.headers["Access-Control-Allow-Methods"] == "GET, POST, PATCH, DELETE, OPTIONS"
     assert resp.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
 
 
-async def test_handle_upload_project_files_invalid_multipart(web_channel: WebChannel) -> None:
+async def test_handle_upload_project_files_invalid_multipart(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
     req.query = {}
     req.multipart = AsyncMock(side_effect=RuntimeError("bad form"))
 
-    resp = await web_channel._handle_upload_project_files(req)
+    resp = await ui_channel._handle_upload_project_files(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "expected multipart/form-data"}
 
 
-async def test_handle_upload_project_files_missing_files(web_channel: WebChannel) -> None:
+async def test_handle_upload_project_files_missing_files(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
     req.query = {}
@@ -1164,12 +1165,12 @@ async def test_handle_upload_project_files_missing_files(web_channel: WebChannel
         _FakePart(name="metadata", filename="ignored.txt", chunks=[b"abc"]),
     ]))
 
-    resp = await web_channel._handle_upload_project_files(req)
+    resp = await ui_channel._handle_upload_project_files(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "no files uploaded"}
 
 
-async def test_handle_upload_project_files_writes_data_files(web_channel: WebChannel) -> None:
+async def test_handle_upload_project_files_writes_data_files(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
     req.query = {}
@@ -1178,7 +1179,7 @@ async def test_handle_upload_project_files_writes_data_files(web_channel: WebCha
         _FakePart(name="files", filename="sample.csv", chunks=[b"c,d\n"]),
     ]))
 
-    resp = await web_channel._handle_upload_project_files(req)
+    resp = await ui_channel._handle_upload_project_files(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["session_id"] == "PRJ-0001"
@@ -1189,13 +1190,13 @@ async def test_handle_upload_project_files_writes_data_files(web_channel: WebCha
     ]
     assert body["extracted"] == []
 
-    data_dir = web_channel.projects_root / "PRJ-0001" / "data"
+    data_dir = ui_channel.projects_root / "PRJ-0001" / "data"
     assert (data_dir / "sample.csv").read_bytes() == b"a,b\n"
     assert (data_dir / "sample_1.csv").read_bytes() == b"c,d\n"
 
 
 async def test_handle_upload_project_files_references_extracts_zip(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
 ) -> None:
     zip_buf = BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as zf:
@@ -1210,7 +1211,7 @@ async def test_handle_upload_project_files_references_extracts_zip(
         _FakePart(name="files", filename="bundle.zip", chunks=[zip_buf.getvalue()]),
     ]))
 
-    resp = await web_channel._handle_upload_project_files(req)
+    resp = await ui_channel._handle_upload_project_files(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["session_id"] == "PRJ-0002"
@@ -1225,14 +1226,14 @@ async def test_handle_upload_project_files_references_extracts_zip(
         "references/bundle/notes/summary.txt",
     }
 
-    refs_dir = web_channel.projects_root / "PRJ-0002" / "references"
+    refs_dir = ui_channel.projects_root / "PRJ-0002" / "references"
     assert (refs_dir / "seed.pdf").read_bytes() == b"%PDF-1.7"
     assert (refs_dir / "bundle" / "papers" / "paper_a.pdf").read_bytes() == b"%PDF-1.4"
     assert (refs_dir / "bundle" / "notes" / "summary.txt").read_bytes() == b"ok"
 
 
 async def test_handle_upload_project_files_references_rejects_non_pdf_zip(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
 ) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0003"}
@@ -1241,7 +1242,7 @@ async def test_handle_upload_project_files_references_rejects_non_pdf_zip(
         _FakePart(name="files", filename="notes.txt", chunks=[b"hello"]),
     ]))
 
-    resp = await web_channel._handle_upload_project_files(req)
+    resp = await ui_channel._handle_upload_project_files(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {
         "error": "references uploads only support .pdf and .zip files"
@@ -1249,7 +1250,7 @@ async def test_handle_upload_project_files_references_rejects_non_pdf_zip(
 
 
 async def test_handle_upload_project_files_references_rejects_zip_slip(
-    web_channel: WebChannel,
+    ui_channel: UiChannel,
 ) -> None:
     zip_buf = BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as zf:
@@ -1262,14 +1263,14 @@ async def test_handle_upload_project_files_references_rejects_zip_slip(
         _FakePart(name="files", filename="unsafe.zip", chunks=[zip_buf.getvalue()]),
     ]))
 
-    resp = await web_channel._handle_upload_project_files(req)
+    resp = await ui_channel._handle_upload_project_files(req)
     assert resp.status == 400
     assert "unsafe zip entry" in json.loads(resp.text)["error"]
-    assert not (web_channel.projects_root / "escape.txt").exists()
+    assert not (ui_channel.projects_root / "escape.txt").exists()
 
 
-async def test_handle_project_artifact_serves_file(web_channel: WebChannel) -> None:
-    project_dir = web_channel.projects_root / "PRJ-0001"
+async def test_handle_project_artifact_serves_file(ui_channel: UiChannel) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
     artifact = project_dir / "experiments" / "exp005" / "roc_pr_curves.png"
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"png")
@@ -1278,14 +1279,14 @@ async def test_handle_project_artifact_serves_file(web_channel: WebChannel) -> N
     req.match_info = {"session_id": "PRJ-0001"}
     req.query = {"path": "experiments/exp005/roc_pr_curves.png"}
 
-    resp = await web_channel._handle_project_artifact(req)
+    resp = await ui_channel._handle_project_artifact(req)
     assert isinstance(resp, web.FileResponse)
     assert resp.status == 200
     assert Path(resp._path) == artifact
 
 
-async def test_handle_project_artifact_blocks_traversal(web_channel: WebChannel, tmp_path: Path) -> None:
-    project_dir = web_channel.projects_root / "PRJ-0001"
+async def test_handle_project_artifact_blocks_traversal(ui_channel: UiChannel, tmp_path: Path) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
     project_dir.mkdir(parents=True)
     outside = tmp_path / "outside.txt"
     outside.write_text("x", encoding="utf-8")
@@ -1294,32 +1295,32 @@ async def test_handle_project_artifact_blocks_traversal(web_channel: WebChannel,
     req.match_info = {"session_id": "PRJ-0001"}
     req.query = {"path": "../outside.txt"}
 
-    resp = await web_channel._handle_project_artifact(req)
+    resp = await ui_channel._handle_project_artifact(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "invalid artifact path"}
 
 
-async def test_skill_plugin_install_from_directory_and_list(web_channel: WebChannel, tmp_path: Path) -> None:
+async def test_skill_plugin_install_from_directory_and_list(ui_channel: UiChannel, tmp_path: Path) -> None:
     src = _create_plugin_source(tmp_path)
     install_req = MagicMock(spec=web.Request)
     install_req.match_info = {"session_id": "PRJ-0001"}
     install_req.headers = {"Content-Type": "application/json"}
     install_req.json = AsyncMock(return_value={"path": str(src)})
 
-    install_resp = await web_channel._handle_skill_plugins_install(install_req)
+    install_resp = await ui_channel._handle_skill_plugins_install(install_req)
     assert install_resp.status == 200
     body = json.loads(install_resp.text)
     assert body["installed"]["id"] == "plugin-pack"
 
     list_req = MagicMock(spec=web.Request)
     list_req.match_info = {"session_id": "PRJ-0001"}
-    list_resp = await web_channel._handle_skill_plugins_list(list_req)
+    list_resp = await ui_channel._handle_skill_plugins_list(list_req)
     assert list_resp.status == 200
     list_body = json.loads(list_resp.text)
     assert {p["id"] for p in list_body["plugins"]} >= {"builtin-skills", "plugin-pack"}
 
 
-async def test_skill_plugin_install_from_zip(web_channel: WebChannel, tmp_path: Path) -> None:
+async def test_skill_plugin_install_from_zip(ui_channel: UiChannel, tmp_path: Path) -> None:
     src = _create_plugin_source(tmp_path, plugin_id="zip-pack")
     zip_path = tmp_path / "zip-pack.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
@@ -1335,13 +1336,13 @@ async def test_skill_plugin_install_from_zip(web_channel: WebChannel, tmp_path: 
         _FakePart(name="zip", filename="zip-pack.zip", chunks=[zip_bytes]),
     ]))
 
-    resp = await web_channel._handle_skill_plugins_install(req)
+    resp = await ui_channel._handle_skill_plugins_install(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["installed"]["id"] == "zip-pack"
 
 
-async def test_skill_plugin_install_from_zip_without_manifest(web_channel: WebChannel, tmp_path: Path) -> None:
+async def test_skill_plugin_install_from_zip_without_manifest(ui_channel: UiChannel, tmp_path: Path) -> None:
     src = tmp_path / "no-manifest-pack"
     (src / "research" / "finder").mkdir(parents=True, exist_ok=True)
     (src / "research" / "finder" / "SKILL.md").write_text(
@@ -1361,19 +1362,19 @@ async def test_skill_plugin_install_from_zip_without_manifest(web_channel: WebCh
         _FakePart(name="zip", filename="no-manifest-pack.zip", chunks=[zip_path.read_bytes()]),
     ]))
 
-    resp = await web_channel._handle_skill_plugins_install(req)
+    resp = await ui_channel._handle_skill_plugins_install(req)
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["installed"]["id"] == "no-manifest-pack"
 
 
-async def test_skill_plugin_toggle_and_uninstall(web_channel: WebChannel, tmp_path: Path) -> None:
+async def test_skill_plugin_toggle_and_uninstall(ui_channel: UiChannel, tmp_path: Path) -> None:
     src = _create_plugin_source(tmp_path)
     install_req = MagicMock(spec=web.Request)
     install_req.match_info = {"session_id": "PRJ-0001"}
     install_req.headers = {"Content-Type": "application/json"}
     install_req.json = AsyncMock(return_value={"path": str(src)})
-    await web_channel._handle_skill_plugins_install(install_req)
+    await ui_channel._handle_skill_plugins_install(install_req)
 
     toggle_req = MagicMock(spec=web.Request)
     toggle_req.match_info = {"session_id": "PRJ-0001"}
@@ -1384,7 +1385,7 @@ async def test_skill_plugin_toggle_and_uninstall(web_channel: WebChannel, tmp_pa
         "target_id": "writer",
         "enabled": False,
     })
-    toggle_resp = await web_channel._handle_skill_plugins_state(toggle_req)
+    toggle_resp = await ui_channel._handle_skill_plugins_state(toggle_req)
     assert toggle_resp.status == 200
     toggle_body = json.loads(toggle_resp.text)
     plugin_pack = next(item for item in toggle_body["plugins"] if item["id"] == "plugin-pack")
@@ -1393,25 +1394,25 @@ async def test_skill_plugin_toggle_and_uninstall(web_channel: WebChannel, tmp_pa
 
     remove_req = MagicMock(spec=web.Request)
     remove_req.match_info = {"session_id": "PRJ-0001", "plugin_id": "plugin-pack"}
-    remove_resp = await web_channel._handle_skill_plugins_uninstall(remove_req)
+    remove_resp = await ui_channel._handle_skill_plugins_uninstall(remove_req)
     assert remove_resp.status == 200
     remove_body = json.loads(remove_resp.text)
     assert [item["id"] for item in remove_body["plugins"]] == ["builtin-skills"]
 
 
-async def test_send_delivers_json_to_open_socket(web_channel: WebChannel) -> None:
+async def test_send_delivers_json_to_open_socket(ui_channel: UiChannel) -> None:
     ws = MagicMock()
     ws.closed = False
     ws.send_json = AsyncMock()
-    web_channel._clients["sid-1"] = ws
+    ui_channel._clients["sid-1"] = ws
     msg = OutboundMessage(
-        channel="web",
+        channel="ui",
         chat_id="sid-1",
         content="hello",
         media=["u1"],
         metadata={"k": "v"},
     )
-    await web_channel.send(msg)
+    await ui_channel.send(msg)
     ws.send_json.assert_awaited_once()
     payload = ws.send_json.await_args.args[0]
     assert payload == {
@@ -1423,38 +1424,38 @@ async def test_send_delivers_json_to_open_socket(web_channel: WebChannel) -> Non
     }
 
 
-async def test_send_progress_type(web_channel: WebChannel) -> None:
+async def test_send_progress_type(ui_channel: UiChannel) -> None:
     ws = MagicMock()
     ws.closed = False
     ws.send_json = AsyncMock()
-    web_channel._clients["x"] = ws
+    ui_channel._clients["x"] = ws
     msg = OutboundMessage(
-        channel="web",
+        channel="ui",
         chat_id="x",
         content="…",
         metadata={"_progress": True},
     )
-    await web_channel.send(msg)
+    await ui_channel.send(msg)
     assert ws.send_json.await_args.args[0]["type"] == "progress"
 
 
-async def test_send_writes_project_audit_entry(web_channel: WebChannel) -> None:
+async def test_send_writes_project_audit_entry(ui_channel: UiChannel) -> None:
     session_id = "sid-log"
-    project_dir = web_channel.projects_root / session_id
+    project_dir = ui_channel.projects_root / session_id
     project_dir.mkdir(parents=True)
 
     ws = MagicMock()
     ws.closed = False
     ws.send_json = AsyncMock()
-    web_channel._clients[session_id] = ws
+    ui_channel._clients[session_id] = ws
 
     msg = OutboundMessage(
-        channel="web",
+        channel="ui",
         chat_id=session_id,
         content="running exp",
         metadata={"_progress": True, "_tool_hint": True},
     )
-    await web_channel.send(msg)
+    await ui_channel.send(msg)
 
     project_log = project_dir / ".mira" / "logs" / "actions.jsonl"
     assert project_log.is_file()
@@ -1465,13 +1466,13 @@ async def test_send_writes_project_audit_entry(web_channel: WebChannel) -> None:
     assert entry["details"]["tool_hint"] is True
 
 
-async def test_send_audit_only_skill_event_writes_project_log(web_channel: WebChannel) -> None:
+async def test_send_audit_only_skill_event_writes_project_log(ui_channel: UiChannel) -> None:
     session_id = "sid-skill-log"
-    project_dir = web_channel.projects_root / session_id
+    project_dir = ui_channel.projects_root / session_id
     project_dir.mkdir(parents=True)
 
     msg = OutboundMessage(
-        channel="web",
+        channel="ui",
         chat_id=session_id,
         content="",
         metadata={
@@ -1484,7 +1485,7 @@ async def test_send_audit_only_skill_event_writes_project_log(web_channel: WebCh
             },
         },
     )
-    await web_channel.send(msg)
+    await ui_channel.send(msg)
 
     project_log = project_dir / ".mira" / "logs" / "actions.jsonl"
     assert project_log.is_file()
@@ -1495,26 +1496,26 @@ async def test_send_audit_only_skill_event_writes_project_log(web_channel: WebCh
     assert entry["details"]["skill_name"] == "scientific-method"
 
 
-async def test_send_no_client_noop(web_channel: WebChannel) -> None:
-    msg = OutboundMessage(channel="web", chat_id="missing", content="x")
-    await web_channel.send(msg)
+async def test_send_no_client_noop(ui_channel: UiChannel) -> None:
+    msg = OutboundMessage(channel="ui", chat_id="missing", content="x")
+    await ui_channel.send(msg)
 
 
-async def test_send_closed_socket_noop(web_channel: WebChannel) -> None:
+async def test_send_closed_socket_noop(ui_channel: UiChannel) -> None:
     ws = MagicMock()
     ws.closed = True
     ws.send_json = AsyncMock()
-    web_channel._clients["gone"] = ws
-    await web_channel.send(OutboundMessage(channel="web", chat_id="gone", content="x"))
+    ui_channel._clients["gone"] = ws
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="gone", content="x"))
     ws.send_json.assert_not_called()
 
 
-async def test_send_send_json_failure_swallowed(web_channel: WebChannel) -> None:
+async def test_send_send_json_failure_swallowed(ui_channel: UiChannel) -> None:
     ws = MagicMock()
     ws.closed = False
     ws.send_json = AsyncMock(side_effect=RuntimeError("broken"))
-    web_channel._clients["err"] = ws
-    await web_channel.send(OutboundMessage(channel="web", chat_id="err", content="x"))
+    ui_channel._clients["err"] = ws
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="err", content="x"))
 
 
 def test_web_helpers_cover_normalization_and_formatting() -> None:
@@ -1530,26 +1531,26 @@ def test_web_helpers_cover_normalization_and_formatting() -> None:
     assert _format_tool_call({"function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}}) == 'read_file({"path":"a"})'
 
 
-def test_reconcile_plan_data_without_experiments_returns_false(web_channel: WebChannel, tmp_path: Path) -> None:
+def test_reconcile_plan_data_without_experiments_returns_false(ui_channel: UiChannel, tmp_path: Path) -> None:
     payload = {"title": "demo"}
-    assert web_channel._reconcile_plan_data(tmp_path, payload) is False
+    assert ui_channel._reconcile_plan_data(tmp_path, payload) is False
     assert payload == {"title": "demo"}
 
 
 def test_load_plan_data_errors_and_reconcile_write_warning(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    project = web_channel.projects_root / "PRJ-3001"
+    project = ui_channel.projects_root / "PRJ-3001"
     project.mkdir(parents=True)
     plan = project / PLAN_FILENAME
     plan.write_text("[]", encoding="utf-8")
     with pytest.raises(ValueError, match="Unexpected non-object JSON"):
-        web_channel._load_plan_data("PRJ-3001")
+        ui_channel._load_plan_data("PRJ-3001")
 
     plan.write_text(json.dumps({"experiments": []}), encoding="utf-8")
-    monkeypatch.setattr(web_channel, "_reconcile_plan_data", lambda *a, **k: True)
+    monkeypatch.setattr(ui_channel, "_reconcile_plan_data", lambda *a, **k: True)
     monkeypatch.setattr(Path, "write_text", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
-    data = web_channel._load_plan_data("PRJ-3001")
+    data = ui_channel._load_plan_data("PRJ-3001")
     assert data == {"experiments": []}
 
 
@@ -1582,7 +1583,7 @@ class _FakeWs:
 
 
 async def test_ws_handler_invalid_json_and_missing_session_id(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ws = _FakeWs(
         [
@@ -1590,15 +1591,15 @@ async def test_ws_handler_invalid_json_and_missing_session_id(
             _FakeWsMessage(web.WSMsgType.TEXT, json.dumps({"type": "message", "content": "x"})),
         ]
     )
-    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
     req = MagicMock(spec=web.Request)
-    await web_channel._ws_handler(req)
+    await ui_channel._ws_handler(req)
     assert ws.sent[0]["content"] == "Invalid JSON"
     assert ws.sent[1]["content"] == "session_id required"
 
 
 async def test_ws_handler_message_and_set_mode_dispatch(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     messages = [
         _FakeWsMessage(
@@ -1634,17 +1635,17 @@ async def test_ws_handler_message_and_set_mode_dispatch(
         ),
     ]
     ws = _FakeWs(messages)
-    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
-    web_channel._ui_instructions = "UI instruction"
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    ui_channel._ui_instructions = "UI instruction"
     handled = []
 
     async def _handle_message(**kwargs):
         handled.append(kwargs)
 
-    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
-    monkeypatch.setattr(web_channel, "_load_plan_data", lambda *_a, **_k: None)
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    monkeypatch.setattr(ui_channel, "_load_plan_data", lambda *_a, **_k: None)
     req = MagicMock(spec=web.Request)
-    await web_channel._ws_handler(req)
+    await ui_channel._ws_handler(req)
 
     assert len(handled) == 2
     assert handled[0]["metadata"]["run_mode"] == "auto"
@@ -1654,17 +1655,17 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert "_ui_system_instructions" in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"
 
-    meta_file = web_channel.projects_root / "PRJ-4001" / ".mira" / "project.json"
+    meta_file = ui_channel.projects_root / "PRJ-4001" / ".mira" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["contract_version"] == 2
     assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
 
 
 async def test_ws_handler_injects_guard_notice_on_id_reassignment(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = "PRJ-4012"
-    project_dir = web_channel.projects_root / session_id
+    project_dir = ui_channel.projects_root / session_id
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / PLAN_FILENAME).write_text(
         json.dumps(
@@ -1696,15 +1697,15 @@ async def test_ws_handler_injects_guard_notice_on_id_reassignment(
             ),
         ),
     ])
-    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
     captured: dict[str, Any] = {}
 
     async def _handle_message(**kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
     req = MagicMock(spec=web.Request)
-    await web_channel._ws_handler(req)
+    await ui_channel._ws_handler(req)
 
     notice = captured.get("metadata", {}).get("_task_plan_guard_notice")
     assert isinstance(notice, str)
@@ -1716,9 +1717,9 @@ async def test_ws_handler_injects_guard_notice_on_id_reassignment(
 
 
 async def test_ws_handler_bind_registers_active_client(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    (web_channel.projects_root / "PRJ-4011").mkdir(parents=True, exist_ok=True)
+    (ui_channel.projects_root / "PRJ-4011").mkdir(parents=True, exist_ok=True)
     ws = _FakeWs([
         _FakeWsMessage(
             web.WSMsgType.TEXT,
@@ -1731,23 +1732,23 @@ async def test_ws_handler_bind_registers_active_client(
             ),
         ),
     ])
-    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
     req = MagicMock(spec=web.Request)
-    await web_channel._ws_handler(req)
+    await ui_channel._ws_handler(req)
 
-    assert "PRJ-4011" not in web_channel._clients
+    assert "PRJ-4011" not in ui_channel._clients
     # Connection closes after handler loop exits; verify bind was accepted via audit entry.
-    audit_log = web_channel.projects_root / "PRJ-4011" / ".mira" / "logs" / "actions.jsonl"
+    audit_log = ui_channel.projects_root / "PRJ-4011" / ".mira" / "logs" / "actions.jsonl"
     assert audit_log.is_file()
     lines = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert any(item.get("action") == "ws_bind_received" for item in lines)
 
 
 async def test_ws_handler_persists_ui_chat_user_entry(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = "PRJ-4010"
-    (web_channel.projects_root / session_id).mkdir(parents=True)
+    (ui_channel.projects_root / session_id).mkdir(parents=True)
     ws = _FakeWs([
         _FakeWsMessage(
             web.WSMsgType.TEXT,
@@ -1760,179 +1761,65 @@ async def test_ws_handler_persists_ui_chat_user_entry(
             }),
         ),
     ])
-    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
 
     async def _handle_message(**kwargs):
         return None
 
-    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
     req = MagicMock(spec=web.Request)
-    await web_channel._ws_handler(req)
+    await ui_channel._ws_handler(req)
 
-    manager = SessionManager(web_channel.projects_root / session_id)
-    session = manager.get_or_create(f"web:{session_id}")
+    manager = SessionManager(ui_channel.projects_root / session_id)
+    session = manager.get_or_create(f"ui:{session_id}")
     assert any(event.get("role") == "user" and event.get("content") == "persist me" for event in session.ui_events)
 
 
-async def test_ws_handler_injects_guard_notice_on_id_reassignment(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    session_id = "PRJ-4012"
-    project_dir = web_channel.projects_root / session_id
-    project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / PLAN_FILENAME).write_text(
-        json.dumps(
-            {
-                "title": "demo",
-                "status": "in_progress",
-                "experiments": [
-                    {"id": "Exp003", "status": "pending"},
-                    {"id": "Exp003", "status": "pending"},
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    ws = _FakeWs([
-        _FakeWsMessage(
-            web.WSMsgType.TEXT,
-            json.dumps(
-                {
-                    "type": "message",
-                    "session_id": session_id,
-                    "user_id": "u1",
-                    "mode": "auto",
-                    "agent_profile": "default",
-                    "content": "check latest exp ids",
-                    "media": [],
-                }
-            ),
-        ),
-    ])
-    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
-    captured: dict[str, Any] = {}
-
-    async def _handle_message(**kwargs):
-        captured.update(kwargs)
-
-    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
-    req = MagicMock(spec=web.Request)
-    await web_channel._ws_handler(req)
-
-    notice = captured.get("metadata", {}).get("_task_plan_guard_notice")
-    assert isinstance(notice, str)
-    assert "Exp003 -> Exp004" in notice
-
-    repaired = json.loads((project_dir / PLAN_FILENAME).read_text(encoding="utf-8"))
-    ids = [item.get("id") for item in repaired.get("experiments", [])]
-    assert ids == ["Exp003", "Exp004"]
-
-
-async def test_ws_handler_bind_registers_active_client(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    (web_channel.projects_root / "PRJ-4011").mkdir(parents=True, exist_ok=True)
-    ws = _FakeWs([
-        _FakeWsMessage(
-            web.WSMsgType.TEXT,
-            json.dumps(
-                {
-                    "type": "bind",
-                    "session_id": "PRJ-4011",
-                    "user_id": "u1",
-                }
-            ),
-        ),
-    ])
-    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
-    req = MagicMock(spec=web.Request)
-    await web_channel._ws_handler(req)
-
-    assert "PRJ-4011" not in web_channel._clients
-    # Connection closes after handler loop exits; verify bind was accepted via audit entry.
-    audit_log = web_channel.projects_root / "PRJ-4011" / ".mira" / "logs" / "actions.jsonl"
-    assert audit_log.is_file()
-    lines = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert any(item.get("action") == "ws_bind_received" for item in lines)
-
-
-async def test_ws_handler_persists_ui_chat_user_entry(
-    web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    session_id = "PRJ-4010"
-    (web_channel.projects_root / session_id).mkdir(parents=True)
-    ws = _FakeWs([
-        _FakeWsMessage(
-            web.WSMsgType.TEXT,
-            json.dumps({
-                "type": "message",
-                "session_id": session_id,
-                "user_id": "u1",
-                "content": "persist me",
-                "media": [],
-            }),
-        ),
-    ])
-    monkeypatch.setattr(web_channel_mod.web, "WebSocketResponse", lambda: ws)
-
-    async def _handle_message(**kwargs):
-        return None
-
-    monkeypatch.setattr(web_channel, "_handle_message", _handle_message)
-    req = MagicMock(spec=web.Request)
-    await web_channel._ws_handler(req)
-
-    manager = SessionManager(web_channel.projects_root / session_id)
-    session = manager.get_or_create(f"web:{session_id}")
-    assert any(event.get("role") == "user" and event.get("content") == "persist me" for event in session.ui_events)
-
-
-async def test_handle_status_and_sessions_endpoints(web_channel: WebChannel) -> None:
+async def test_handle_status_and_sessions_endpoints(ui_channel: UiChannel) -> None:
     ws = MagicMock()
     ws.closed = False
-    web_channel._clients = {"PRJ-5001": ws}
-    web_channel.bind_host = "127.0.0.1"
-    web_channel.bind_port = 18790
+    ui_channel._clients = {"PRJ-5001": ws}
+    ui_channel.bind_host = "127.0.0.1"
+    ui_channel.bind_port = 18790
     req = MagicMock(spec=web.Request)
 
-    status = await web_channel._handle_status(req)
+    status = await ui_channel._handle_status(req)
     status_body = json.loads(status.text)
-    assert status_body["channel"] == "web"
+    assert status_body["channel"] == "ui"
     assert status_body["connected_clients"] == 1
 
-    sessions = await web_channel._handle_sessions(req)
+    sessions = await ui_channel._handle_sessions(req)
     sessions_body = json.loads(sessions.text)
     assert sessions_body == {"sessions": [{"session_id": "PRJ-5001", "connected": True}]}
 
 
-async def test_handle_history_requires_session_id(web_channel: WebChannel) -> None:
+async def test_handle_history_requires_session_id(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": ""}
-    resp = await web_channel._handle_history(req)
+    resp = await ui_channel._handle_history(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "session_id required"}
 
 
-async def test_handle_delete_project_paths(web_channel: WebChannel, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_handle_delete_project_paths(ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch) -> None:
     req_missing = MagicMock(spec=web.Request)
     req_missing.query = {}
-    missing_id = await web_channel._handle_delete_project(req_missing)
+    missing_id = await ui_channel._handle_delete_project(req_missing)
     assert missing_id.status == 400
 
     req_not_found = MagicMock(spec=web.Request)
     req_not_found.query = {"session_id": "PRJ-NOPE"}
-    not_found = await web_channel._handle_delete_project(req_not_found)
+    not_found = await ui_channel._handle_delete_project(req_not_found)
     assert json.loads(not_found.text)["deleted"] is False
 
-    project = web_channel.projects_root / "PRJ-DEL"
+    project = ui_channel.projects_root / "PRJ-DEL"
     project.mkdir(parents=True)
     req_ok = MagicMock(spec=web.Request)
     req_ok.query = {"session_id": "PRJ-DEL"}
-    ok = await web_channel._handle_delete_project(req_ok)
+    ok = await ui_channel._handle_delete_project(req_ok)
     assert json.loads(ok.text) == {"deleted": True}
 
-    project2 = web_channel.projects_root / "PRJ-ERR"
+    project2 = ui_channel.projects_root / "PRJ-ERR"
     project2.mkdir(parents=True)
     req_err = MagicMock(spec=web.Request)
     req_err.query = {"session_id": "PRJ-ERR"}
@@ -1940,7 +1827,7 @@ async def test_handle_delete_project_paths(web_channel: WebChannel, monkeypatch:
     def _boom(_):
         raise OSError("cannot delete")
 
-    monkeypatch.setattr(web_channel_mod.shutil, "rmtree", _boom)
-    err = await web_channel._handle_delete_project(req_err)
+    monkeypatch.setattr(ui_channel_mod.shutil, "rmtree", _boom)
+    err = await ui_channel._handle_delete_project(req_err)
     assert err.status == 500
     assert "cannot delete" in json.loads(err.text)["error"]

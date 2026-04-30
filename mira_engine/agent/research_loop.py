@@ -770,7 +770,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             f"{contract_hint}"
         )
 
-    def _should_continue_auto_web(
+    def _should_continue_auto_ui(
         self,
         *,
         channel: str,
@@ -783,7 +783,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         tokens_used: int = 0,
     ) -> bool:
         """Decide whether to schedule another internal auto-run cycle."""
-        if channel != "web" or run_mode != "auto":
+        if channel != "ui" or run_mode != "auto":
             return False
         if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
             return False
@@ -1048,7 +1048,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         progress_cb = on_progress or _bus_progress
         current_turn_skills: set[str] = set()
         audit_cb = None
-        emit_audit_to_channel = msg.channel == "web" or bool(meta.get("_emit_skill_audit"))
+        emit_audit_to_channel = msg.channel == "ui" or bool(meta.get("_emit_skill_audit"))
         allow_result_write = self._looks_like_result_request(msg.content, meta)
         if emit_audit_to_channel or audit_hook:
             async def _audit(details: dict[str, Any]) -> None:
@@ -1080,12 +1080,12 @@ class ResearchAgentLoop(BaseAgentLoop):
             run_kwargs["on_stream"] = on_stream
         if on_stream_end is not None:
             run_kwargs["on_stream_end"] = on_stream_end
-        round_plan_before = self._load_task_plan(project_dir) if msg.channel == "web" else None
+        round_plan_before = self._load_task_plan(project_dir) if msg.channel == "ui" else None
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
         total_tokens_used = self._last_loop_tokens_used
         self._accumulate_session_tokens(key, self._last_loop_tokens_used)
-        round_plan_after = self._load_task_plan(project_dir) if msg.channel == "web" else None
-        if msg.channel == "web" and not allow_result_write:
+        round_plan_after = self._load_task_plan(project_dir) if msg.channel == "ui" else None
+        if msg.channel == "ui" and not allow_result_write:
             round_plan_after, restored = self._restore_result_section(
                 project_dir,
                 before_plan=round_plan_before,
@@ -1110,7 +1110,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         while True:
             current_mode = self._session_run_modes.get(key, run_mode)
             automation_policy = self._resolve_session_automation_policy(key, None)
-            if msg.channel == "web" and current_mode == "auto":
+            if msg.channel == "ui" and current_mode == "auto":
                 crossed = self._experiments_crossed_boundary(round_plan_before, round_plan_after)
                 if len(crossed) > 1:
                     await progress_cb(
@@ -1164,7 +1164,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                         total_tokens_used += self._last_loop_tokens_used
                         self._accumulate_session_tokens(key, self._last_loop_tokens_used)
                         round_plan_after = self._load_task_plan(project_dir)
-                        if msg.channel == "web" and not allow_result_write:
+                        if msg.channel == "ui" and not allow_result_write:
                             round_plan_after, restored = self._restore_result_section(
                                 project_dir,
                                 before_plan=round_plan_before,
@@ -1184,7 +1184,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                                 )
                         continue
 
-            if msg.channel == "web" and current_mode == "auto":
+            if msg.channel == "ui" and current_mode == "auto":
                 current_plan = self._load_task_plan(project_dir)
                 stop_reason = self._evaluate_automation_stop_policy(
                     automation_policy,
@@ -1195,7 +1195,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                     await progress_cb(f"auto-run stop condition: {stop_reason}")
                     break
 
-            should_continue = self._should_continue_auto_web(
+            should_continue = self._should_continue_auto_ui(
                 channel=msg.channel,
                 run_mode=current_mode,
                 project_dir=project_dir,
@@ -1209,7 +1209,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                 guard_issues = list(getattr(self, "_last_task_plan_guard_issues", []))
                 continue_despite_guard = False
                 if (
-                    msg.channel == "web"
+                    msg.channel == "ui"
                     and current_mode == "auto"
                     and guard_issues
                     and not self._looks_like_failure_response(final_content)
@@ -1232,13 +1232,13 @@ class ResearchAgentLoop(BaseAgentLoop):
                                 issues=guard_issues,
                             ),
                         })
-                        guard_plan_before = round_plan_after if msg.channel == "web" else None
+                        guard_plan_before = round_plan_after if msg.channel == "ui" else None
                         final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
                         total_tokens_used += self._last_loop_tokens_used
                         self._accumulate_session_tokens(key, self._last_loop_tokens_used)
                         round_plan_after = self._load_task_plan(project_dir)
                         round_plan_before = guard_plan_before
-                        if msg.channel == "web" and not allow_result_write:
+                        if msg.channel == "ui" and not allow_result_write:
                             round_plan_after, restored = self._restore_result_section(
                                 project_dir,
                                 before_plan=guard_plan_before,
@@ -1279,13 +1279,13 @@ class ResearchAgentLoop(BaseAgentLoop):
                                 issues=guard_issues,
                             ),
                         })
-                        guard_plan_before = round_plan_after if msg.channel == "web" else None
+                        guard_plan_before = round_plan_after if msg.channel == "ui" else None
                         final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
                         total_tokens_used += self._last_loop_tokens_used
                         self._accumulate_session_tokens(key, self._last_loop_tokens_used)
                         round_plan_after = self._load_task_plan(project_dir)
                         round_plan_before = guard_plan_before
-                        if msg.channel == "web" and not allow_result_write:
+                        if msg.channel == "ui" and not allow_result_write:
                             round_plan_after, restored = self._restore_result_section(
                                 project_dir,
                                 before_plan=guard_plan_before,
@@ -1332,7 +1332,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             total_tokens_used += self._last_loop_tokens_used
             self._accumulate_session_tokens(key, self._last_loop_tokens_used)
             round_plan_after = self._load_task_plan(project_dir)
-            if msg.channel == "web" and not allow_result_write:
+            if msg.channel == "ui" and not allow_result_write:
                 round_plan_after, restored = self._restore_result_section(
                     project_dir,
                     before_plan=round_plan_before,
