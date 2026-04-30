@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from mira_engine.agent.tools.base import Tool
+from mira_engine.agent.tools.bg import (
+    BackgroundJobRegistry,
+    cleanup_old_job_dirs,
+    spawn_background_job,
+)
 from mira_engine.agent.tools.sandbox import wrap_command
 from mira_engine.config.paths import get_media_dir
 from mira_engine.security.network import contains_internal_url
@@ -50,9 +55,17 @@ class ExecTool(Tool):
         restrict_to_workspace: bool = False,
         path_append: str = "",
         sandbox: str | None = None,
+        background_registry: BackgroundJobRegistry | None = None,
+        enable_background: bool = False,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
+        # Background execution is opt-in: callers (the loop) wire a shared
+        # registry and flip ``enable_background``. Subagents leave it off so
+        # the LLM doesn't accidentally spawn fire-and-forget jobs in a
+        # context that has no companion ``bg`` tool to inspect them.
+        self.background_registry = background_registry
+        self.enable_background = enable_background and background_registry is not None
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
@@ -75,27 +88,57 @@ class ExecTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        base = "Execute a shell command and return its output. Use with caution."
+        if self.enable_background:
+            base += (
+                " Set background=true for long-running tasks (e.g. neural-net "
+                "training): the command is launched as a detached subprocess, "
+                "logs go to .mira/jobs/<job_id>/, and the call returns "
+                "immediately with a job_id. Use the `bg` tool to poll, tail, "
+                "wait, or kill it."
+            )
+        return base
 
     @property
     def parameters(self) -> dict[str, Any]:
+        props: dict[str, Any] = {
+            "command": {
+                "type": "string",
+                "description": "The shell command to execute"
+            },
+            "working_dir": {
+                "type": "string",
+                "description": "Optional working directory for the command"
+            }
+        }
+        if self.enable_background:
+            props["background"] = {
+                "type": "boolean",
+                "description": (
+                    "If true, launch the command as a detached background job "
+                    "and return immediately with a job_id (foreground timeout "
+                    "does not apply). Monitor / control the job via the `bg` "
+                    "tool. Use this for any command that may run longer than "
+                    "a few minutes (model training, large preprocessing, "
+                    "long simulations)."
+                ),
+            }
+            props["description"] = {
+                "type": "string",
+                "description": (
+                    "Optional human-readable label for the background job, "
+                    "shown in `bg list`. Ignored when background=false."
+                ),
+            }
         return {
             "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute"
-                },
-                "working_dir": {
-                    "type": "string",
-                    "description": "Optional working directory for the command"
-                }
-            },
-            "required": ["command"]
+            "properties": props,
+            "required": ["command"],
         }
-    
+
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
+        background = bool(kwargs.get("background", False))
         timeout = kwargs.get("timeout", self.timeout)
         try:
             timeout = int(timeout)
@@ -105,6 +148,14 @@ class ExecTool(Tool):
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
+
+        if background:
+            if not self.enable_background:
+                return (
+                    "Error: background execution is not enabled in this context. "
+                    "Re-run with background=false (foreground), or escalate to "
+                    "the main loop where the `bg` tool is available."
+                )
 
         env = self._build_env()
         spawn_command = command
@@ -117,6 +168,14 @@ class ExecTool(Tool):
 
         if self.sandbox and self.sandbox == "bwrap" and not _IS_WINDOWS:
             spawn_command = wrap_command(self.sandbox, spawn_command, cwd, cwd)
+
+        if background:
+            return await self._launch_background(
+                spawn_command=spawn_command,
+                cwd=cwd,
+                env=env,
+                description=kwargs.get("description"),
+            )
 
         create_shell = getattr(asyncio, "create_subprocess_shell", None)
         if create_shell is not None and self.sandbox != "bwrap":
@@ -178,6 +237,42 @@ class ExecTool(Tool):
             
         except Exception as e:
             return f"Error executing command: {str(e)}"
+
+    async def _launch_background(
+        self,
+        *,
+        spawn_command: str,
+        cwd: str,
+        env: dict[str, str],
+        description: str | None,
+    ) -> str:
+        """Spawn a detached subprocess and register it with the bg registry.
+
+        We don't apply ``_MAX_TIMEOUT`` here — that's the whole point of the
+        background path. The subprocess survives across agent loop iterations
+        until it exits naturally, the agent kills it via ``bg(action='kill')``,
+        or the loop shuts down (which best-effort terminates everything).
+        """
+        assert self.background_registry is not None  # guarded by enable_background
+        jobs_root = Path(cwd) / ".mira" / "jobs"
+        cleanup_old_job_dirs(jobs_root)
+        try:
+            job = await spawn_background_job(
+                registry=self.background_registry,
+                command=spawn_command,
+                cwd=cwd,
+                env=env,
+                description=description,
+                job_dir_root=jobs_root,
+            )
+        except Exception as e:
+            return f"Error launching background job: {e}"
+        return (
+            f"Started background job {job.job_id} (pid={job.pid}).\n"
+            f"Logs: {job.log_dir}\n"
+            f"Use bg(action='status', job_id='{job.job_id}') or "
+            f"bg(action='wait', job_id='{job.job_id}', timeout=...) to monitor."
+        )
 
     def _build_env(self) -> dict[str, str]:
         """Build a minimized environment without sensitive parent variables."""
