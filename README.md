@@ -80,10 +80,37 @@ Mira provides a comprehensive CLI for managing your sessions and configurations:
   Initialize your configuration file and local workspace directory (`~/.mira` by default). This is the first command you should run after installation.
 
 - **`mira agent`**
-  Start an interactive AI chat session directly in your terminal. You can optionally pass a prompt instantly via the `-m` flag:
+  Start an interactive AI chat session against the **general-purpose agent loop** (no auto-mode, no agent profiles, no task-plan contracts — closest to the upstream nanobot baseline). You can optionally pass a prompt instantly via the `-m` flag:
   ```bash
-  mira agent -m "I have 77 MRI Dixon cases. Please set up a 3D classification pipeline to predict expiration vs. inspiration."
+  mira agent -m "Summarise the README and list the top 3 todos."
   ```
+
+- **`mira research`**
+  Start an interactive session against the **research-flavoured agent loop** powering the desktop UI. Adds auto-mode while-loops, agent profiles (which `AGENTS_*.md` to bootstrap), automation stop policies (token / experiment budgets), and task-plan guardrails. Use this for the kind of multi-experiment workflows the desktop app drives:
+  ```bash
+  mira research \
+    --message "I have 77 MRI Dixon cases. Please set up a 3D classification pipeline." \
+    --mode auto \
+    --profile research \
+    --max-tokens 200000 \
+    --max-experiments 8 \
+    --project-dir ~/projects/dixon-mri
+  ```
+  Available flags:
+  - `--mode / -m` — `manual` or `auto`. `auto` only triggers the auto-continue
+    while-loop when running through the **web channel** (i.e. via `mira gateway`
+    + the desktop UI); CLI sessions still honour the flag for cached state but
+    won't drive multi-round orchestration.
+  - `--profile / -p` — `default | engineer | research` (chooses
+    `AGENTS.md` / `AGENTS_EG.md` / `AGENTS_RS.md`).
+  - `--max-tokens` / `--max-experiments` — automation stop thresholds.
+  - `--project-dir` — forwarded as `metadata.project_dir` so guardrails and
+    `task_plan.json` lookups resolve correctly.
+
+  Both `mira agent` and `mira research` are thin wrappers around the same chat
+  REPL; the only difference is which loop class (`BaseAgentLoop` vs
+  `ResearchAgentLoop`) drives `_process_message`. `mira gateway` keeps using
+  `ResearchAgentLoop` to match the desktop UI.
 
 - **`mira status`**
   Check the current status of your Mira configuration, agent defaults, and workspace environment.

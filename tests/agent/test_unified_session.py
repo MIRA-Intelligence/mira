@@ -38,9 +38,9 @@ def _make_loop(tmp_path: Path, unified_session: bool = False) -> AgentLoop:
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
 
-    with patch("mira_engine.agent.loop.SessionManager"), \
-         patch("mira_engine.agent.loop.SubagentManager") as MockSubMgr, \
-         patch("mira_engine.agent.loop.Dream"):
+    with patch("mira_engine.agent.base_loop.SessionManager"), \
+         patch("mira_engine.agent.base_loop.SubagentManager") as MockSubMgr, \
+         patch("mira_engine.agent.base_loop.Dream"):
         MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(
             bus=bus,

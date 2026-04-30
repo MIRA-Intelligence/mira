@@ -579,7 +579,7 @@ def onboard(
                             # Other providers: use default api_base if available
                             if selected.default_api_base and not selected_cfg.api_base:
                                 selected_cfg.api_base = selected.default_api_base
-                        
+
                         api_key = typer.prompt(
                             f"API key for {selected.label} (optional, hidden input)",
                             default=selected_cfg.api_key or "",
@@ -754,9 +754,10 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
     """Check for existing Mira instances by PID file and port."""
     import atexit
     import os
-    import psutil
     import socket
     from pathlib import Path
+
+    import psutil
 
     if os.environ.get("MIRA_SKIP_GATEWAY_FAILSAVE"):
         return
@@ -809,9 +810,6 @@ def gateway(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Start the mira gateway."""
-    import atexit
-    import os
-    import psutil
     from mira_engine.agent.loop import AgentLoop
     from mira_engine.bus.queue import MessageBus
     from mira_engine.channels.manager import ChannelManager
@@ -1077,55 +1075,17 @@ def serve(
 # ============================================================================
 
 
-@app.command()
-def agent(
-    message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
-    session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
-    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
-    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show mira runtime logs during chat"),
-    verbose: bool = typer.Option(False, "--verbose/--no-verbose", help="Show verbose runtime hints (including invoked skills)"),
-    debug: bool = typer.Option(False, "--debug/--no-debug", help="Alias of --verbose"),
-):
-    """Interact with the agent directly."""
-    from loguru import logger
-
-    from mira_engine.agent.loop import AgentLoop
-    from mira_engine.bus.queue import MessageBus
-    from mira_engine.cron.service import CronService
-
-    if workspace is None and sys.stdin.isatty():
-        if typer.confirm("Do you want to use the current directory as a project workspace?"):
-            workspace = os.getcwd()
-
-    config = _load_runtime_config(config, workspace)
-    
-    from mira_engine.utils.env import auto_activate_env
-    auto_activate_env(config.workspace_path)
-    
-    sync_workspace_templates(config.workspace_path)
-
-    bus = MessageBus()
-    provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
+def _build_agent_loop_kwargs(
+    *,
+    bus,
+    provider,
+    config: Config,
+    cron_service=None,
+    model_router=None,
+) -> dict[str, object]:
+    """Common keyword arguments shared by ``mira agent`` and ``mira research``."""
     default_tz = config.agents.defaults.timezone
-
-    # Create cron service for tool usage (no callback needed for CLI unless running)
-    cron_store_path = _workspace_cron_store(config)
-    cron = CronService(cron_store_path)
-
-    verbose_mode = verbose or debug
-    # In interactive chat, verbose output is more stable than raw runtime logs.
-    # Keep --debug useful (skill/tool visibility) without TTY log interleaving.
-    logs_mode = logs or (debug and message is not None)
-
-    if logs_mode:
-        logger.enable("mira")
-    else:
-        logger.disable("mira")
-
-    agent_loop = AgentLoop(
+    return dict(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
@@ -1138,7 +1098,7 @@ def agent(
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
-        cron_service=cron,
+        cron_service=cron_service,
         timezone=default_tz,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
@@ -1147,12 +1107,32 @@ def agent(
         model_router=model_router,
     )
 
-    # Show spinner when logs are off (no output to miss); skip when logs are on
+
+def _run_cli_agent_session(
+    *,
+    agent_loop,
+    bus,
+    message: str | None,
+    session_id: str,
+    markdown: bool,
+    verbose_mode: bool,
+    logs_mode: bool,
+    inbound_metadata: dict[str, object] | None = None,
+    interactive_banner: str | None = None,
+) -> None:
+    """Drive a single message or REPL session against ``agent_loop``.
+
+    Shared between ``mira agent`` (general) and ``mira research`` (research
+    superset). ``inbound_metadata`` is merged into every InboundMessage so
+    callers can pre-populate fields like ``run_mode`` / ``agent_profile`` /
+    ``automation_policy``.
+    """
+    inbound_metadata = dict(inbound_metadata or {})
+
     def _thinking_ctx():
         if logs_mode:
             from contextlib import nullcontext
             return nullcontext()
-        # Animated spinner is safe to use with prompt_toolkit input handling
         return console.status("[dim]mira is thinking...[/dim]", spinner="dots")
 
     async def _cli_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -1163,19 +1143,7 @@ def agent(
             return
         console.print(f"  [dim]↳ {content}[/dim]")
 
-    async def _cli_audit(details: dict[str, object]) -> None:
-        if not verbose_mode:
-            return
-        event = str(details.get("tool", "") or "")
-        if event != "read_file":
-            return
-        skill_name = str(details.get("skill_name", "") or "").strip()
-        if not skill_name:
-            return
-        console.print(f"  [cyan]↳ skill:[/cyan] {skill_name}")
-
     if message:
-        # Single message mode — direct call, no bus needed
         async def run_once():
             invoked_skills: set[str] = set()
 
@@ -1197,9 +1165,15 @@ def agent(
                         session_id,
                         on_progress=_cli_progress,
                         audit_hook=_cli_audit_once,
+                        metadata=inbound_metadata,
                     )
                 else:
-                    response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
+                    response = await agent_loop.process_direct(
+                        message,
+                        session_id,
+                        on_progress=_cli_progress,
+                        metadata=inbound_metadata,
+                    )
             if hasattr(response, "content"):
                 _print_agent_response(
                     getattr(response, "content", ""),
@@ -1214,131 +1188,359 @@ def agent(
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
+        return
+
+    # Interactive mode — route through bus like other channels
+    from mira_engine.bus.events import InboundMessage
+    _init_prompt_session()
+    banner = interactive_banner or (
+        f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+    )
+    console.print(banner)
+
+    if ":" in session_id:
+        cli_channel, cli_chat_id = session_id.split(":", 1)
     else:
-        # Interactive mode — route through bus like other channels
-        from mira_engine.bus.events import InboundMessage
-        _init_prompt_session()
-        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+        cli_channel, cli_chat_id = "cli", session_id
 
-        if ":" in session_id:
-            cli_channel, cli_chat_id = session_id.split(":", 1)
-        else:
-            cli_channel, cli_chat_id = "cli", session_id
+    def _handle_signal(signum, frame):
+        sig_name = signal.Signals(signum).name
+        _restore_terminal()
+        console.print(f"\nReceived {sig_name}, goodbye!")
+        sys.exit(0)
 
-        def _handle_signal(signum, frame):
-            sig_name = signal.Signals(signum).name
-            _restore_terminal()
-            console.print(f"\nReceived {sig_name}, goodbye!")
-            sys.exit(0)
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    if hasattr(signal, 'SIGHUP'):
+        signal.signal(signal.SIGHUP, _handle_signal)
+    if hasattr(signal, 'SIGPIPE'):
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    if hasattr(signal, 'SIGTTOU'):
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    if hasattr(signal, 'SIGTTIN'):
+        signal.signal(signal.SIGTTIN, signal.SIG_IGN)
 
-        signal.signal(signal.SIGINT, _handle_signal)
-        signal.signal(signal.SIGTERM, _handle_signal)
-        # SIGHUP is not available on Windows
-        if hasattr(signal, 'SIGHUP'):
-            signal.signal(signal.SIGHUP, _handle_signal)
-        # Ignore SIGPIPE to prevent silent process termination when writing to closed pipes
-        # SIGPIPE is not available on Windows
-        if hasattr(signal, 'SIGPIPE'):
-            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-        # Some shells (notably zsh) can suspend the process when background/patch_stdout
-        # interactions touch the TTY. Ignore job-control TTY signals in interactive mode.
-        if hasattr(signal, 'SIGTTOU'):
-            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-        if hasattr(signal, 'SIGTTIN'):
-            signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+    async def run_interactive():
+        bus_task = asyncio.create_task(agent_loop.run())
+        turn_done = asyncio.Event()
+        turn_done.set()
+        turn_response: list[str] = []
+        turn_skills: set[str] = set()
 
-        async def run_interactive():
-            bus_task = asyncio.create_task(agent_loop.run())
-            turn_done = asyncio.Event()
-            turn_done.set()
-            turn_response: list[str] = []
-            turn_skills: set[str] = set()
-
-            async def _consume_outbound():
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-                        if msg.metadata.get("_audit_only"):
-                            if verbose_mode and msg.metadata.get("_audit_event") == "skill_invoked":
-                                details = msg.metadata.get("_audit_details") or {}
-                                if isinstance(details, dict):
-                                    skill_name = str(details.get("skill_name", "") or "").strip()
-                                    if skill_name:
-                                        turn_skills.add(skill_name)
-                                        console.print(f"  [cyan]↳ skill:[/cyan] {skill_name}")
-                            continue
-                        if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
-                            ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
-                                pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
-                                pass
-                            else:
-                                console.print(f"  [dim]↳ {msg.content}[/dim]")
-                        elif not turn_done.is_set():
-                            if msg.content:
-                                turn_response.append(msg.content)
-                            turn_done.set()
-                        elif msg.content:
-                            console.print()
-                            _print_agent_response(msg.content, render_markdown=markdown)
-                    except asyncio.TimeoutError:
+        async def _consume_outbound():
+            while True:
+                try:
+                    msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+                    if msg.metadata.get("_audit_only"):
+                        if verbose_mode and msg.metadata.get("_audit_event") == "skill_invoked":
+                            details = msg.metadata.get("_audit_details") or {}
+                            if isinstance(details, dict):
+                                skill_name = str(details.get("skill_name", "") or "").strip()
+                                if skill_name:
+                                    turn_skills.add(skill_name)
+                                    console.print(f"  [cyan]↳ skill:[/cyan] {skill_name}")
                         continue
-                    except asyncio.CancelledError:
-                        break
+                    if msg.metadata.get("_progress"):
+                        is_tool_hint = msg.metadata.get("_tool_hint", False)
+                        ch = agent_loop.channels_config
+                        if ch and is_tool_hint and not ch.send_tool_hints:
+                            pass
+                        elif ch and not is_tool_hint and not ch.send_progress:
+                            pass
+                        else:
+                            console.print(f"  [dim]↳ {msg.content}[/dim]")
+                    elif not turn_done.is_set():
+                        if msg.content:
+                            turn_response.append(msg.content)
+                        turn_done.set()
+                    elif msg.content:
+                        console.print()
+                        _print_agent_response(msg.content, render_markdown=markdown)
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    break
 
-            outbound_task = asyncio.create_task(_consume_outbound())
+        outbound_task = asyncio.create_task(_consume_outbound())
 
-            try:
-                while True:
-                    try:
-                        _flush_pending_tty_input()
-                        user_input = await _read_interactive_input_async()
-                        command = user_input.strip()
-                        if not command:
-                            continue
+        try:
+            while True:
+                try:
+                    _flush_pending_tty_input()
+                    user_input = await _read_interactive_input_async()
+                    command = user_input.strip()
+                    if not command:
+                        continue
 
-                        if _is_exit_command(command):
-                            _restore_terminal()
-                            console.print("\nGoodbye!")
-                            break
-
-                        turn_done.clear()
-                        turn_response.clear()
-                        turn_skills.clear()
-
-                        await bus.publish_inbound(InboundMessage(
-                            channel=cli_channel,
-                            sender_id="user",
-                            chat_id=cli_chat_id,
-                            content=user_input,
-                            metadata={"_emit_skill_audit": True} if verbose_mode else {},
-                        ))
-
-                        with _thinking_ctx():
-                            await turn_done.wait()
-
-                        if turn_response:
-                            _print_agent_response(turn_response[0], render_markdown=markdown)
-                        if verbose_mode:
-                            used = ", ".join(sorted(turn_skills)) if turn_skills else "none"
-                            console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
-                    except KeyboardInterrupt:
+                    if _is_exit_command(command):
                         _restore_terminal()
                         console.print("\nGoodbye!")
                         break
-                    except EOFError:
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
-            finally:
-                agent_loop.stop()
-                outbound_task.cancel()
-                await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.close_mcp()
 
-        asyncio.run(run_interactive())
+                    turn_done.clear()
+                    turn_response.clear()
+                    turn_skills.clear()
+
+                    turn_metadata = dict(inbound_metadata)
+                    if verbose_mode:
+                        turn_metadata["_emit_skill_audit"] = True
+
+                    await bus.publish_inbound(InboundMessage(
+                        channel=cli_channel,
+                        sender_id="user",
+                        chat_id=cli_chat_id,
+                        content=user_input,
+                        metadata=turn_metadata,
+                    ))
+
+                    with _thinking_ctx():
+                        await turn_done.wait()
+
+                    if turn_response:
+                        _print_agent_response(turn_response[0], render_markdown=markdown)
+                    if verbose_mode:
+                        used = ", ".join(sorted(turn_skills)) if turn_skills else "none"
+                        console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
+                except KeyboardInterrupt:
+                    _restore_terminal()
+                    console.print("\nGoodbye!")
+                    break
+                except EOFError:
+                    _restore_terminal()
+                    console.print("\nGoodbye!")
+                    break
+        finally:
+            agent_loop.stop()
+            outbound_task.cancel()
+            await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
+            await agent_loop.close_mcp()
+
+    asyncio.run(run_interactive())
+
+
+def _build_research_inbound_metadata(
+    *,
+    mode: str,
+    profile: str,
+    max_tokens: int | None,
+    max_experiments: int | None,
+    project_dir: str | None,
+) -> dict[str, object]:
+    """Translate ``mira research`` flags into InboundMessage.metadata fields."""
+    metadata: dict[str, object] = {
+        "run_mode": mode,
+        "agent_profile": profile,
+    }
+    automation_policy: dict[str, object] = {}
+    if max_tokens is not None:
+        automation_policy["maxTokens"] = max_tokens
+    if max_experiments is not None:
+        automation_policy["maxExperiments"] = max_experiments
+    if automation_policy:
+        # Preserve the goals/logic shape expected by ResearchAgentLoop's
+        # parser even when only thresholds are specified.
+        automation_policy.setdefault("logic", "AND")
+        automation_policy.setdefault("goals", [])
+        metadata["automation_policy"] = automation_policy
+    if project_dir:
+        metadata["project_dir"] = project_dir
+    return metadata
+
+
+@app.command()
+def agent(
+    message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
+    session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
+    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show mira runtime logs during chat"),
+    verbose: bool = typer.Option(False, "--verbose/--no-verbose", help="Show verbose runtime hints (including invoked skills)"),
+    debug: bool = typer.Option(False, "--debug/--no-debug", help="Alias of --verbose"),
+):
+    """Interact with the general-purpose agent (no research orchestration)."""
+    from loguru import logger
+
+    from mira_engine.agent.base_loop import BaseAgentLoop
+    from mira_engine.bus.queue import MessageBus
+    from mira_engine.cron.service import CronService
+
+    if workspace is None and sys.stdin.isatty():
+        if typer.confirm("Do you want to use the current directory as a project workspace?"):
+            workspace = os.getcwd()
+
+    config = _load_runtime_config(config, workspace)
+
+    from mira_engine.utils.env import auto_activate_env
+    auto_activate_env(config.workspace_path)
+
+    sync_workspace_templates(config.workspace_path)
+
+    bus = MessageBus()
+    provider = _make_provider(config)
+    model_router = ModelRouter(config.agents.defaults)
+
+    cron_store_path = _workspace_cron_store(config)
+    cron = CronService(cron_store_path)
+
+    verbose_mode = verbose or debug
+    # In interactive chat, verbose output is more stable than raw runtime logs.
+    # Keep --debug useful (skill/tool visibility) without TTY log interleaving.
+    logs_mode = logs or (debug and message is not None)
+
+    if logs_mode:
+        logger.enable("mira")
+    else:
+        logger.disable("mira")
+
+    agent_loop = BaseAgentLoop(
+        **_build_agent_loop_kwargs(
+            bus=bus,
+            provider=provider,
+            config=config,
+            cron_service=cron,
+            model_router=model_router,
+        ),
+    )
+
+    _run_cli_agent_session(
+        agent_loop=agent_loop,
+        bus=bus,
+        message=message,
+        session_id=session_id,
+        markdown=markdown,
+        verbose_mode=verbose_mode,
+        logs_mode=logs_mode,
+        inbound_metadata=None,
+    )
+
+
+@app.command()
+def research(
+    message: str = typer.Option(None, "--message", help="Message to send to the research agent"),
+    session_id: str = typer.Option("cli:research", "--session", "-s", help="Session ID"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    mode: str = typer.Option(
+        "manual",
+        "--mode",
+        "-m",
+        case_sensitive=False,
+        help="Run mode: manual | auto. (auto-continue rounds are honoured by the web channel.)",
+    ),
+    profile: str = typer.Option(
+        "default",
+        "--profile",
+        "-p",
+        case_sensitive=False,
+        help="Agent profile: default | engineer | research. Selects AGENTS_*.md bootstrap.",
+    ),
+    max_tokens: int | None = typer.Option(
+        None,
+        "--max-tokens",
+        help="Automation policy: stop auto loop when cumulative session tokens exceed this budget.",
+    ),
+    max_experiments: int | None = typer.Option(
+        None,
+        "--max-experiments",
+        help="Automation policy: stop auto loop after N completed experiments.",
+    ),
+    project_dir: str | None = typer.Option(
+        None,
+        "--project-dir",
+        help="Optional research project directory (forwarded as metadata.project_dir).",
+    ),
+    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
+    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show mira runtime logs during chat"),
+    verbose: bool = typer.Option(False, "--verbose/--no-verbose", help="Show verbose runtime hints (including invoked skills)"),
+    debug: bool = typer.Option(False, "--debug/--no-debug", help="Alias of --verbose"),
+):
+    """Interact with the research-flavoured agent (auto-mode, profiles, contracts)."""
+    from loguru import logger
+
+    from mira_engine.agent.research_loop import ResearchAgentLoop
+    from mira_engine.bus.queue import MessageBus
+    from mira_engine.cron.service import CronService
+
+    mode_value = (mode or "manual").strip().lower()
+    if mode_value not in {"manual", "auto"}:
+        console.print(
+            f"[red]Invalid --mode value: {mode!r}. Expected one of: manual, auto.[/red]"
+        )
+        raise typer.Exit(1)
+    profile_value = (profile or "default").strip().lower()
+    if profile_value not in {"default", "engineer", "research"}:
+        console.print(
+            f"[red]Invalid --profile value: {profile!r}. "
+            "Expected one of: default, engineer, research.[/red]"
+        )
+        raise typer.Exit(1)
+    if max_tokens is not None and max_tokens <= 0:
+        console.print("[red]--max-tokens must be a positive integer.[/red]")
+        raise typer.Exit(1)
+    if max_experiments is not None and max_experiments <= 0:
+        console.print("[red]--max-experiments must be a positive integer.[/red]")
+        raise typer.Exit(1)
+
+    if workspace is None and sys.stdin.isatty():
+        if typer.confirm("Do you want to use the current directory as a project workspace?"):
+            workspace = os.getcwd()
+
+    config = _load_runtime_config(config, workspace)
+
+    from mira_engine.utils.env import auto_activate_env
+    auto_activate_env(config.workspace_path)
+
+    sync_workspace_templates(config.workspace_path)
+
+    bus = MessageBus()
+    provider = _make_provider(config)
+    model_router = ModelRouter(config.agents.defaults)
+
+    cron_store_path = _workspace_cron_store(config)
+    cron = CronService(cron_store_path)
+
+    verbose_mode = verbose or debug
+    logs_mode = logs or (debug and message is not None)
+    if logs_mode:
+        logger.enable("mira")
+    else:
+        logger.disable("mira")
+
+    agent_loop = ResearchAgentLoop(
+        **_build_agent_loop_kwargs(
+            bus=bus,
+            provider=provider,
+            config=config,
+            cron_service=cron,
+            model_router=model_router,
+        ),
+    )
+
+    inbound_metadata = _build_research_inbound_metadata(
+        mode=mode_value,
+        profile=profile_value,
+        max_tokens=max_tokens,
+        max_experiments=max_experiments,
+        project_dir=project_dir,
+    )
+
+    banner = (
+        f"{__logo__} Research mode "
+        f"(mode=[bold]{mode_value}[/bold], profile=[bold]{profile_value}[/bold]) "
+        "(type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+    )
+    _run_cli_agent_session(
+        agent_loop=agent_loop,
+        bus=bus,
+        message=message,
+        session_id=session_id,
+        markdown=markdown,
+        verbose_mode=verbose_mode,
+        logs_mode=logs_mode,
+        inbound_metadata=inbound_metadata,
+        interactive_banner=banner,
+    )
 
 
 # ============================================================================
