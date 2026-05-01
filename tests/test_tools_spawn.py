@@ -32,10 +32,10 @@ async def test_spawn_tool_execute_uses_default_context() -> None:
 async def test_spawn_tool_execute_uses_updated_context_and_label() -> None:
     manager = _FakeManager()
     tool = SpawnTool(manager)
-    tool.set_context("web", "PRJ-2")
+    tool.set_context("ui", "PRJ-2")
     await tool.execute(task="build", label="Batch")
     call = manager.calls[0]
-    assert call["origin_channel"] == "web"
+    assert call["origin_channel"] == "ui"
     assert call["origin_chat_id"] == "PRJ-2"
-    assert call["session_key"] == "web:PRJ-2"
+    assert call["session_key"] == "ui:PRJ-2"
     assert call["label"] == "Batch"

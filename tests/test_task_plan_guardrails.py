@@ -349,6 +349,67 @@ def test_guard_task_plan_auto_fixes_duplicate_experiment_ids(tmp_path: Path) -> 
     assert len(ids) == len(set(ids))
 
 
+def test_guard_task_plan_keeps_project_in_progress_without_final_result(tmp_path: Path) -> None:
+    project_dir = tmp_path / "PRJ-0003A"
+    project_dir.mkdir(parents=True)
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "completed too early",
+                "status": "completed",
+                "experiments": [
+                    {
+                        "id": "Exp001",
+                        "title": "done",
+                        "status": "completed",
+                        "conclusion": "Finished analysis but no export was requested.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=True)
+    assert result["ok"] is True
+    assert result["fixed"] is True
+
+    repaired = json.loads((project_dir / "task_plan.json").read_text(encoding="utf-8"))
+    assert repaired["status"] == "in_progress"
+
+
+def test_guard_task_plan_reopens_completed_project_when_pending_work_exists(tmp_path: Path) -> None:
+    project_dir = tmp_path / "PRJ-0003AA"
+    project_dir.mkdir(parents=True)
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "replanned after export",
+                "status": "completed",
+                "current_experiment": "Exp001",
+                "experiments": [
+                    {"id": "Exp001", "title": "done", "status": "completed", "conclusion": "done"},
+                    {"id": "Exp002", "title": "next", "status": "pending"},
+                ],
+                "result": {
+                    "output_path": "result/report.md",
+                    "output_type": "report",
+                    "summary": "A prior export exists.",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=True)
+    assert result["ok"] is True
+    assert result["fixed"] is True
+
+    repaired = json.loads((project_dir / "task_plan.json").read_text(encoding="utf-8"))
+    assert repaired["status"] == "in_progress"
+    assert repaired["current_experiment"] == "Exp002"
+
+
 def test_guard_task_plan_allows_existing_noncanonical_artifacts(tmp_path: Path) -> None:
     project_dir = tmp_path / "PRJ-0003B"
     (project_dir / "data").mkdir(parents=True)

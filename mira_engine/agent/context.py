@@ -123,7 +123,7 @@ class ContextBuilder:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
             if project_dir:
                 lines.append(f"Project Directory: {project_dir}")
-            elif channel == "web":
+            elif channel == "ui":
                 lines.append(f"Project Directory: projects/{chat_id}")
             if run_mode:
                 lines.append(f"Run Mode: {run_mode}")

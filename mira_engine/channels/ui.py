@@ -1,4 +1,12 @@
-"""Web channel – exposes a WebSocket + HTTP API for browser/Electron clients."""
+"""UI channel – exposes a WebSocket + HTTP API for browser/Electron clients.
+
+Historical note: this module was previously named ``web``. It has been renamed
+to ``ui`` to better reflect its purpose (the channel that fronts Mira's
+desktop/browser UI). The underlying transport is still WebSocket + HTTP.
+The ``web`` channel name remains accepted on inbound config and on disk for
+backward compatibility – see ``mira_engine/config/loader.py`` and the
+session-key fallback in :class:`UiChannel`.
+"""
 
 from __future__ import annotations
 
@@ -23,7 +31,7 @@ from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.config import loader as config_loader
 from mira_engine.config.paths import get_runtime_subdir
-from mira_engine.config.schema import WebChannelConfig
+from mira_engine.config.schema import UiChannelConfig
 from mira_engine.config.ui_runtime import apply_ui_runtime_update, build_ui_runtime_payload
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
@@ -41,13 +49,40 @@ PROJECT_META_DEFAULT_RUN_MODE = "auto"
 PROJECT_META_DEFAULT_AGENT_PROFILE = "default"
 PROJECT_META_DEFAULT_CONTRACT_VERSION = 1
 PROJECT_META_STRICT_CONTRACT_VERSION = 2
-_ASSETS_DIR = Path(__file__).parent / "web_assets"
+_ASSETS_DIR = Path(__file__).parent / "ui_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".mira") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
 _PROJECT_EXPERIMENT_SNAPSHOT_REL_DIR = Path(".mira") / "snapshots" / "experiments"
 _PROJECT_DIR_INDEX_FILENAME = "project-dirs.json"
 _RECOVERED_CONCLUSION_PLACEHOLDER = "Recovered completed experiment artifacts from workspace."
 _API_CONTRACT_VERSION = "v1"
+
+
+def _resolve_project_dir_index_path() -> Path:
+    """Locate the project-dirs index file, migrating from the legacy ``web`` dir.
+
+    Until v0.4 the UI channel stored its project-dir index under
+    ``~/.mira/runtime/web/project-dirs.json``. After the channel was renamed to
+    ``ui`` we prefer ``~/.mira/runtime/ui/project-dirs.json`` but transparently
+    migrate any pre-existing legacy file so users keep their project list.
+    """
+    new_path = get_runtime_subdir("ui") / _PROJECT_DIR_INDEX_FILENAME
+    if new_path.exists():
+        return new_path
+    legacy_path = get_runtime_subdir("web") / _PROJECT_DIR_INDEX_FILENAME
+    if legacy_path.exists():
+        try:
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy_path), str(new_path))
+            logger.info(
+                "Migrated UI channel project-dir index from {} to {}",
+                legacy_path,
+                new_path,
+            )
+        except Exception:
+            logger.exception("Failed to migrate legacy project-dir index")
+            return legacy_path
+    return new_path
 
 
 def _load_ui_instructions() -> str:
@@ -445,14 +480,14 @@ def _merge_recovered_results(existing: Any, recovered_metrics: Any, artifacts: l
     return results
 
 
-class WebChannel(BaseChannel):
-    """WebSocket + REST channel for frontend clients."""
+class UiChannel(BaseChannel):
+    """WebSocket + REST channel for frontend clients (desktop/browser UI)."""
 
-    name = "web"
+    name = "ui"
 
     def __init__(
         self,
-        config: WebChannelConfig,
+        config: UiChannelConfig,
         bus: MessageBus,
         workspace: Path | None = None,
         bind_host: str | None = None,
@@ -460,7 +495,7 @@ class WebChannel(BaseChannel):
         restrict_to_workspace: bool = True,
     ):
         super().__init__(config, bus)
-        self.config: WebChannelConfig = config
+        self.config: UiChannelConfig = config
         self.workspace: Path | None = workspace
         legacy_host = getattr(config, "host", None)
         legacy_port = getattr(config, "port", None)
@@ -474,9 +509,7 @@ class WebChannel(BaseChannel):
         self.restrict_to_workspace: bool = restrict_to_workspace
         default_root = workspace or Path("~/.mira/workspace")
         self.projects_root: Path = default_root.expanduser().resolve()
-        self._project_dir_index_path: Path = (
-            get_runtime_subdir("web") / _PROJECT_DIR_INDEX_FILENAME
-        )
+        self._project_dir_index_path: Path = _resolve_project_dir_index_path()
         self._project_dirs: dict[str, Path] = {}
         self._known_project_roots: set[Path] = {self.projects_root}
         self._boot_ts: float = time.monotonic()
@@ -511,9 +544,9 @@ class WebChannel(BaseChannel):
         safe: dict[str, Any] = {}
         for key, value in details.items():
             if isinstance(value, (str, int, float, bool)) or value is None:
-                safe[key] = value if not isinstance(value, str) else WebChannel._preview(value, limit=500)
+                safe[key] = value if not isinstance(value, str) else UiChannel._preview(value, limit=500)
             else:
-                safe[key] = WebChannel._preview(value, limit=500)
+                safe[key] = UiChannel._preview(value, limit=500)
         return safe
 
     @staticmethod
@@ -811,7 +844,7 @@ class WebChannel(BaseChannel):
         await self._site.start()
         self._running = True
         logger.info(
-            "Web channel listening on {}:{}",
+            "UI channel listening on {}:{} (WebSocket + HTTP)",
             self.bind_host,
             self.bind_port,
         )
@@ -837,7 +870,7 @@ class WebChannel(BaseChannel):
             await self._runner.cleanup()
             self._runner = None
         self._app = None
-        logger.info("Web channel stopped")
+        logger.info("UI channel stopped")
 
     async def send(self, msg: OutboundMessage) -> None:
         metadata = msg.metadata or {}
@@ -864,7 +897,7 @@ class WebChannel(BaseChannel):
         project_dir = self._resolve_project_dir(msg.chat_id) if msg.chat_id else None
         if project_dir and project_dir.is_dir():
             SessionManager(project_dir).append_ui_event(
-                key=f"web:{msg.chat_id}",
+                key=f"ui:{msg.chat_id}",
                 role="assistant",
                 content=msg.content,
                 msg_type=msg_type,
@@ -1178,14 +1211,14 @@ class WebChannel(BaseChannel):
                     },
                 )
                 SessionManager(project_dir_path).append_ui_event(
-                    key=f"web:{session_id}",
+                    key=f"ui:{session_id}",
                     role="user",
                     content=content,
                     msg_type="response",
                     metadata={"_user": True},
                 )
                 metadata: dict[str, Any] = {
-                    "source": "web",
+                    "source": "ui",
                     "project_dir": project_dir,
                     "run_mode": run_mode,
                     "agent_profile": agent_profile,
@@ -1206,7 +1239,7 @@ class WebChannel(BaseChannel):
                     content=content,
                     media=media,
                     metadata=metadata,
-                    session_key=f"web:{session_id}",
+                    session_key=f"ui:{session_id}",
                 )
             elif msg_type == "set_mode":
                 session_id = data.get("session_id", session_id)
@@ -1240,7 +1273,7 @@ class WebChannel(BaseChannel):
                     },
                 )
                 metadata = {
-                    "source": "web",
+                    "source": "ui",
                     "project_dir": project_dir,
                     "run_mode": run_mode,
                     "_control": "set_mode",
@@ -1251,7 +1284,7 @@ class WebChannel(BaseChannel):
                     content="__set_mode__",
                     media=[],
                     metadata=metadata,
-                    session_key=f"web:{session_id}",
+                    session_key=f"ui:{session_id}",
                 )
             elif msg_type == "bind":
                 session_id = data.get("session_id", session_id)
@@ -1382,7 +1415,7 @@ class WebChannel(BaseChannel):
             return []
 
         manager = SessionManager(project_dir)
-        session_key = f"web:{session_id}"
+        session_key = f"ui:{session_id}"
         session = manager.get_or_create(session_key)
         ui_entries = manager.get_ui_history(session_key)
         merged: list[dict[str, Any]] = list(ui_entries)
