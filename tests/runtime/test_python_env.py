@@ -180,6 +180,118 @@ class TestDetectUv:
         assert captured == {"name": "uv", "path": "/opt/embedded"}
 
 
+class TestDetectUvBundledFallback:
+    """``sys._MEIPASS`` / ``sys.executable``-relative discovery for PyInstaller."""
+
+    def _stub_run(self, monkeypatch: pytest.MonkeyPatch, version: str) -> list[str]:
+        """Make every uv invocation report ``version``. Returns the list that
+        records the binary path each call used."""
+        calls: list[str] = []
+
+        def _fake_run(args, **kwargs):
+            calls.append(args[0])
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=f"uv {version}\n", stderr=""
+            )
+
+        monkeypatch.setattr(python_env.subprocess, "run", _fake_run)
+        return calls
+
+    def test_meipass_binary_preferred_over_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(python_env.sys, "platform", "linux")
+        meipass = tmp_path / "_MEIxxx"
+        meipass.mkdir()
+        bundled = meipass / "uv"
+        bundled.touch()
+        monkeypatch.setattr(python_env.sys, "_MEIPASS", str(meipass), raising=False)
+
+        path_hit = tmp_path / "system" / "uv"
+        path_hit.parent.mkdir()
+        path_hit.touch()
+        monkeypatch.setattr(python_env.shutil, "which", lambda *_a, **_k: str(path_hit))
+
+        calls = self._stub_run(monkeypatch, "0.5.4")
+        result = detect_uv()
+        assert result is not None
+        assert result.path == bundled
+        # Only the bundled candidate was probed; PATH discovery was skipped.
+        assert calls == [str(bundled)]
+
+    def test_falls_back_to_path_when_bundled_too_old(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(python_env.sys, "platform", "linux")
+        meipass = tmp_path / "_MEIxxx"
+        meipass.mkdir()
+        bundled = meipass / "uv"
+        bundled.touch()
+        monkeypatch.setattr(python_env.sys, "_MEIPASS", str(meipass), raising=False)
+
+        path_hit = tmp_path / "system" / "uv"
+        path_hit.parent.mkdir()
+        path_hit.touch()
+        monkeypatch.setattr(python_env.shutil, "which", lambda *_a, **_k: str(path_hit))
+
+        # Bundled returns 0.4.0 (too old), path version is fresh.
+        versions = {str(bundled): "0.4.0", str(path_hit): "0.5.4"}
+        observed: list[str] = []
+
+        def _fake_run(args, **kwargs):
+            observed.append(args[0])
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=f"uv {versions[args[0]]}\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(python_env.subprocess, "run", _fake_run)
+        result = detect_uv()
+        assert result is not None
+        assert result.path == path_hit
+        assert observed == [str(bundled), str(path_hit)]
+
+    def test_executable_dir_fallback_when_frozen_without_meipass(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Folder-mode PyInstaller bundles (no ``_MEIPASS``) still find uv."""
+        monkeypatch.setattr(python_env.sys, "platform", "linux")
+        monkeypatch.setattr(python_env.sys, "frozen", True, raising=False)
+        # No _MEIPASS attribute at all.
+        monkeypatch.delattr(python_env.sys, "_MEIPASS", raising=False)
+        exe = tmp_path / "mira-engine"
+        exe.touch()
+        monkeypatch.setattr(python_env.sys, "executable", str(exe))
+        bundled = tmp_path / "uv"
+        bundled.touch()
+
+        monkeypatch.setattr(python_env.shutil, "which", lambda *_a, **_k: None)
+        self._stub_run(monkeypatch, "0.5.4")
+        result = detect_uv()
+        assert result is not None
+        assert result.path == bundled
+
+    def test_no_bundle_detection_when_not_frozen(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A spurious ``uv`` next to ``sys.executable`` mustn't be picked up
+        when the engine is running from a regular Python install."""
+        monkeypatch.setattr(python_env.sys, "platform", "linux")
+        monkeypatch.delattr(python_env.sys, "_MEIPASS", raising=False)
+        # frozen is normally False, ensure it stays that way.
+        if hasattr(python_env.sys, "frozen"):
+            monkeypatch.delattr(python_env.sys, "frozen", raising=False)
+        decoy = tmp_path / "uv"
+        decoy.touch()
+        monkeypatch.setattr(python_env.sys, "executable", str(tmp_path / "python"))
+
+        monkeypatch.setattr(python_env.shutil, "which", lambda *_a, **_k: None)
+        self._stub_run(monkeypatch, "0.5.4")
+        assert detect_uv() is None
+
+
 # ---------------------------------------------------------------------------
 # ensure_project_venv
 # ---------------------------------------------------------------------------
