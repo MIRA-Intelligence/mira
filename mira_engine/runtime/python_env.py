@@ -80,17 +80,64 @@ class UvBinary:
 # ---------------------------------------------------------------------------
 
 
-def detect_uv(*, search_path: str | None = None) -> UvBinary | None:
-    """Return the first usable ``uv`` on ``$PATH`` (or ``search_path``).
+def _bundled_uv_candidates() -> list[Path]:
+    """Probe well-known locations where a PyInstaller bundle stashes ``uv``.
 
-    A binary is considered "usable" if ``uv --version`` exits 0 and
-    reports a version >= :data:`MIN_UV_VERSION`. Older binaries are
-    rejected — caller should surface a friendly upgrade hint rather than
-    silently falling back.
+    Returns an ordered list of ``Path`` objects, each of which **may or may
+    not exist**. Callers should test each with :meth:`Path.is_file` before
+    invoking it. The order is deliberate: the one-file ``sys._MEIPASS``
+    extraction directory is tried before any sibling-of-executable path
+    because the former is the canonical location written by PyInstaller's
+    ``binaries=[(uv, '.')]`` directive.
     """
-    binary = shutil.which("uv", path=search_path)
-    if not binary:
-        return None
+    candidates: list[Path] = []
+    name = "uv.exe" if sys.platform == "win32" else "uv"
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / name)
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / name)
+        candidates.append(exe_dir / "_internal" / name)
+
+    return candidates
+
+
+def detect_uv(*, search_path: str | None = None) -> UvBinary | None:
+    """Return the first usable ``uv``.
+
+    Search order:
+    1. Any candidate stashed inside the running PyInstaller bundle
+       (``sys._MEIPASS`` or alongside ``sys.executable``). This makes
+       ``uv`` available out of the box for users of the bundled
+       ``mira-engine`` desktop release.
+    2. ``shutil.which("uv", path=search_path)`` — PATH-based discovery
+       for source / pip installs.
+
+    A candidate is considered "usable" if ``uv --version`` exits 0 and
+    reports a version >= :data:`MIN_UV_VERSION`. Older binaries are
+    rejected — the caller should surface a friendly upgrade hint rather
+    than silently falling back.
+    """
+    candidates: list[str] = []
+    for candidate in _bundled_uv_candidates():
+        if candidate.is_file():
+            candidates.append(str(candidate))
+
+    path_hit = shutil.which("uv", path=search_path)
+    if path_hit:
+        candidates.append(path_hit)
+
+    for binary in candidates:
+        result = _query_uv_version(binary)
+        if result is not None:
+            return result
+    return None
+
+
+def _query_uv_version(binary: str) -> UvBinary | None:
     try:
         result = subprocess.run(
             [binary, "--version"],

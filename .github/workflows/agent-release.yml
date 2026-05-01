@@ -43,6 +43,10 @@ jobs:
       - name: Run tests
         run: python -m pytest tests -q
 
+      - name: Fetch bundled uv binary
+        shell: bash
+        run: python scripts/fetch_uv.py --target host
+
       - name: Build wheel and sdist (linux only)
         if: matrix.os == 'ubuntu-latest'
         run: python -m build
