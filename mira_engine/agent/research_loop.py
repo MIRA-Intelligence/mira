@@ -123,10 +123,29 @@ class ResearchAgentLoop(BaseAgentLoop):
         if not isinstance(max_tokens, int) or max_tokens <= 0:
             max_tokens = None
 
-        if not goals and max_experiments is None and max_tokens is None:
+        # ``strictHeuristics`` (default True) lets long-running auto sessions
+        # opt out of the user-input / failure keyword heuristics when only
+        # hard guards (max rounds / max tokens / max experiments / explicit
+        # tool failures) should decide when to stop. We track whether the
+        # caller set the field so we can persist the policy even when no
+        # other goals/budgets are configured.
+        strict_raw = value.get("strictHeuristics")
+        strict_explicit = isinstance(strict_raw, bool)
+        strict_heuristics = strict_raw if strict_explicit else True
+
+        if (
+            not goals
+            and max_experiments is None
+            and max_tokens is None
+            and not strict_explicit
+        ):
             return None
 
-        parsed: dict[str, Any] = {"logic": logic, "goals": goals}
+        parsed: dict[str, Any] = {
+            "logic": logic,
+            "goals": goals,
+            "strictHeuristics": strict_heuristics,
+        }
         if max_experiments is not None:
             parsed["maxExperiments"] = max_experiments
         if max_tokens is not None:
@@ -179,6 +198,22 @@ class ResearchAgentLoop(BaseAgentLoop):
         return None
 
     @staticmethod
+    def _strict_heuristics_from_policy(policy: dict[str, Any] | None) -> bool:
+        """Return whether the user-input / failure heuristics should fire.
+
+        Defaults to True (current behaviour). Setting
+        ``automation_policy.strictHeuristics = false`` lets a long auto run
+        rely solely on hard guards (round / experiment / token budgets and
+        explicit tool failures), which matters when the model's natural
+        prose keeps tripping the keyword heuristics.
+        """
+        if isinstance(policy, dict):
+            value = policy.get("strictHeuristics")
+            if isinstance(value, bool):
+                return value
+        return True
+
+    @staticmethod
     def _agent_profile_to_agents_filename(profile: str) -> str:
         """Map profile to its AGENTS bootstrap file."""
         if profile == "engineer":
@@ -191,39 +226,76 @@ class ResearchAgentLoop(BaseAgentLoop):
     # Heuristic content classifiers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _looks_like_user_input_request(text: str | None) -> bool:
-        """Heuristic: detect when assistant explicitly needs user input."""
+    # Closing-paragraph window used by the user-input / failure heuristics.
+    # A genuine "blocked, please advise" message almost always lands in the
+    # last paragraph of the assistant turn; matching mid-text was the main
+    # source of false positives in auto mode where the model would casually
+    # mention "could you" / "请确认" inside a summary and the loop would
+    # treat that as a hard stop.
+    _AUTO_HEURISTIC_TAIL_CHARS = 600
+
+    @classmethod
+    def _heuristic_tail(cls, text: str) -> str:
+        """Return the closing window of ``text`` used by stop heuristics."""
+        last_block = text.rsplit("\n\n", 1)[-1]
+        if len(last_block) > cls._AUTO_HEURISTIC_TAIL_CHARS:
+            return last_block[-cls._AUTO_HEURISTIC_TAIL_CHARS:]
+        return last_block
+
+    @classmethod
+    def _looks_like_user_input_request(cls, text: str | None) -> bool:
+        """Heuristic: detect when the assistant explicitly needs user input.
+
+        Tightened in PR 1: only inspects the closing paragraph and uses a
+        conservative keyword list. Generic phrases like ``could you`` /
+        ``clarify`` / ``需要你`` appearing in mid-response prose are NOT
+        halts — they used to over-trigger and stop auto mode for no reason.
+        """
         if not text:
             return False
-        lowered = text.lower()
+        tail = cls._heuristic_tail(text).lower()
         keywords = (
-            "please provide",
+            # English: explicit asks, deliberately conservative.
             "please confirm",
             "please choose",
-            "could you",
+            "please provide",
+            "could you provide",
+            "could you confirm",
             "can you provide",
-            "which option",
-            "clarify",
             "need your input",
+            "awaiting your input",
+            "awaiting your confirmation",
             "what would you like to do next",
-            "需要你",
+            "shall i proceed",
+            "should i proceed",
+            "do you want me to",
+            # Chinese: keep only phrasings that genuinely block on the user.
             "请提供",
             "请确认",
             "请选择",
             "是否继续",
             "是否开始",
             "是否要我",
-            "要我现在",
+            "等待你的确认",
+            "等待用户",
         )
-        return any(k in lowered for k in keywords)
+        return any(k in tail for k in keywords)
 
-    @staticmethod
-    def _looks_like_failure_response(text: str | None) -> bool:
-        """Heuristic: detect blocking errors where auto should stop.
+    @classmethod
+    def _looks_like_failure_response(cls, text: str | None) -> bool:
+        """Heuristic: detect blocking system errors where auto should stop.
 
-        IMPORTANT: Do not treat ordinary experiment outcomes like "hypothesis failed"
-        as blocking failures. We only stop on explicit runtime/system blockage.
+        Tightened in PR 1: we only stop on errors that the agent surface
+        itself cannot recover from (tracebacks bubbled to the assistant,
+        memory archival failure, tool-call failure, and explicit "I can't
+        continue" verdicts in the closing paragraph).
+
+        Ordinary experiment-level signals MUST NOT trigger here:
+        - ``exit code:`` / ``module not found`` / ``no such file or
+          directory`` / ``permission denied`` legitimately appear in stdout
+          dumps and in analysis text while the model is debugging.
+        - ``hypothesis failed`` / ``实验失败`` / ``出现错误`` are valid
+          experiment outcomes that auto mode should keep iterating on.
         """
         if not text:
             return False
@@ -232,25 +304,22 @@ class ResearchAgentLoop(BaseAgentLoop):
             "traceback (most recent call last)",
             "sorry, i encountered an error",
             "memory archival failed",
-            "command timed out",
-            "exit code:",
-            "permission denied",
-            "no such file or directory",
-            "module not found",
-            "failed to connect",
-            "failed to load",
             "tool call failed",
-            "unrecoverable",
-            "blocked by",
+            "unrecoverable error",
             "无法继续",
-            "出现错误",
-            "运行时错误",
         )
         if any(k in lowered for k in hard_signals):
             return True
-        if lowered.startswith("error:") or "\nerror:" in lowered:
-            return True
-        return False
+        tail = cls._heuristic_tail(text).lower()
+        soft_signals = (
+            "i'm unable to proceed",
+            "i am unable to proceed",
+            "cannot proceed because",
+            "cannot continue because",
+            "i cannot continue",
+            "blocked by ",
+        )
+        return any(k in tail for k in soft_signals)
 
     # ------------------------------------------------------------------
     # task_plan loaders / inspectors
@@ -790,9 +859,10 @@ class ResearchAgentLoop(BaseAgentLoop):
         if auto_round >= self._AUTO_MAX_ROUNDS:
             logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
             return False
-        if self._looks_like_failure_response(final_content):
+        strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
+        if strict_heuristics and self._looks_like_failure_response(final_content):
             return False
-        if self._looks_like_user_input_request(final_content):
+        if strict_heuristics and self._looks_like_user_input_request(final_content):
             return False
         plan = self._load_task_plan(project_dir)
         if self._plan_has_pending_work(plan):
@@ -1208,12 +1278,16 @@ class ResearchAgentLoop(BaseAgentLoop):
             if not should_continue:
                 guard_issues = list(getattr(self, "_last_task_plan_guard_issues", []))
                 continue_despite_guard = False
+                strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
+                heuristic_block = strict_heuristics and (
+                    self._looks_like_failure_response(final_content)
+                    or self._looks_like_user_input_request(final_content)
+                )
                 if (
                     msg.channel == "ui"
                     and current_mode == "auto"
                     and guard_issues
-                    and not self._looks_like_failure_response(final_content)
-                    and not self._looks_like_user_input_request(final_content)
+                    and not heuristic_block
                 ):
                     if guard_repair_round < self._AUTO_GUARD_REPAIR_MAX:
                         guard_repair_round += 1
