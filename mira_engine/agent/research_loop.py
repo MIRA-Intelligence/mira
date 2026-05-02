@@ -851,7 +851,6 @@ class ResearchAgentLoop(BaseAgentLoop):
     def _evaluate_continuation(
         self,
         *,
-        channel: str,
         run_mode: str,
         project_dir: str | None,
         final_content: str | None,
@@ -865,10 +864,15 @@ class ResearchAgentLoop(BaseAgentLoop):
         Returns ``(should_continue, stop_reason)``. ``stop_reason`` is a short
         machine-readable label suitable for inclusion in progress events so
         the user can tell *why* auto mode stopped without grepping logs.
-        ``stop_reason`` is ``None`` when the loop continues; it is also
-        ``None`` when the call is a silent no-op (non-UI / non-auto channel).
+        ``stop_reason`` is ``None`` when the loop continues, and ``None``
+        when the call is a silent no-op (non-auto run mode).
+
+        Note: there is no longer a channel filter here. ``ResearchAgentLoop``
+        is the only class wiring auto mode in, so any channel reaching this
+        method is by definition the research surface and should be honoured
+        uniformly. The basic agent loop never calls this method.
         """
-        if channel != "ui" or run_mode != "auto":
+        if run_mode != "auto":
             return False, None
         if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
             return False, "task_plan guardrail blocking"
@@ -894,7 +898,6 @@ class ResearchAgentLoop(BaseAgentLoop):
     def _should_continue_auto_ui(
         self,
         *,
-        channel: str,
         run_mode: str,
         project_dir: str | None,
         final_content: str | None,
@@ -905,12 +908,11 @@ class ResearchAgentLoop(BaseAgentLoop):
     ) -> bool:
         """Boolean wrapper around :meth:`_evaluate_continuation`.
 
-        Kept as a thin shim because external tests and call sites already use
-        a plain bool; new code should call ``_evaluate_continuation`` so it
-        can surface ``stop_reason`` in progress events.
+        Name kept for backward compatibility with downstream call sites
+        even though the ``_ui`` suffix is now historical — research auto
+        mode no longer requires the UI channel.
         """
         decision, _ = self._evaluate_continuation(
-            channel=channel,
             run_mode=run_mode,
             project_dir=project_dir,
             final_content=final_content,
@@ -1338,7 +1340,6 @@ class ResearchAgentLoop(BaseAgentLoop):
                     break
 
             should_continue, continuation_reason = self._evaluate_continuation(
-                channel=msg.channel,
                 run_mode=current_mode,
                 project_dir=project_dir,
                 final_content=final_content,
@@ -1348,11 +1349,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                 tokens_used=total_tokens_used,
             )
             if not should_continue:
-                if (
-                    msg.channel == "ui"
-                    and current_mode == "auto"
-                    and continuation_reason
-                ):
+                if current_mode == "auto" and continuation_reason:
                     await progress_cb(
                         f"auto-run stop reason: {continuation_reason}"
                     )

@@ -193,21 +193,20 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert ResearchAgentLoop._running_experiment_ids(loaded) == []
 
     assert loop._should_continue_auto_ui(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
         auto_round=0,
     ) is True
+    # PR 2 follow-up: research auto mode no longer filters on channel — any
+    # channel reaching ResearchAgentLoop is by definition the research surface.
     assert loop._should_continue_auto_ui(
-        channel="cli",
-        run_mode="auto",
+        run_mode="manual",
         project_dir=str(project),
         final_content="all good",
         auto_round=0,
     ) is False
     assert loop._should_continue_auto_ui(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="please confirm",
@@ -221,7 +220,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         {"goals": [], "strictHeuristics": False}
     )
     assert loop._should_continue_auto_ui(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="please confirm",
@@ -229,7 +227,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         automation_policy=relaxed_policy,
     ) is True
     assert loop._should_continue_auto_ui(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="Traceback (most recent call last): ...",
@@ -241,7 +238,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     bad_project.mkdir()
     (bad_project / "task_plan.json").write_text("{", encoding="utf-8")
     assert loop._should_continue_auto_ui(
-        channel="ui",
         run_mode="auto",
         project_dir=str(bad_project),
         final_content="all good",
@@ -268,7 +264,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert loop._should_continue_auto_ui(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
@@ -288,7 +283,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert loop._should_continue_auto_ui(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
@@ -317,7 +311,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert loop._should_continue_auto_ui(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
@@ -341,7 +334,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert loop._should_continue_auto_ui(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
@@ -350,15 +342,13 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
 
     # PR 2: structured stop reasons surface from _evaluate_continuation.
     decision, reason = loop._evaluate_continuation(
-        channel="cli",
-        run_mode="auto",
+        run_mode="manual",
         project_dir=str(project),
         final_content="all good",
         auto_round=0,
     )
-    assert decision is False and reason is None  # silent no-op for non-UI
+    assert decision is False and reason is None  # silent no-op for non-auto
     decision, reason = loop._evaluate_continuation(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
@@ -367,7 +357,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert decision is False
     assert reason is not None and "max rounds reached" in reason
     decision, reason = loop._evaluate_continuation(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="please confirm before continuing",
@@ -376,7 +365,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert decision is False
     assert reason == "user-input heuristic matched"
     decision, reason = loop._evaluate_continuation(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="Tool call failed: provider unreachable.",
@@ -389,7 +377,6 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     decision, reason = loop._evaluate_continuation(
-        channel="ui",
         run_mode="auto",
         project_dir=str(project),
         final_content="all good",
