@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mira_engine.agent.tools.base import Tool
 from mira_engine.agent.tools.bg import (
@@ -18,6 +19,57 @@ from mira_engine.agent.tools.bg import (
 from mira_engine.agent.tools.sandbox import wrap_command
 from mira_engine.config.paths import get_media_dir
 from mira_engine.security.network import contains_internal_url
+
+if TYPE_CHECKING:
+    from mira_engine.config.schema import PythonRuntimeConfig
+
+logger = logging.getLogger(__name__)
+
+_PYTHON_EXECUTABLE_NAMES = frozenset(
+    {"python", "python3", "pip", "pip3", "pytest", "ipython", "jupyter", "uv"}
+)
+_SEGMENT_SEPARATOR_RE = re.compile(r"\s*(?:&&|\|\||[;|])\s*")
+# Strips ``KEY=VAL `` env-var prefixes that appear at the head of a command
+# segment in POSIX shells. Repeated to handle ``A=1 B=2 python x.py``.
+_ENV_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S+\s+")
+
+
+def _is_python_command(command: str) -> bool:
+    """Return True if ``command`` looks like it expects a Python interpreter.
+
+    Detects bare ``python``, ``python3``, ``pip``, ``pytest``, ``ipython``,
+    ``jupyter``, ``uv`` invocations as well as path-prefixed variants
+    (``/usr/bin/python``, ``./venv/bin/python``) and chained commands
+    (``cd foo && python x``, ``activate; pip install .``,
+    ``PYTHONHASHSEED=0 python script.py``). Used to decide whether to
+    lazily bootstrap the project venv before spawning the subprocess.
+
+    Slight over-triggering is acceptable: bootstrap is idempotent and the
+    second invocation short-circuits via :class:`ExecTool._venv_cache`.
+    """
+    if not command:
+        return False
+    for raw_segment in _SEGMENT_SEPARATOR_RE.split(command):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        # Drop any leading ``KEY=VAL`` assignments (one or more).
+        while True:
+            stripped = _ENV_PREFIX_RE.sub("", segment)
+            if stripped == segment:
+                break
+            segment = stripped
+        first_token = segment.split(None, 1)[0] if segment else ""
+        if not first_token:
+            continue
+        # Strip path components: ``/usr/bin/python3`` -> ``python3``.
+        basename = first_token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        # Drop a trailing ``.exe`` so Windows paths still match.
+        if basename.lower().endswith(".exe"):
+            basename = basename[:-4]
+        if basename in _PYTHON_EXECUTABLE_NAMES:
+            return True
+    return False
 
 _IS_WINDOWS = sys.platform == "win32"
 _SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "COOKIE")
@@ -99,6 +151,7 @@ class ExecTool(Tool):
         sandbox: str | None = None,
         background_registry: BackgroundJobRegistry | None = None,
         enable_background: bool = False,
+        python_runtime: "PythonRuntimeConfig | None" = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -108,6 +161,15 @@ class ExecTool(Tool):
         # context that has no companion ``bg`` tool to inspect them.
         self.background_registry = background_registry
         self.enable_background = enable_background and background_registry is not None
+        # Per-project Python runtime config. ``None`` and ``manager == "off"``
+        # both mean "do not manage venvs"; the tool resolves ``python`` against
+        # the parent process environment exactly like before.
+        self.python_runtime = python_runtime
+        # Per-project venv cache: working_dir -> resolved venv path (or None
+        # to mean "bootstrap was attempted and failed; do not retry"). Keeps
+        # the bootstrap subprocess off the hot path for repeated commands.
+        self._venv_cache: dict[str, Path | None] = {}
+        self._venv_cache_lock = asyncio.Lock()
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
@@ -199,7 +261,10 @@ class ExecTool(Tool):
                     "the main loop where the `bg` tool is available."
                 )
 
+        venv = await self._maybe_bootstrap_venv(command, cwd)
         env = self._build_env()
+        if venv is not None:
+            self._apply_venv_to_env(env, venv)
         spawn_command = command
 
         if self.path_append:
@@ -315,6 +380,80 @@ class ExecTool(Tool):
             f"Use bg(action='status', job_id='{job.job_id}') or "
             f"bg(action='wait', job_id='{job.job_id}', timeout=...) to monitor."
         )
+
+    async def _maybe_bootstrap_venv(self, command: str, cwd: str) -> Path | None:
+        """Lazily provision a project-local venv before running ``command``.
+
+        Returns the resolved venv path if the configured manager is active,
+        the command looks like it needs Python, and bootstrap succeeded.
+        Returns ``None`` in all other cases — including when bootstrap fails;
+        the caller should fall back to the legacy environment so a
+        misconfigured uv install doesn't bring the agent to a halt.
+        """
+        runtime = self.python_runtime
+        if runtime is None or runtime.manager != "uv":
+            return None
+        if not runtime.auto_bootstrap:
+            return None
+        if not _is_python_command(command):
+            return None
+
+        async with self._venv_cache_lock:
+            if cwd in self._venv_cache:
+                return self._venv_cache[cwd]
+
+            try:
+                venv = await asyncio.to_thread(self._bootstrap_venv_sync, cwd, runtime)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to bootstrap project venv at %s: %s; "
+                    "falling back to system python.",
+                    cwd,
+                    exc,
+                )
+                self._venv_cache[cwd] = None
+                return None
+
+            self._venv_cache[cwd] = venv
+            return venv
+
+    @staticmethod
+    def _bootstrap_venv_sync(
+        cwd: str, runtime: "PythonRuntimeConfig"
+    ) -> Path | None:
+        """Synchronous bridge to :func:`ensure_project_venv`.
+
+        Imported lazily so importing this module never requires
+        :mod:`mira_engine.runtime` to be loadable (keeps the engine bootable
+        on hosts without uv).
+        """
+        from mira_engine.runtime.python_env import ensure_project_venv
+
+        return ensure_project_venv(cwd, runtime)
+
+    @staticmethod
+    def _apply_venv_to_env(env: dict[str, str], venv: Path) -> None:
+        """Mutate ``env`` so subprocesses see the venv as activated.
+
+        Mirrors what ``source <venv>/bin/activate`` does: prepends the
+        venv's ``bin/`` (or ``Scripts/``) to PATH, sets ``VIRTUAL_ENV``,
+        and scrubs ``CONDA_*`` / ``PYTHONHOME`` so a coexisting conda
+        activation doesn't shadow the venv's interpreter.
+        """
+        bin_name = "Scripts" if _IS_WINDOWS else "bin"
+        venv_bin = str(venv / bin_name)
+        # Use the platform's native PATH separator regardless of the
+        # interpreter's ``os.pathsep`` (which only reflects the host OS,
+        # not the simulated platform under test).
+        pathsep = ";" if _IS_WINDOWS else ":"
+        existing_path = env.get("PATH", "")
+        env["PATH"] = (
+            venv_bin + pathsep + existing_path if existing_path else venv_bin
+        )
+        env["VIRTUAL_ENV"] = str(venv)
+        env.pop("CONDA_PREFIX", None)
+        env.pop("CONDA_DEFAULT_ENV", None)
+        env.pop("PYTHONHOME", None)
 
     def _build_env(self) -> dict[str, str]:
         """Build a curated subprocess environment.
