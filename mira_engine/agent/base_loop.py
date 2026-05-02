@@ -248,6 +248,7 @@ class BaseAgentLoop:
                 path_append=self.exec_config.path_append,
                 background_registry=self._bg_registry,
                 enable_background=True,
+                python_runtime=self.exec_config.python,
             ))
             self.tools.register(BgTool(registry=self._bg_registry))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
