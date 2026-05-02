@@ -95,10 +95,15 @@ def test_run_mode_profile_and_contract_helpers(tmp_path: Path) -> None:
         agent_profile="research",
     )
     assert "Execute exactly ONE pending experiment in this round" in auto_msg
-    assert "If no pending experiment exists but automation goals are still unmet" in auto_msg
+    assert "If no pending experiment exists but the project's research goals" in auto_msg
     assert "immediately update and write task_plan.json" in auto_msg
     assert "Task-plan contract requirements" in auto_msg
     assert "theoretical_proof" in auto_msg
+    # PR 2: prompt explicitly forbids auto-mode confirmation prompts.
+    assert "Do NOT stop for confirmation" in auto_msg
+    assert "Do NOT end your reply with a question to the user" in auto_msg
+    assert "shall I proceed" in auto_msg
+    assert "是否继续" in auto_msg
 
     checkpoint_msg = loop._build_auto_checkpoint_sync_message(
         channel="ui",
@@ -292,6 +297,106 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         tokens_used=100,
     ) is False
 
+    # PR 2: replan when queue empty + goals unmet, even WITHOUT maxExperiments.
+    goals_only_policy = loop._parse_automation_policy(
+        {
+            "logic": "AND",
+            "goals": [{"metric": "Dice", "operator": ">=", "value": 0.9}],
+        }
+    )
+    assert goals_only_policy is not None
+    assert "maxExperiments" not in goals_only_policy
+    (project / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "experiments": [
+                    {"status": "completed", "results": {"metrics": {"Dice": 0.78}}}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert loop._should_continue_auto_ui(
+        channel="ui",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=0,
+        automation_policy=goals_only_policy,
+    ) is True
+
+    # PR 2: replan when queue empty + no policy at all (rely on _AUTO_MAX_ROUNDS).
+    (project / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "experiments": [
+                    {
+                        "status": "completed",
+                        "results": {"metrics": {"Dice": 0.81}},
+                        "conclusion": "baseline established",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert loop._should_continue_auto_ui(
+        channel="ui",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=0,
+    ) is True
+
+    # PR 2: structured stop reasons surface from _evaluate_continuation.
+    decision, reason = loop._evaluate_continuation(
+        channel="cli",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=0,
+    )
+    assert decision is False and reason is None  # silent no-op for non-UI
+    decision, reason = loop._evaluate_continuation(
+        channel="ui",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=ResearchAgentLoop._AUTO_MAX_ROUNDS,
+    )
+    assert decision is False
+    assert reason is not None and "max rounds reached" in reason
+    decision, reason = loop._evaluate_continuation(
+        channel="ui",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="please confirm before continuing",
+        auto_round=0,
+    )
+    assert decision is False
+    assert reason == "user-input heuristic matched"
+    decision, reason = loop._evaluate_continuation(
+        channel="ui",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="Tool call failed: provider unreachable.",
+        auto_round=0,
+    )
+    assert decision is False
+    assert reason == "failure heuristic matched"
+    (project / "task_plan.json").write_text(
+        json.dumps({"experiments": [{"status": "pending"}]}),
+        encoding="utf-8",
+    )
+    decision, reason = loop._evaluate_continuation(
+        channel="ui",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=0,
+    )
+    assert decision is True and reason is None
+
     before = {
         "experiments": [
             {"id": "Exp001", "status": "running", "results": {"metrics": {}}},
@@ -462,11 +567,17 @@ async def test_handle_control_routes_set_mode(tmp_path: Path) -> None:
 async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
     progress_events: list[str] = []
-    decisions = iter([True, False])
+    # PR 2: _process_message now consumes _evaluate_continuation directly so
+    # progress emissions can include a structured stop reason.
+    decisions: list[tuple[bool, str | None]] = [
+        (True, None),
+        (False, "queue exhausted, no replan condition met"),
+    ]
+    iter_decisions = iter(decisions)
     calls = {"n": 0}
 
     def _decide(**kwargs):
-        return next(decisions)
+        return next(iter_decisions)
 
     async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
         calls["n"] += 1
@@ -475,7 +586,7 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     async def _progress(msg: str) -> None:
         progress_events.append(msg)
 
-    monkeypatch.setattr(loop, "_should_continue_auto_ui", _decide)
+    monkeypatch.setattr(loop, "_evaluate_continuation", _decide)
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
 
     msg = InboundMessage(
@@ -488,6 +599,9 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     out = await loop._process_message(msg, on_progress=_progress)
     assert out.content == "round-2"
     assert any("auto-run round 1" in item for item in progress_events)
+    assert any(
+        "auto-run stop reason: queue exhausted" in item for item in progress_events
+    )
 
 
 async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path: Path) -> None:
@@ -501,7 +615,7 @@ async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path
             loop._last_task_plan_guard_issues = ["Exp001: missing theoretical_proof"]
         else:
             loop._last_task_plan_guard_issues = []
-        return False
+        return False, "queue exhausted, no replan condition met"
 
     async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
         calls["n"] += 1
@@ -510,7 +624,7 @@ async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path
     async def _progress(msg: str) -> None:
         progress_events.append(msg)
 
-    monkeypatch.setattr(loop, "_should_continue_auto_ui", _decide)
+    monkeypatch.setattr(loop, "_evaluate_continuation", _decide)
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
 
     msg = InboundMessage(

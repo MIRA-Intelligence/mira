@@ -772,10 +772,19 @@ class ResearchAgentLoop(BaseAgentLoop):
             "1) If you just finished an experiment, immediately update and write task_plan.json "
             "(set status/results/conclusion/next for that experiment) BEFORE starting the next one.\n"
             "2) Execute exactly ONE pending experiment in this round, then return control. "
-            "If no pending experiment exists but automation goals are still unmet and "
-            "maxExperiments budget remains, first append the next sequential pending "
-            "experiment(s) to task_plan.json, execute exactly ONE of them, then return control.\n"
-            "3) Do not stop for confirmation unless user input is strictly required.\n\n"
+            "If no pending experiment exists but the project's research goals are still "
+            "unmet (or any automation budget remains), first append the next sequential "
+            "pending experiment(s) to task_plan.json, execute exactly ONE of them, then "
+            "return control.\n"
+            "3) Do NOT stop for confirmation. The user is not in the loop on this turn — "
+            "auto mode keeps running until a hard guard (round / experiment / token "
+            "budget, guardrail block, or explicit tool failure) fires. If a logical next "
+            "step exists, perform it. Only ask the user when you are blocked by data or "
+            "credentials that only the user can supply.\n"
+            "4) Do NOT end your reply with a question to the user. Avoid auto-mode "
+            "anti-patterns such as 'shall I proceed?', 'do you want me to ...?', "
+            "'是否继续?', '是否要我...?', '请确认...?'. State the conclusion of this "
+            "round and the concrete next action you will take.\n\n"
             f"{contract_hint}"
         )
 
@@ -839,6 +848,49 @@ class ResearchAgentLoop(BaseAgentLoop):
             f"{contract_hint}"
         )
 
+    def _evaluate_continuation(
+        self,
+        *,
+        channel: str,
+        run_mode: str,
+        project_dir: str | None,
+        final_content: str | None,
+        auto_round: int,
+        agent_profile: str | None = None,
+        automation_policy: dict[str, Any] | None = None,
+        tokens_used: int = 0,
+    ) -> tuple[bool, str | None]:
+        """Decide whether to schedule another auto-run cycle, with reason.
+
+        Returns ``(should_continue, stop_reason)``. ``stop_reason`` is a short
+        machine-readable label suitable for inclusion in progress events so
+        the user can tell *why* auto mode stopped without grepping logs.
+        ``stop_reason`` is ``None`` when the loop continues; it is also
+        ``None`` when the call is a silent no-op (non-UI / non-auto channel).
+        """
+        if channel != "ui" or run_mode != "auto":
+            return False, None
+        if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
+            return False, "task_plan guardrail blocking"
+        if auto_round >= self._AUTO_MAX_ROUNDS:
+            logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
+            return False, f"max rounds reached ({self._AUTO_MAX_ROUNDS})"
+        strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
+        if strict_heuristics and self._looks_like_failure_response(final_content):
+            return False, "failure heuristic matched"
+        if strict_heuristics and self._looks_like_user_input_request(final_content):
+            return False, "user-input heuristic matched"
+        plan = self._load_task_plan(project_dir)
+        if self._plan_has_pending_work(plan):
+            return True, None
+        if self._should_replan_exhausted_queue(
+            automation_policy,
+            plan=plan,
+            tokens_used=tokens_used,
+        ):
+            return True, None
+        return False, "queue exhausted, no replan condition met"
+
     def _should_continue_auto_ui(
         self,
         *,
@@ -851,27 +903,23 @@ class ResearchAgentLoop(BaseAgentLoop):
         automation_policy: dict[str, Any] | None = None,
         tokens_used: int = 0,
     ) -> bool:
-        """Decide whether to schedule another internal auto-run cycle."""
-        if channel != "ui" or run_mode != "auto":
-            return False
-        if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
-            return False
-        if auto_round >= self._AUTO_MAX_ROUNDS:
-            logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
-            return False
-        strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
-        if strict_heuristics and self._looks_like_failure_response(final_content):
-            return False
-        if strict_heuristics and self._looks_like_user_input_request(final_content):
-            return False
-        plan = self._load_task_plan(project_dir)
-        if self._plan_has_pending_work(plan):
-            return True
-        return self._should_replan_exhausted_queue(
-            automation_policy,
-            plan=plan,
+        """Boolean wrapper around :meth:`_evaluate_continuation`.
+
+        Kept as a thin shim because external tests and call sites already use
+        a plain bool; new code should call ``_evaluate_continuation`` so it
+        can surface ``stop_reason`` in progress events.
+        """
+        decision, _ = self._evaluate_continuation(
+            channel=channel,
+            run_mode=run_mode,
+            project_dir=project_dir,
+            final_content=final_content,
+            auto_round=auto_round,
+            agent_profile=agent_profile,
+            automation_policy=automation_policy,
             tokens_used=tokens_used,
         )
+        return decision
 
     @classmethod
     def _should_replan_exhausted_queue(
@@ -881,15 +929,39 @@ class ResearchAgentLoop(BaseAgentLoop):
         plan: dict | None,
         tokens_used: int,
     ) -> bool:
-        """Continue auto mode when the queue is empty but experiment budget remains."""
-        if not policy or cls._plan_has_pending_work(plan):
+        """Continue auto mode when the queue is empty but more work is warranted.
+
+        Liberalised in PR 2 so that auto mode does not silently halt the
+        moment the model forgets to append the next experiment:
+
+        - With pending work in the plan, never replan (caller handles it).
+        - With no policy at all, replan — ``_AUTO_MAX_ROUNDS`` already bounds
+          the runaway and ``strictHeuristics`` still gates the heuristics.
+        - With a policy whose stop conditions (goals / maxExperiments /
+          maxTokens) are already met, do not replan.
+        - With a policy that has goals not yet reached, replan regardless of
+          whether ``maxExperiments`` is configured (previously we only
+          replanned when ``maxExperiments`` was set, which silently dropped
+          goal-driven sessions).
+        - With a policy whose ``maxExperiments`` budget still has room,
+          replan up to that budget.
+        - With a policy that only carries ``maxTokens`` /
+          ``strictHeuristics`` and no goals/budget, default to replanning;
+          ``maxTokens`` and ``_AUTO_MAX_ROUNDS`` keep the loop bounded.
+        """
+        if cls._plan_has_pending_work(plan):
             return False
-        max_experiments = policy.get("maxExperiments")
-        if not isinstance(max_experiments, int) or max_experiments <= 0:
-            return False
+        if policy is None:
+            return True
         if cls._evaluate_automation_stop_policy(policy, plan=plan, tokens_used=tokens_used):
             return False
-        return cls._count_completed_experiments(plan) < max_experiments
+        goals = policy.get("goals") if isinstance(policy.get("goals"), list) else []
+        if goals:
+            return True
+        max_experiments = policy.get("maxExperiments")
+        if isinstance(max_experiments, int) and max_experiments > 0:
+            return cls._count_completed_experiments(plan) < max_experiments
+        return True
 
     # ------------------------------------------------------------------
     # Control / session lifecycle overrides
@@ -1265,7 +1337,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                     await progress_cb(f"auto-run stop condition: {stop_reason}")
                     break
 
-            should_continue = self._should_continue_auto_ui(
+            should_continue, continuation_reason = self._evaluate_continuation(
                 channel=msg.channel,
                 run_mode=current_mode,
                 project_dir=project_dir,
@@ -1276,6 +1348,14 @@ class ResearchAgentLoop(BaseAgentLoop):
                 tokens_used=total_tokens_used,
             )
             if not should_continue:
+                if (
+                    msg.channel == "ui"
+                    and current_mode == "auto"
+                    and continuation_reason
+                ):
+                    await progress_cb(
+                        f"auto-run stop reason: {continuation_reason}"
+                    )
                 guard_issues = list(getattr(self, "_last_task_plan_guard_issues", []))
                 continue_despite_guard = False
                 strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
