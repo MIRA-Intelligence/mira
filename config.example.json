@@ -12,7 +12,22 @@
     }
   },
   "tools": {
-    "restrictToWorkspace": false
+    "restrictToWorkspace": false,
+    "exec": {
+      "enable": true,
+      "timeout": 60,
+      "pathAppend": "",
+      "sandbox": "",
+      "python": {
+        "manager": "off",
+        "autoBootstrap": true,
+        "venvDir": ".venv",
+        "cacheDir": "",
+        "linkMode": "hardlink",
+        "baselineRequirements": [],
+        "pythonVersion": ""
+      }
+    }
   },
   "channels": {
     "telegram": {
