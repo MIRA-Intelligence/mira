@@ -310,7 +310,9 @@ class TestCli:
         assert "Manager: uv" in result.stdout
         assert "3.11" in result.stdout
         assert "numpy" in result.stdout
-        assert "/usr/local/bin/uv" in result.stdout
+        # ``Path`` stringifies with backslashes on Windows, so derive the
+        # expected path string from the same Path the CLI will render.
+        assert str(_uv().path) in result.stdout
 
     def test_info_when_uv_missing(self) -> None:
         runner, app = self._runner()

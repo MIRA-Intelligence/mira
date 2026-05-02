@@ -45,6 +45,13 @@ jobs:
 
       - name: Fetch bundled uv binary
         shell: bash
+        env:
+          # Authenticated GitHub API calls (5000 req/h per repo) avoid the
+          # 60 req/h unauthenticated quota that GitHub Actions runners
+          # share by source IP — that quota gets blown out across the
+          # macos/windows/linux matrix and intermittently fails this step
+          # with HTTP 403.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python scripts/fetch_uv.py --target host
 
       - name: Build wheel and sdist (linux only)

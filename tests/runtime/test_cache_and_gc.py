@@ -301,7 +301,12 @@ class TestCli:
             )
 
         assert result.exit_code == 0, result.stdout
-        assert "proj" in result.stdout
+        # On narrow CI terminals (Windows in particular) Rich wraps the
+        # absolute project path mid-word inside the table cell, so the
+        # literal ``proj`` substring may straddle a newline. Collapse line
+        # breaks before searching to keep the assertion robust.
+        normalized_stdout = result.stdout.replace("\n", "")
+        assert "proj" in normalized_stdout
         assert "active" in result.stdout
 
     def test_project_gc_handles_no_venvs(self, tmp_path: Path) -> None:

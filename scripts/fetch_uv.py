@@ -83,13 +83,32 @@ def detect_host_target() -> str:
     raise SystemExit(f"Unsupported host platform: {sys.platform}/{machine}")
 
 
+def _github_api_request(url: str) -> urllib.request.Request:
+    """Build a GitHub API request, adding auth when a token is available.
+
+    GitHub's unauthenticated rate limit (60 req/h per IP) is shared across
+    all GitHub Actions runners on the same IP, so the bare ``urlopen`` call
+    intermittently fails the macOS / Windows ``Fetch bundled uv binary``
+    step with HTTP 403. When ``GITHUB_TOKEN`` (or ``GH_TOKEN``) is exposed
+    to the script, attaching it lifts the quota to 5,000 req/h per repo
+    and stops the flake.
+    """
+    req = urllib.request.Request(url)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    return req
+
+
 def resolve_release_tag(version: str | None) -> str:
     """Return the GitHub release tag (e.g. ``0.5.4``)."""
     if version:
         normalized = version.lstrip("v")
         return normalized
     url = f"https://api.github.com/repos/{REPO}/releases/latest"
-    with urllib.request.urlopen(url, timeout=30) as resp:
+    with urllib.request.urlopen(_github_api_request(url), timeout=30) as resp:
         payload = json.load(resp)
     tag = (payload.get("tag_name") or "").lstrip("v")
     if not tag:
