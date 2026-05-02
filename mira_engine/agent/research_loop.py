@@ -1224,11 +1224,11 @@ class ResearchAgentLoop(BaseAgentLoop):
             run_kwargs["on_stream"] = on_stream
         if on_stream_end is not None:
             run_kwargs["on_stream_end"] = on_stream_end
-        round_plan_before = self._load_task_plan(project_dir) if msg.channel == "ui" else None
+        round_plan_before = self._load_task_plan(project_dir)
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
         total_tokens_used = self._last_loop_tokens_used
         self._accumulate_session_tokens(key, self._last_loop_tokens_used)
-        round_plan_after = self._load_task_plan(project_dir) if msg.channel == "ui" else None
+        round_plan_after = self._load_task_plan(project_dir)
         if msg.channel == "ui" and not allow_result_write:
             round_plan_after, restored = self._restore_result_section(
                 project_dir,
@@ -1254,7 +1254,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         while True:
             current_mode = self._session_run_modes.get(key, run_mode)
             automation_policy = self._resolve_session_automation_policy(key, None)
-            if msg.channel == "ui" and current_mode == "auto":
+            if current_mode == "auto":
                 crossed = self._experiments_crossed_boundary(round_plan_before, round_plan_after)
                 if len(crossed) > 1:
                     await progress_cb(
@@ -1328,7 +1328,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                                 )
                         continue
 
-            if msg.channel == "ui" and current_mode == "auto":
+            if current_mode == "auto":
                 current_plan = self._load_task_plan(project_dir)
                 stop_reason = self._evaluate_automation_stop_policy(
                     automation_policy,
@@ -1361,8 +1361,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                     or self._looks_like_user_input_request(final_content)
                 )
                 if (
-                    msg.channel == "ui"
-                    and current_mode == "auto"
+                    current_mode == "auto"
                     and guard_issues
                     and not heuristic_block
                 ):
@@ -1383,7 +1382,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                                 issues=guard_issues,
                             ),
                         })
-                        guard_plan_before = round_plan_after if msg.channel == "ui" else None
+                        guard_plan_before = round_plan_after
                         final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
                         total_tokens_used += self._last_loop_tokens_used
                         self._accumulate_session_tokens(key, self._last_loop_tokens_used)
@@ -1430,7 +1429,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                                 issues=guard_issues,
                             ),
                         })
-                        guard_plan_before = round_plan_after if msg.channel == "ui" else None
+                        guard_plan_before = round_plan_after
                         final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
                         total_tokens_used += self._last_loop_tokens_used
                         self._accumulate_session_tokens(key, self._last_loop_tokens_used)

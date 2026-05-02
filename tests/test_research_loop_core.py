@@ -591,6 +591,47 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     )
 
 
+async def test_process_message_auto_continue_round_non_ui_channel(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Auto mode now fires for non-UI channels too (channel filter removed)."""
+    loop = _make_real_loop(tmp_path)
+    progress_events: list[str] = []
+    decisions: list[tuple[bool, str | None]] = [
+        (True, None),
+        (False, "queue exhausted, no replan condition met"),
+    ]
+    iter_decisions = iter(decisions)
+    calls = {"n": 0}
+
+    def _decide(**kwargs):
+        return next(iter_decisions)
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        calls["n"] += 1
+        return f"round-{calls['n']}", [], messages + [{"role": "assistant", "content": f"round-{calls['n']}"}]
+
+    async def _progress(msg: str) -> None:
+        progress_events.append(msg)
+
+    monkeypatch.setattr(loop, "_evaluate_continuation", _decide)
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+
+    msg = InboundMessage(
+        channel="cli",
+        sender_id="u",
+        chat_id="PRJ-CLI",
+        content="go",
+        metadata={"run_mode": "auto", "project_dir": str(tmp_path / "PRJ-CLI")},
+    )
+    out = await loop._process_message(msg, on_progress=_progress)
+    assert out.content == "round-2"
+    assert any("auto-run round 1" in item for item in progress_events)
+    assert any(
+        "auto-run stop reason: queue exhausted" in item for item in progress_events
+    )
+
+
 async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
     progress_events: list[str] = []
