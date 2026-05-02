@@ -330,6 +330,202 @@ def _interpreter_installed(
 
 
 # ---------------------------------------------------------------------------
+# Cache & venv housekeeping
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VenvInfo:
+    """Discovered project venv on disk."""
+
+    venv_path: Path
+    project_dir: Path
+    size_bytes: int
+    last_used: float  # epoch seconds; the most-recent mtime under the venv
+    last_project_activity: float  # most-recent mtime of project files (excl. venv)
+
+
+def find_project_venvs(
+    root: Path | str,
+    *,
+    venv_dir_name: str = ".venv",
+    max_depth: int = 6,
+) -> list[VenvInfo]:
+    """Walk ``root`` and return every directory whose basename matches
+    ``venv_dir_name`` and which looks like a venv (has ``pyvenv.cfg``).
+
+    The walk is bounded at ``max_depth`` to avoid runaway scans on huge
+    workspaces. Symlinks are not followed.
+
+    For each hit we collect:
+
+    - on-disk size (sum of file sizes, hardlinks counted once);
+    - ``last_used`` — newest mtime of any file under the venv (rough
+      proxy for "the agent ran something via this interpreter
+      recently");
+    - ``last_project_activity`` — newest mtime of project files
+      *outside* the venv. Stale = project untouched for a while.
+    """
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        return []
+
+    found: list[VenvInfo] = []
+    for venv in _walk_for_venvs(root, venv_dir_name, max_depth):
+        project = venv.parent
+        size = _venv_size_bytes(venv)
+        last_used = _newest_mtime(venv)
+        last_activity = _newest_mtime_excluding(project, venv)
+        found.append(
+            VenvInfo(
+                venv_path=venv,
+                project_dir=project,
+                size_bytes=size,
+                last_used=last_used,
+                last_project_activity=last_activity,
+            )
+        )
+    return sorted(found, key=lambda v: v.size_bytes, reverse=True)
+
+
+def _walk_for_venvs(root: Path, name: str, max_depth: int):
+    """Yield candidate venv directories without descending into any."""
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        try:
+            entries = list(current.iterdir())
+        except (OSError, PermissionError):
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    if entry.name == name and (entry / "pyvenv.cfg").is_file():
+                        yield entry
+                        # don't descend into a venv
+                        continue
+                    stack.append((entry, depth + 1))
+            except OSError:
+                continue
+
+
+def _venv_size_bytes(venv: Path) -> int:
+    """Sum file sizes under ``venv``, counting each inode once."""
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for path in venv.rglob("*"):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            stat = path.stat()
+        except OSError:
+            continue
+        key = (stat.st_dev, stat.st_ino)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += stat.st_size
+    return total
+
+
+def _newest_mtime(path: Path) -> float:
+    newest = 0.0
+    for child in path.rglob("*"):
+        try:
+            mt = child.stat().st_mtime
+        except OSError:
+            continue
+        if mt > newest:
+            newest = mt
+    return newest
+
+
+def _newest_mtime_excluding(root: Path, exclude: Path) -> float:
+    newest = 0.0
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return newest
+    for child in children:
+        try:
+            if child == exclude:
+                continue
+            if child.is_dir():
+                inner = _newest_mtime(child)
+                if inner > newest:
+                    newest = inner
+            else:
+                mt = child.stat().st_mtime
+                if mt > newest:
+                    newest = mt
+        except OSError:
+            continue
+    return newest
+
+
+def prune_uv_cache(
+    uv: UvBinary | None = None,
+    *,
+    cache_dir: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Run ``uv cache prune`` and return its stdout.
+
+    ``uv cache prune`` removes packages from the global content-addressed
+    cache that are no longer referenced by any ``uv.lock`` or
+    pre-existing venv. Hardlinks mean removed packages are usually
+    already disk-free if some venv still pins them.
+
+    Raises :class:`PythonEnvError` on failure.
+    """
+    binary = uv or detect_uv()
+    if binary is None:
+        raise PythonEnvError("uv is required for cache prune but was not found.")
+    args: list[str] = [str(binary.path), "cache", "prune"]
+    if dry_run:
+        args.append("--dry-run")
+    env = os.environ.copy()
+    if cache_dir:
+        env["UV_CACHE_DIR"] = str(Path(cache_dir).expanduser())
+    try:
+        result = subprocess.run(
+            args,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PythonEnvError(f"failed to prune uv cache: {exc}") from exc
+    if result.returncode != 0:
+        raise PythonEnvError(
+            f"uv cache prune failed (exit={result.returncode}): "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    return (result.stdout or result.stderr or "").strip()
+
+
+def remove_venv(venv: Path) -> int:
+    """Recursively delete a venv directory. Returns reclaimed bytes.
+
+    Hardlink-aware: a deleted file that's also linked under the uv
+    cache won't actually free disk space, but the byte count returned
+    here reflects the venv's *apparent* size (sum of file sizes), which
+    is the user-facing number we want to report.
+    """
+    if not venv.exists():
+        return 0
+    size = _venv_size_bytes(venv)
+    import shutil as _shutil
+    _shutil.rmtree(venv, ignore_errors=False)
+    return size
+
+
+# ---------------------------------------------------------------------------
 # Internal subprocess helpers
 # ---------------------------------------------------------------------------
 
