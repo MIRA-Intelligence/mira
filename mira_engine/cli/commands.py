@@ -1554,6 +1554,110 @@ def research(
 
 
 # ============================================================================
+# Runtime Commands (Python environment management)
+# ============================================================================
+
+
+runtime_app = typer.Typer(help="Manage the per-project Python runtime")
+app.add_typer(runtime_app, name="runtime")
+
+
+@runtime_app.command("install-python")
+def runtime_install_python(
+    version: str | None = typer.Option(
+        None,
+        "--version",
+        help="Python version to install (default: tools.exec.python.python_version from config)",
+    ),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+    workspace: str | None = typer.Option(None, "--workspace", help="Workspace path"),
+):
+    """Install the pinned CPython interpreter via ``uv python install``.
+
+    Intended to run once at first launch (e.g. by the desktop installer)
+    so that subsequent ``uv venv --python <ver>`` calls hit a warm cache
+    rather than blocking on a network download. Idempotent — safe to
+    re-run any time.
+    """
+    from mira_engine.runtime.python_env import (
+        PythonEnvError,
+        detect_uv,
+        ensure_python_interpreter,
+    )
+
+    cfg = _load_runtime_config(config, workspace)
+    python_cfg = cfg.tools.exec.python
+    target = version or python_cfg.python_version
+
+    if not target:
+        console.print(
+            "[red]No Python version specified.[/red] "
+            "Set ``tools.exec.python.python_version`` in your config "
+            "or pass ``--version 3.11``."
+        )
+        raise typer.Exit(code=2)
+
+    binary = detect_uv()
+    if binary is None:
+        console.print(
+            "[red]uv not found.[/red] Install it from "
+            "https://docs.astral.sh/uv/ or rebuild the desktop bundle."
+        )
+        raise typer.Exit(code=1)
+
+    console.print(f"Using uv at [cyan]{binary.path}[/cyan] (version "
+                  f"{'.'.join(map(str, binary.version))})")
+    console.print(f"Ensuring Python [cyan]{target}[/cyan] is installed...")
+
+    try:
+        ensure_python_interpreter(binary, target)
+    except PythonEnvError as exc:
+        console.print(f"[red]Failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]✓[/green] Python {target} ready.")
+
+
+@runtime_app.command("info")
+def runtime_info(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+    workspace: str | None = typer.Option(None, "--workspace", help="Workspace path"),
+):
+    """Show the active Python runtime configuration and detected uv."""
+    from mira_engine.runtime.python_env import detect_uv
+
+    cfg = _load_runtime_config(config, workspace)
+    python_cfg = cfg.tools.exec.python
+
+    console.print(f"[bold]Manager:[/bold] {python_cfg.manager}")
+    if python_cfg.manager == "off":
+        console.print("[dim]Per-project venvs are disabled. "
+                      "Set tools.exec.python.manager = 'uv' to enable.[/dim]")
+        return
+
+    console.print(f"[bold]Auto-bootstrap:[/bold] {python_cfg.auto_bootstrap}")
+    console.print(f"[bold]Venv dir:[/bold] {python_cfg.venv_dir}")
+    if python_cfg.python_version:
+        console.print(f"[bold]Pinned python:[/bold] {python_cfg.python_version}")
+    if python_cfg.cache_dir:
+        console.print(f"[bold]uv cache dir:[/bold] {python_cfg.cache_dir}")
+    if python_cfg.link_mode:
+        console.print(f"[bold]Link mode:[/bold] {python_cfg.link_mode}")
+    if python_cfg.baseline_requirements:
+        console.print(
+            "[bold]Baseline:[/bold] "
+            + ", ".join(python_cfg.baseline_requirements)
+        )
+
+    binary = detect_uv()
+    if binary is None:
+        console.print("[red]uv:[/red] not found on PATH or in bundle")
+    else:
+        version = ".".join(map(str, binary.version))
+        console.print(f"[green]uv:[/green] {binary.path} (v{version})")
+
+
+# ============================================================================
 # Channel Commands
 # ============================================================================
 

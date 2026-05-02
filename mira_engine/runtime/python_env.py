@@ -236,10 +236,97 @@ def ensure_project_venv(
 
     env = _build_uv_env(cfg, extra_env)
 
+    if cfg.python_version:
+        ensure_python_interpreter(binary, cfg.python_version, env=env)
+
     _create_venv(binary, venv, cfg, env=env, cwd=project)
     _install_initial_dependencies(binary, project, venv, cfg, env=env)
 
     return venv
+
+
+def ensure_python_interpreter(
+    uv: UvBinary,
+    version: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Make sure ``uv`` has the requested CPython available locally.
+
+    On first launch the bundled ``uv`` has zero pre-installed
+    interpreters; ``uv venv --python 3.11`` would either auto-download
+    silently (recent uv) or fail (older uv). This helper makes the
+    download explicit so:
+
+    * the user sees a single up-front progress message ("installing
+      Python 3.11...") rather than during every project venv creation;
+    * we can fail fast with a useful error before bothering with venv
+      creation;
+    * desktop launchers (PyInstaller bundle) can invoke it once at
+      first launch via ``mira runtime install-python`` so the rest of
+      the session uses a warm cache.
+
+    The function is idempotent: it consults ``uv python list
+    --only-installed`` and short-circuits when the requested version
+    is already present.
+
+    Parameters
+    ----------
+    uv:
+        Located ``uv`` binary (typically from :func:`detect_uv`).
+    version:
+        Either a major.minor (``"3.11"``) or a full version
+        (``"3.11.10"``) accepted by ``uv python install``.
+    env:
+        Optional process environment for the subprocess. When ``None``,
+        ``os.environ`` is inherited.
+    """
+    if _interpreter_installed(uv, version, env=env):
+        logger.debug("uv: python %s already installed", version)
+        return
+    logger.info("uv: installing python %s (one-time)", version)
+    _run(
+        [str(uv.path), "python", "install", version],
+        env=env if env is not None else os.environ.copy(),
+        cwd=Path.cwd(),
+        action=f"install python {version}",
+    )
+
+
+def _interpreter_installed(
+    uv: UvBinary,
+    version: str,
+    *,
+    env: dict[str, str] | None,
+) -> bool:
+    """True iff ``uv python list --only-installed`` mentions ``version``.
+
+    The output format is one entry per line, e.g.::
+
+        cpython-3.11.10-macos-aarch64-none    /path/to/uv/python/...
+
+    We do a substring match on the major.minor (or full) version so the
+    check works for both ``"3.11"`` and ``"3.11.10"`` callers.
+    """
+    try:
+        result = subprocess.run(
+            [str(uv.path), "python", "list", "--only-installed"],
+            env=env if env is not None else os.environ.copy(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("uv python list failed: %s", exc)
+        return False
+    if result.returncode != 0:
+        return False
+    needle = f"-{version}" if version.count(".") >= 1 else version
+    for line in (result.stdout or "").splitlines():
+        if needle in line:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
