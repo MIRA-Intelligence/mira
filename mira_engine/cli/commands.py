@@ -1554,6 +1554,277 @@ def research(
 
 
 # ============================================================================
+# Runtime Commands (Python environment management)
+# ============================================================================
+
+
+runtime_app = typer.Typer(help="Manage the per-project Python runtime")
+app.add_typer(runtime_app, name="runtime")
+
+
+@runtime_app.command("install-python")
+def runtime_install_python(
+    version: str | None = typer.Option(
+        None,
+        "--version",
+        help="Python version to install (default: tools.exec.python.python_version from config)",
+    ),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+    workspace: str | None = typer.Option(None, "--workspace", help="Workspace path"),
+):
+    """Install the pinned CPython interpreter via ``uv python install``.
+
+    Intended to run once at first launch (e.g. by the desktop installer)
+    so that subsequent ``uv venv --python <ver>`` calls hit a warm cache
+    rather than blocking on a network download. Idempotent — safe to
+    re-run any time.
+    """
+    from mira_engine.runtime.python_env import (
+        PythonEnvError,
+        detect_uv,
+        ensure_python_interpreter,
+    )
+
+    cfg = _load_runtime_config(config, workspace)
+    python_cfg = cfg.tools.exec.python
+    target = version or python_cfg.python_version
+
+    if not target:
+        console.print(
+            "[red]No Python version specified.[/red] "
+            "Set ``tools.exec.python.python_version`` in your config "
+            "or pass ``--version 3.11``."
+        )
+        raise typer.Exit(code=2)
+
+    binary = detect_uv()
+    if binary is None:
+        console.print(
+            "[red]uv not found.[/red] Install it from "
+            "https://docs.astral.sh/uv/ or rebuild the desktop bundle."
+        )
+        raise typer.Exit(code=1)
+
+    console.print(f"Using uv at [cyan]{binary.path}[/cyan] (version "
+                  f"{'.'.join(map(str, binary.version))})")
+    console.print(f"Ensuring Python [cyan]{target}[/cyan] is installed...")
+
+    try:
+        ensure_python_interpreter(binary, target)
+    except PythonEnvError as exc:
+        console.print(f"[red]Failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]✓[/green] Python {target} ready.")
+
+
+@runtime_app.command("info")
+def runtime_info(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+    workspace: str | None = typer.Option(None, "--workspace", help="Workspace path"),
+):
+    """Show the active Python runtime configuration and detected uv."""
+    from mira_engine.runtime.python_env import detect_uv
+
+    cfg = _load_runtime_config(config, workspace)
+    python_cfg = cfg.tools.exec.python
+
+    console.print(f"[bold]Manager:[/bold] {python_cfg.manager}")
+    if python_cfg.manager == "off":
+        console.print("[dim]Per-project venvs are disabled. "
+                      "Set tools.exec.python.manager = 'uv' to enable.[/dim]")
+        return
+
+    console.print(f"[bold]Auto-bootstrap:[/bold] {python_cfg.auto_bootstrap}")
+    console.print(f"[bold]Venv dir:[/bold] {python_cfg.venv_dir}")
+    if python_cfg.python_version:
+        console.print(f"[bold]Pinned python:[/bold] {python_cfg.python_version}")
+    if python_cfg.cache_dir:
+        console.print(f"[bold]uv cache dir:[/bold] {python_cfg.cache_dir}")
+    if python_cfg.link_mode:
+        console.print(f"[bold]Link mode:[/bold] {python_cfg.link_mode}")
+    if python_cfg.baseline_requirements:
+        console.print(
+            "[bold]Baseline:[/bold] "
+            + ", ".join(python_cfg.baseline_requirements)
+        )
+
+    binary = detect_uv()
+    if binary is None:
+        console.print("[red]uv:[/red] not found on PATH or in bundle")
+    else:
+        version = ".".join(map(str, binary.version))
+        console.print(f"[green]uv:[/green] {binary.path} (v{version})")
+
+
+def _human_size(num_bytes: int) -> str:
+    """Format bytes like ``1.2 GiB`` for display."""
+    step = 1024.0
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(num_bytes)
+    for unit in units:
+        if size < step or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= step
+    return f"{size:.1f} TiB"
+
+
+@runtime_app.command("cache-prune")
+def runtime_cache_prune(
+    dry_run: bool = typer.Option(
+        False, "--dry-run/--apply",
+        help="Preview what would be removed without deleting anything",
+    ),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+    workspace: str | None = typer.Option(None, "--workspace", help="Workspace path"),
+):
+    """Remove unreferenced packages from uv's global cache.
+
+    Wraps ``uv cache prune``. Hardlink semantics mean a pruned package
+    is only really freed if no project venv still pins it; the byte
+    count uv reports is the headline savings.
+    """
+    from mira_engine.runtime.python_env import (
+        PythonEnvError,
+        detect_uv,
+        prune_uv_cache,
+    )
+
+    cfg = _load_runtime_config(config, workspace)
+    python_cfg = cfg.tools.exec.python
+
+    binary = detect_uv()
+    if binary is None:
+        console.print("[red]uv not found.[/red]")
+        raise typer.Exit(code=1)
+
+    label = "Dry run:" if dry_run else "Pruning"
+    console.print(f"{label} uv cache via {binary.path}...")
+    try:
+        output = prune_uv_cache(
+            binary, cache_dir=python_cfg.cache_dir or None, dry_run=dry_run
+        )
+    except PythonEnvError as exc:
+        console.print(f"[red]Failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if output:
+        console.print(output)
+    console.print("[green]✓[/green] cache prune complete.")
+
+
+@runtime_app.command("project-gc")
+def runtime_project_gc(
+    root: str | None = typer.Option(
+        None,
+        "--root",
+        help="Directory to scan (default: current workspace)",
+    ),
+    stale_days: int = typer.Option(
+        30,
+        "--stale-days",
+        help="Project is 'stale' if no file outside the venv has been "
+             "touched in this many days",
+    ),
+    delete_stale: bool = typer.Option(
+        False,
+        "--delete-stale",
+        help="Delete venvs whose project hasn't been touched in --stale-days",
+    ),
+    delete: list[str] | None = typer.Option(
+        None,
+        "--delete",
+        help="Delete a specific venv path (may be passed multiple times)",
+    ),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+    workspace: str | None = typer.Option(None, "--workspace", help="Workspace path"),
+):
+    """List (or delete) per-project ``.venv`` directories under a root.
+
+    By default just prints a table of (size, last-used, project) so the
+    user can decide what to clean up. Pass ``--delete-stale`` to remove
+    every venv whose parent project has been idle for more than
+    ``--stale-days`` days, or ``--delete <path>`` for surgical removal.
+    """
+    import time
+
+    from mira_engine.runtime.python_env import (
+        find_project_venvs,
+        remove_venv,
+    )
+
+    cfg = _load_runtime_config(config, workspace)
+    python_cfg = cfg.tools.exec.python
+    venv_name = Path(python_cfg.venv_dir).name or ".venv"
+
+    scan_root = Path(root).expanduser() if root else cfg.workspace_path
+    console.print(f"Scanning [cyan]{scan_root}[/cyan] for ``{venv_name}`` directories...")
+
+    venvs = find_project_venvs(scan_root, venv_dir_name=venv_name)
+    if not venvs:
+        console.print("[dim]no venvs found.[/dim]")
+        return
+
+    now = time.time()
+    stale_cutoff = now - stale_days * 86400
+
+    table = Table(title=f"Project venvs under {scan_root}")
+    table.add_column("Size", justify="right")
+    table.add_column("Last used")
+    table.add_column("Project last touched")
+    table.add_column("Project")
+    table.add_column("Status")
+
+    total = 0
+    stale: list[Path] = []
+    for info in venvs:
+        total += info.size_bytes
+        is_stale = info.last_project_activity < stale_cutoff
+        if is_stale:
+            stale.append(info.venv_path)
+        last_used = (
+            f"{int((now - info.last_used) / 86400)}d ago"
+            if info.last_used
+            else "?"
+        )
+        last_act = (
+            f"{int((now - info.last_project_activity) / 86400)}d ago"
+            if info.last_project_activity
+            else "?"
+        )
+        table.add_row(
+            _human_size(info.size_bytes),
+            last_used,
+            last_act,
+            str(info.project_dir),
+            "[yellow]stale[/yellow]" if is_stale else "[green]active[/green]",
+        )
+    console.print(table)
+    console.print(
+        f"Total: {_human_size(total)} across {len(venvs)} venv"
+        f"{'s' if len(venvs) != 1 else ''}"
+        + (f" ({len(stale)} stale)" if stale else "")
+    )
+
+    explicit = [Path(p).expanduser().resolve() for p in (delete or [])]
+    targets: list[Path] = list(explicit)
+    if delete_stale:
+        targets.extend(stale)
+    targets = list(dict.fromkeys(targets))
+
+    if not targets:
+        return
+
+    freed = 0
+    for venv in targets:
+        try:
+            freed += remove_venv(venv)
+            console.print(f"[green]removed[/green] {venv}")
+        except OSError as exc:
+            console.print(f"[red]failed to remove[/red] {venv}: {exc}")
+    console.print(f"Reclaimed [bold]{_human_size(freed)}[/bold] (apparent size).")
+
+
+# ============================================================================
 # Channel Commands
 # ============================================================================
 

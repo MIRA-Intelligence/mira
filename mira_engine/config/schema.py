@@ -469,6 +469,61 @@ class WebToolsConfig(Base):
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
 
+class PythonRuntimeConfig(Base):
+    """Per-project Python runtime configuration for the exec tool.
+
+    When ``manager == "uv"`` and ``auto_bootstrap`` is true, the exec tool
+    creates a project-local ``.venv`` (configurable via ``venv_dir``) on the
+    first python-related command and prepends it to PATH for every subsequent
+    subprocess. With ``manager == "off"`` (the default) the exec tool keeps
+    its legacy behaviour and resolves ``python`` against the parent process
+    environment, leaving environment management entirely to the user.
+
+    See the milestone ``Per-project Python environments`` for design context.
+    """
+
+    # ``off`` keeps the historical behaviour. ``uv`` enables per-project venv
+    # auto-bootstrap. ``system`` is reserved for a future passthrough mode
+    # (no venv, but with explicit interpreter pinning).
+    manager: Literal["off", "uv", "system"] = "off"
+
+    # Whether to lazily create the project venv the first time the agent runs
+    # a python-shaped command (python, pip, pytest, jupyter, ipython, uv).
+    auto_bootstrap: bool = True
+
+    # Project-relative directory for the venv. Resolved against the project
+    # working directory at exec time, not against the global workspace.
+    venv_dir: str = ".venv"
+
+    # Override for ``$UV_CACHE_DIR``. Empty means "let uv choose its default
+    # (``~/.cache/uv`` on Unix, ``%LOCALAPPDATA%\\uv\\cache`` on Windows)".
+    cache_dir: str = ""
+
+    # uv link mode for hardlinking wheels from the cache into the venv.
+    # ``hardlink`` is the most disk-efficient and is uv's default; ``clone``
+    # uses APFS / btrfs reflinks (CoW); ``copy`` is the safe fallback.
+    link_mode: Literal["hardlink", "clone", "symlink", "copy"] = "hardlink"
+
+    # Packages to install into a freshly bootstrapped venv that has no
+    # ``pyproject.toml`` / ``requirements.txt``. Empty means "create the venv
+    # but install nothing extra; agent will add packages on demand".
+    baseline_requirements: list[str] = Field(default_factory=list)
+
+    # Pinned interpreter version, e.g. ``3.11``, ``3.12``, ``3.11.10``.
+    # Empty means "let uv pick a compatible interpreter, downloading a
+    # standalone build if necessary".
+    python_version: str = ""
+
+    # Opt-in: when True and ``manager == "uv"``, the exec tool rewrites
+    # ``pip install ...`` and ``python -m pip install ...`` into
+    # ``uv pip install ...`` before spawning the subprocess. This is a
+    # safety net for agents that "forget" the prompt convention; defaults
+    # to off so agents that legitimately need bare pip (e.g. testing pip
+    # itself) aren't second-guessed. ``pip list``, ``pip show`` and
+    # other read-only subcommands are never rewritten.
+    rewrite_pip_install: bool = False
+
+
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
@@ -476,6 +531,8 @@ class ExecToolConfig(Base):
     timeout: int = 60
     path_append: str = ""
     sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
+    python: PythonRuntimeConfig = Field(default_factory=PythonRuntimeConfig)
+
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""

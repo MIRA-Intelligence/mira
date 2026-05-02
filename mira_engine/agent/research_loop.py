@@ -123,10 +123,29 @@ class ResearchAgentLoop(BaseAgentLoop):
         if not isinstance(max_tokens, int) or max_tokens <= 0:
             max_tokens = None
 
-        if not goals and max_experiments is None and max_tokens is None:
+        # ``strictHeuristics`` (default True) lets long-running auto sessions
+        # opt out of the user-input / failure keyword heuristics when only
+        # hard guards (max rounds / max tokens / max experiments / explicit
+        # tool failures) should decide when to stop. We track whether the
+        # caller set the field so we can persist the policy even when no
+        # other goals/budgets are configured.
+        strict_raw = value.get("strictHeuristics")
+        strict_explicit = isinstance(strict_raw, bool)
+        strict_heuristics = strict_raw if strict_explicit else True
+
+        if (
+            not goals
+            and max_experiments is None
+            and max_tokens is None
+            and not strict_explicit
+        ):
             return None
 
-        parsed: dict[str, Any] = {"logic": logic, "goals": goals}
+        parsed: dict[str, Any] = {
+            "logic": logic,
+            "goals": goals,
+            "strictHeuristics": strict_heuristics,
+        }
         if max_experiments is not None:
             parsed["maxExperiments"] = max_experiments
         if max_tokens is not None:
@@ -179,6 +198,22 @@ class ResearchAgentLoop(BaseAgentLoop):
         return None
 
     @staticmethod
+    def _strict_heuristics_from_policy(policy: dict[str, Any] | None) -> bool:
+        """Return whether the user-input / failure heuristics should fire.
+
+        Defaults to True (current behaviour). Setting
+        ``automation_policy.strictHeuristics = false`` lets a long auto run
+        rely solely on hard guards (round / experiment / token budgets and
+        explicit tool failures), which matters when the model's natural
+        prose keeps tripping the keyword heuristics.
+        """
+        if isinstance(policy, dict):
+            value = policy.get("strictHeuristics")
+            if isinstance(value, bool):
+                return value
+        return True
+
+    @staticmethod
     def _agent_profile_to_agents_filename(profile: str) -> str:
         """Map profile to its AGENTS bootstrap file."""
         if profile == "engineer":
@@ -191,39 +226,76 @@ class ResearchAgentLoop(BaseAgentLoop):
     # Heuristic content classifiers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _looks_like_user_input_request(text: str | None) -> bool:
-        """Heuristic: detect when assistant explicitly needs user input."""
+    # Closing-paragraph window used by the user-input / failure heuristics.
+    # A genuine "blocked, please advise" message almost always lands in the
+    # last paragraph of the assistant turn; matching mid-text was the main
+    # source of false positives in auto mode where the model would casually
+    # mention "could you" / "请确认" inside a summary and the loop would
+    # treat that as a hard stop.
+    _AUTO_HEURISTIC_TAIL_CHARS = 600
+
+    @classmethod
+    def _heuristic_tail(cls, text: str) -> str:
+        """Return the closing window of ``text`` used by stop heuristics."""
+        last_block = text.rsplit("\n\n", 1)[-1]
+        if len(last_block) > cls._AUTO_HEURISTIC_TAIL_CHARS:
+            return last_block[-cls._AUTO_HEURISTIC_TAIL_CHARS:]
+        return last_block
+
+    @classmethod
+    def _looks_like_user_input_request(cls, text: str | None) -> bool:
+        """Heuristic: detect when the assistant explicitly needs user input.
+
+        Tightened in PR 1: only inspects the closing paragraph and uses a
+        conservative keyword list. Generic phrases like ``could you`` /
+        ``clarify`` / ``需要你`` appearing in mid-response prose are NOT
+        halts — they used to over-trigger and stop auto mode for no reason.
+        """
         if not text:
             return False
-        lowered = text.lower()
+        tail = cls._heuristic_tail(text).lower()
         keywords = (
-            "please provide",
+            # English: explicit asks, deliberately conservative.
             "please confirm",
             "please choose",
-            "could you",
+            "please provide",
+            "could you provide",
+            "could you confirm",
             "can you provide",
-            "which option",
-            "clarify",
             "need your input",
+            "awaiting your input",
+            "awaiting your confirmation",
             "what would you like to do next",
-            "需要你",
+            "shall i proceed",
+            "should i proceed",
+            "do you want me to",
+            # Chinese: keep only phrasings that genuinely block on the user.
             "请提供",
             "请确认",
             "请选择",
             "是否继续",
             "是否开始",
             "是否要我",
-            "要我现在",
+            "等待你的确认",
+            "等待用户",
         )
-        return any(k in lowered for k in keywords)
+        return any(k in tail for k in keywords)
 
-    @staticmethod
-    def _looks_like_failure_response(text: str | None) -> bool:
-        """Heuristic: detect blocking errors where auto should stop.
+    @classmethod
+    def _looks_like_failure_response(cls, text: str | None) -> bool:
+        """Heuristic: detect blocking system errors where auto should stop.
 
-        IMPORTANT: Do not treat ordinary experiment outcomes like "hypothesis failed"
-        as blocking failures. We only stop on explicit runtime/system blockage.
+        Tightened in PR 1: we only stop on errors that the agent surface
+        itself cannot recover from (tracebacks bubbled to the assistant,
+        memory archival failure, tool-call failure, and explicit "I can't
+        continue" verdicts in the closing paragraph).
+
+        Ordinary experiment-level signals MUST NOT trigger here:
+        - ``exit code:`` / ``module not found`` / ``no such file or
+          directory`` / ``permission denied`` legitimately appear in stdout
+          dumps and in analysis text while the model is debugging.
+        - ``hypothesis failed`` / ``实验失败`` / ``出现错误`` are valid
+          experiment outcomes that auto mode should keep iterating on.
         """
         if not text:
             return False
@@ -232,25 +304,22 @@ class ResearchAgentLoop(BaseAgentLoop):
             "traceback (most recent call last)",
             "sorry, i encountered an error",
             "memory archival failed",
-            "command timed out",
-            "exit code:",
-            "permission denied",
-            "no such file or directory",
-            "module not found",
-            "failed to connect",
-            "failed to load",
             "tool call failed",
-            "unrecoverable",
-            "blocked by",
+            "unrecoverable error",
             "无法继续",
-            "出现错误",
-            "运行时错误",
         )
         if any(k in lowered for k in hard_signals):
             return True
-        if lowered.startswith("error:") or "\nerror:" in lowered:
-            return True
-        return False
+        tail = cls._heuristic_tail(text).lower()
+        soft_signals = (
+            "i'm unable to proceed",
+            "i am unable to proceed",
+            "cannot proceed because",
+            "cannot continue because",
+            "i cannot continue",
+            "blocked by ",
+        )
+        return any(k in tail for k in soft_signals)
 
     # ------------------------------------------------------------------
     # task_plan loaders / inspectors
@@ -703,10 +772,19 @@ class ResearchAgentLoop(BaseAgentLoop):
             "1) If you just finished an experiment, immediately update and write task_plan.json "
             "(set status/results/conclusion/next for that experiment) BEFORE starting the next one.\n"
             "2) Execute exactly ONE pending experiment in this round, then return control. "
-            "If no pending experiment exists but automation goals are still unmet and "
-            "maxExperiments budget remains, first append the next sequential pending "
-            "experiment(s) to task_plan.json, execute exactly ONE of them, then return control.\n"
-            "3) Do not stop for confirmation unless user input is strictly required.\n\n"
+            "If no pending experiment exists but the project's research goals are still "
+            "unmet (or any automation budget remains), first append the next sequential "
+            "pending experiment(s) to task_plan.json, execute exactly ONE of them, then "
+            "return control.\n"
+            "3) Do NOT stop for confirmation. The user is not in the loop on this turn — "
+            "auto mode keeps running until a hard guard (round / experiment / token "
+            "budget, guardrail block, or explicit tool failure) fires. If a logical next "
+            "step exists, perform it. Only ask the user when you are blocked by data or "
+            "credentials that only the user can supply.\n"
+            "4) Do NOT end your reply with a question to the user. Avoid auto-mode "
+            "anti-patterns such as 'shall I proceed?', 'do you want me to ...?', "
+            "'是否继续?', '是否要我...?', '请确认...?'. State the conclusion of this "
+            "round and the concrete next action you will take.\n\n"
             f"{contract_hint}"
         )
 
@@ -770,10 +848,56 @@ class ResearchAgentLoop(BaseAgentLoop):
             f"{contract_hint}"
         )
 
+    def _evaluate_continuation(
+        self,
+        *,
+        run_mode: str,
+        project_dir: str | None,
+        final_content: str | None,
+        auto_round: int,
+        agent_profile: str | None = None,
+        automation_policy: dict[str, Any] | None = None,
+        tokens_used: int = 0,
+    ) -> tuple[bool, str | None]:
+        """Decide whether to schedule another auto-run cycle, with reason.
+
+        Returns ``(should_continue, stop_reason)``. ``stop_reason`` is a short
+        machine-readable label suitable for inclusion in progress events so
+        the user can tell *why* auto mode stopped without grepping logs.
+        ``stop_reason`` is ``None`` when the loop continues, and ``None``
+        when the call is a silent no-op (non-auto run mode).
+
+        Note: there is no longer a channel filter here. ``ResearchAgentLoop``
+        is the only class wiring auto mode in, so any channel reaching this
+        method is by definition the research surface and should be honoured
+        uniformly. The basic agent loop never calls this method.
+        """
+        if run_mode != "auto":
+            return False, None
+        if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
+            return False, "task_plan guardrail blocking"
+        if auto_round >= self._AUTO_MAX_ROUNDS:
+            logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
+            return False, f"max rounds reached ({self._AUTO_MAX_ROUNDS})"
+        strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
+        if strict_heuristics and self._looks_like_failure_response(final_content):
+            return False, "failure heuristic matched"
+        if strict_heuristics and self._looks_like_user_input_request(final_content):
+            return False, "user-input heuristic matched"
+        plan = self._load_task_plan(project_dir)
+        if self._plan_has_pending_work(plan):
+            return True, None
+        if self._should_replan_exhausted_queue(
+            automation_policy,
+            plan=plan,
+            tokens_used=tokens_used,
+        ):
+            return True, None
+        return False, "queue exhausted, no replan condition met"
+
     def _should_continue_auto_ui(
         self,
         *,
-        channel: str,
         run_mode: str,
         project_dir: str | None,
         final_content: str | None,
@@ -782,26 +906,22 @@ class ResearchAgentLoop(BaseAgentLoop):
         automation_policy: dict[str, Any] | None = None,
         tokens_used: int = 0,
     ) -> bool:
-        """Decide whether to schedule another internal auto-run cycle."""
-        if channel != "ui" or run_mode != "auto":
-            return False
-        if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
-            return False
-        if auto_round >= self._AUTO_MAX_ROUNDS:
-            logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
-            return False
-        if self._looks_like_failure_response(final_content):
-            return False
-        if self._looks_like_user_input_request(final_content):
-            return False
-        plan = self._load_task_plan(project_dir)
-        if self._plan_has_pending_work(plan):
-            return True
-        return self._should_replan_exhausted_queue(
-            automation_policy,
-            plan=plan,
+        """Boolean wrapper around :meth:`_evaluate_continuation`.
+
+        Name kept for backward compatibility with downstream call sites
+        even though the ``_ui`` suffix is now historical — research auto
+        mode no longer requires the UI channel.
+        """
+        decision, _ = self._evaluate_continuation(
+            run_mode=run_mode,
+            project_dir=project_dir,
+            final_content=final_content,
+            auto_round=auto_round,
+            agent_profile=agent_profile,
+            automation_policy=automation_policy,
             tokens_used=tokens_used,
         )
+        return decision
 
     @classmethod
     def _should_replan_exhausted_queue(
@@ -811,15 +931,39 @@ class ResearchAgentLoop(BaseAgentLoop):
         plan: dict | None,
         tokens_used: int,
     ) -> bool:
-        """Continue auto mode when the queue is empty but experiment budget remains."""
-        if not policy or cls._plan_has_pending_work(plan):
+        """Continue auto mode when the queue is empty but more work is warranted.
+
+        Liberalised in PR 2 so that auto mode does not silently halt the
+        moment the model forgets to append the next experiment:
+
+        - With pending work in the plan, never replan (caller handles it).
+        - With no policy at all, replan — ``_AUTO_MAX_ROUNDS`` already bounds
+          the runaway and ``strictHeuristics`` still gates the heuristics.
+        - With a policy whose stop conditions (goals / maxExperiments /
+          maxTokens) are already met, do not replan.
+        - With a policy that has goals not yet reached, replan regardless of
+          whether ``maxExperiments`` is configured (previously we only
+          replanned when ``maxExperiments`` was set, which silently dropped
+          goal-driven sessions).
+        - With a policy whose ``maxExperiments`` budget still has room,
+          replan up to that budget.
+        - With a policy that only carries ``maxTokens`` /
+          ``strictHeuristics`` and no goals/budget, default to replanning;
+          ``maxTokens`` and ``_AUTO_MAX_ROUNDS`` keep the loop bounded.
+        """
+        if cls._plan_has_pending_work(plan):
             return False
-        max_experiments = policy.get("maxExperiments")
-        if not isinstance(max_experiments, int) or max_experiments <= 0:
-            return False
+        if policy is None:
+            return True
         if cls._evaluate_automation_stop_policy(policy, plan=plan, tokens_used=tokens_used):
             return False
-        return cls._count_completed_experiments(plan) < max_experiments
+        goals = policy.get("goals") if isinstance(policy.get("goals"), list) else []
+        if goals:
+            return True
+        max_experiments = policy.get("maxExperiments")
+        if isinstance(max_experiments, int) and max_experiments > 0:
+            return cls._count_completed_experiments(plan) < max_experiments
+        return True
 
     # ------------------------------------------------------------------
     # Control / session lifecycle overrides
@@ -1080,11 +1224,11 @@ class ResearchAgentLoop(BaseAgentLoop):
             run_kwargs["on_stream"] = on_stream
         if on_stream_end is not None:
             run_kwargs["on_stream_end"] = on_stream_end
-        round_plan_before = self._load_task_plan(project_dir) if msg.channel == "ui" else None
+        round_plan_before = self._load_task_plan(project_dir)
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
         total_tokens_used = self._last_loop_tokens_used
         self._accumulate_session_tokens(key, self._last_loop_tokens_used)
-        round_plan_after = self._load_task_plan(project_dir) if msg.channel == "ui" else None
+        round_plan_after = self._load_task_plan(project_dir)
         if msg.channel == "ui" and not allow_result_write:
             round_plan_after, restored = self._restore_result_section(
                 project_dir,
@@ -1110,7 +1254,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         while True:
             current_mode = self._session_run_modes.get(key, run_mode)
             automation_policy = self._resolve_session_automation_policy(key, None)
-            if msg.channel == "ui" and current_mode == "auto":
+            if current_mode == "auto":
                 crossed = self._experiments_crossed_boundary(round_plan_before, round_plan_after)
                 if len(crossed) > 1:
                     await progress_cb(
@@ -1184,7 +1328,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                                 )
                         continue
 
-            if msg.channel == "ui" and current_mode == "auto":
+            if current_mode == "auto":
                 current_plan = self._load_task_plan(project_dir)
                 stop_reason = self._evaluate_automation_stop_policy(
                     automation_policy,
@@ -1195,8 +1339,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                     await progress_cb(f"auto-run stop condition: {stop_reason}")
                     break
 
-            should_continue = self._should_continue_auto_ui(
-                channel=msg.channel,
+            should_continue, continuation_reason = self._evaluate_continuation(
                 run_mode=current_mode,
                 project_dir=project_dir,
                 final_content=final_content,
@@ -1206,14 +1349,21 @@ class ResearchAgentLoop(BaseAgentLoop):
                 tokens_used=total_tokens_used,
             )
             if not should_continue:
+                if current_mode == "auto" and continuation_reason:
+                    await progress_cb(
+                        f"auto-run stop reason: {continuation_reason}"
+                    )
                 guard_issues = list(getattr(self, "_last_task_plan_guard_issues", []))
                 continue_despite_guard = False
+                strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
+                heuristic_block = strict_heuristics and (
+                    self._looks_like_failure_response(final_content)
+                    or self._looks_like_user_input_request(final_content)
+                )
                 if (
-                    msg.channel == "ui"
-                    and current_mode == "auto"
+                    current_mode == "auto"
                     and guard_issues
-                    and not self._looks_like_failure_response(final_content)
-                    and not self._looks_like_user_input_request(final_content)
+                    and not heuristic_block
                 ):
                     if guard_repair_round < self._AUTO_GUARD_REPAIR_MAX:
                         guard_repair_round += 1
@@ -1232,7 +1382,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                                 issues=guard_issues,
                             ),
                         })
-                        guard_plan_before = round_plan_after if msg.channel == "ui" else None
+                        guard_plan_before = round_plan_after
                         final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
                         total_tokens_used += self._last_loop_tokens_used
                         self._accumulate_session_tokens(key, self._last_loop_tokens_used)
@@ -1279,7 +1429,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                                 issues=guard_issues,
                             ),
                         })
-                        guard_plan_before = round_plan_after if msg.channel == "ui" else None
+                        guard_plan_before = round_plan_after
                         final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
                         total_tokens_used += self._last_loop_tokens_used
                         self._accumulate_session_tokens(key, self._last_loop_tokens_used)

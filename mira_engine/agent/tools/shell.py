@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mira_engine.agent.tools.base import Tool
 from mira_engine.agent.tools.bg import (
@@ -19,9 +20,136 @@ from mira_engine.agent.tools.sandbox import wrap_command
 from mira_engine.config.paths import get_media_dir
 from mira_engine.security.network import contains_internal_url
 
+if TYPE_CHECKING:
+    from mira_engine.config.schema import PythonRuntimeConfig
+
+logger = logging.getLogger(__name__)
+
+_PYTHON_EXECUTABLE_NAMES = frozenset(
+    {"python", "python3", "pip", "pip3", "pytest", "ipython", "jupyter", "uv"}
+)
+_SEGMENT_SEPARATOR_RE = re.compile(r"\s*(?:&&|\|\||[;|])\s*")
+# Strips ``KEY=VAL `` env-var prefixes that appear at the head of a command
+# segment in POSIX shells. Repeated to handle ``A=1 B=2 python x.py``.
+_ENV_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S+\s+")
+
+
+_PIP_INSTALL_RE = re.compile(
+    r"""
+    (?P<lead>(?:^|(?<=&&\ )|(?<=\|\|\ )|(?<=;\ )|(?<=\|\ )))   # boundary
+    (?P<prefix>(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)              # KEY=VAL prefixes
+    (?P<head>
+        (?:[\w./\\-]*pip3?(?:\.exe)?)                           # pip / pip3 (path or bare)
+      | (?:[\w./\\-]*python3?(?:\.exe)?\s+-m\s+pip)             # python -m pip
+    )
+    \s+install\b                                                # the subcommand
+    """,
+    re.VERBOSE,
+)
+
+
+def rewrite_pip_install_to_uv(command: str) -> str:
+    """Rewrite ``pip install`` (and ``python -m pip install``) into
+    ``uv pip install`` for every command segment, preserving everything
+    else (env-var prefixes, command chaining, the rest of the args).
+
+    Read-only pip subcommands (``pip list``, ``pip show``, ``pip
+    freeze``) are **not** rewritten — only ``install`` mutates state and
+    benefits from uv.lock-aware routing.
+
+    The function is text-based: it doesn't actually parse the shell
+    grammar. It handles the common cases the agent is likely to emit:
+
+    - ``pip install foo``
+    - ``pip3 install foo``
+    - ``python -m pip install foo``
+    - ``./.venv/bin/pip install foo``
+    - ``cd dir && pip install foo``
+    - ``PIP_INDEX_URL=... pip install foo``
+
+    Anything more exotic (subshells, here-docs, quoted ``pip install``
+    inside a script literal) is left untouched on purpose; rewriting
+    those is risk-greater than reward.
+    """
+    if not command or "install" not in command:
+        return command
+
+    def _replace(match: re.Match[str]) -> str:
+        prefix = match.group("prefix") or ""
+        return f"{prefix}uv pip install"
+
+    return _PIP_INSTALL_RE.sub(_replace, command)
+
+
+def _is_python_command(command: str) -> bool:
+    """Return True if ``command`` looks like it expects a Python interpreter.
+
+    Detects bare ``python``, ``python3``, ``pip``, ``pytest``, ``ipython``,
+    ``jupyter``, ``uv`` invocations as well as path-prefixed variants
+    (``/usr/bin/python``, ``./venv/bin/python``) and chained commands
+    (``cd foo && python x``, ``activate; pip install .``,
+    ``PYTHONHASHSEED=0 python script.py``). Used to decide whether to
+    lazily bootstrap the project venv before spawning the subprocess.
+
+    Slight over-triggering is acceptable: bootstrap is idempotent and the
+    second invocation short-circuits via :class:`ExecTool._venv_cache`.
+    """
+    if not command:
+        return False
+    for raw_segment in _SEGMENT_SEPARATOR_RE.split(command):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        # Drop any leading ``KEY=VAL`` assignments (one or more).
+        while True:
+            stripped = _ENV_PREFIX_RE.sub("", segment)
+            if stripped == segment:
+                break
+            segment = stripped
+        first_token = segment.split(None, 1)[0] if segment else ""
+        if not first_token:
+            continue
+        # Strip path components: ``/usr/bin/python3`` -> ``python3``.
+        basename = first_token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        # Drop a trailing ``.exe`` so Windows paths still match.
+        if basename.lower().endswith(".exe"):
+            basename = basename[:-4]
+        if basename in _PYTHON_EXECUTABLE_NAMES:
+            return True
+    return False
+
 _IS_WINDOWS = sys.platform == "win32"
 _SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "COOKIE")
-_UNIX_ENV_KEYS = ("HOME", "LANG", "TERM")
+
+# Runtime-relevant variables we transparently forward to subprocesses.
+# Without these, an agent that runs ``python script.py`` either resolves
+# ``python`` against bash login profiles (Unix) or fails to locate the
+# correct interpreter inside a virtualenv / conda env that the engine itself
+# was launched from. Sensitive markers above still apply on top of this list.
+_UNIX_ENV_KEYS = (
+    "HOME",
+    "LANG",
+    "TERM",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TZ",
+    "TMPDIR",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "PYTHONPATH",
+    "PYTHONHASHSEED",
+    "PYTHONUNBUFFERED",
+    "PYTHONIOENCODING",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+)
+_UNIX_ENV_PREFIXES = ("LC_", "MIRA_")  # locale + project meta we mint ourselves
+# Windows core keys: always present in the subprocess env (defaulted if empty).
+# Many Win32 APIs misbehave when these are unset entirely.
 _WINDOWS_ENV_KEYS = (
     "SYSTEMROOT",
     "COMSPEC",
@@ -39,6 +167,19 @@ _WINDOWS_ENV_KEYS = (
     "ProgramFiles(x86)",
     "ProgramW6432",
 )
+# Windows optional keys: only forwarded when actually set in the parent env.
+# We avoid synthesising empty values for VIRTUAL_ENV / CONDA_PREFIX because
+# Python launchers and conda activate scripts treat "" differently from unset.
+_WINDOWS_OPTIONAL_KEYS = (
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "PYTHONPATH",
+    "PYTHONHASHSEED",
+    "PYTHONUNBUFFERED",
+    "PYTHONIOENCODING",
+)
+_WINDOWS_ENV_PREFIXES = ("MIRA_",)
 
 
 class ExecTool(Tool):
@@ -57,6 +198,7 @@ class ExecTool(Tool):
         sandbox: str | None = None,
         background_registry: BackgroundJobRegistry | None = None,
         enable_background: bool = False,
+        python_runtime: "PythonRuntimeConfig | None" = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -66,6 +208,15 @@ class ExecTool(Tool):
         # context that has no companion ``bg`` tool to inspect them.
         self.background_registry = background_registry
         self.enable_background = enable_background and background_registry is not None
+        # Per-project Python runtime config. ``None`` and ``manager == "off"``
+        # both mean "do not manage venvs"; the tool resolves ``python`` against
+        # the parent process environment exactly like before.
+        self.python_runtime = python_runtime
+        # Per-project venv cache: working_dir -> resolved venv path (or None
+        # to mean "bootstrap was attempted and failed; do not retry"). Keeps
+        # the bootstrap subprocess off the hot path for repeated commands.
+        self._venv_cache: dict[str, Path | None] = {}
+        self._venv_cache_lock = asyncio.Lock()
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
@@ -157,8 +308,13 @@ class ExecTool(Tool):
                     "the main loop where the `bg` tool is available."
                 )
 
+        venv = await self._maybe_bootstrap_venv(command, cwd)
         env = self._build_env()
+        if venv is not None:
+            self._apply_venv_to_env(env, venv)
         spawn_command = command
+        if venv is not None and self._should_rewrite_pip():
+            spawn_command = rewrite_pip_install_to_uv(spawn_command)
 
         if self.path_append:
             if _IS_WINDOWS:
@@ -274,29 +430,136 @@ class ExecTool(Tool):
             f"bg(action='wait', job_id='{job.job_id}', timeout=...) to monitor."
         )
 
+    async def _maybe_bootstrap_venv(self, command: str, cwd: str) -> Path | None:
+        """Lazily provision a project-local venv before running ``command``.
+
+        Returns the resolved venv path if the configured manager is active,
+        the command looks like it needs Python, and bootstrap succeeded.
+        Returns ``None`` in all other cases — including when bootstrap fails;
+        the caller should fall back to the legacy environment so a
+        misconfigured uv install doesn't bring the agent to a halt.
+        """
+        runtime = self.python_runtime
+        if runtime is None or runtime.manager != "uv":
+            return None
+        if not runtime.auto_bootstrap:
+            return None
+        if not _is_python_command(command):
+            return None
+
+        async with self._venv_cache_lock:
+            if cwd in self._venv_cache:
+                return self._venv_cache[cwd]
+
+            try:
+                venv = await asyncio.to_thread(self._bootstrap_venv_sync, cwd, runtime)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to bootstrap project venv at %s: %s; "
+                    "falling back to system python.",
+                    cwd,
+                    exc,
+                )
+                self._venv_cache[cwd] = None
+                return None
+
+            self._venv_cache[cwd] = venv
+            return venv
+
+    @staticmethod
+    def _bootstrap_venv_sync(
+        cwd: str, runtime: "PythonRuntimeConfig"
+    ) -> Path | None:
+        """Synchronous bridge to :func:`ensure_project_venv`.
+
+        Imported lazily so importing this module never requires
+        :mod:`mira_engine.runtime` to be loadable (keeps the engine bootable
+        on hosts without uv).
+        """
+        from mira_engine.runtime.python_env import ensure_project_venv
+
+        return ensure_project_venv(cwd, runtime)
+
+    def _should_rewrite_pip(self) -> bool:
+        """True iff the active runtime config asked us to rewrite
+        ``pip install`` into ``uv pip install``."""
+        runtime = self.python_runtime
+        if runtime is None or runtime.manager != "uv":
+            return False
+        return bool(getattr(runtime, "rewrite_pip_install", False))
+
+    @staticmethod
+    def _apply_venv_to_env(env: dict[str, str], venv: Path) -> None:
+        """Mutate ``env`` so subprocesses see the venv as activated.
+
+        Mirrors what ``source <venv>/bin/activate`` does: prepends the
+        venv's ``bin/`` (or ``Scripts/``) to PATH, sets ``VIRTUAL_ENV``,
+        and scrubs ``CONDA_*`` / ``PYTHONHOME`` so a coexisting conda
+        activation doesn't shadow the venv's interpreter.
+        """
+        bin_name = "Scripts" if _IS_WINDOWS else "bin"
+        venv_bin = str(venv / bin_name)
+        # Use the platform's native PATH separator regardless of the
+        # interpreter's ``os.pathsep`` (which only reflects the host OS,
+        # not the simulated platform under test).
+        pathsep = ";" if _IS_WINDOWS else ":"
+        existing_path = env.get("PATH", "")
+        env["PATH"] = (
+            venv_bin + pathsep + existing_path if existing_path else venv_bin
+        )
+        env["VIRTUAL_ENV"] = str(venv)
+        env.pop("CONDA_PREFIX", None)
+        env.pop("CONDA_DEFAULT_ENV", None)
+        env.pop("PYTHONHOME", None)
+
     def _build_env(self) -> dict[str, str]:
-        """Build a minimized environment without sensitive parent variables."""
+        """Build a curated subprocess environment.
+
+        Forwards a positive allowlist of runtime-relevant variables (PATH,
+        locale, virtualenv / conda activation hints, native library search
+        paths, etc.) while still scrubbing anything that looks like a credential
+        via :data:`_SENSITIVE_ENV_MARKERS`.
+        """
         if _IS_WINDOWS:
             env: dict[str, str] = {}
             for key in _WINDOWS_ENV_KEYS:
+                env[key] = os.environ.get(key) or ""
+            env["SYSTEMROOT"] = env["SYSTEMROOT"] or r"C:\Windows"
+            env["COMSPEC"] = env["COMSPEC"] or "cmd.exe"
+            env["USERPROFILE"] = env["USERPROFILE"] or r"C:\Users\Default"
+            env["HOMEDRIVE"] = env["HOMEDRIVE"] or "C:"
+            env["HOMEPATH"] = env["HOMEPATH"] or r"\Users\Default"
+            env["TEMP"] = env["TEMP"] or r"C:\Windows\Temp"
+            env["TMP"] = env["TMP"] or env["TEMP"]
+            env["PATHEXT"] = env["PATHEXT"] or ".COM;.EXE;.BAT;.CMD"
+            env["PATH"] = env["PATH"] or r"C:\Windows\System32;C:\Windows"
+            for key in _WINDOWS_OPTIONAL_KEYS:
                 value = os.environ.get(key)
-                env[key] = value or ""
-            env["SYSTEMROOT"] = env.get("SYSTEMROOT") or r"C:\Windows"
-            env["COMSPEC"] = env.get("COMSPEC") or "cmd.exe"
-            env["USERPROFILE"] = env.get("USERPROFILE") or r"C:\Users\Default"
-            env["HOMEDRIVE"] = env.get("HOMEDRIVE") or "C:"
-            env["HOMEPATH"] = env.get("HOMEPATH") or r"\Users\Default"
-            env["TEMP"] = env.get("TEMP") or r"C:\Windows\Temp"
-            env["TMP"] = env.get("TMP") or env["TEMP"]
-            env["PATHEXT"] = env.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
-            env["PATH"] = env.get("PATH") or r"C:\Windows\System32;C:\Windows"
-            return env
+                if value:
+                    env[key] = value
+            for name, value in os.environ.items():
+                if any(name.startswith(prefix) for prefix in _WINDOWS_ENV_PREFIXES):
+                    env.setdefault(name, value)
+            return self._scrub_sensitive(env)
 
-        env = {
+        env: dict[str, str] = {
             "HOME": os.environ.get("HOME", str(Path.home())),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "TERM": os.environ.get("TERM", "xterm-256color"),
         }
+        for key in _UNIX_ENV_KEYS:
+            if key in env:
+                continue
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
+        for name, value in os.environ.items():
+            if any(name.startswith(prefix) for prefix in _UNIX_ENV_PREFIXES):
+                env.setdefault(name, value)
+        return self._scrub_sensitive(env)
+
+    @staticmethod
+    def _scrub_sensitive(env: dict[str, str]) -> dict[str, str]:
         return {
             key: value
             for key, value in env.items()

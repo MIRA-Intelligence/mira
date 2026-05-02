@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from mira_engine.agent.context import ContextBuilder
+from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
 from mira_engine.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from mira_engine.agent.memory import Consolidator, Dream, MemoryStore
 from mira_engine.agent.routing import ModelRouter, RoutedProviderManager
@@ -248,6 +249,7 @@ class BaseAgentLoop:
                 path_append=self.exec_config.path_append,
                 background_registry=self._bg_registry,
                 enable_background=True,
+                python_runtime=self.exec_config.python,
             ))
             self.tools.register(BgTool(registry=self._bg_registry))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
@@ -376,12 +378,13 @@ class BaseAgentLoop:
             return f"router -> {tier} ({model}{details})"
         return f"router -> {tier} ({model}, score={score}{details})"
 
-    @staticmethod
     def _compose_extra_system(
+        self,
         ui_system_instructions: object,
         guard_notice: object,
     ) -> str | None:
-        """Merge optional UI instructions with guardrail notices."""
+        """Merge optional UI instructions, guardrail notices, and a venv
+        usage hint when ``tools.exec.python.manager`` is active."""
         base = (
             ui_system_instructions.strip()
             if isinstance(ui_system_instructions, str) and ui_system_instructions.strip()
@@ -392,9 +395,11 @@ class BaseAgentLoop:
             if isinstance(guard_notice, str) and guard_notice.strip()
             else ""
         )
-        if base and notice:
-            return f"{base}\n\n{notice}"
-        return base or notice or None
+        python_hint = build_python_runtime_hint(
+            getattr(getattr(self, "exec_config", None), "python", None)
+        ) or ""
+        sections = [chunk for chunk in (python_hint, base, notice) if chunk]
+        return "\n\n".join(sections) if sections else None
 
     def _get_model_runtime(self, session_key: str) -> RoutedProviderManager:
         """Return the session-local model runtime, creating it on demand."""
