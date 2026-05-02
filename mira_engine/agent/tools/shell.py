@@ -21,7 +21,36 @@ from mira_engine.security.network import contains_internal_url
 
 _IS_WINDOWS = sys.platform == "win32"
 _SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "COOKIE")
-_UNIX_ENV_KEYS = ("HOME", "LANG", "TERM")
+
+# Runtime-relevant variables we transparently forward to subprocesses.
+# Without these, an agent that runs ``python script.py`` either resolves
+# ``python`` against bash login profiles (Unix) or fails to locate the
+# correct interpreter inside a virtualenv / conda env that the engine itself
+# was launched from. Sensitive markers above still apply on top of this list.
+_UNIX_ENV_KEYS = (
+    "HOME",
+    "LANG",
+    "TERM",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TZ",
+    "TMPDIR",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "PYTHONPATH",
+    "PYTHONHASHSEED",
+    "PYTHONUNBUFFERED",
+    "PYTHONIOENCODING",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+)
+_UNIX_ENV_PREFIXES = ("LC_", "MIRA_")  # locale + project meta we mint ourselves
+# Windows core keys: always present in the subprocess env (defaulted if empty).
+# Many Win32 APIs misbehave when these are unset entirely.
 _WINDOWS_ENV_KEYS = (
     "SYSTEMROOT",
     "COMSPEC",
@@ -39,6 +68,19 @@ _WINDOWS_ENV_KEYS = (
     "ProgramFiles(x86)",
     "ProgramW6432",
 )
+# Windows optional keys: only forwarded when actually set in the parent env.
+# We avoid synthesising empty values for VIRTUAL_ENV / CONDA_PREFIX because
+# Python launchers and conda activate scripts treat "" differently from unset.
+_WINDOWS_OPTIONAL_KEYS = (
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "PYTHONPATH",
+    "PYTHONHASHSEED",
+    "PYTHONUNBUFFERED",
+    "PYTHONIOENCODING",
+)
+_WINDOWS_ENV_PREFIXES = ("MIRA_",)
 
 
 class ExecTool(Tool):
@@ -275,28 +317,53 @@ class ExecTool(Tool):
         )
 
     def _build_env(self) -> dict[str, str]:
-        """Build a minimized environment without sensitive parent variables."""
+        """Build a curated subprocess environment.
+
+        Forwards a positive allowlist of runtime-relevant variables (PATH,
+        locale, virtualenv / conda activation hints, native library search
+        paths, etc.) while still scrubbing anything that looks like a credential
+        via :data:`_SENSITIVE_ENV_MARKERS`.
+        """
         if _IS_WINDOWS:
             env: dict[str, str] = {}
             for key in _WINDOWS_ENV_KEYS:
+                env[key] = os.environ.get(key) or ""
+            env["SYSTEMROOT"] = env["SYSTEMROOT"] or r"C:\Windows"
+            env["COMSPEC"] = env["COMSPEC"] or "cmd.exe"
+            env["USERPROFILE"] = env["USERPROFILE"] or r"C:\Users\Default"
+            env["HOMEDRIVE"] = env["HOMEDRIVE"] or "C:"
+            env["HOMEPATH"] = env["HOMEPATH"] or r"\Users\Default"
+            env["TEMP"] = env["TEMP"] or r"C:\Windows\Temp"
+            env["TMP"] = env["TMP"] or env["TEMP"]
+            env["PATHEXT"] = env["PATHEXT"] or ".COM;.EXE;.BAT;.CMD"
+            env["PATH"] = env["PATH"] or r"C:\Windows\System32;C:\Windows"
+            for key in _WINDOWS_OPTIONAL_KEYS:
                 value = os.environ.get(key)
-                env[key] = value or ""
-            env["SYSTEMROOT"] = env.get("SYSTEMROOT") or r"C:\Windows"
-            env["COMSPEC"] = env.get("COMSPEC") or "cmd.exe"
-            env["USERPROFILE"] = env.get("USERPROFILE") or r"C:\Users\Default"
-            env["HOMEDRIVE"] = env.get("HOMEDRIVE") or "C:"
-            env["HOMEPATH"] = env.get("HOMEPATH") or r"\Users\Default"
-            env["TEMP"] = env.get("TEMP") or r"C:\Windows\Temp"
-            env["TMP"] = env.get("TMP") or env["TEMP"]
-            env["PATHEXT"] = env.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
-            env["PATH"] = env.get("PATH") or r"C:\Windows\System32;C:\Windows"
-            return env
+                if value:
+                    env[key] = value
+            for name, value in os.environ.items():
+                if any(name.startswith(prefix) for prefix in _WINDOWS_ENV_PREFIXES):
+                    env.setdefault(name, value)
+            return self._scrub_sensitive(env)
 
-        env = {
+        env: dict[str, str] = {
             "HOME": os.environ.get("HOME", str(Path.home())),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "TERM": os.environ.get("TERM", "xterm-256color"),
         }
+        for key in _UNIX_ENV_KEYS:
+            if key in env:
+                continue
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
+        for name, value in os.environ.items():
+            if any(name.startswith(prefix) for prefix in _UNIX_ENV_PREFIXES):
+                env.setdefault(name, value)
+        return self._scrub_sensitive(env)
+
+    @staticmethod
+    def _scrub_sensitive(env: dict[str, str]) -> dict[str, str]:
         return {
             key: value
             for key, value in env.items()

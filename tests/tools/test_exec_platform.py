@@ -24,13 +24,11 @@ _WINDOWS_ENV_KEYS = {
 
 class TestBuildEnvUnix:
 
-    def test_expected_keys(self):
+    def test_baseline_keys_present(self):
         with patch("mira_engine.agent.tools.shell._IS_WINDOWS", False):
             env = ExecTool()._build_env()
-        expected = {"HOME", "LANG", "TERM"}
-        assert expected <= set(env)
-        if sys.platform != "win32":
-            assert set(env) == expected
+        # Locale + home are always present even with an empty parent environ.
+        assert {"HOME", "LANG", "TERM"} <= set(env)
 
     def test_home_from_environ(self, monkeypatch):
         monkeypatch.setenv("HOME", "/Users/dev")
@@ -38,9 +36,47 @@ class TestBuildEnvUnix:
             env = ExecTool()._build_env()
         assert env["HOME"] == "/Users/dev"
 
+    def test_runtime_keys_forwarded_when_set(self, monkeypatch):
+        """PATH, VIRTUAL_ENV, CONDA_PREFIX, PYTHONPATH must reach subprocesses."""
+        monkeypatch.setenv("PATH", "/opt/x:/usr/bin")
+        monkeypatch.setenv("VIRTUAL_ENV", "/tmp/venv")
+        monkeypatch.setenv("CONDA_PREFIX", "/opt/conda/envs/foo")
+        monkeypatch.setenv("CONDA_DEFAULT_ENV", "foo")
+        monkeypatch.setenv("PYTHONPATH", "/proj/src")
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/lib")
+        with patch("mira_engine.agent.tools.shell._IS_WINDOWS", False):
+            env = ExecTool()._build_env()
+        assert env["PATH"] == "/opt/x:/usr/bin"
+        assert env["VIRTUAL_ENV"] == "/tmp/venv"
+        assert env["CONDA_PREFIX"] == "/opt/conda/envs/foo"
+        assert env["CONDA_DEFAULT_ENV"] == "foo"
+        assert env["PYTHONPATH"] == "/proj/src"
+        assert env["LD_LIBRARY_PATH"] == "/opt/lib"
+
+    def test_runtime_keys_absent_when_unset(self, monkeypatch):
+        """Optional runtime keys must NOT show up when the parent never set them."""
+        for key in ("VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONPATH"):
+            monkeypatch.delenv(key, raising=False)
+        with patch("mira_engine.agent.tools.shell._IS_WINDOWS", False):
+            env = ExecTool()._build_env()
+        for key in ("VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONPATH"):
+            assert key not in env
+
+    def test_lc_locale_prefix_forwarded(self, monkeypatch):
+        monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+        monkeypatch.setenv("LC_CTYPE", "en_US.UTF-8")
+        with patch("mira_engine.agent.tools.shell._IS_WINDOWS", False):
+            env = ExecTool()._build_env()
+        assert env["LC_ALL"] == "en_US.UTF-8"
+        assert env["LC_CTYPE"] == "en_US.UTF-8"
+
     def test_secrets_excluded(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
         monkeypatch.setenv("MIRA_TOKEN", "tok-secret")
+        # Even with PATH / VIRTUAL_ENV explicitly forwarded, credential-shaped
+        # vars must still be scrubbed by _SENSITIVE_ENV_MARKERS.
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setenv("VIRTUAL_ENV", "/tmp/v")
         with patch("mira_engine.agent.tools.shell._IS_WINDOWS", False):
             env = ExecTool()._build_env()
         assert "OPENAI_API_KEY" not in env
@@ -51,16 +87,35 @@ class TestBuildEnvUnix:
 
 class TestBuildEnvWindows:
 
-    _EXPECTED_KEYS = {
+    _CORE_KEYS = {
         "SYSTEMROOT", "COMSPEC", "USERPROFILE", "HOMEDRIVE",
         "HOMEPATH", "TEMP", "TMP", "PATHEXT", "PATH",
         *_WINDOWS_ENV_KEYS,
     }
 
-    def test_expected_keys(self):
+    def test_core_keys_always_present(self):
         with patch("mira_engine.agent.tools.shell._IS_WINDOWS", True):
             env = ExecTool()._build_env()
-        assert set(env) == self._EXPECTED_KEYS
+        # Every core Win32 key must show up, even if defaulted to empty.
+        assert self._CORE_KEYS <= set(env)
+
+    def test_optional_python_keys_forwarded(self, monkeypatch):
+        monkeypatch.setenv("VIRTUAL_ENV", r"C:\proj\.venv")
+        monkeypatch.setenv("PYTHONPATH", r"C:\proj\src")
+        with patch("mira_engine.agent.tools.shell._IS_WINDOWS", True):
+            env = ExecTool()._build_env()
+        assert env["VIRTUAL_ENV"] == r"C:\proj\.venv"
+        assert env["PYTHONPATH"] == r"C:\proj\src"
+
+    def test_optional_python_keys_omitted_when_unset(self, monkeypatch):
+        for key in ("VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONPATH"):
+            monkeypatch.delenv(key, raising=False)
+        with patch("mira_engine.agent.tools.shell._IS_WINDOWS", True):
+            env = ExecTool()._build_env()
+        assert "VIRTUAL_ENV" not in env
+        assert "CONDA_PREFIX" not in env
+        assert "CONDA_DEFAULT_ENV" not in env
+        assert "PYTHONPATH" not in env
 
     def test_secrets_excluded(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
