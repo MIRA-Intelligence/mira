@@ -127,6 +127,55 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert ResearchAgentLoop._looks_like_user_input_request("Please confirm your choice.") is True
     assert ResearchAgentLoop._looks_like_failure_response("Traceback (most recent call last): ...") is True
     assert ResearchAgentLoop._looks_like_failure_response("hypothesis failed but continue") is False
+    # PR 1: tightened heuristics — generic mid-text phrasing no longer halts.
+    assert (
+        ResearchAgentLoop._looks_like_user_input_request(
+            "Could you tell me more about the dataset later? "
+            "I'll proceed with the next experiment now."
+        )
+        is False
+    )
+    assert (
+        ResearchAgentLoop._looks_like_user_input_request(
+            "I want to clarify that the metric improved.\n\n"
+            "Starting Exp003 next."
+        )
+        is False
+    )
+    assert (
+        ResearchAgentLoop._looks_like_user_input_request(
+            "实验完成。\n\n继续下一步实验，无需你介入。"
+        )
+        is False
+    )
+    # Closing-paragraph asks (real blockers) still halt.
+    assert (
+        ResearchAgentLoop._looks_like_user_input_request(
+            "已完成 Exp001。\n\n请确认是否进入下一阶段？"
+        )
+        is True
+    )
+    assert (
+        ResearchAgentLoop._looks_like_user_input_request(
+            "Summary written.\n\nWhat would you like to do next?"
+        )
+        is True
+    )
+    # PR 1: tightened failure heuristic — log-style snippets no longer halt.
+    assert ResearchAgentLoop._looks_like_failure_response("[stderr] exit code: 0") is False
+    assert ResearchAgentLoop._looks_like_failure_response("[stderr] exit code: 1; recorded as failed in task_plan") is False
+    assert ResearchAgentLoop._looks_like_failure_response("ModuleNotFoundError will be fixed by installing X") is False
+    assert ResearchAgentLoop._looks_like_failure_response("error: shell call returned non-zero, retrying") is False
+    assert ResearchAgentLoop._looks_like_failure_response("出现错误但已捕获，继续下一步。") is False
+    # System-level blockers and explicit "I cannot continue" verdicts still halt.
+    assert ResearchAgentLoop._looks_like_failure_response("Tool call failed: provider unreachable.") is True
+    assert ResearchAgentLoop._looks_like_failure_response("Memory archival failed during /new.") is True
+    assert (
+        ResearchAgentLoop._looks_like_failure_response(
+            "Analysis complete.\n\nI cannot continue without write access."
+        )
+        is True
+    )
 
     project = tmp_path / "PRJ-1"
     project.mkdir()
@@ -159,6 +208,29 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         final_content="please confirm",
         auto_round=0,
     ) is False
+    # PR 1: strictHeuristics=False bypasses the user-input/failure heuristics
+    # so the loop only stops on hard guards (round / experiment / token /
+    # explicit tool failure). With pending work in the plan, the same input
+    # that halts above must continue here.
+    relaxed_policy = loop._parse_automation_policy(
+        {"goals": [], "strictHeuristics": False}
+    )
+    assert loop._should_continue_auto_ui(
+        channel="ui",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="please confirm",
+        auto_round=0,
+        automation_policy=relaxed_policy,
+    ) is True
+    assert loop._should_continue_auto_ui(
+        channel="ui",
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="Traceback (most recent call last): ...",
+        auto_round=0,
+        automation_policy=relaxed_policy,
+    ) is True
 
     bad_project = tmp_path / "PRJ-bad"
     bad_project.mkdir()
@@ -307,6 +379,21 @@ def test_automation_policy_helpers(tmp_path: Path) -> None:
     assert policy is not None
     assert policy["logic"] == "OR"
     assert len(policy["goals"]) == 2
+    assert policy["strictHeuristics"] is True
+
+    # PR 1: the strictHeuristics flag round-trips through parsing.
+    relaxed = loop._parse_automation_policy(
+        {"goals": [], "strictHeuristics": False}
+    )
+    assert relaxed is not None
+    assert relaxed["strictHeuristics"] is False
+    assert ResearchAgentLoop._strict_heuristics_from_policy(relaxed) is False
+    assert ResearchAgentLoop._strict_heuristics_from_policy(None) is True
+    assert ResearchAgentLoop._strict_heuristics_from_policy({}) is True
+    # Non-bool values fall back to default (True).
+    assert (
+        ResearchAgentLoop._strict_heuristics_from_policy({"strictHeuristics": "off"}) is True
+    )
 
     plan = {
         "experiments": [
