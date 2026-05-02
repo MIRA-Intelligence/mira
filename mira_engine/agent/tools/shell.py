@@ -34,6 +34,53 @@ _SEGMENT_SEPARATOR_RE = re.compile(r"\s*(?:&&|\|\||[;|])\s*")
 _ENV_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S+\s+")
 
 
+_PIP_INSTALL_RE = re.compile(
+    r"""
+    (?P<lead>(?:^|(?<=&&\ )|(?<=\|\|\ )|(?<=;\ )|(?<=\|\ )))   # boundary
+    (?P<prefix>(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)              # KEY=VAL prefixes
+    (?P<head>
+        (?:[\w./\\-]*pip3?(?:\.exe)?)                           # pip / pip3 (path or bare)
+      | (?:[\w./\\-]*python3?(?:\.exe)?\s+-m\s+pip)             # python -m pip
+    )
+    \s+install\b                                                # the subcommand
+    """,
+    re.VERBOSE,
+)
+
+
+def rewrite_pip_install_to_uv(command: str) -> str:
+    """Rewrite ``pip install`` (and ``python -m pip install``) into
+    ``uv pip install`` for every command segment, preserving everything
+    else (env-var prefixes, command chaining, the rest of the args).
+
+    Read-only pip subcommands (``pip list``, ``pip show``, ``pip
+    freeze``) are **not** rewritten — only ``install`` mutates state and
+    benefits from uv.lock-aware routing.
+
+    The function is text-based: it doesn't actually parse the shell
+    grammar. It handles the common cases the agent is likely to emit:
+
+    - ``pip install foo``
+    - ``pip3 install foo``
+    - ``python -m pip install foo``
+    - ``./.venv/bin/pip install foo``
+    - ``cd dir && pip install foo``
+    - ``PIP_INDEX_URL=... pip install foo``
+
+    Anything more exotic (subshells, here-docs, quoted ``pip install``
+    inside a script literal) is left untouched on purpose; rewriting
+    those is risk-greater than reward.
+    """
+    if not command or "install" not in command:
+        return command
+
+    def _replace(match: re.Match[str]) -> str:
+        prefix = match.group("prefix") or ""
+        return f"{prefix}uv pip install"
+
+    return _PIP_INSTALL_RE.sub(_replace, command)
+
+
 def _is_python_command(command: str) -> bool:
     """Return True if ``command`` looks like it expects a Python interpreter.
 
@@ -266,6 +313,8 @@ class ExecTool(Tool):
         if venv is not None:
             self._apply_venv_to_env(env, venv)
         spawn_command = command
+        if venv is not None and self._should_rewrite_pip():
+            spawn_command = rewrite_pip_install_to_uv(spawn_command)
 
         if self.path_append:
             if _IS_WINDOWS:
@@ -430,6 +479,14 @@ class ExecTool(Tool):
         from mira_engine.runtime.python_env import ensure_project_venv
 
         return ensure_project_venv(cwd, runtime)
+
+    def _should_rewrite_pip(self) -> bool:
+        """True iff the active runtime config asked us to rewrite
+        ``pip install`` into ``uv pip install``."""
+        runtime = self.python_runtime
+        if runtime is None or runtime.manager != "uv":
+            return False
+        return bool(getattr(runtime, "rewrite_pip_install", False))
 
     @staticmethod
     def _apply_venv_to_env(env: dict[str, str], venv: Path) -> None:

@@ -65,4 +65,11 @@ def build_python_runtime_hint(runtime: "PythonRuntimeConfig | None") -> str | No
             + ", ".join(f"`{p}`" for p in runtime.baseline_requirements)
             + "."
         )
+    if getattr(runtime, "rewrite_pip_install", False):
+        lines.append(
+            "- Note: any `pip install` (or `python -m pip install`) you "
+            "issue is automatically rewritten to `uv pip install` before "
+            "execution. Read-only pip subcommands (`pip list`, "
+            "`pip show`, `pip freeze`) are left unchanged."
+        )
     return "\n".join(lines)

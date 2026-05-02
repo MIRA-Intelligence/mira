@@ -514,6 +514,15 @@ class PythonRuntimeConfig(Base):
     # standalone build if necessary".
     python_version: str = ""
 
+    # Opt-in: when True and ``manager == "uv"``, the exec tool rewrites
+    # ``pip install ...`` and ``python -m pip install ...`` into
+    # ``uv pip install ...`` before spawning the subprocess. This is a
+    # safety net for agents that "forget" the prompt convention; defaults
+    # to off so agents that legitimately need bare pip (e.g. testing pip
+    # itself) aren't second-guessed. ``pip list``, ``pip show`` and
+    # other read-only subcommands are never rewritten.
+    rewrite_pip_install: bool = False
+
 
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
