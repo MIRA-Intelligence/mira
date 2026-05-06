@@ -161,19 +161,12 @@ Local engine logs and diagnostics:
 
 ## 🔗 Release Compatibility Mapping
 
-Mira tracks UI/Agent release compatibility in `compatibility.json`.
+UI ↔ Agent release compatibility is tracked in the **`mira-ui` repo** (`compatibility.json` there),
+since the UI is the consumer of the agent's API and is the side that needs to declare what it works with.
 
-- `release_train`: release window in `YYYY.MM` format
-- `ui`: supported UI minor range (e.g. `0.1.x`)
-- `agent`: supported agent minor range (e.g. `0.1.x`)
-- `api_contract`: API contract version (e.g. `v1`)
-- `min_agent_for_ui`: minimum compatible agent patch version
-
-Validate updates locally before opening a PR:
-
-```bash
-python scripts/validate_compatibility.py --file compatibility.json
-```
+The agent's own contribution to that handshake is the `api_contract` field on `GET /version`,
+sourced from `_API_CONTRACT_VERSION` in `mira_engine/channels/ui.py`. Bump that constant
+(and only that constant) whenever the wire format changes in a backward-incompatible way.
 
 ## 📦 Agent Release Pipeline
 
