@@ -8,18 +8,20 @@
   - Agent tag: `vX.Y.Z`（`Mira`）
   - UI tag: `vA.B.C`（`MiraUI`）
 - [ ] 确认本次 release train 映射已更新：
-  - `compatibility.json`
+  - `compatibility.json`（**注意**：`agent` 字段必须等于 `vX.Y.Z` 去掉 `v` 前缀；GA 后改成 `X.Y.x` 也合法）
 - [ ] 确认里程碑与变更范围一致（只发已验收内容）
+
+> 这一步忘记后果由 `agent-release.yml` 的 `verify-compatibility` job 兜底——tag 推上去后会立刻 fail，不会进入 build/publish。下一步本地回归就是它的镜像。
 
 ## 1) 发布前基线检查（T-1）
 
 ### Mira
 
 - [ ] 在 `release` 分支同步最新代码
-- [ ] 本地回归：
+- [ ] 本地回归（**注意**：`--require-agent` 用要打的 tag 版本号，不带 `v`）：
 
 ```bash
-python scripts/validate_compatibility.py --file compatibility.json
+python scripts/validate_compatibility.py --file compatibility.json --require-agent X.Y.Z
 python -m pytest tests -q
 ```
 
