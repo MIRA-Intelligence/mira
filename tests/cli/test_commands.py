@@ -3,6 +3,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -413,6 +414,38 @@ async def test_github_copilot_provider_refreshes_client_api_key_before_chat():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_login_openai_codex_prepares_oauth_state(monkeypatch):
+    from mira_engine.cli import commands
+
+    calls: list[str] = []
+    monkeypatch.setattr(commands, "ensure_oauth_state_dirs_for_runtime", lambda: calls.append("prepare"))
+    monkeypatch.setattr(
+        "oauth_cli_kit.get_token",
+        lambda: SimpleNamespace(access="access-token", account_id="account-id"),
+    )
+
+    commands._login_openai_codex()
+
+    assert calls == ["prepare"]
+
+
+def test_login_github_copilot_prepares_oauth_state(monkeypatch):
+    from mira_engine.cli import commands
+    import mira_engine.providers.github_copilot_provider as github_provider
+
+    calls: list[str] = []
+    monkeypatch.setattr(commands, "ensure_oauth_state_dirs_for_runtime", lambda: calls.append("prepare"))
+    monkeypatch.setattr(
+        github_provider,
+        "login_github_copilot",
+        lambda print_fn: SimpleNamespace(access="access-token", account_id="account-id"),
+    )
+
+    commands._login_github_copilot()
+
+    assert calls == ["prepare"]
 
 
 def test_make_provider_passes_extra_headers_to_custom_provider():

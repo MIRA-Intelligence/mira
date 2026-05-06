@@ -37,6 +37,7 @@ from mira_engine.agent.routing import ModelRouter
 from mira_engine.config.paths import get_workspace_path
 from mira_engine.config.schema import Config
 from mira_engine.providers.factory import make_provider
+from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
 from mira_engine.utils.helpers import sync_workspace_templates
 from mira_engine.utils.migration import run_startup_migrations
 
@@ -2021,15 +2022,7 @@ def status():
 
 
 def _login_openai_codex() -> None:
-    # Keep OAuth state under writable mira home in containers.
-    writable_home = Path("/home/mira/.mira")
-    writable_home.mkdir(parents=True, exist_ok=True)
-    (writable_home / ".config" / "litellm").mkdir(parents=True, exist_ok=True)
-    (writable_home / ".local" / "share").mkdir(parents=True, exist_ok=True)
-    (writable_home / ".cache").mkdir(parents=True, exist_ok=True)
-    os.environ["XDG_CONFIG_HOME"] = str(writable_home / ".config")
-    os.environ["XDG_DATA_HOME"] = str(writable_home / ".local" / "share")
-    os.environ["XDG_CACHE_HOME"] = str(writable_home / ".cache")
+    ensure_oauth_state_dirs_for_runtime()
     try:
         from oauth_cli_kit import get_token, login_oauth_interactive
         token = None
@@ -2053,16 +2046,7 @@ def _login_openai_codex() -> None:
 
 
 def _login_github_copilot() -> None:
-    # Keep OAuth state under writable mira home in containers.
-    writable_home = Path("/home/mira/.mira")
-    writable_home.mkdir(parents=True, exist_ok=True)
-    (writable_home / ".config").mkdir(parents=True, exist_ok=True)
-    (writable_home / ".local" / "share").mkdir(parents=True, exist_ok=True)
-    (writable_home / ".cache").mkdir(parents=True, exist_ok=True)
-    os.environ["XDG_CONFIG_HOME"] = str(writable_home / ".config")
-    os.environ["XDG_DATA_HOME"] = str(writable_home / ".local" / "share")
-    os.environ["XDG_CACHE_HOME"] = str(writable_home / ".cache")
-
+    ensure_oauth_state_dirs_for_runtime()
     console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
     try:
         from mira_engine.providers.github_copilot_provider import login_github_copilot

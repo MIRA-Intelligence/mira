@@ -6,6 +6,11 @@ from mira_engine.config.schema import Config, primary_model_candidate
 from mira_engine.providers.base import LLMProvider
 
 
+def resolve_provider_proxy(config: Config) -> str | None:
+    """Resolve the global LLM provider proxy, with web proxy as legacy fallback."""
+    return config.providers.proxy or config.tools.web.proxy or None
+
+
 def make_provider(config: Config, model: str | None = None) -> LLMProvider:
     """Create the appropriate provider for the given model."""
     from mira_engine.providers.azure_openai_provider import AzureOpenAIProvider
@@ -27,7 +32,10 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
         )
 
     if provider_name == "openai_codex" or resolved_model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=resolved_model)
+        return OpenAICodexProvider(
+            default_model=resolved_model,
+            proxy=resolve_provider_proxy(config),
+        )
     if provider_name == "github_copilot" or resolved_model.startswith("github-copilot/"):
         return GitHubCopilotProvider(default_model=resolved_model)
 

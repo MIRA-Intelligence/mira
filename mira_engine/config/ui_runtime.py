@@ -20,7 +20,9 @@ def _mask_secret(value: str) -> str | None:
 
 
 def _provider_field_names() -> tuple[str, ...]:
-    return tuple(ProvidersConfig.model_fields.keys())
+    # ProvidersConfig also contains global provider settings such as `proxy`.
+    # The UI provider map below only serializes concrete ProviderConfig entries.
+    return tuple(name for name in ProvidersConfig.model_fields.keys() if name != "proxy")
 
 
 def _provider_display_name(provider_name: str) -> str:
@@ -174,6 +176,7 @@ def build_ui_runtime_payload(
             "setup_subject": setup_subject,
         },
         "providers": providers,
+        "provider_proxy": config.providers.proxy,
     }
 
 
@@ -250,6 +253,16 @@ def apply_ui_runtime_update(
         if not isinstance(providers_payload, dict):
             raise ValueError("providers must be an object")
         for provider_name, provider_update in providers_payload.items():
+            if provider_name == "proxy":
+                if provider_update is None or provider_update == "":
+                    config.providers.proxy = None
+                elif isinstance(provider_update, str):
+                    config.providers.proxy = provider_update.strip()
+                else:
+                    raise ValueError("providers.proxy must be a string or null")
+                changed = True
+                continue
+
             if provider_name not in _provider_field_names():
                 raise ValueError(f"unsupported provider: {provider_name}")
             if not isinstance(provider_update, dict):
