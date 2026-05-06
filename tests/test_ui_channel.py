@@ -732,6 +732,60 @@ async def test_handle_history_uses_bound_project_dir_after_projects_root_change(
     assert [entry["content"] for entry in body["entries"]] == ["persisted in old root"]
 
 
+async def test_resolve_project_dir_prefers_current_root_for_duplicate_project_ids(
+    ui_channel: UiChannel,
+    tmp_path: Path,
+) -> None:
+    old_root = tmp_path / "old-root"
+    new_root = tmp_path / "new-root"
+    session_id = "PRJ-4222"
+    old_project = old_root / session_id
+    new_project = new_root / session_id
+    old_project.mkdir(parents=True, exist_ok=True)
+    new_project.mkdir(parents=True, exist_ok=True)
+
+    ui_channel.projects_root = old_root.resolve()
+    ui_channel._known_project_roots = {old_root.resolve()}
+    assert ui_channel._resolve_project_dir(session_id) == old_project.resolve()
+
+    ui_channel.projects_root = new_root.resolve()
+    ui_channel._remember_projects_root(new_root)
+
+    assert ui_channel._resolve_project_dir(session_id) == new_project.resolve()
+
+
+async def test_send_drops_outbound_for_same_id_bound_to_different_project_dir(
+    ui_channel: UiChannel,
+    tmp_path: Path,
+) -> None:
+    old_root = tmp_path / "old-root"
+    new_root = tmp_path / "new-root"
+    session_id = "PRJ-4223"
+    old_project = old_root / session_id
+    new_project = new_root / session_id
+    old_project.mkdir(parents=True, exist_ok=True)
+    new_project.mkdir(parents=True, exist_ok=True)
+
+    ws = MagicMock()
+    ws.closed = False
+    ws.send_json = AsyncMock()
+    ui_channel._clients[session_id] = ws
+    ui_channel._client_project_dirs[session_id] = new_project.resolve()
+
+    await ui_channel.send(OutboundMessage(
+        channel="ui",
+        chat_id=session_id,
+        content="old-root progress",
+        metadata={"project_dir": str(old_project), "_progress": True},
+    ))
+
+    ws.send_json.assert_not_called()
+    old_history = SessionManager(old_project).get_ui_history(f"ui:{session_id}")
+    new_history = SessionManager(new_project).get_ui_history(f"ui:{session_id}")
+    assert [entry["content"] for entry in old_history] == ["old-root progress"]
+    assert new_history == []
+
+
 async def test_project_dir_index_survives_channel_restart_after_root_change(
     ui_channel: UiChannel,
     tmp_path: Path,
@@ -779,6 +833,36 @@ async def test_project_dir_index_survives_channel_restart_after_root_change(
     assert isinstance(artifact_resp, web.FileResponse)
     assert artifact_resp.status == 200
     assert Path(artifact_resp._path) == artifact
+
+
+async def test_handle_config_root_change_closes_existing_ws_bindings(
+    ui_channel: UiChannel,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_root = tmp_path / "old-root"
+    new_root = tmp_path / "new-root"
+    old_root.mkdir(parents=True, exist_ok=True)
+
+    ui_channel.projects_root = old_root.resolve()
+    ui_channel._known_project_roots = {old_root.resolve()}
+    ws = MagicMock()
+    ws.close = AsyncMock()
+    ui_channel._clients["PRJ-4224"] = ws
+    ui_channel._client_project_dirs["PRJ-4224"] = old_root / "PRJ-4224"
+
+    config = Config()
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
+
+    config_req = MagicMock(spec=web.Request)
+    config_req.json = AsyncMock(return_value={"projects_root": str(new_root)})
+    config_resp = await ui_channel._handle_config(config_req)
+
+    assert config_resp.status == 200
+    ws.close.assert_awaited_once()
+    assert ui_channel._clients == {}
+    assert ui_channel._client_project_dirs == {}
 
 
 async def test_handle_config_invalid_json(ui_channel: UiChannel) -> None:
