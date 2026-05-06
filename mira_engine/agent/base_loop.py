@@ -684,6 +684,7 @@ class BaseAgentLoop:
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata=dict(msg.metadata or {}),
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -735,6 +736,7 @@ class BaseAgentLoop:
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content=err_text,
+                    metadata=dict(msg.metadata or {}),
                 ))
             return
         async with self._processing_lock:
@@ -758,6 +760,7 @@ class BaseAgentLoop:
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content=err_text,
+                    metadata=dict(msg.metadata or {}),
                 ))
 
     async def close_mcp(self) -> None:
