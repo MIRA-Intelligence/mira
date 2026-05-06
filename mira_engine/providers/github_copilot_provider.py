@@ -11,6 +11,7 @@ from oauth_cli_kit.models import OAuthToken
 from oauth_cli_kit.storage import FileTokenStorage
 
 from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
+from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
 
 DEFAULT_GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
 DEFAULT_GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
@@ -29,6 +30,7 @@ _LONG_LIVED_TOKEN_SECONDS = 315360000
 
 
 def _storage() -> FileTokenStorage:
+    ensure_oauth_state_dirs_for_runtime()
     return FileTokenStorage(
         token_filename=TOKEN_FILENAME,
         app_name=TOKEN_APP_NAME,

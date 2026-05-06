@@ -11,6 +11,9 @@
       "workspace": "~/.mira/workspace"
     }
   },
+  "providers": {
+    "proxy": null
+  },
   "tools": {
     "restrictToWorkspace": false,
     "exec": {

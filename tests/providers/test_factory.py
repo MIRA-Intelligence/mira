@@ -38,3 +38,44 @@ def test_make_provider_succeeds_for_custom_with_api_base() -> None:
     # Should not raise
     provider = make_provider(config)
     assert provider is not None
+
+
+def test_make_provider_passes_provider_proxy_to_openai_codex() -> None:
+    """OpenAI Codex provider uses providers.proxy for LLM HTTP calls."""
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "openai_codex",
+                    "model": "openai-codex/gpt-5.3-codex",
+                }
+            },
+            "providers": {"proxy": "http://127.0.0.1:7890"},
+            "tools": {"web": {"proxy": "http://127.0.0.1:9999"}},
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "OpenAICodexProvider"
+    assert provider.proxy == "http://127.0.0.1:7890"
+
+
+def test_make_provider_falls_back_to_web_proxy_for_openai_codex() -> None:
+    """Existing tools.web.proxy configs continue to work until migrated."""
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "openai_codex",
+                    "model": "openai-codex/gpt-5.3-codex",
+                }
+            },
+            "tools": {"web": {"proxy": "http://127.0.0.1:7890"}},
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "OpenAICodexProvider"
+    assert provider.proxy == "http://127.0.0.1:7890"
