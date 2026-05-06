@@ -1,4 +1,0 @@
-[submodule "UI"]
-	path = UI
-	url = git@github.com:MIRA-Intelligence/mira-ui.git
-	branch = dev
