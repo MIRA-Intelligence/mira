@@ -7,8 +7,8 @@
 - [ ] 确认目标版本：
   - Agent tag: `vX.Y.Z`（`Mira`）
   - UI tag: `vA.B.C`（`MiraUI`）
-- [ ] 确认本次 release train 映射已更新：
-  - `compatibility.json`
+- [ ] 确认 `mira-ui` 仓库的 `compatibility.json` 已更新到本次 release train，并且 `compatibility.json#ui` 等于（或落在 minor 范围内）即将打的 UI tag。该校验由 `mira-ui` 的 `desktop-release.yml#verify-compatibility` job 在打 tag 时强制执行，但发布前最好本地先跑一遍 `node scripts/validate-compatibility.mjs --file compatibility.json --require-ui A.B.C`。
+- [ ] 如果本轮改了 wire format，确认 `mira_engine/channels/ui.py` 里的 `_API_CONTRACT_VERSION` 已 bump，且 `mira-ui/compatibility.json#api_contract` 同步更新。
 - [ ] 确认里程碑与变更范围一致（只发已验收内容）
 
 ## 1) 发布前基线检查（T-1）
@@ -19,7 +19,6 @@
 - [ ] 本地回归：
 
 ```bash
-python scripts/validate_compatibility.py --file compatibility.json
 python -m pytest tests -q
 ```
 

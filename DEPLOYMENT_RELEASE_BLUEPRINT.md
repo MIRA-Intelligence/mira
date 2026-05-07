@@ -22,11 +22,7 @@
 | `Mira` | Agent 核心能力、API、任务执行 | PyPI 包、Docker 镜像、OpenAPI 规范 |
 | `MiraUI` | 前端交互、桌面壳、连接管理 | Web 静态构建、桌面安装包 |
 
-建议新增一个轻量“编排层”（可新 repo：`mira-release`，也可放在 UI repo）：
-
-- 维护 `compatibility.json`（UI 版本与 Agent 版本映射）
-- 维护自托管模板 `docker-compose.yml`
-- 维护安装脚本与发行说明模板
+兼容性映射 (`compatibility.json`) 由 **`MiraUI` 仓库**维护——UI 是 agent 的消费者，由它来声明"我跟哪些 agent 版本兼容"，与依赖方向一致；Agent 仓库本身不参与该映射，可独立发版。
 
 ## 4. 版本与兼容策略（关键）
 
@@ -34,7 +30,7 @@
 - `MiraUI`：语义化版本（例如 `2.3.0`）
 - 对外定义“发行列车版本”（例如 `2026.04`），对应一组兼容组合
 
-建议增加兼容清单文件：`compatibility.json`
+兼容清单文件 `compatibility.json` 落在 `MiraUI` 仓库根目录：
 
 ```json
 {
@@ -46,12 +42,13 @@
 }
 ```
 
-同时让 Agent 暴露：
+Agent 侧只负责暴露：
 
 - `GET /health`
-- `GET /version`
+- `GET /version`（返回 `agent_version` + `api_contract`，由 `mira_engine/channels/ui.py` 里的 `_API_CONTRACT_VERSION` 常量提供）
 
-UI 启动时先校验版本兼容；不兼容时提示自动升级或一键修复。
+`MiraUI` 启动时先打 `/version` 拿 `api_contract`，跟自己 `compatibility.json` 里期望的版本对一下；
+不一致时提示自动升级或一键修复。
 
 ## 5. CI/CD 蓝图（可直接建 workflow）
 
@@ -134,7 +131,7 @@ mira-engine uninstall-service
 
 升级策略（建议）：
 
-- Desktop 启动时检查本地 engine 版本与 `compatibility.json`
+- Desktop 启动时检查本地 engine 版本与 `MiraUI` 仓库内的 `compatibility.json`
 - 不兼容时提示“一键升级本地引擎”
 - 升级流程：下载新包 -> 停服务 -> 替换 -> 启服务 -> 健康检查
 
@@ -169,7 +166,7 @@ docker compose up -d
 
 - [ ] Agent 增加 `/version` 与 `/health` 字段规范
 - [ ] UI 增加版本兼容检查与错误提示
-- [ ] 建立 `compatibility.json` 与校验脚本
+- [ ] 在 `MiraUI` 仓库建立 `compatibility.json` 与校验脚本（`mira-ui/scripts/validate-compatibility.mjs`），由 `desktop-release.yml` 在 tag 时强制校验
 
 ### A2. 构建与发布
 
@@ -181,7 +178,7 @@ docker compose up -d
 
 - [ ] `mira-engine` CLI（install-service/start/stop/status/logs/doctor）
 - [ ] 三平台服务注册脚本（launchd/systemd user/Windows Service）
-- [ ] 本地引擎升级器（与 `compatibility.json` 联动）
+- [ ] 本地引擎升级器（与 `MiraUI` 仓库内的 `compatibility.json` 联动）
 - [ ] 自托管 `docker-compose.yml` 与 `.env.example`
 - [ ] `mira doctor` 环境诊断工具
 - [ ] 回滚手册与值班排障手册
