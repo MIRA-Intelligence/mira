@@ -24,6 +24,7 @@ from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.config.schema import ChannelsConfig, ExecToolConfig
+from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from mira_engine.session.manager import Session, SessionManager
 
@@ -459,6 +460,50 @@ def test_set_tool_context_calls_supported_tools(tmp_path: Path) -> None:
     assert ("message", ("ui", "chat-1", "msg-9")) in calls
     assert ("spawn", ("ui", "chat-1")) in calls
     assert ("cron", ("ui", "chat-1")) in calls
+
+
+async def test_project_ref_scopes_session_cache_and_tools(tmp_path: Path) -> None:
+    instance_workspace = tmp_path / "instance"
+    project_dir = tmp_path / "projects" / "alpha"
+    instance_workspace.mkdir()
+    project_dir.mkdir(parents=True)
+    (instance_workspace / "note.txt").write_text("instance", encoding="utf-8")
+    (project_dir / "note.txt").write_text("alpha", encoding="utf-8")
+
+    loop = BaseAgentLoop(
+        bus=MessageBus(),
+        provider=_NoopProvider(),
+        workspace=instance_workspace,
+        model="dummy/default",
+        channels_config=ChannelsConfig(),
+        exec_config=ExecToolConfig(timeout=5),
+        session_manager=SessionManager(instance_workspace),
+        restrict_to_workspace=True,
+    )
+    ref = ProjectRef(project_id="alpha", project_dir=project_dir, metadata={})
+
+    assert loop._scoped_session_key(ref, "ui:chat-1") == "alpha:ui:chat-1"
+    first = loop._get_project_sessions(ref)
+    second = loop._get_project_sessions(ref)
+    assert first is second
+    assert first.workspace == project_dir
+
+    loop._set_tool_context("ui", "chat-1", "msg-1", project_ref=ref, session_key="alpha:ui:chat-1")
+    read_tool = loop.tools.get("read_file")
+    assert read_tool is not None
+    assert await read_tool.execute("note.txt") == "alpha"
+
+    spawn_tool = loop.tools.get("spawn")
+    assert spawn_tool is not None
+    assert spawn_tool._runtime_session_key.get() == "alpha:ui:chat-1"
+    assert spawn_tool._runtime_project_id.get() == "alpha"
+    assert spawn_tool._runtime_project_dir.get() == project_dir
+
+    loop._set_tool_context("ui", "chat-2", "msg-2", session_key="ui:chat-2")
+    assert await read_tool.execute("note.txt") == "instance"
+    assert spawn_tool._runtime_session_key.get() == "ui:chat-2"
+    assert spawn_tool._runtime_project_id.get() is None
+    assert spawn_tool._runtime_project_dir.get() is None
 
 
 def test_real_loop_initialization_registers_default_tools(tmp_path: Path) -> None:

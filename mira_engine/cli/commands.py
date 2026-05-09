@@ -954,11 +954,20 @@ def gateway(
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
+            metadata = {
+                key: value
+                for key, value in {
+                    "project_id": job.payload.project_id,
+                    "project_dir": job.payload.project_dir,
+                }.items()
+                if value
+            }
             response = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                metadata=metadata,
             )
             response = _as_text_response(response)
         finally:
@@ -986,7 +995,8 @@ def gateway(
             await bus.publish_outbound(OutboundMessage(
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to,
-                content=response
+                content=response,
+                metadata=metadata,
             ))
         return response
     cron.on_job = on_cron_job

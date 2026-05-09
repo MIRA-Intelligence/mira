@@ -5,7 +5,6 @@ strategy, and sandbox behaviour per platform — without actually running
 platform-specific binaries (all subprocess calls are mocked).
 """
 
-import sys
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -332,3 +331,48 @@ class TestExecuteEndToEnd:
 
         assert "hello world" in result
         assert "Exit code: 0" in result
+
+    @pytest.mark.asyncio
+    async def test_runtime_context_sets_default_working_dir(self, tmp_path):
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"ok\n", b"")
+        mock_proc.returncode = 0
+        instance_workspace = tmp_path / "instance"
+        project_dir = tmp_path / "projects" / "alpha"
+        instance_workspace.mkdir()
+        project_dir.mkdir(parents=True)
+
+        with (
+            patch("asyncio.create_subprocess_shell", new_callable=AsyncMock),
+            patch.object(ExecTool, "_spawn", return_value=mock_proc) as mock_spawn,
+            patch.object(ExecTool, "_guard_command", return_value=None),
+        ):
+            tool = ExecTool(working_dir=str(instance_workspace))
+            tool.set_runtime_context(workspace=project_dir)
+            result = await tool.execute(command="pwd")
+
+        assert "ok" in result
+        assert mock_spawn.call_args[0][1] == str(project_dir)
+
+    @pytest.mark.asyncio
+    async def test_runtime_context_can_be_cleared(self, tmp_path):
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"ok\n", b"")
+        mock_proc.returncode = 0
+        instance_workspace = tmp_path / "instance"
+        project_dir = tmp_path / "projects" / "alpha"
+        instance_workspace.mkdir()
+        project_dir.mkdir(parents=True)
+
+        with (
+            patch("asyncio.create_subprocess_shell", new_callable=AsyncMock),
+            patch.object(ExecTool, "_spawn", return_value=mock_proc) as mock_spawn,
+            patch.object(ExecTool, "_guard_command", return_value=None),
+        ):
+            tool = ExecTool(working_dir=str(instance_workspace))
+            tool.set_runtime_context(workspace=project_dir)
+            tool.clear_runtime_context()
+            result = await tool.execute(command="pwd")
+
+        assert "ok" in result
+        assert mock_spawn.call_args[0][1] == str(instance_workspace)

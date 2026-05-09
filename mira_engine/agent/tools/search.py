@@ -91,9 +91,10 @@ class _SearchTool(_FsTool):
     _IGNORE_DIRS = set(ListDirTool._IGNORE_DIRS)
 
     def _display_path(self, target: Path, root: Path) -> str:
-        if self._workspace:
+        workspace = self._current_workspace()
+        if workspace:
             try:
-                return target.relative_to(self._workspace).as_posix()
+                return target.relative_to(workspace).as_posix()
             except ValueError:
                 pass
         return target.relative_to(root).as_posix()
