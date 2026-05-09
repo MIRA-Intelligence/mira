@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import mimetypes
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -64,13 +65,55 @@ class _FsTool(Tool):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._extra_allowed_dirs = extra_allowed_dirs
+        self._runtime_workspace: ContextVar[Path | None] = ContextVar(
+            f"{self.__class__.__name__}_workspace",
+            default=None,
+        )
+        self._runtime_allowed_dir: ContextVar[Path | None] = ContextVar(
+            f"{self.__class__.__name__}_allowed_dir",
+            default=None,
+        )
+        self._runtime_extra_allowed_dirs: ContextVar[list[Path] | None] = ContextVar(
+            f"{self.__class__.__name__}_extra_allowed_dirs",
+            default=None,
+        )
+
+    def set_runtime_context(
+        self,
+        *,
+        workspace: Path,
+        allowed_dir: Path | None = None,
+        extra_allowed_dirs: list[Path] | None = None,
+    ) -> None:
+        """Set the per-turn workspace used by a multi-project gateway."""
+
+        self._runtime_workspace.set(workspace)
+        self._runtime_allowed_dir.set(allowed_dir)
+        self._runtime_extra_allowed_dirs.set(extra_allowed_dirs)
+
+    def clear_runtime_context(self) -> None:
+        """Clear the per-turn workspace and fall back to the static workspace."""
+
+        self._runtime_workspace.set(None)
+        self._runtime_allowed_dir.set(None)
+        self._runtime_extra_allowed_dirs.set(None)
+
+    def _current_workspace(self) -> Path | None:
+        return self._runtime_workspace.get() or self._workspace
 
     def _resolve(self, path: str) -> Path:
+        workspace = self._current_workspace()
+        allowed_dir = self._runtime_allowed_dir.get()
+        extra_allowed_dirs = self._runtime_extra_allowed_dirs.get()
         return _resolve_path(
             path,
-            workspace=self._workspace,
-            allowed_dir=self._allowed_dir,
-            extra_allowed_dirs=self._extra_allowed_dirs,
+            workspace=workspace,
+            allowed_dir=allowed_dir if allowed_dir is not None else self._allowed_dir,
+            extra_allowed_dirs=(
+                extra_allowed_dirs
+                if extra_allowed_dirs is not None
+                else self._extra_allowed_dirs
+            ),
         )
 
 
@@ -237,13 +280,13 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
     old_lines = old_text.splitlines()
     if not old_lines:
         return None, 0
-    stripped_old = [l.strip() for l in old_lines]
+    stripped_old = [line.strip() for line in old_lines]
     content_lines = content.splitlines()
 
     candidates: list[str] = []
     for i in range(len(content_lines) - len(stripped_old) + 1):
         window = content_lines[i : i + len(stripped_old)]
-        if [l.strip() for l in window] == stripped_old:
+        if [line.strip() for line in window] == stripped_old:
             candidates.append("\n".join(window))
     if candidates:
         return candidates[0], len(candidates)

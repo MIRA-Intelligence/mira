@@ -1,5 +1,6 @@
 """Message tool for sending messages to users."""
 
+from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
 
 from mira_engine.agent.tools.base import Tool
@@ -20,13 +21,36 @@ class MessageTool(Tool):
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
-        self._sent_in_turn: bool = False
+        self._runtime_channel: ContextVar[str | None] = ContextVar("message_channel", default=None)
+        self._runtime_chat_id: ContextVar[str | None] = ContextVar("message_chat_id", default=None)
+        self._runtime_message_id: ContextVar[str | None] = ContextVar("message_id", default=None)
+        self._runtime_sent_in_turn: ContextVar[bool | None] = ContextVar(
+            "message_sent_in_turn",
+            default=None,
+        )
+        self._sent_in_turn_fallback = False
+
+    @property
+    def _sent_in_turn(self) -> bool:
+        runtime_value = self._runtime_sent_in_turn.get()
+        if runtime_value is not None:
+            return runtime_value
+        return self._sent_in_turn_fallback
+
+    @_sent_in_turn.setter
+    def _sent_in_turn(self, value: bool) -> None:
+        bool_value = bool(value)
+        self._sent_in_turn_fallback = bool_value
+        self._runtime_sent_in_turn.set(bool_value)
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
         self._default_channel = channel
         self._default_chat_id = chat_id
         self._default_message_id = message_id
+        self._runtime_channel.set(channel)
+        self._runtime_chat_id.set(chat_id)
+        self._runtime_message_id.set(message_id)
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -79,9 +103,12 @@ class MessageTool(Tool):
         media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
-        channel = channel or self._default_channel
-        chat_id = chat_id or self._default_chat_id
-        message_id = message_id or self._default_message_id
+        default_channel = self._runtime_channel.get() or self._default_channel
+        default_chat_id = self._runtime_chat_id.get() or self._default_chat_id
+        default_message_id = self._runtime_message_id.get() or self._default_message_id
+        channel = channel or default_channel
+        chat_id = chat_id or default_chat_id
+        message_id = message_id or default_message_id
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
@@ -101,7 +128,7 @@ class MessageTool(Tool):
 
         try:
             await self._send_callback(msg)
-            if channel == self._default_channel and chat_id == self._default_chat_id:
+            if channel == default_channel and chat_id == default_chat_id:
                 self._sent_in_turn = True
             media_info = f" with {len(media)} attachments" if media else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"

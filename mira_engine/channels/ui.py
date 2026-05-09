@@ -37,6 +37,18 @@ from mira_engine.config.ui_runtime import (
     build_ui_runtime_payload,
     save_ui_runtime_update,
 )
+from mira_engine.projects import (
+    PROJECT_DIR_INDEX_FILENAME,
+    PROJECT_META_DEFAULT_AGENT_PROFILE,
+    PROJECT_META_DEFAULT_CONTRACT_VERSION,
+    PROJECT_META_DEFAULT_RUN_MODE,
+    PROJECT_META_STRICT_CONTRACT_VERSION,
+    PROJECT_WORKSPACE_FILENAME,
+    ProjectRef,
+    ProjectRegistry,
+    slugify_project_id,
+    validate_project_id,
+)
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
     get_task_plan_contract,
@@ -45,19 +57,10 @@ from mira_engine.task_plan.guardrails import (
 )
 
 PLAN_FILENAME = "task_plan.json"
-PROJECT_DIR_PREFIX = "PRJ"
-PROJECT_META_DIRNAME = ".mira"
-PROJECT_META_FILENAME = "project.json"
-PROJECT_META_SCHEMA_VERSION = 1
-PROJECT_META_DEFAULT_RUN_MODE = "auto"
-PROJECT_META_DEFAULT_AGENT_PROFILE = "default"
-PROJECT_META_DEFAULT_CONTRACT_VERSION = 1
-PROJECT_META_STRICT_CONTRACT_VERSION = 2
 _ASSETS_DIR = Path(__file__).parent / "ui_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".mira") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
 _PROJECT_EXPERIMENT_SNAPSHOT_REL_DIR = Path(".mira") / "snapshots" / "experiments"
-_PROJECT_DIR_INDEX_FILENAME = "project-dirs.json"
 _RECOVERED_CONCLUSION_PLACEHOLDER = "Recovered completed experiment artifacts from workspace."
 _API_CONTRACT_VERSION = "v1"
 
@@ -66,14 +69,14 @@ def _resolve_project_dir_index_path() -> Path:
     """Locate the project-dirs index file, migrating from the legacy ``web`` dir.
 
     Until v0.4 the UI channel stored its project-dir index under
-    ``~/.mira/runtime/web/project-dirs.json``. After the channel was renamed to
-    ``ui`` we prefer ``~/.mira/runtime/ui/project-dirs.json`` but transparently
-    migrate any pre-existing legacy file so users keep their project list.
+    ``~/.mira/web/project-dirs.json``. After the channel was renamed to ``ui``
+    we prefer ``~/.mira/ui/project-dirs.json`` but transparently migrate any
+    pre-existing legacy file so users keep their project list.
     """
-    new_path = get_runtime_subdir("ui") / _PROJECT_DIR_INDEX_FILENAME
+    new_path = get_runtime_subdir("ui") / PROJECT_DIR_INDEX_FILENAME
     if new_path.exists():
         return new_path
-    legacy_path = get_runtime_subdir("web") / _PROJECT_DIR_INDEX_FILENAME
+    legacy_path = get_runtime_subdir("web") / PROJECT_DIR_INDEX_FILENAME
     if legacy_path.exists():
         try:
             new_path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,6 +90,10 @@ def _resolve_project_dir_index_path() -> Path:
             logger.exception("Failed to migrate legacy project-dir index")
             return legacy_path
     return new_path
+
+
+def _resolve_project_workspace_path() -> Path:
+    return get_runtime_subdir("ui").parent / PROJECT_WORKSPACE_FILENAME
 
 
 def _load_ui_instructions() -> str:
@@ -511,11 +518,25 @@ class UiChannel(BaseChannel):
             bind_port if bind_port is not None else (legacy_port if isinstance(legacy_port, int) else 18790)
         )
         self.restrict_to_workspace: bool = restrict_to_workspace
-        default_root = workspace or Path("~/.mira/workspace")
+        storage_mode = getattr(config, "project_storage", "user_selectable")
+        managed_root = getattr(config, "managed_project_root", None)
+        default_root = (
+            Path(managed_root)
+            if storage_mode == "managed" and isinstance(managed_root, str) and managed_root.strip()
+            else workspace or Path("~/.mira/workspace")
+        )
         self.projects_root: Path = default_root.expanduser().resolve()
-        self._project_dir_index_path: Path = _resolve_project_dir_index_path()
-        self._project_dirs: dict[str, Path] = {}
-        self._known_project_roots: set[Path] = {self.projects_root}
+        self.project_registry = ProjectRegistry(
+            self.projects_root,
+            workspace_path=_resolve_project_workspace_path(),
+            legacy_index_path=_resolve_project_dir_index_path(),
+        )
+        self._project_workspace_path: Path = self.project_registry.workspace_path
+        self._project_dir_index_path: Path = self.project_registry.legacy_index_path
+        # Compatibility attributes used by existing tests and helper methods.
+        # The registry owns the underlying mutable objects.
+        self._project_dirs: dict[str, Path] = self.project_registry.project_dirs
+        self._known_project_roots: set[Path] = self.project_registry.known_project_roots
         self._boot_ts: float = time.monotonic()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
@@ -523,8 +544,6 @@ class UiChannel(BaseChannel):
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
-        self._load_project_dir_index()
-        self._register_projects_under_root(self.projects_root)
         self._migrate_global_to_project()
 
     @staticmethod
@@ -562,55 +581,32 @@ class UiChannel(BaseChannel):
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def _remember_projects_root(self, root: Path) -> Path:
-        normalized = root.expanduser().resolve()
-        self._known_project_roots.add(normalized)
-        return normalized
+        self._sync_project_registry()
+        remembered = self.project_registry.remember_projects_root(root)
+        self._known_project_roots = self.project_registry.known_project_roots
+        return remembered
+
+    def _sync_project_registry(self) -> None:
+        """Keep legacy mutable UI attributes aligned with the shared registry."""
+
+        root = self.projects_root.expanduser().resolve()
+        if self.project_registry.projects_root != root:
+            self.project_registry.projects_root = root
+        if self._known_project_roots is not self.project_registry.known_project_roots:
+            self.project_registry._known_project_roots = {
+                Path(p).expanduser().resolve() for p in self._known_project_roots
+            }
+            self._known_project_roots = self.project_registry.known_project_roots
+        if self._project_dirs is not self.project_registry.project_dirs:
+            self.project_registry._project_dirs = dict(self._project_dirs)
+            self._project_dirs = self.project_registry.project_dirs
 
     def _load_project_dir_index(self) -> None:
-        if not self._project_dir_index_path.is_file():
-            return
-        try:
-            payload = json.loads(
-                self._project_dir_index_path.read_text(encoding="utf-8")
-            )
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(
-                "Failed to load project-dir index {}: {}",
-                self._project_dir_index_path,
-                exc,
-            )
-            return
-        if not isinstance(payload, dict):
-            return
-        for session_id, raw_path in payload.items():
-            if not isinstance(session_id, str) or not session_id.strip():
-                continue
-            if not isinstance(raw_path, str) or not raw_path.strip():
-                continue
-            project_dir = Path(raw_path).expanduser().resolve()
-            if project_dir.name != session_id or not project_dir.is_dir():
-                continue
-            self._project_dirs[session_id] = project_dir
-            self._remember_projects_root(project_dir.parent)
+        return None
 
     def _save_project_dir_index(self) -> None:
-        payload = {
-            session_id: str(project_dir)
-            for session_id, project_dir in sorted(self._project_dirs.items())
-            if project_dir.name == session_id and project_dir.is_dir()
-        }
-        try:
-            self._project_dir_index_path.parent.mkdir(parents=True, exist_ok=True)
-            self._project_dir_index_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            logger.warning(
-                "Failed to persist project-dir index {}: {}",
-                self._project_dir_index_path,
-                exc,
-            )
+        self.project_registry.save()
+        self.project_registry.save_legacy_index()
 
     def _register_project_dir(
         self,
@@ -619,35 +615,19 @@ class UiChannel(BaseChannel):
         *,
         persist: bool = True,
     ) -> Path:
-        normalized = project_dir.expanduser().resolve()
-        existing = self._project_dirs.get(session_id)
-        self._project_dirs[session_id] = normalized
-        self._remember_projects_root(normalized.parent)
-        if persist and existing != normalized:
-            self._save_project_dir_index()
-        return normalized
+        return self.project_registry.register_project_dir(
+            session_id,
+            project_dir,
+            persist=persist,
+        ).project_dir
 
     def _drop_project_dir_registration(
         self, session_id: str, *, persist: bool = True
     ) -> None:
-        if self._project_dirs.pop(session_id, None) is not None and persist:
-            self._save_project_dir_index()
+        self.project_registry.drop_project_dir_registration(session_id, persist=persist)
 
     def _register_projects_under_root(self, root: Path) -> None:
-        normalized_root = self._remember_projects_root(root)
-        if not normalized_root.is_dir():
-            return
-        changed = False
-        for candidate in normalized_root.iterdir():
-            if not self._is_project_dir(candidate):
-                continue
-            existing = self._project_dirs.get(candidate.name)
-            normalized_candidate = candidate.expanduser().resolve()
-            self._project_dirs[candidate.name] = normalized_candidate
-            if existing != normalized_candidate:
-                changed = True
-        if changed:
-            self._save_project_dir_index()
+        self.project_registry.register_projects_under_root(root)
 
     def _resolve_project_dir(
         self,
@@ -658,31 +638,14 @@ class UiChannel(BaseChannel):
         session_key = session_id.strip()
         if not session_key:
             return None
-
-        current_candidate = (self.projects_root / session_key).expanduser().resolve()
-        if current_candidate.is_dir():
-            return self._register_project_dir(session_key, current_candidate)
-
-        cached = self._project_dirs.get(session_key)
-        if cached is not None:
-            if cached.is_dir():
-                return self._register_project_dir(
-                    session_key, cached, persist=False
-                )
-            self._drop_project_dir_registration(session_key)
-
-        for root in self._known_project_roots:
-            if root == self.projects_root:
-                continue
-            candidate = (root / session_key).expanduser().resolve()
-            if candidate.is_dir():
-                return self._register_project_dir(session_key, candidate)
-
-        if not create:
+        self._sync_project_registry()
+        try:
+            return self.project_registry.resolve(
+                session_key,
+                create=create,
+            ).project_dir
+        except (FileNotFoundError, ValueError):
             return None
-
-        current_candidate.mkdir(parents=True, exist_ok=True)
-        return self._register_project_dir(session_key, current_candidate)
 
     def _project_dir_from_metadata(
         self,
@@ -698,9 +661,12 @@ class UiChannel(BaseChannel):
             project_dir = Path(raw_project_dir).expanduser().resolve()
         except OSError:
             return None
-        if project_dir.name != session_id or not project_dir.is_dir():
+        if not project_dir.is_dir():
             return None
-        return self._register_project_dir(session_id, project_dir)
+        try:
+            return self._register_project_dir(session_id, project_dir)
+        except ValueError:
+            return project_dir
 
     def _audit(
         self,
@@ -848,6 +814,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/config", self._handle_get_config)
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
+        self._app.router.add_post("/api/projects", self._handle_create_project)
         self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
         self._app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
@@ -1283,6 +1250,7 @@ class UiChannel(BaseChannel):
                 )
                 metadata: dict[str, Any] = {
                     "source": "ui",
+                    "project_id": session_id,
                     "project_dir": project_dir,
                     "run_mode": run_mode,
                     "agent_profile": agent_profile,
@@ -1339,6 +1307,7 @@ class UiChannel(BaseChannel):
                 )
                 metadata = {
                     "source": "ui",
+                    "project_id": session_id,
                     "project_dir": project_dir,
                     "run_mode": run_mode,
                     "_control": "set_mode",
@@ -1575,14 +1544,14 @@ class UiChannel(BaseChannel):
     async def _handle_get_config(self, _request: web.Request) -> web.Response:
         config_path = config_loader.get_config_path().expanduser().resolve()
         runtime_config = config_loader.load_config(config_path)
-        return web.json_response(
-            build_ui_runtime_payload(
-                runtime_config,
-                projects_root=self.projects_root,
-                config_path=config_path,
-                persisted=False,
-            )
+        payload = build_ui_runtime_payload(
+            runtime_config,
+            projects_root=self.projects_root,
+            config_path=config_path,
+            persisted=False,
         )
+        payload["project_location"] = self._project_location_payload()
+        return web.json_response(payload)
 
     async def _handle_config(self, request: web.Request) -> web.Response:
         """Allow the UI to inspect and update the active runtime config."""
@@ -1598,6 +1567,16 @@ class UiChannel(BaseChannel):
         runtime_config = config_loader.load_config(config_path)
         previous_root = self.projects_root.expanduser().resolve()
 
+        runtime_body = body.get("runtime")
+        requests_root_change = "projects_root" in body or (
+            isinstance(runtime_body, dict) and "workspace" in runtime_body
+        )
+        if requests_root_change and not self._custom_project_dirs_allowed():
+            return web.json_response(
+                {"error": "project root is managed by server configuration"},
+                status=400,
+            )
+
         try:
             next_root, changed = apply_ui_runtime_update(
                 runtime_config,
@@ -1611,6 +1590,7 @@ class UiChannel(BaseChannel):
             await self._close_active_clients()
             self._register_projects_under_root(previous_root)
             self.projects_root = next_root
+            self.project_registry.projects_root = next_root
             self._remember_projects_root(next_root)
             self._register_projects_under_root(next_root)
             self._audit(
@@ -1645,18 +1625,33 @@ class UiChannel(BaseChannel):
                     status=500,
                 )
 
-        return web.json_response(
-            build_ui_runtime_payload(
-                runtime_config,
-                projects_root=self.projects_root,
-                config_path=config_path,
-                persisted=persisted,
-            )
+        payload = build_ui_runtime_payload(
+            runtime_config,
+            projects_root=self.projects_root,
+            config_path=config_path,
+            persisted=persisted,
         )
+        payload["project_location"] = self._project_location_payload()
+        return web.json_response(payload)
 
     def _workspace_root_for_access(self) -> Path:
         """Return the root path used for workspace access checks."""
         return self.projects_root.expanduser().resolve()
+
+    def _project_storage_mode(self) -> str:
+        mode = getattr(self.config, "project_storage", "user_selectable")
+        return "managed" if mode == "managed" else "user_selectable"
+
+    def _custom_project_dirs_allowed(self) -> bool:
+        return self._project_storage_mode() != "managed"
+
+    def _project_location_payload(self) -> dict[str, Any]:
+        return {
+            "mode": self._project_storage_mode(),
+            "custom_dir_allowed": self._custom_project_dirs_allowed(),
+            "default_parent_dir": str(self.projects_root),
+            "workspace_file": str(self._project_workspace_path),
+        }
 
     def _resolve_probe_path(self, raw_path: str) -> tuple[Path | None, str | None]:
         """Resolve a UI-provided data path using agent-like workspace rules."""
@@ -1799,76 +1794,38 @@ class UiChannel(BaseChannel):
         return web.json_response(result)
 
     def _project_meta_path(self, project_dir: Path) -> Path:
-        return project_dir / PROJECT_META_DIRNAME / PROJECT_META_FILENAME
+        return self.project_registry.project_meta_path(project_dir)
 
     def _is_project_dir(self, project_dir: Path) -> bool:
-        return project_dir.is_dir() and project_dir.name.startswith(PROJECT_DIR_PREFIX)
+        return (
+            project_dir.is_dir()
+            and (
+                self.project_registry.is_registered_project_dir(project_dir)
+                or self.project_registry.is_legacy_project_dir(project_dir)
+            )
+        )
 
     def _load_project_meta(self, project_dir: Path) -> dict[str, Any]:
-        meta_path = self._project_meta_path(project_dir)
-        if not meta_path.is_file():
-            return {}
-        try:
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-        except (json.JSONDecodeError, OSError):
-            pass
-        return {}
+        return self.project_registry.load_project_meta(project_dir)
 
     def _default_project_meta(self, project_dir: Path) -> dict[str, Any]:
-        project_id = project_dir.name
-        now = f"{datetime.utcnow().isoformat()}Z"
-        return {
-            "id": project_id,
-            "project_dir": str(project_dir.expanduser().resolve()),
-            "display_name": project_id,
-            "run_mode": PROJECT_META_DEFAULT_RUN_MODE,
-            "agent_profile": PROJECT_META_DEFAULT_AGENT_PROFILE,
-            "contract_version": PROJECT_META_DEFAULT_CONTRACT_VERSION,
-            "automation_policy": None,
-            "created_at": now,
-            "updated_at": now,
-            "schema_version": PROJECT_META_SCHEMA_VERSION,
-        }
+        project_id = self.project_registry.project_id_for_dir(project_dir) or project_dir.name
+        return self.project_registry.default_project_meta(project_id, project_dir)
 
     def _write_project_meta(self, project_dir: Path, meta: dict[str, Any]) -> None:
-        meta_path = self._project_meta_path(project_dir)
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.project_registry.write_project_meta(project_dir, meta)
 
     def _ensure_project_meta(self, project_dir: Path) -> dict[str, Any]:
         project_dir = project_dir.expanduser().resolve()
-        project_id = project_dir.name
-        current = self._load_project_meta(project_dir)
-        baseline = self._default_project_meta(project_dir)
-        meta = {**baseline, **current}
-
-        display_name = meta.get("display_name")
-        if not isinstance(display_name, str) or not display_name.strip():
-            meta["display_name"] = project_id
-        else:
-            meta["display_name"] = display_name.strip()
-
-        if meta.get("id") != project_id:
-            meta["id"] = project_id
-        meta["project_dir"] = str(project_dir)
-
-        meta["run_mode"] = _normalize_run_mode(meta.get("run_mode"))
-        meta["agent_profile"] = _normalize_agent_profile(meta.get("agent_profile"))
-        meta["contract_version"] = _normalize_contract_version(meta.get("contract_version"))
-        meta["automation_policy"] = _normalize_automation_policy(meta.get("automation_policy"))
-
-        if not isinstance(meta.get("schema_version"), int):
-            meta["schema_version"] = PROJECT_META_SCHEMA_VERSION
-
-        if not isinstance(meta.get("created_at"), str) or not meta["created_at"]:
-            meta["created_at"] = baseline["created_at"]
-        if not isinstance(meta.get("updated_at"), str) or not meta["updated_at"]:
-            meta["updated_at"] = baseline["updated_at"]
-
-        self._write_project_meta(project_dir, meta)
-        return meta
+        project_id = self.project_registry.project_id_for_dir(project_dir) or project_dir.name
+        try:
+            return self.project_registry.ensure_project_meta(project_id, project_dir)
+        except ValueError:
+            return self.project_registry.ensure_project_meta(
+                slugify_project_id(project_id),
+                project_dir,
+                display_name=project_id,
+            )
 
     def _persist_project_runtime_preferences(
         self,
@@ -1880,7 +1837,8 @@ class UiChannel(BaseChannel):
         automation_policy: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Persist runtime preferences for websocket-driven project sessions."""
-        project_dir = self._register_project_dir(project_dir.name, project_dir)
+        project_id = self.project_registry.project_id_for_dir(project_dir) or project_dir.name
+        project_dir = self._register_project_dir(project_id, project_dir)
         project_dir.mkdir(parents=True, exist_ok=True)
         meta = self._ensure_project_meta(project_dir)
         changed = False
@@ -1907,59 +1865,136 @@ class UiChannel(BaseChannel):
             self._write_project_meta(project_dir, meta)
         return meta
 
-    async def _handle_list_projects(self, _request: web.Request) -> web.Response:
-        """List PRJ-* project directories under projects_root with optional task_plan data."""
-        if not self.projects_root.is_dir():
-            return web.json_response({"projects": []})
-
-        self._register_projects_under_root(self.projects_root)
-        projects: list[dict[str, Any]] = []
-        for d in sorted(self.projects_root.iterdir()):
-            if not self._is_project_dir(d):
-                continue
-
-            meta = self._ensure_project_meta(d)
-            info: dict[str, Any] = {
-                "id": d.name,
-                "display_name": str(meta.get("display_name", d.name)),
-                "run_mode": str(meta.get("run_mode", PROJECT_META_DEFAULT_RUN_MODE)),
-                "agent_profile": str(
-                    meta.get("agent_profile", PROJECT_META_DEFAULT_AGENT_PROFILE)
-                ),
-                "contract_version": int(
-                    _normalize_contract_version(meta.get("contract_version"))
-                ),
-                "automation_policy": _normalize_automation_policy(
-                    meta.get("automation_policy")
-                ),
-                "has_meta": True,
-            }
-            plan_file = d / PLAN_FILENAME
-            if plan_file.is_file():
-                try:
-                    plan = json.loads(plan_file.read_text(encoding="utf-8"))
-                    if not isinstance(plan, dict):
-                        raise ValueError(f"Unexpected non-object JSON in {plan_file}")
-                    if self._reconcile_plan_data(d, plan):
-                        try:
-                            plan_file.write_text(
-                                json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
-                                encoding="utf-8",
-                            )
-                        except OSError as exc:
-                            logger.warning("Failed to write reconciled {}: {}", plan_file, exc)
-                    info["title"] = plan.get("title", "")
-                    info["status"] = plan.get("status", "in_progress")
-                    info["core_question"] = plan.get("core_question", "")
-                    info["started_at"] = plan.get("started_at", "")
-                    info["has_plan"] = True
-                except (ValueError, json.JSONDecodeError, OSError):
-                    info["has_plan"] = False
-            else:
+    def _project_info(self, ref: ProjectRef) -> dict[str, Any]:
+        project_id = ref.project_id
+        project_dir = ref.project_dir
+        meta = self._ensure_project_meta(project_dir)
+        info: dict[str, Any] = {
+            "id": project_id,
+            "display_name": str(meta.get("display_name", project_id)),
+            "project_dir": str(project_dir),
+            "run_mode": str(meta.get("run_mode", PROJECT_META_DEFAULT_RUN_MODE)),
+            "agent_profile": str(
+                meta.get("agent_profile", PROJECT_META_DEFAULT_AGENT_PROFILE)
+            ),
+            "contract_version": int(
+                _normalize_contract_version(meta.get("contract_version"))
+            ),
+            "automation_policy": _normalize_automation_policy(
+                meta.get("automation_policy")
+            ),
+            "has_meta": True,
+        }
+        plan_file = project_dir / PLAN_FILENAME
+        if plan_file.is_file():
+            try:
+                plan = json.loads(plan_file.read_text(encoding="utf-8"))
+                if not isinstance(plan, dict):
+                    raise ValueError(f"Unexpected non-object JSON in {plan_file}")
+                if self._reconcile_plan_data(project_dir, plan):
+                    try:
+                        plan_file.write_text(
+                            json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                    except OSError as exc:
+                        logger.warning("Failed to write reconciled {}: {}", plan_file, exc)
+                info["title"] = plan.get("title", "")
+                info["status"] = plan.get("status", "in_progress")
+                info["core_question"] = plan.get("core_question", "")
+                info["started_at"] = plan.get("started_at", "")
+                info["has_plan"] = True
+            except (ValueError, json.JSONDecodeError, OSError):
                 info["has_plan"] = False
-            projects.append(info)
+        else:
+            info["has_plan"] = False
+        return info
 
+    async def _handle_list_projects(self, _request: web.Request) -> web.Response:
+        """List projects from the workspace registry plus legacy PRJ-* folders."""
+        refs = self.project_registry.list_projects()
+        projects = [self._project_info(ref) for ref in refs]
         return web.json_response({"projects": projects})
+
+    async def _handle_create_project(self, request: web.Request) -> web.Response:
+        """Create/register a project in the workspace file."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "JSON body must be an object"}, status=400)
+
+        raw_display_name = body.get("display_name") or body.get("name") or body.get("title")
+        display_name = raw_display_name.strip() if isinstance(raw_display_name, str) else ""
+        raw_project_id = body.get("project_id") or body.get("id")
+        project_id = raw_project_id.strip() if isinstance(raw_project_id, str) else ""
+        if not project_id:
+            project_id = slugify_project_id(display_name)
+
+        try:
+            project_id = validate_project_id(project_id)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        project_dir = body.get("project_dir")
+        project_parent_dir = body.get("project_parent_dir")
+        if not self._custom_project_dirs_allowed():
+            project_dir = None
+            project_parent_dir = None
+        else:
+            if project_dir is not None and not isinstance(project_dir, str):
+                return web.json_response({"error": "project_dir must be a string"}, status=400)
+            if project_parent_dir is not None and not isinstance(project_parent_dir, str):
+                return web.json_response({"error": "project_parent_dir must be a string"}, status=400)
+
+        try:
+            ref = self.project_registry.create_project(
+                project_id=project_id,
+                display_name=display_name or project_id,
+                project_dir=project_dir,
+                project_parent_dir=project_parent_dir,
+            )
+        except FileExistsError as exc:
+            return web.json_response({"error": str(exc)}, status=409)
+        except (OSError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        meta = self._ensure_project_meta(ref.project_dir)
+        changed = False
+        run_mode = body.get("run_mode")
+        if isinstance(run_mode, str):
+            meta["run_mode"] = _normalize_run_mode(run_mode)
+            changed = True
+        agent_profile = body.get("agent_profile")
+        if isinstance(agent_profile, str):
+            meta["agent_profile"] = _normalize_agent_profile(agent_profile)
+            changed = True
+        contract_version = body.get("contract_version")
+        if isinstance(contract_version, int):
+            meta["contract_version"] = _normalize_contract_version(contract_version)
+            changed = True
+        automation_policy = body.get("automation_policy")
+        if isinstance(automation_policy, (dict, type(None))):
+            meta["automation_policy"] = _normalize_automation_policy(automation_policy)
+            changed = True
+        if changed:
+            meta["updated_at"] = f"{datetime.utcnow().isoformat()}Z"
+            self._write_project_meta(ref.project_dir, meta)
+            self.project_registry.save()
+
+        self._audit(
+            source="ui",
+            action="api_project_created",
+            session_id=ref.project_id,
+            project_dir=ref.project_dir,
+            details={
+                "display_name": meta.get("display_name"),
+                "storage_mode": self._project_storage_mode(),
+            },
+        )
+
+        return web.json_response(self._project_info(ref), status=201)
 
     async def _handle_project_meta(self, request: web.Request) -> web.Response:
         session_id = request.match_info.get("session_id", "").strip()

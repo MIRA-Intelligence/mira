@@ -805,6 +805,32 @@ async def test_run_main_loop_dispatches_set_mode_control(monkeypatch, tmp_path: 
     assert set_mode_calls[0].metadata.get("run_mode") == "auto"
 
 
+async def test_set_mode_control_uses_project_scoped_key(tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+    project_dir = tmp_path / "projects" / "alpha"
+    project_dir.mkdir(parents=True)
+
+    await loop._handle_set_mode(
+        InboundMessage(
+            channel="ui",
+            sender_id="u",
+            chat_id="PRJ-X",
+            content="",
+            metadata={
+                "_control": "set_mode",
+                "run_mode": "auto",
+                "project_id": "alpha",
+                "project_dir": str(project_dir),
+            },
+        )
+    )
+
+    assert loop._session_run_modes == {"alpha:ui:PRJ-X": "auto"}
+    ack = await loop.bus.consume_outbound()
+    assert ack.metadata["project_id"] == "alpha"
+    assert ack.metadata["project_dir"] == str(project_dir.resolve())
+
+
 async def test_session_reset_drops_research_state(tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
     loop._session_run_modes["ui:PRJ-X"] = "auto"

@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sys
+from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -202,6 +203,10 @@ class ExecTool(Tool):
     ):
         self.timeout = timeout
         self.working_dir = working_dir
+        self._runtime_working_dir: ContextVar[str | None] = ContextVar(
+            "exec_runtime_working_dir",
+            default=None,
+        )
         # Background execution is opt-in: callers (the loop) wire a shared
         # registry and flip ``enable_background``. Subagents leave it off so
         # the LLM doesn't accidentally spawn fire-and-forget jobs in a
@@ -232,6 +237,16 @@ class ExecTool(Tool):
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
         self.sandbox = sandbox
+
+    def set_runtime_context(self, *, workspace: Path, **_: Any) -> None:
+        """Set the per-turn working directory used by a multi-project gateway."""
+
+        self._runtime_working_dir.set(str(workspace))
+
+    def clear_runtime_context(self) -> None:
+        """Clear the per-turn working directory."""
+
+        self._runtime_working_dir.set(None)
 
     @property
     def name(self) -> str:
@@ -288,7 +303,7 @@ class ExecTool(Tool):
         }
 
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
-        cwd = working_dir or self.working_dir or os.getcwd()
+        cwd = working_dir or self._runtime_working_dir.get() or self.working_dir or os.getcwd()
         background = bool(kwargs.get("background", False))
         timeout = kwargs.get("timeout", self.timeout)
         try:
@@ -349,7 +364,7 @@ class ExecTool(Tool):
 
         try:
             process = await self._spawn(spawn_command, cwd, env)
-            
+
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
@@ -364,21 +379,21 @@ class ExecTool(Tool):
                 except asyncio.TimeoutError:
                     pass
                 return f"Error: Command timed out after {timeout} seconds"
-            
+
             output_parts = []
-            
+
             if stdout:
                 output_parts.append(stdout.decode("utf-8", errors="replace"))
-            
+
             if stderr:
                 stderr_text = stderr.decode("utf-8", errors="replace")
                 if stderr_text.strip():
                     output_parts.append(f"STDERR:\n{stderr_text}")
 
             output_parts.append(f"\nExit code: {process.returncode}")
-            
+
             result = "\n".join(output_parts) if output_parts else "(no output)"
-            
+
             # Truncate very long output
             max_len = self._MAX_OUTPUT
             if len(result) > max_len:
@@ -388,9 +403,9 @@ class ExecTool(Tool):
                 result = (
                     f"{head}\n... ({removed} chars truncated) ...\n{tail}"
                 )
-            
+
             return result
-            
+
         except Exception as e:
             return f"Error executing command: {str(e)}"
 

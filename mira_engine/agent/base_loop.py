@@ -26,9 +26,9 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from mira_engine.agent.context import ContextBuilder
-from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
 from mira_engine.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from mira_engine.agent.memory import Consolidator, Dream, MemoryStore
+from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
 from mira_engine.agent.routing import ModelRouter, RoutedProviderManager
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
@@ -48,6 +48,7 @@ from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.command.router import CommandContext, CommandRouter
+from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
 
@@ -135,6 +136,8 @@ class BaseAgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self._project_sessions: dict[str, SessionManager] = {}
+        self._project_contexts: dict[str, ContextBuilder] = {}
+        self._project_consolidators: dict[str, Consolidator] = {}
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -261,6 +264,34 @@ class BaseAgentLoop:
             setattr(cron_tool, "_default_timezone", self.timezone)
             self.tools.register(cron_tool)
 
+    def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
+        skill_access_dirs: list[Path] = []
+        if not self.restrict_to_workspace:
+            return skill_access_dirs
+
+        from mira_engine.agent.skills import SkillsLoader
+
+        def _add_skill_dir(path: Path) -> None:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                return
+            if resolved != workspace and resolved not in skill_access_dirs:
+                skill_access_dirs.append(resolved)
+
+        skills_loader = SkillsLoader(workspace)
+        for root in skills_loader.workspace_skills_roots:
+            _add_skill_dir(root)
+        if skills_loader.builtin_skills:
+            _add_skill_dir(skills_loader.builtin_skills)
+        for skill in skills_loader.list_skills(filter_unavailable=False):
+            skill_path = Path(skill["path"])
+            _add_skill_dir(skill_path.parent)
+            parent = skill_path.parent.parent
+            if parent != skill_path.parent:
+                _add_skill_dir(parent)
+        return skill_access_dirs
+
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
@@ -283,12 +314,113 @@ class BaseAgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    @staticmethod
+    def _project_ref_from_metadata(metadata: dict[str, Any] | None) -> ProjectRef | None:
+        meta = metadata or {}
+        raw_project_dir = meta.get("project_dir")
+        if not isinstance(raw_project_dir, str) or not raw_project_dir.strip():
+            return None
+        try:
+            project_dir = Path(raw_project_dir).expanduser().resolve(strict=False)
+        except OSError:
+            return None
+        raw_project_id = meta.get("project_id")
+        project_id = raw_project_id.strip() if isinstance(raw_project_id, str) and raw_project_id.strip() else project_dir.name
+        return ProjectRef(project_id=project_id, project_dir=project_dir, metadata=meta)
+
+    @staticmethod
+    def _scoped_session_key(project_ref: ProjectRef | None, session_key: str) -> str:
+        if project_ref is None:
+            return session_key
+        return f"{project_ref.project_id}:{session_key}"
+
+    def _get_project_sessions(self, project_ref: ProjectRef | str) -> SessionManager:
+        """Return a per-project SessionManager, creating one if needed."""
+
+        if isinstance(project_ref, ProjectRef):
+            project_id = project_ref.project_id
+            project_dir = project_ref.project_dir
+        else:
+            project_dir = Path(project_ref)
+            project_id = str(project_dir)
+        manager = self._project_sessions.get(project_id)
+        if manager is None or manager.workspace.resolve(strict=False) != project_dir.resolve(strict=False):
+            manager = SessionManager(project_dir)
+            self._project_sessions[project_id] = manager
+        return manager
+
+    def _get_project_context(self, project_ref: ProjectRef | None) -> ContextBuilder:
+        if project_ref is None:
+            return self.context
+        ctx = self._project_contexts.get(project_ref.project_id)
+        if ctx is None or ctx.workspace.resolve(strict=False) != project_ref.project_dir.resolve(strict=False):
+            ctx = ContextBuilder(project_ref.project_dir)
+            self._project_contexts[project_ref.project_id] = ctx
+        return ctx
+
+    def _get_project_consolidator(
+        self,
+        project_ref: ProjectRef | None,
+        sessions_mgr: SessionManager,
+        ctx: ContextBuilder,
+    ) -> Consolidator:
+        if project_ref is None:
+            return self.consolidator
+        consolidator = self._project_consolidators.get(project_ref.project_id)
+        if consolidator is None or getattr(consolidator.store, "workspace", None) != project_ref.project_dir:
+            generation_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", None)
+            completion_tokens = (
+                int(generation_max_tokens)
+                if isinstance(generation_max_tokens, int | float)
+                else self.max_tokens
+            )
+            consolidator = Consolidator(
+                store=MemoryStore(project_ref.project_dir),
+                provider=self.provider,
+                model=self.model,
+                sessions=sessions_mgr,
+                context_window_tokens=self.context_window_tokens,
+                build_messages=ctx.build_messages,
+                get_tool_definitions=self.tools.get_definitions,
+                max_completion_tokens=completion_tokens,
+            )
+            self._project_consolidators[project_ref.project_id] = consolidator
+        return consolidator
+
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        project_ref: ProjectRef | None = None,
+        session_key: str | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
+        if project_ref is not None:
+            allowed_dir = project_ref.project_dir if self.restrict_to_workspace else None
+            extra_allowed_dirs = self._skill_access_dirs_for_workspace(project_ref.project_dir)
+            for tool in getattr(self.tools, "_tools", {}).values():
+                if hasattr(tool, "set_runtime_context"):
+                    tool.set_runtime_context(
+                        workspace=project_ref.project_dir,
+                        allowed_dir=allowed_dir,
+                        extra_allowed_dirs=extra_allowed_dirs,
+                    )
+                if hasattr(tool, "set_project_context"):
+                    tool.set_project_context(project_ref.project_id, str(project_ref.project_dir))
+        else:
+            for tool in getattr(self.tools, "_tools", {}).values():
+                if hasattr(tool, "clear_runtime_context"):
+                    tool.clear_runtime_context()
+                if hasattr(tool, "clear_project_context"):
+                    tool.clear_project_context()
+
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                if session_key and hasattr(tool, "set_session_key"):
+                    tool.set_session_key(session_key)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -637,16 +769,25 @@ class BaseAgentLoop:
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
             elif self._command_router.is_priority(msg.content):
+                project_ref = self._project_ref_from_metadata(msg.metadata)
                 key = (
                     UNIFIED_SESSION_KEY
                     if self._unified_session and not msg.session_key_override
                     else msg.session_key
                 )
-                session = self.sessions.get_or_create(key)
+                scoped_key = self._scoped_session_key(project_ref, key)
+                sessions_mgr = self._get_project_sessions(project_ref) if project_ref else self.sessions
+                session = sessions_mgr.get_or_create(key)
+                if project_ref is not None:
+                    msg.metadata = {
+                        **dict(msg.metadata or {}),
+                        "project_id": project_ref.project_id,
+                        "project_dir": str(project_ref.project_dir),
+                    }
                 ctx = CommandContext(
                     msg=msg,
                     session=session,
-                    key=key,
+                    key=scoped_key,
                     raw=msg.content.strip(),
                     loop=self,
                 )
@@ -654,9 +795,11 @@ class BaseAgentLoop:
                 if response is not None:
                     await self.bus.publish_outbound(response)
             else:
+                project_ref = self._project_ref_from_metadata(msg.metadata)
                 effective_key = (
                     UNIFIED_SESSION_KEY if self._unified_session and not msg.session_key_override else msg.session_key
                 )
+                effective_key = self._scoped_session_key(project_ref, effective_key)
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(effective_key, []).append(task)
                 task.add_done_callback(lambda t, k=effective_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
@@ -672,14 +815,21 @@ class BaseAgentLoop:
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
-        tasks = self._active_tasks.pop(msg.session_key, [])
+        project_ref = self._project_ref_from_metadata(msg.metadata)
+        raw_key = (
+            UNIFIED_SESSION_KEY
+            if getattr(self, "_unified_session", False) and not msg.session_key_override
+            else msg.session_key
+        )
+        scoped_key = self._scoped_session_key(project_ref, raw_key)
+        tasks = self._active_tasks.pop(scoped_key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
         for t in tasks:
             try:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
+        sub_cancelled = await self.subagents.cancel_by_session(scoped_key)
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
@@ -816,18 +966,30 @@ class BaseAgentLoop:
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
                                 else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
-            key = f"{channel}:{chat_id}"
-            session = self.sessions.get_or_create(key)
+            meta = msg.metadata or {}
+            project_ref = self._project_ref_from_metadata(meta)
+            raw_key = f"{channel}:{chat_id}"
+            key = self._scoped_session_key(project_ref, raw_key)
+            sessions_mgr = self._get_project_sessions(project_ref) if project_ref else self.sessions
+            session = sessions_mgr.get_or_create(raw_key)
             model_runtime = self._get_model_runtime(key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(
+                channel,
+                chat_id,
+                meta.get("message_id"),
+                project_ref=project_ref,
+                session_key=key,
+            )
             history = session.get_history(max_messages=self.memory_window)
-            messages = self.context.build_messages(
+            ctx = self._get_project_context(project_ref)
+            messages = ctx.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
+                project_dir=str(project_ref.project_dir) if project_ref else None,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages, model_runtime=model_runtime)
             self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
+            sessions_mgr.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -835,15 +997,16 @@ class BaseAgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = msg.metadata or {}
-        project_dir = meta.get("project_dir")
-        key = session_key or msg.session_key
-        if project_dir:
-            sessions_mgr = self._get_project_sessions(project_dir)
-        else:
-            sessions_mgr = self.sessions
+        project_ref = self._project_ref_from_metadata(meta)
+        project_dir = str(project_ref.project_dir) if project_ref else None
+        raw_key = session_key or msg.session_key
+        key = self._scoped_session_key(project_ref, raw_key)
+        sessions_mgr = self._get_project_sessions(project_ref) if project_ref else self.sessions
 
-        session = sessions_mgr.get_or_create(key)
-        memory_workspace = Path(project_dir) if project_dir else self.workspace
+        session = sessions_mgr.get_or_create(raw_key)
+        memory_workspace = project_ref.project_dir if project_ref else self.workspace
+        ctx = self._get_project_context(project_ref)
+        project_consolidator = self._get_project_consolidator(project_ref, sessions_mgr, ctx)
         recent_skill_names: list[str] = []
         if isinstance(session.metadata, dict):
             raw_recent = session.metadata.get("_recent_skills")
@@ -858,9 +1021,9 @@ class BaseAgentLoop:
                 session.clear()
                 sessions_mgr.save(session)
                 sessions_mgr.invalidate(session.key)
-                self._on_session_reset(session.key)
+                self._on_session_reset(key)
                 if snapshot:
-                    self._schedule_background(self.consolidator.archive(snapshot))
+                    self._schedule_background(project_consolidator.archive(snapshot))
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                       content="New session started.")
             ok = await self._consolidate_memory(session, archive_all=True, workspace_override=memory_workspace)
@@ -870,7 +1033,7 @@ class BaseAgentLoop:
             session.clear()
             sessions_mgr.save(session)
             sessions_mgr.invalidate(session.key)
-            self._on_session_reset(session.key)
+            self._on_session_reset(key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -898,9 +1061,9 @@ class BaseAgentLoop:
                 return handled
 
         unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
+        if (unconsolidated >= self.memory_window and key not in self._consolidating):
+            self._consolidating.add(key)
+            lock = self._consolidation_locks.setdefault(key, asyncio.Lock())
             _mw = memory_workspace
 
             async def _consolidate_and_unlock():
@@ -908,7 +1071,7 @@ class BaseAgentLoop:
                     async with lock:
                         await self._consolidate_memory(session, workspace_override=_mw)
                 finally:
-                    self._consolidating.discard(session.key)
+                    self._consolidating.discard(key)
                     _task = asyncio.current_task()
                     if _task is not None:
                         self._consolidation_tasks.discard(_task)
@@ -916,12 +1079,18 @@ class BaseAgentLoop:
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            meta.get("message_id"),
+            project_ref=project_ref,
+            session_key=key,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        await self.consolidator.maybe_consolidate_by_tokens(session)
+        await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
         model_runtime = self._get_model_runtime(key)
         extra_system = self._compose_extra_system(
@@ -929,7 +1098,6 @@ class BaseAgentLoop:
             meta.get("_task_plan_guard_notice"),
         )
 
-        ctx = ContextBuilder(memory_workspace) if project_dir else self.context
         suggested_skills = ctx.skills.suggest_skills(
             msg.content,
             recent=recent_skill_names,
@@ -1128,12 +1296,6 @@ class BaseAgentLoop:
         if isinstance(session.metadata, dict):
             session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
         return True
-
-    def _get_project_sessions(self, project_dir: str) -> SessionManager:
-        """Return a per-project SessionManager, creating one if needed."""
-        if project_dir not in self._project_sessions:
-            self._project_sessions[project_dir] = SessionManager(Path(project_dir))
-        return self._project_sessions[project_dir]
 
     async def _consolidate_memory(
         self, session, archive_all: bool = False, workspace_override: Path | None = None,

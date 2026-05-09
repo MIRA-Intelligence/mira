@@ -10,7 +10,14 @@ from typing import Any, Callable, Coroutine
 
 from loguru import logger
 
-from mira_engine.cron.types import CronJob, CronJobState, CronPayload, CronRunRecord, CronSchedule, CronStore
+from mira_engine.cron.types import (
+    CronJob,
+    CronJobState,
+    CronPayload,
+    CronRunRecord,
+    CronSchedule,
+    CronStore,
+)
 
 
 def _now_ms() -> int:
@@ -122,6 +129,8 @@ class CronService:
                         deliver=j["payload"].get("deliver", False),
                         channel=j["payload"].get("channel"),
                         to=j["payload"].get("to"),
+                        project_id=j["payload"].get("projectId") or j["payload"].get("project_id"),
+                        project_dir=j["payload"].get("projectDir") or j["payload"].get("project_dir"),
                     ),
                     state=CronJobState(
                         next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -185,6 +194,8 @@ class CronService:
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
                         "to": j.payload.to,
+                        "projectId": j.payload.project_id,
+                        "projectDir": j.payload.project_dir,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -211,7 +222,7 @@ class CronService:
 
         self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         self._last_mtime_ns = self.store_path.stat().st_mtime_ns
-    
+
     async def start(self) -> None:
         """Start the cron service."""
         self._running = True
@@ -291,9 +302,8 @@ class CronService:
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
         try:
-            response = None
             if self.on_job:
-                response = await self.on_job(job)
+                await self.on_job(job)
 
             job.state.last_status = "ok"
             job.state.last_error = None
@@ -345,6 +355,8 @@ class CronService:
         deliver: bool = False,
         channel: str | None = None,
         to: str | None = None,
+        project_id: str | None = None,
+        project_dir: str | None = None,
         delete_after_run: bool = False,
     ) -> CronJob:
         """Add a new job."""
@@ -363,6 +375,8 @@ class CronService:
                 deliver=deliver,
                 channel=channel,
                 to=to,
+                project_id=project_id,
+                project_dir=project_dir,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,

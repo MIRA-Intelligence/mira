@@ -95,23 +95,35 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         return _error_json(400, f"Only configured model '{model_name}' is available")
 
     session_key = f"api:{body['session_id']}" if body.get("session_id") else API_SESSION_KEY
+    project_metadata = {
+        key: value.strip()
+        for key, value in {
+            "project_id": body.get("project_id"),
+            "project_dir": body.get("project_dir"),
+        }.items()
+        if isinstance(value, str) and value.strip()
+    }
+    lock_project = project_metadata.get("project_id") or project_metadata.get("project_dir") or "default"
     session_locks: dict[str, asyncio.Lock] = request.app["session_locks"]
-    session_lock = session_locks.setdefault(session_key, asyncio.Lock())
+    session_lock = session_locks.setdefault(f"{lock_project}:{session_key}", asyncio.Lock())
 
     logger.info("API request session_key={} content={}", session_key, user_content[:80])
 
-    _FALLBACK = EMPTY_FINAL_RESPONSE_MESSAGE
+    fallback = EMPTY_FINAL_RESPONSE_MESSAGE
 
     try:
         async with session_lock:
             try:
+                process_kwargs = {
+                    "content": user_content,
+                    "session_key": session_key,
+                    "channel": "api",
+                    "chat_id": API_CHAT_ID,
+                }
+                if project_metadata:
+                    process_kwargs["metadata"] = project_metadata
                 response = await asyncio.wait_for(
-                    agent_loop.process_direct(
-                        content=user_content,
-                        session_key=session_key,
-                        channel="api",
-                        chat_id=API_CHAT_ID,
-                    ),
+                    agent_loop.process_direct(**process_kwargs),
                     timeout=timeout_s,
                 )
                 response_text = _response_text(response)
@@ -122,12 +134,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         session_key,
                     )
                     retry_response = await asyncio.wait_for(
-                        agent_loop.process_direct(
-                            content=user_content,
-                            session_key=session_key,
-                            channel="api",
-                            chat_id=API_CHAT_ID,
-                        ),
+                        agent_loop.process_direct(**process_kwargs),
                         timeout=timeout_s,
                     )
                     response_text = _response_text(retry_response)
@@ -136,7 +143,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             "Empty response after retry for session {}, using fallback",
                             session_key,
                         )
-                        response_text = _FALLBACK
+                        response_text = fallback
 
             except asyncio.TimeoutError:
                 return _error_json(504, f"Request timed out after {timeout_s}s")
