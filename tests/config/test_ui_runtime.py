@@ -1,7 +1,11 @@
 from pathlib import Path
 
 from mira_engine.config.schema import Config
-from mira_engine.config.ui_runtime import apply_ui_runtime_update, build_ui_runtime_payload
+from mira_engine.config.ui_runtime import (
+    apply_ui_runtime_update,
+    apply_ui_runtime_update_to_raw_data,
+    build_ui_runtime_payload,
+)
 
 
 def test_build_ui_runtime_payload_includes_dynamic_provider_metadata() -> None:
@@ -86,3 +90,55 @@ def test_apply_ui_runtime_update_accepts_global_provider_proxy() -> None:
     assert changed is True
     assert next_root == Path("/tmp/workspace").resolve()
     assert cfg.providers.proxy == "http://127.0.0.1:7890"
+
+
+def test_apply_ui_runtime_update_to_raw_data_preserves_routing_models() -> None:
+    data = {
+        "agents": {
+            "defaults": {
+                "workspace": "/tmp/old",
+                "provider": "openrouter",
+                "model": ["claude-3-opus", "anthropic/claude-sonnet-4-5"],
+                "routeModel": ["openai/gpt-4.1-mini", "openai/gpt-4.1-nano"],
+                "smallModel": ["deepseek/deepseek-chat", "openai/gpt-4.1-mini"],
+                "mediumModel": "anthropic/claude-sonnet-4-5",
+                "largeModel": "anthropic/claude-opus-4-5",
+            }
+        },
+        "providers": {
+            "openrouter": {
+                "apiKey": "existing-key",
+            }
+        },
+    }
+
+    next_root, changed = apply_ui_runtime_update_to_raw_data(
+        data,
+        {
+            "runtime": {
+                "workspace": "/tmp/new",
+                "provider": "openrouter",
+                "model": "openrouter/claude-3-opus",
+                "max_tool_iterations": 64,
+            },
+            "providers": {
+                "openrouter": {
+                    "api_base": "https://openrouter.ai/api/v1",
+                }
+            },
+        },
+        current_projects_root=Path("/tmp/old"),
+    )
+
+    defaults = data["agents"]["defaults"]
+    assert changed is True
+    assert next_root == Path("/tmp/new").resolve()
+    assert defaults["workspace"] == str(Path("/tmp/new").resolve())
+    assert defaults["model"] == ["claude-3-opus", "anthropic/claude-sonnet-4-5"]
+    assert defaults["routeModel"] == ["openai/gpt-4.1-mini", "openai/gpt-4.1-nano"]
+    assert defaults["smallModel"] == ["deepseek/deepseek-chat", "openai/gpt-4.1-mini"]
+    assert defaults["mediumModel"] == "anthropic/claude-sonnet-4-5"
+    assert defaults["largeModel"] == "anthropic/claude-opus-4-5"
+    assert defaults["maxToolIterations"] == 64
+    assert data["providers"]["openrouter"]["apiKey"] == "existing-key"
+    assert data["providers"]["openrouter"]["apiBase"] == "https://openrouter.ai/api/v1"
