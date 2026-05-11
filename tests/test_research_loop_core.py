@@ -20,6 +20,7 @@ from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.config.schema import ChannelsConfig, ExecToolConfig
+from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider, LLMResponse
 from mira_engine.session.manager import SessionManager
 
@@ -825,7 +826,11 @@ async def test_set_mode_control_uses_project_scoped_key(tmp_path: Path) -> None:
         )
     )
 
-    assert loop._session_run_modes == {"alpha:ui:PRJ-X": "auto"}
+    scoped_key = loop._scoped_session_key(
+        ProjectRef(project_id="alpha", project_dir=project_dir.resolve(), metadata={}),
+        "ui:PRJ-X",
+    )
+    assert loop._session_run_modes == {scoped_key: "auto"}
     ack = await loop.bus.consume_outbound()
     assert ack.metadata["project_id"] == "alpha"
     assert ack.metadata["project_dir"] == str(project_dir.resolve())

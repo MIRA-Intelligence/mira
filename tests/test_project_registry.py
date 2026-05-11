@@ -60,7 +60,11 @@ def test_project_id_validation_rejects_path_separators() -> None:
     with pytest.raises(ValueError):
         validate_project_id("../outside")
 
+    with pytest.raises(ValueError):
+        validate_project_id("alpha:ui:PRJ-X")
+
 
 def test_slugify_project_id_preserves_readable_name() -> None:
     assert slugify_project_id("  Lung CT Baseline  ") == "lung-ct-baseline"
     assert slugify_project_id("医学影像 项目") == "医学影像-项目"
+    assert slugify_project_id("Alpha: Beta") == "alpha-beta"

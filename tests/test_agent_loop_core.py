@@ -365,21 +365,28 @@ async def test_project_ref_scopes_session_cache_and_tools(tmp_path: Path) -> Non
         restrict_to_workspace=True,
     )
     ref = ProjectRef(project_id="alpha", project_dir=project_dir, metadata={})
+    other_ref = ProjectRef(project_id="alpha", project_dir=tmp_path / "other" / "alpha", metadata={})
+    other_ref.project_dir.mkdir(parents=True)
+    scoped_key = loop._scoped_session_key(ref, "ui:chat-1")
 
-    assert loop._scoped_session_key(ref, "ui:chat-1") == "alpha:ui:chat-1"
+    assert scoped_key.startswith("project:")
+    assert scoped_key.endswith(":ui:chat-1")
+    assert loop._scoped_session_key(other_ref, "ui:chat-1") != scoped_key
     first = loop._get_project_sessions(ref)
     second = loop._get_project_sessions(ref)
+    other = loop._get_project_sessions(other_ref)
     assert first is second
+    assert other is not first
     assert first.workspace == project_dir
 
-    loop._set_tool_context("ui", "chat-1", "msg-1", project_ref=ref, session_key="alpha:ui:chat-1")
+    loop._set_tool_context("ui", "chat-1", "msg-1", project_ref=ref, session_key=scoped_key)
     read_tool = loop.tools.get("read_file")
     assert read_tool is not None
     assert await read_tool.execute("note.txt") == "alpha"
 
     spawn_tool = loop.tools.get("spawn")
     assert spawn_tool is not None
-    assert spawn_tool._runtime_session_key.get() == "alpha:ui:chat-1"
+    assert spawn_tool._runtime_session_key.get() == scoped_key
     assert spawn_tool._runtime_project_id.get() == "alpha"
     assert spawn_tool._runtime_project_dir.get() == project_dir
 

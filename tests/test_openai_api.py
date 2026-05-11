@@ -17,6 +17,7 @@ from mira_engine.api.server import (
     create_app,
     handle_chat_completions,
 )
+from mira_engine.projects import ProjectRegistry
 
 try:
     from aiohttp.test_utils import TestClient, TestServer
@@ -198,6 +199,83 @@ async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_ag
         channel="api",
         chat_id=API_CHAT_ID,
     )
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_project_dir_requires_registered_project_id(aiohttp_client, mock_agent, tmp_path) -> None:
+    app = create_app(mock_agent, model_name="m")
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "project_dir": str(tmp_path / "outside"),
+        },
+    )
+
+    assert resp.status == 400
+    body = await resp.json()
+    assert "project_id is required" in body["error"]["message"]
+    mock_agent.process_direct.assert_not_called()
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_registered_project_metadata_is_forwarded(aiohttp_client, mock_agent, tmp_path) -> None:
+    registry = ProjectRegistry(
+        tmp_path / "projects",
+        workspace_path=tmp_path / "workspace.json",
+        legacy_index_path=tmp_path / "project-dirs.json",
+    )
+    ref = registry.create_project(project_id="alpha", display_name="Alpha")
+    app = create_app(mock_agent, model_name="m", project_registry=registry)
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "project_id": "alpha",
+            "project_dir": str(ref.project_dir),
+        },
+    )
+
+    assert resp.status == 200
+    mock_agent.process_direct.assert_called_once_with(
+        content="hello",
+        session_key=API_SESSION_KEY,
+        channel="api",
+        chat_id=API_CHAT_ID,
+        metadata={"project_id": "alpha", "project_dir": str(ref.project_dir)},
+    )
+
+
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
+@pytest.mark.asyncio
+async def test_project_dir_must_match_registry(aiohttp_client, mock_agent, tmp_path) -> None:
+    registry = ProjectRegistry(
+        tmp_path / "projects",
+        workspace_path=tmp_path / "workspace.json",
+        legacy_index_path=tmp_path / "project-dirs.json",
+    )
+    registry.create_project(project_id="alpha", display_name="Alpha")
+    app = create_app(mock_agent, model_name="m", project_registry=registry)
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "project_id": "alpha",
+            "project_dir": str(tmp_path / "outside"),
+        },
+    )
+
+    assert resp.status == 400
+    body = await resp.json()
+    assert "does not match" in body["error"]["message"]
+    mock_agent.process_direct.assert_not_called()
 
 
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
