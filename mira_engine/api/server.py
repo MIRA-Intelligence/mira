@@ -9,11 +9,13 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 from loguru import logger
 
+from mira_engine.projects import ProjectRef, ProjectRegistry
 from mira_engine.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 API_SESSION_KEY = "api:default"
@@ -57,6 +59,50 @@ def _response_text(value: Any) -> str:
     return str(value)
 
 
+def _project_registry_for_loop(agent_loop: Any) -> ProjectRegistry | None:
+    workspace = getattr(agent_loop, "workspace", None)
+    if not isinstance(workspace, (str, Path)):
+        return None
+    try:
+        return ProjectRegistry(Path(workspace))
+    except Exception as exc:
+        logger.warning("Failed to initialize API project registry: {}", exc)
+        return None
+
+
+def _strip_body_string(body: dict[str, Any], key: str) -> str | None:
+    value = body.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _api_project_ref(body: dict[str, Any], registry: ProjectRegistry | None) -> ProjectRef | None:
+    project_id = _strip_body_string(body, "project_id")
+    project_dir = _strip_body_string(body, "project_dir")
+    if not project_id and not project_dir:
+        return None
+    if not project_id:
+        raise ValueError("project_id is required when project_dir is provided")
+    if registry is None:
+        raise ValueError("project registry is unavailable")
+
+    try:
+        ref = registry.resolve(project_id)
+    except FileNotFoundError as exc:
+        raise ValueError(f"project not found: {project_id}") from exc
+
+    if project_dir:
+        try:
+            requested_dir = Path(project_dir).expanduser().resolve(strict=False)
+        except OSError as exc:
+            raise ValueError("invalid project_dir") from exc
+        registered_dir = ref.project_dir.expanduser().resolve(strict=False)
+        if requested_dir != registered_dir:
+            raise ValueError("project_dir does not match the registered project")
+    return ref
+
+
 # ---------------------------------------------------------------------------
 # Route handlers
 # ---------------------------------------------------------------------------
@@ -95,15 +141,19 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         return _error_json(400, f"Only configured model '{model_name}' is available")
 
     session_key = f"api:{body['session_id']}" if body.get("session_id") else API_SESSION_KEY
-    project_metadata = {
-        key: value.strip()
-        for key, value in {
-            "project_id": body.get("project_id"),
-            "project_dir": body.get("project_dir"),
-        }.items()
-        if isinstance(value, str) and value.strip()
-    }
-    lock_project = project_metadata.get("project_id") or project_metadata.get("project_dir") or "default"
+    try:
+        project_ref = _api_project_ref(body, request.app.get("project_registry"))
+    except ValueError as exc:
+        return _error_json(400, str(exc))
+    project_metadata = (
+        {
+            "project_id": project_ref.project_id,
+            "project_dir": str(project_ref.project_dir),
+        }
+        if project_ref is not None
+        else {}
+    )
+    lock_project = project_ref.project_dir if project_ref is not None else "default"
     session_locks: dict[str, asyncio.Lock] = request.app["session_locks"]
     session_lock = session_locks.setdefault(f"{lock_project}:{session_key}", asyncio.Lock())
 
@@ -182,7 +232,12 @@ async def handle_health(request: web.Request) -> web.Response:
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app(agent_loop, model_name: str = "mira", request_timeout: float = 120.0) -> web.Application:
+def create_app(
+    agent_loop,
+    model_name: str = "mira",
+    request_timeout: float = 120.0,
+    project_registry: ProjectRegistry | None = None,
+) -> web.Application:
     """Create the aiohttp application.
 
     Args:
@@ -194,7 +249,10 @@ def create_app(agent_loop, model_name: str = "mira", request_timeout: float = 12
     app["agent_loop"] = agent_loop
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout
-    app["session_locks"] = {}  # per-user locks, keyed by session_key
+    app["session_locks"] = {}  # per-project/session locks
+    app["project_registry"] = (
+        project_registry if project_registry is not None else _project_registry_for_loop(agent_loop)
+    )
 
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)

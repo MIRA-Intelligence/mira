@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import hashlib
 import json
 import re
 import time
@@ -434,33 +435,39 @@ class BaseAgentLoop:
         return ProjectRef(project_id=project_id, project_dir=project_dir, metadata=meta)
 
     @staticmethod
-    def _scoped_session_key(project_ref: ProjectRef | None, session_key: str) -> str:
+    def _project_scope_key(project_ref: ProjectRef) -> str:
+        project_dir = project_ref.project_dir.expanduser().resolve(strict=False)
+        return hashlib.sha256(str(project_dir).encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def _scoped_session_key(cls, project_ref: ProjectRef | None, session_key: str) -> str:
         if project_ref is None:
             return session_key
-        return f"{project_ref.project_id}:{session_key}"
+        return f"project:{cls._project_scope_key(project_ref)}:{session_key}"
 
     def _get_project_sessions(self, project_ref: ProjectRef | str) -> SessionManager:
         """Return a per-project SessionManager, creating one if needed."""
 
         if isinstance(project_ref, ProjectRef):
-            project_id = project_ref.project_id
+            cache_key = self._project_scope_key(project_ref)
             project_dir = project_ref.project_dir
         else:
             project_dir = Path(project_ref)
-            project_id = str(project_dir)
-        manager = self._project_sessions.get(project_id)
+            cache_key = str(project_dir.expanduser().resolve(strict=False))
+        manager = self._project_sessions.get(cache_key)
         if manager is None or manager.workspace.resolve(strict=False) != project_dir.resolve(strict=False):
             manager = SessionManager(project_dir)
-            self._project_sessions[project_id] = manager
+            self._project_sessions[cache_key] = manager
         return manager
 
     def _get_project_context(self, project_ref: ProjectRef | None) -> ContextBuilder:
         if project_ref is None:
             return self.context
-        ctx = self._project_contexts.get(project_ref.project_id)
+        cache_key = self._project_scope_key(project_ref)
+        ctx = self._project_contexts.get(cache_key)
         if ctx is None or ctx.workspace.resolve(strict=False) != project_ref.project_dir.resolve(strict=False):
             ctx = ContextBuilder(project_ref.project_dir)
-            self._project_contexts[project_ref.project_id] = ctx
+            self._project_contexts[cache_key] = ctx
         return ctx
 
     def _get_project_consolidator(
@@ -471,7 +478,8 @@ class BaseAgentLoop:
     ) -> Consolidator:
         if project_ref is None:
             return self.consolidator
-        consolidator = self._project_consolidators.get(project_ref.project_id)
+        cache_key = self._project_scope_key(project_ref)
+        consolidator = self._project_consolidators.get(cache_key)
         if consolidator is None or getattr(consolidator.store, "workspace", None) != project_ref.project_dir:
             generation_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", None)
             completion_tokens = (
@@ -489,7 +497,7 @@ class BaseAgentLoop:
                 get_tool_definitions=self.tools.get_definitions,
                 max_completion_tokens=completion_tokens,
             )
-            self._project_consolidators[project_ref.project_id] = consolidator
+            self._project_consolidators[cache_key] = consolidator
         return consolidator
 
     def _set_tool_context(

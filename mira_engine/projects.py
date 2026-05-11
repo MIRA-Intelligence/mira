@@ -79,8 +79,8 @@ def validate_project_id(project_id: str) -> str:
         raise ValueError(
             "project_id must be 1-128 characters and cannot be '.' or '..'"
         )
-    if any(ch in normalized for ch in {"/", "\\", "\x00"}):
-        raise ValueError("project_id cannot contain path separators")
+    if any(ch in normalized for ch in {"/", "\\", ":", "\x00"}):
+        raise ValueError("project_id cannot contain path separators or ':'")
     if any(ord(ch) < 32 for ch in normalized):
         raise ValueError("project_id cannot contain control characters")
     return normalized
@@ -90,7 +90,7 @@ def slugify_project_id(value: str, *, fallback: str = "project") -> str:
     """Convert a display name into a stable local project id."""
 
     text = value.strip().lower()
-    text = "".join("-" if ch in {"/", "\\", "\x00"} or ord(ch) < 32 else ch for ch in text)
+    text = "".join("-" if ch in {"/", "\\", ":", "\x00"} or ord(ch) < 32 else ch for ch in text)
     text = "-".join(part for part in text.split() if part)
     while "--" in text:
         text = text.replace("--", "-")
