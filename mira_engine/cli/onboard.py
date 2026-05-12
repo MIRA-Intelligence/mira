@@ -22,7 +22,7 @@ from mira_engine.cli.models import (
     get_model_suggestions,
 )
 from mira_engine.config.loader import get_config_path, load_config
-from mira_engine.config.schema import Config
+from mira_engine.config.schema import Config, UiChannelConfig
 
 console = Console()
 
@@ -927,23 +927,71 @@ def _configure_channels(config: Config) -> None:
             break
 
 
+def _get_ui_channel_config(config: Config) -> UiChannelConfig:
+    """Return the UI channel config as a typed model for gateway editing."""
+    current = getattr(config.channels, "ui", None)
+    if isinstance(current, UiChannelConfig):
+        return current
+    if isinstance(current, BaseModel):
+        return UiChannelConfig.model_validate(current.model_dump(by_alias=True))
+    if isinstance(current, dict):
+        return UiChannelConfig.model_validate(current)
+    return UiChannelConfig()
+
+
+def _configure_gateway_settings(config: Config) -> None:
+    """Configure gateway server settings and UI channel runtime settings."""
+    choices = ["Gateway Server", "UI Channel", "<- Back"]
+
+    while True:
+        try:
+            console.clear()
+            _show_section_header(
+                "Gateway Settings",
+                "Configure the backend server and the desktop/browser UI channel",
+            )
+            answer = _select_with_back("Select gateway area:", choices)
+
+            if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
+                break
+
+            if answer == "Gateway Server":
+                updated_gateway = _configure_pydantic_model(config.gateway, "Gateway Server")
+                if updated_gateway is not None:
+                    config.gateway = updated_gateway
+                continue
+
+            if answer == "UI Channel":
+                updated_ui = _configure_pydantic_model(
+                    _get_ui_channel_config(config),
+                    "UI Channel",
+                )
+                if updated_ui is not None:
+                    setattr(
+                        config.channels,
+                        "ui",
+                        updated_ui.model_dump(by_alias=True, exclude_none=True),
+                    )
+                continue
+        except KeyboardInterrupt:
+            console.print("\n[dim]Returning to main menu...[/dim]")
+            break
+
+
 # --- General Settings ---
 
 _SETTINGS_SECTIONS: dict[str, tuple[str, str, set[str] | None]] = {
     "Agent Settings": ("Agent Defaults", "Configure default model, temperature, and behavior", None),
-    "Gateway": ("Gateway Settings", "Configure server host, port, and heartbeat", None),
     "Tools": ("Tools Settings", "Configure web search, shell exec, and other tools", {"mcp_servers"}),
 }
 
 _SETTINGS_GETTER = {
     "Agent Settings": lambda c: c.agents.defaults,
-    "Gateway": lambda c: c.gateway,
     "Tools": lambda c: c.tools,
 }
 
 _SETTINGS_SETTER = {
     "Agent Settings": lambda c, v: setattr(c.agents, "defaults", v),
-    "Gateway": lambda c, v: setattr(c, "gateway", v),
     "Tools": lambda c, v: setattr(c, "tools", v),
 }
 
@@ -1132,7 +1180,7 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
             "[P] LLM Provider": lambda: _configure_providers(config),
             "[C] Chat Channel": lambda: _configure_channels(config),
             "[A] Agent Settings": lambda: _configure_general_settings(config, "Agent Settings"),
-            "[G] Gateway": lambda: _configure_general_settings(config, "Gateway"),
+            "[G] Gateway": lambda: _configure_gateway_settings(config),
             "[T] Tools": lambda: _configure_general_settings(config, "Tools"),
             "[V] View Configuration Summary": lambda: _show_summary(config),
         }

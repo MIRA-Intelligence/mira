@@ -18,6 +18,7 @@ from mira_engine.cli import onboard as onboard_wizard
 from mira_engine.cli.commands import _merge_missing_defaults
 from mira_engine.cli.onboard import (
     _BACK_PRESSED,
+    _configure_gateway_settings,
     _configure_provider,
     _configure_pydantic_model,
     _format_value,
@@ -25,7 +26,7 @@ from mira_engine.cli.onboard import (
     _get_field_type_info,
     run_onboard,
 )
-from mira_engine.config.schema import Config
+from mira_engine.config.schema import Config, UiChannelConfig
 from mira_engine.utils.helpers import sync_workspace_templates
 
 
@@ -554,6 +555,61 @@ class TestConfigurePydanticModelDrafts:
         updated = cast(_OuterDraftModel, result)
         assert updated.nested.api_key == "secret"
         assert model.nested.api_key == ""
+
+
+class TestConfigureGatewaySettings:
+    def test_gateway_menu_can_configure_ui_channel(self, monkeypatch):
+        config = Config()
+
+        select_answers = iter(["UI Channel", "<- Back"])
+
+        def fake_select(_prompt, _choices, default=None):
+            return next(select_answers)
+
+        def fake_configure(model, display_name, **_kwargs):
+            assert display_name == "UI Channel"
+            assert isinstance(model, UiChannelConfig)
+            return UiChannelConfig(
+                enabled=True,
+                cors_origins=["http://localhost:5173"],
+                project_storage="managed",
+                managed_project_root="~/MiraProjects",
+            )
+
+        monkeypatch.setattr(onboard_wizard, "_select_with_back", fake_select)
+        monkeypatch.setattr(onboard_wizard, "_show_section_header", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(onboard_wizard.console, "clear", lambda: None)
+        monkeypatch.setattr(onboard_wizard, "_configure_pydantic_model", fake_configure)
+
+        _configure_gateway_settings(config)
+
+        assert config.channels.ui["enabled"] is True
+        assert config.channels.ui["corsOrigins"] == ["http://localhost:5173"]
+        assert config.channels.ui["projectStorage"] == "managed"
+        assert config.channels.ui["managedProjectRoot"] == "~/MiraProjects"
+
+    def test_gateway_menu_still_configures_server_settings(self, monkeypatch):
+        config = Config()
+
+        select_answers = iter(["Gateway Server", "<- Back"])
+
+        def fake_select(_prompt, _choices, default=None):
+            return next(select_answers)
+
+        def fake_configure(model, display_name, **_kwargs):
+            assert display_name == "Gateway Server"
+            updated = model.model_copy(deep=True)
+            updated.port = 28790
+            return updated
+
+        monkeypatch.setattr(onboard_wizard, "_select_with_back", fake_select)
+        monkeypatch.setattr(onboard_wizard, "_show_section_header", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(onboard_wizard.console, "clear", lambda: None)
+        monkeypatch.setattr(onboard_wizard, "_configure_pydantic_model", fake_configure)
+
+        _configure_gateway_settings(config)
+
+        assert config.gateway.port == 28790
 
 
 class TestRunOnboardExitBehavior:
