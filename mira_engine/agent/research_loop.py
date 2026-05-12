@@ -985,6 +985,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             chat_id=msg.chat_id,
             content=f"Run mode switched to {mode}.",
             metadata={
+                **dict(msg.metadata or {}),
                 "_control": "set_mode_ack",
                 "run_mode": mode,
             },

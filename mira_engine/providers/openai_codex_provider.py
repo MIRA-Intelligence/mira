@@ -12,17 +12,34 @@ from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "mira"
+CODEX_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
+
+
+class CodexAPIError(RuntimeError):
+    """HTTP-level Codex API error with retry metadata."""
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        retry_after: float | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class OpenAICodexProvider(LLMProvider):
     """Use Codex OAuth to call the Responses API."""
 
-    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
+    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex", proxy: str | None = None):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
+        self.proxy = proxy or None
 
     async def chat(
         self,
@@ -37,47 +54,63 @@ class OpenAICodexProvider(LLMProvider):
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
 
-        token = await asyncio.to_thread(get_codex_token)
-        headers = _build_headers(token.account_id, token.access)
-
-        body: dict[str, Any] = {
-            "model": _strip_model_prefix(model),
-            "store": False,
-            "stream": True,
-            "instructions": system_prompt,
-            "input": input_items,
-            "text": {"verbosity": "medium"},
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": _prompt_cache_key(messages),
-            "parallel_tool_calls": True,
-        }
-
-        if reasoning_effort:
-            body["reasoning"] = {"effort": reasoning_effort}
-
-        if tools:
-            body["tools"] = _convert_tools(tools)
-            body["tool_choice"] = tool_choice if tool_choice is not None else "auto"
-
-        url = DEFAULT_CODEX_URL
-
         try:
+            ensure_oauth_state_dirs_for_runtime()
+            token = await asyncio.to_thread(get_codex_token)
+            if not getattr(token, "access", None):
+                raise RuntimeError(
+                    "Codex OAuth token is missing. Run `mira onboard --wizard` and log in to OpenAI Codex."
+                )
+            if not getattr(token, "account_id", None):
+                raise RuntimeError(
+                    "Codex OAuth account id is missing. Run `mira onboard --wizard` and log in again."
+                )
+
+            headers = _build_headers(token.account_id, token.access)
+            body: dict[str, Any] = {
+                "model": _strip_model_prefix(model),
+                "store": False,
+                "stream": True,
+                "instructions": system_prompt,
+                "input": input_items,
+                "text": {"verbosity": "medium"},
+                "include": ["reasoning.encrypted_content"],
+                "prompt_cache_key": _prompt_cache_key(messages),
+                "parallel_tool_calls": True,
+            }
+
+            if reasoning_effort:
+                body["reasoning"] = {"effort": reasoning_effort}
+
+            if tools:
+                body["tools"] = _convert_tools(tools)
+                body["tool_choice"] = tool_choice if tool_choice is not None else "auto"
+
+            url = DEFAULT_CODEX_URL
             try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                content, tool_calls, finish_reason = await _request_codex(
+                    url, headers, body, verify=True, proxy=self.proxy
+                )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
+                content, tool_calls, finish_reason = await _request_codex(
+                    url, headers, body, verify=False, proxy=self.proxy
+                )
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
             )
         except Exception as e:
+            logger.exception("Codex request failed: {}", _format_exception(e, self.proxy))
             return LLMResponse(
-                content=f"Error calling Codex: {str(e)}",
+                content=f"Error calling Codex: {_format_exception(e, self.proxy)}",
                 finish_reason="error",
+                error_status_code=getattr(e, "status_code", None),
+                error_kind=_error_kind(e),
+                error_retry_after_s=getattr(e, "retry_after", None),
             )
 
     def get_default_model(self) -> str:
@@ -108,12 +141,57 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
+    proxy: str | None = None,
 ) -> tuple[str, list[ToolCallRequest], str]:
-    async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
+    try:
+        return await _request_codex_once(url, headers, body, verify=verify, proxy=proxy)
+    except httpx.ConnectTimeout:
+        if proxy:
+            raise
+        logger.warning("Codex connection timed out; retrying with IPv4-only transport")
+        return await _request_codex_once(
+            url,
+            headers,
+            body,
+            verify=verify,
+            proxy=None,
+            force_ipv4=True,
+        )
+
+
+async def _request_codex_once(
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    verify: bool,
+    proxy: str | None = None,
+    force_ipv4: bool = False,
+) -> tuple[str, list[ToolCallRequest], str]:
+    client_kwargs: dict[str, Any] = {
+        "timeout": CODEX_TIMEOUT,
+        "verify": verify,
+        "proxy": proxy,
+        "trust_env": True,
+    }
+    if force_ipv4:
+        client_kwargs = {
+            "timeout": CODEX_TIMEOUT,
+            "transport": httpx.AsyncHTTPTransport(
+                verify=verify,
+                local_address="0.0.0.0",
+                retries=1,
+            ),
+        }
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
-                raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
+                raise CodexAPIError(
+                    response.status_code,
+                    _friendly_error(response.status_code, text.decode("utf-8", "ignore")),
+                    retry_after=LLMProvider._extract_retry_after_from_headers(response.headers),
+                )
             return await _consume_sse(response)
 
 
@@ -312,7 +390,7 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
             status = (event.get("response") or {}).get("status")
             finish_reason = _map_finish_reason(status)
         elif event_type in {"error", "response.failed"}:
-            raise RuntimeError("Codex response failed")
+            raise RuntimeError(_event_error_message(event) or "Codex response failed")
 
     return content, tool_calls, finish_reason
 
@@ -325,6 +403,75 @@ def _map_finish_reason(status: str | None) -> str:
 
 
 def _friendly_error(status_code: int, raw: str) -> str:
+    detail = _extract_error_message(raw) or raw
     if status_code == 429:
         return "ChatGPT usage quota exceeded or rate limit triggered. Please try again later."
-    return f"HTTP {status_code}: {raw}"
+    if status_code == 401:
+        return "HTTP 401: Codex OAuth token was rejected. Run `mira onboard --wizard` and log in to OpenAI Codex again."
+    if status_code == 403:
+        return f"HTTP 403: Codex access was forbidden. {detail}".strip()
+    return f"HTTP {status_code}: {detail}"
+
+
+def _extract_error_message(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return text
+    if not isinstance(payload, dict):
+        return text
+    error = payload.get("error")
+    if isinstance(error, dict):
+        for key in ("message", "detail", "code", "type"):
+            value = error.get(key)
+            if value:
+                return str(value)
+    for key in ("message", "detail"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return text
+
+
+def _event_error_message(event: dict[str, Any]) -> str:
+    error = event.get("error") or (event.get("response") or {}).get("error")
+    if isinstance(error, dict):
+        for key in ("message", "detail", "code", "type"):
+            value = error.get(key)
+            if value:
+                return f"Codex response failed: {value}"
+    if error:
+        return f"Codex response failed: {error}"
+    message = event.get("message")
+    if message:
+        return f"Codex response failed: {message}"
+    return ""
+
+
+def _format_exception(exc: Exception, proxy: str | None = None) -> str:
+    message = str(exc).strip()
+    message = message or type(exc).__name__
+    if isinstance(exc, httpx.ConnectTimeout):
+        if proxy:
+            return f"{message} while connecting via proxy {_redact_proxy_url(proxy)}"
+        return f"{message} while connecting to chatgpt.com (no explicit Mira proxy configured)"
+    return message
+
+
+def _error_kind(exc: Exception) -> str | None:
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.NetworkError):
+        return "connection"
+    return None
+
+
+def _redact_proxy_url(proxy: str) -> str:
+    if "@" not in proxy:
+        return proxy
+    scheme, rest = proxy.split("://", 1) if "://" in proxy else ("", proxy)
+    host = rest.rsplit("@", 1)[1]
+    return f"{scheme}://***@{host}" if scheme else f"***@{host}"

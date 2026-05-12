@@ -515,6 +515,7 @@ class UiChannel(BaseChannel):
         self._boot_ts: float = time.monotonic()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
+        self._client_project_dirs: dict[str, Path | None] = {}
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -654,6 +655,10 @@ class UiChannel(BaseChannel):
         if not session_key:
             return None
 
+        current_candidate = (self.projects_root / session_key).expanduser().resolve()
+        if current_candidate.is_dir():
+            return self._register_project_dir(session_key, current_candidate)
+
         cached = self._project_dirs.get(session_key)
         if cached is not None:
             if cached.is_dir():
@@ -661,10 +666,6 @@ class UiChannel(BaseChannel):
                     session_key, cached, persist=False
                 )
             self._drop_project_dir_registration(session_key)
-
-        current_candidate = (self.projects_root / session_key).expanduser().resolve()
-        if current_candidate.is_dir():
-            return self._register_project_dir(session_key, current_candidate)
 
         for root in self._known_project_roots:
             if root == self.projects_root:
@@ -678,6 +679,24 @@ class UiChannel(BaseChannel):
 
         current_candidate.mkdir(parents=True, exist_ok=True)
         return self._register_project_dir(session_key, current_candidate)
+
+    def _project_dir_from_metadata(
+        self,
+        session_id: str | None,
+        metadata: dict[str, Any],
+    ) -> Path | None:
+        if not session_id:
+            return None
+        raw_project_dir = metadata.get("project_dir")
+        if not isinstance(raw_project_dir, str) or not raw_project_dir.strip():
+            return None
+        try:
+            project_dir = Path(raw_project_dir).expanduser().resolve()
+        except OSError:
+            return None
+        if project_dir.name != session_id or not project_dir.is_dir():
+            return None
+        return self._register_project_dir(session_id, project_dir)
 
     def _audit(
         self,
@@ -859,9 +878,7 @@ class UiChannel(BaseChannel):
     async def stop(self) -> None:
         self._running = False
 
-        for sid, ws in list(self._clients.items()):
-            await ws.close()
-        self._clients.clear()
+        await self._close_active_clients()
 
         if self._site:
             await self._site.stop()
@@ -872,21 +889,36 @@ class UiChannel(BaseChannel):
         self._app = None
         logger.info("UI channel stopped")
 
+    async def _close_active_clients(self) -> None:
+        for _sid, ws in list(self._clients.items()):
+            await ws.close()
+        self._clients.clear()
+        self._client_project_dirs.clear()
+
     async def send(self, msg: OutboundMessage) -> None:
         metadata = msg.metadata or {}
         if metadata.get("_audit_only"):
             action = metadata.get("_audit_event")
             details = metadata.get("_audit_details")
             if isinstance(action, str) and action:
+                project_dir = self._project_dir_from_metadata(msg.chat_id, metadata)
                 self._audit(
                     source="agent",
                     action=action,
                     session_id=msg.chat_id,
+                    project_dir=project_dir,
                     details=details if isinstance(details, dict) else {},
                 )
             return
 
-        ws = self._clients.get(msg.chat_id)
+        metadata = msg.metadata or {}
+        project_dir = (
+            self._project_dir_from_metadata(msg.chat_id, metadata)
+            if msg.chat_id
+            else None
+        )
+        if project_dir is None:
+            project_dir = self._resolve_project_dir(msg.chat_id) if msg.chat_id else None
         is_progress = metadata.get("_progress", False)
         msg_type = "progress" if is_progress else "response"
         common_details = {
@@ -894,7 +926,6 @@ class UiChannel(BaseChannel):
             "tool_hint": bool(metadata.get("_tool_hint", False)),
             "content_preview": self._preview(msg.content),
         }
-        project_dir = self._resolve_project_dir(msg.chat_id) if msg.chat_id else None
         if project_dir and project_dir.is_dir():
             SessionManager(project_dir).append_ui_event(
                 key=f"ui:{msg.chat_id}",
@@ -903,14 +934,40 @@ class UiChannel(BaseChannel):
                 msg_type=msg_type,
                 metadata=metadata,
             )
+        ws = self._clients.get(msg.chat_id)
         if ws is None or ws.closed:
             self._audit(
                 source="agent",
                 action="ws_outbound_dropped",
                 session_id=msg.chat_id,
+                project_dir=project_dir,
                 details={**common_details, "reason": "no_active_client"},
             )
             logger.debug("No active WebSocket for chat_id={}", msg.chat_id)
+            return
+        bound_project_dir = self._client_project_dirs.get(msg.chat_id)
+        if (
+            project_dir is not None
+            and bound_project_dir is not None
+            and project_dir != bound_project_dir
+        ):
+            self._audit(
+                source="agent",
+                action="ws_outbound_dropped",
+                session_id=msg.chat_id,
+                project_dir=project_dir,
+                details={
+                    **common_details,
+                    "reason": "client_bound_to_different_project",
+                    "bound_project_dir": str(bound_project_dir),
+                },
+            )
+            logger.debug(
+                "Dropped UI outbound for {} from {} because client is bound to {}",
+                msg.chat_id,
+                project_dir,
+                bound_project_dir,
+            )
             return
 
         payload = {
@@ -927,6 +984,7 @@ class UiChannel(BaseChannel):
                 source="agent",
                 action="ws_outbound_sent",
                 session_id=msg.chat_id,
+                project_dir=project_dir,
                 details=common_details,
             )
         except Exception as e:
@@ -934,6 +992,7 @@ class UiChannel(BaseChannel):
                 source="agent",
                 action="ws_outbound_failed",
                 session_id=msg.chat_id,
+                project_dir=project_dir,
                 details={**common_details, "error": self._preview(str(e), limit=400)},
             )
             logger.warning("Failed to send to {}: {}", msg.chat_id, e)
@@ -1142,7 +1201,6 @@ class UiChannel(BaseChannel):
                     )
                     continue
 
-                self._clients[session_id] = ws
                 project_dir_path = self._resolve_project_dir(
                     session_id, create=True
                 )
@@ -1151,6 +1209,8 @@ class UiChannel(BaseChannel):
                         {"type": "error", "content": "project_dir resolution failed"}
                     )
                     continue
+                self._clients[session_id] = ws
+                self._client_project_dirs[session_id] = project_dir_path
                 project_dir = str(project_dir_path)
                 meta = self._persist_project_runtime_preferences(
                     project_dir_path,
@@ -1252,7 +1312,6 @@ class UiChannel(BaseChannel):
                     )
                     continue
 
-                self._clients[session_id] = ws
                 project_dir_path = self._resolve_project_dir(
                     session_id, create=True
                 )
@@ -1261,6 +1320,8 @@ class UiChannel(BaseChannel):
                         {"type": "error", "content": "project_dir resolution failed"}
                     )
                     continue
+                self._clients[session_id] = ws
+                self._client_project_dirs[session_id] = project_dir_path
                 project_dir = str(project_dir_path)
                 self._audit(
                     source="ui",
@@ -1294,8 +1355,9 @@ class UiChannel(BaseChannel):
                         {"type": "error", "content": "session_id required"}
                     )
                     continue
-                self._clients[session_id] = ws
                 project_dir_path = self._resolve_project_dir(session_id)
+                self._clients[session_id] = ws
+                self._client_project_dirs[session_id] = project_dir_path
                 self._audit(
                     source="ui",
                     action="ws_bind_received",
@@ -1307,6 +1369,7 @@ class UiChannel(BaseChannel):
         # Client disconnected
         if session_id and self._clients.get(session_id) is ws:
             del self._clients[session_id]
+            self._client_project_dirs.pop(session_id, None)
             logger.info("WebSocket client disconnected: {}", session_id)
 
         return ws
@@ -1541,6 +1604,7 @@ class UiChannel(BaseChannel):
             return web.json_response({"error": str(exc)}, status=400)
 
         if next_root != previous_root:
+            await self._close_active_clients()
             self._register_projects_under_root(previous_root)
             self.projects_root = next_root
             self._remember_projects_root(next_root)
