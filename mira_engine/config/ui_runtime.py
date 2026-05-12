@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
-from mira_engine.config.schema import Config, ProvidersConfig
+from pydantic.alias_generators import to_camel
+
+from mira_engine.config.schema import AgentDefaults, Config, ProvidersConfig
 from mira_engine.providers.registry import find_by_name
+
 _ALLOWED_REASONING_EFFORTS = {"low", "medium", "high", "adaptive"}
 
 
@@ -68,6 +72,72 @@ def _provider_metadata(provider_name: str) -> dict[str, Any]:
         "is_oauth": bool(spec.is_oauth),
         "is_local": bool(spec.is_local),
     }
+
+
+def _ensure_json_record(parent: dict[str, Any], key: str) -> dict[str, Any]:
+    value = parent.get(key)
+    if isinstance(value, dict):
+        return value
+    record: dict[str, Any] = {}
+    parent[key] = record
+    return record
+
+
+def _key_for_alias(record: dict[str, Any], field_name: str, alias: str | None = None) -> str:
+    alias = alias or to_camel(field_name)
+    if field_name in record and alias not in record:
+        return field_name
+    if alias in record:
+        return alias
+    return alias
+
+
+def _set_alias_value(
+    record: dict[str, Any],
+    field_name: str,
+    value: Any,
+    *,
+    alias: str | None = None,
+) -> None:
+    record[_key_for_alias(record, field_name, alias)] = value
+
+
+def _raw_model_matches_runtime_value(
+    raw_value: Any,
+    *,
+    provider: str,
+    runtime_model: str,
+) -> bool:
+    try:
+        defaults = AgentDefaults.model_validate({"provider": provider, "model": raw_value})
+    except Exception:
+        return raw_value == runtime_model
+    return defaults.primary_model == runtime_model
+
+
+def _set_model_preserving_candidates(
+    defaults: dict[str, Any],
+    model: str,
+    *,
+    provider: str,
+) -> None:
+    current = defaults.get("model")
+    if _raw_model_matches_runtime_value(current, provider=provider, runtime_model=model):
+        return
+    defaults["model"] = model
+
+
+def _provider_config_record(
+    providers: dict[str, Any],
+    provider_name: str,
+) -> dict[str, Any]:
+    key = _key_for_alias(providers, provider_name, to_camel(provider_name))
+    value = providers.get(key)
+    if isinstance(value, dict):
+        return value
+    record: dict[str, Any] = {}
+    providers[key] = record
+    return record
 
 
 def _build_provider_payload(config: Config) -> dict[str, dict[str, Any]]:
@@ -178,6 +248,123 @@ def build_ui_runtime_payload(
         "providers": providers,
         "provider_proxy": config.providers.proxy,
     }
+
+
+def apply_ui_runtime_update_to_raw_data(
+    data: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    current_projects_root: Path,
+) -> tuple[Path, bool]:
+    """Patch UI-owned config fields without normalizing unrelated user config."""
+    changed = False
+    projects_root = current_projects_root.expanduser().resolve()
+    agents = _ensure_json_record(data, "agents")
+    defaults = _ensure_json_record(agents, "defaults")
+
+    raw_projects_root = payload.get("projects_root")
+    if raw_projects_root is not None:
+        projects_root = Path(str(raw_projects_root)).expanduser().resolve()
+        defaults["workspace"] = str(projects_root)
+        changed = True
+
+    runtime_payload = payload.get("runtime")
+    if isinstance(runtime_payload, dict):
+        if "workspace" in runtime_payload:
+            projects_root = Path(str(runtime_payload["workspace"])).expanduser().resolve()
+            defaults["workspace"] = str(projects_root)
+            changed = True
+
+        if "provider" in runtime_payload:
+            provider = str(runtime_payload["provider"]).strip()
+            defaults["provider"] = provider
+            changed = True
+
+        provider_for_model = str(defaults.get("provider") or "auto").strip() or "auto"
+
+        if "model" in runtime_payload:
+            model = str(runtime_payload["model"]).strip()
+            _set_model_preserving_candidates(defaults, model, provider=provider_for_model)
+            changed = True
+
+        if "reasoning_effort" in runtime_payload:
+            reasoning_effort = runtime_payload["reasoning_effort"]
+            value = None if reasoning_effort is None or reasoning_effort == "" else str(reasoning_effort)
+            _set_alias_value(defaults, "reasoning_effort", value, alias="reasoningEffort")
+            changed = True
+
+        if "max_tool_iterations" in runtime_payload:
+            _set_alias_value(
+                defaults,
+                "max_tool_iterations",
+                runtime_payload["max_tool_iterations"],
+                alias="maxToolIterations",
+            )
+            changed = True
+
+        if "restrict_to_workspace" in runtime_payload:
+            tools = _ensure_json_record(data, "tools")
+            _set_alias_value(
+                tools,
+                "restrict_to_workspace",
+                runtime_payload["restrict_to_workspace"],
+                alias="restrictToWorkspace",
+            )
+            changed = True
+
+    providers_payload = payload.get("providers")
+    if isinstance(providers_payload, dict):
+        providers = _ensure_json_record(data, "providers")
+        for provider_name, provider_update in providers_payload.items():
+            if provider_name == "proxy":
+                providers["proxy"] = None if provider_update in (None, "") else str(provider_update).strip()
+                changed = True
+                continue
+
+            if not isinstance(provider_update, dict):
+                continue
+
+            provider_cfg = _provider_config_record(providers, str(provider_name))
+            if "api_key" in provider_update:
+                _set_alias_value(provider_cfg, "api_key", str(provider_update["api_key"]).strip(), alias="apiKey")
+                changed = True
+            if "api_base" in provider_update:
+                api_base = provider_update["api_base"]
+                value = None if api_base in (None, "") else str(api_base).strip()
+                _set_alias_value(provider_cfg, "api_base", value, alias="apiBase")
+                changed = True
+
+    return projects_root, changed
+
+
+def save_ui_runtime_update(
+    config: Config,
+    payload: dict[str, Any],
+    *,
+    current_projects_root: Path,
+    config_path: Path,
+) -> None:
+    """Persist a UI settings update while preserving unrelated raw JSON fields."""
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = config.model_dump(by_alias=True)
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                data = existing
+        except (OSError, json.JSONDecodeError, ValueError):
+            data = config.model_dump(by_alias=True)
+
+    apply_ui_runtime_update_to_raw_data(
+        data,
+        payload,
+        current_projects_root=current_projects_root,
+    )
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def apply_ui_runtime_update(

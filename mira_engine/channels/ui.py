@@ -32,7 +32,11 @@ from mira_engine.channels.base import BaseChannel
 from mira_engine.config import loader as config_loader
 from mira_engine.config.paths import get_runtime_subdir
 from mira_engine.config.schema import UiChannelConfig
-from mira_engine.config.ui_runtime import apply_ui_runtime_update, build_ui_runtime_payload
+from mira_engine.config.ui_runtime import (
+    apply_ui_runtime_update,
+    build_ui_runtime_payload,
+    save_ui_runtime_update,
+)
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
     get_task_plan_contract,
@@ -1619,7 +1623,12 @@ class UiChannel(BaseChannel):
         persisted = False
         if changed:
             try:
-                config_loader.save_config(runtime_config, config_path)
+                save_ui_runtime_update(
+                    runtime_config,
+                    body,
+                    current_projects_root=previous_root,
+                    config_path=config_path,
+                )
                 persisted = True
             except OSError as exc:
                 logger.warning(

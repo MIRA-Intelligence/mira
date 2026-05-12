@@ -716,7 +716,7 @@ async def test_handle_history_uses_bound_project_dir_after_projects_root_change(
 
     config = Config()
     monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
-    monkeypatch.setattr(ui_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_channel_mod, "save_ui_runtime_update", lambda *_args, **_kwargs: None)
 
     config_req = MagicMock(spec=web.Request)
     config_req.json = AsyncMock(return_value={"projects_root": str(new_root)})
@@ -811,7 +811,7 @@ async def test_project_dir_index_survives_channel_restart_after_root_change(
 
     config = Config()
     monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
-    monkeypatch.setattr(ui_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_channel_mod, "save_ui_runtime_update", lambda *_args, **_kwargs: None)
 
     config_req = MagicMock(spec=web.Request)
     config_req.json = AsyncMock(return_value={"projects_root": str(new_root)})
@@ -853,7 +853,7 @@ async def test_handle_config_root_change_closes_existing_ws_bindings(
 
     config = Config()
     monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
-    monkeypatch.setattr(ui_channel_mod.config_loader, "save_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_channel_mod, "save_ui_runtime_update", lambda *_args, **_kwargs: None)
 
     config_req = MagicMock(spec=web.Request)
     config_req.json = AsyncMock(return_value={"projects_root": str(new_root)})
@@ -886,9 +886,9 @@ async def test_handle_config_updates_projects_root(
     monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
     monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
     monkeypatch.setattr(
-        ui_channel_mod.config_loader,
-        "save_config",
-        lambda cfg, _path=None: saved_configs.append(cfg.model_copy(deep=True)),
+        ui_channel_mod,
+        "save_ui_runtime_update",
+        lambda cfg, *_args, **_kwargs: saved_configs.append(cfg.model_copy(deep=True)),
     )
     resp = await ui_channel._handle_config(req)
     assert resp.status == 200
@@ -944,9 +944,9 @@ async def test_handle_config_skips_audit_when_projects_root_unchanged(
     monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
     monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
     monkeypatch.setattr(
-        ui_channel_mod.config_loader,
-        "save_config",
-        lambda cfg, _path=None: saved_configs.append(cfg.model_copy(deep=True)),
+        ui_channel_mod,
+        "save_ui_runtime_update",
+        lambda cfg, *_args, **_kwargs: saved_configs.append(cfg.model_copy(deep=True)),
     )
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={"projects_root": str(root)})
@@ -1001,9 +1001,9 @@ async def test_handle_config_updates_runtime_fields_and_provider_secrets(
     monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
     monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
     monkeypatch.setattr(
-        ui_channel_mod.config_loader,
-        "save_config",
-        lambda cfg, _path=None: saved_configs.append(cfg.model_copy(deep=True)),
+        ui_channel_mod,
+        "save_ui_runtime_update",
+        lambda cfg, *_args, **_kwargs: saved_configs.append(cfg.model_copy(deep=True)),
     )
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={
@@ -1036,6 +1036,73 @@ async def test_handle_config_updates_runtime_fields_and_provider_secrets(
     assert body["providers"]["custom"]["api_key_preview"] == "cust...et"
     assert saved_configs[-1].providers.custom.api_key == "custom-secret"
     assert saved_configs[-1].providers.custom.api_base == "https://llm.example.com/v1"
+
+
+async def test_handle_config_preserves_raw_routing_models_on_runtime_save(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_root = tmp_path / "old-workspace"
+    new_root = tmp_path / "new-workspace"
+    ui_channel.projects_root = old_root.resolve()
+    config_path = tmp_path / "config_runtime_raw.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "workspace": str(old_root),
+                        "provider": "openrouter",
+                        "model": ["claude-3-opus", "anthropic/claude-sonnet-4-5"],
+                        "routeModel": ["openai/gpt-4.1-mini", "openai/gpt-4.1-nano"],
+                        "smallModel": ["deepseek/deepseek-chat", "openai/gpt-4.1-mini"],
+                        "mediumModel": "anthropic/claude-sonnet-4-5",
+                        "largeModel": "anthropic/claude-opus-4-5",
+                    }
+                },
+                "providers": {
+                    "openrouter": {
+                        "apiKey": "existing-key",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={
+        "runtime": {
+            "workspace": str(new_root),
+            "provider": "openrouter",
+            "model": "openrouter/claude-3-opus",
+            "reasoning_effort": "high",
+            "max_tool_iterations": 64,
+            "restrict_to_workspace": True,
+        },
+        "providers": {
+            "openrouter": {
+                "api_base": "https://openrouter.ai/api/v1",
+            }
+        },
+    })
+
+    resp = await ui_channel._handle_config(req)
+
+    assert resp.status == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    defaults = saved["agents"]["defaults"]
+    assert defaults["workspace"] == str(new_root.resolve())
+    assert defaults["model"] == ["claude-3-opus", "anthropic/claude-sonnet-4-5"]
+    assert defaults["routeModel"] == ["openai/gpt-4.1-mini", "openai/gpt-4.1-nano"]
+    assert defaults["smallModel"] == ["deepseek/deepseek-chat", "openai/gpt-4.1-mini"]
+    assert defaults["mediumModel"] == "anthropic/claude-sonnet-4-5"
+    assert defaults["largeModel"] == "anthropic/claude-opus-4-5"
+    assert defaults["reasoningEffort"] == "high"
+    assert defaults["maxToolIterations"] == 64
+    assert saved["tools"]["restrictToWorkspace"] is True
+    assert saved["providers"]["openrouter"]["apiKey"] == "existing-key"
+    assert saved["providers"]["openrouter"]["apiBase"] == "https://openrouter.ai/api/v1"
 
 
 async def test_handle_validate_data_path_requires_valid_json(ui_channel: UiChannel) -> None:
