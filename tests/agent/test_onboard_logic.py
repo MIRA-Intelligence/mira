@@ -360,8 +360,8 @@ class TestProviderChannelInfo:
         assert len(names) > 0
         # Should include common providers
         assert "openai" in names or "anthropic" in names
-        assert "openai_codex" not in names
-        assert "github_copilot" not in names
+        assert names["openai_codex"] == "OpenAI Codex"
+        assert names["github_copilot"] == "GitHub Copilot"
 
     def test_get_channel_names_returns_dict(self):
         from mira_engine.cli.onboard import _get_channel_names
@@ -383,6 +383,40 @@ class TestProviderChannelInfo:
 
 
 class TestConfigureProviderFlow:
+    def test_configure_oauth_provider_runs_login_without_api_key_prompt(self, monkeypatch):
+        config = Config()
+
+        select_answers = iter(["Start OAuth login now"])
+        login_calls: list[str] = []
+
+        class _Prompt:
+            def __init__(self, value):
+                self._value = value
+
+            def ask(self):
+                return self._value
+
+        class _FakeQuestionary:
+            @staticmethod
+            def select(*_args, **_kwargs):
+                return _Prompt(next(select_answers))
+
+            @staticmethod
+            def password(*_args, **_kwargs):
+                raise AssertionError("OAuth providers must not prompt for an API key")
+
+        monkeypatch.setattr(onboard_wizard, "questionary", _FakeQuestionary())
+        monkeypatch.setattr(
+            onboard_wizard,
+            "_run_oauth_login",
+            lambda provider_name: login_calls.append(provider_name),
+        )
+
+        _configure_provider(config, "github_copilot")
+
+        assert config.agents.defaults.provider == "github_copilot"
+        assert login_calls == ["github_copilot"]
+
     def test_configure_provider_prefills_base_and_sets_api_key_last(self, monkeypatch):
         config = Config()
         config.providers.openrouter.api_base = ""

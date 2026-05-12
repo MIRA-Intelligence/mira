@@ -676,7 +676,6 @@ def _get_provider_info() -> dict[str, tuple[str, bool, bool, str]]:
             spec.default_api_base,
         )
         for spec in PROVIDERS
-        if not spec.is_oauth
     }
 
 
@@ -688,6 +687,19 @@ def _get_provider_names() -> dict[str, str]:
 
 def _provider_usage_hint(provider_name: str) -> str:
     """Return a short provider usage hint shown after provider selection."""
+    from mira_engine.providers.registry import find_by_name
+
+    spec = find_by_name(provider_name)
+    if spec and spec.is_oauth:
+        return (
+            f"Selected provider: [bold]{provider_name}[/bold]\n"
+            "This provider uses OAuth, not an API key in config.json.\n"
+            "How to use it:\n"
+            "1. Complete the OAuth login flow.\n"
+            "2. Set `agents.defaults.model` to a model from this provider.\n"
+            "3. Verify with `mira status`."
+        )
+
     provider_slug = provider_name.replace("_", "-")
     return (
         f"Selected provider: [bold]{provider_name}[/bold]\n"
@@ -698,8 +710,18 @@ def _provider_usage_hint(provider_name: str) -> str:
     )
 
 
+def _run_oauth_login(provider_name: str) -> None:
+    """Start the OAuth login flow for an OAuth-backed provider."""
+    from mira_engine.cli.commands import _run_oauth_login as run_oauth_login
+
+    run_oauth_login(provider_name)
+
+
 def _configure_provider(config: Config, provider_name: str) -> None:
     """Configure a single LLM provider."""
+    from mira_engine.providers.registry import find_by_name
+
+    spec = find_by_name(provider_name)
     provider_config = getattr(config.providers, provider_name, None)
     if provider_config is None:
         console.print(f"[red]Unknown provider: {provider_name}[/red]")
@@ -717,6 +739,16 @@ def _configure_provider(config: Config, provider_name: str) -> None:
         provider_config.api_base = default_api_base
 
     console.print(Panel(_provider_usage_hint(provider_name), title=f"[bold]{display_name}[/bold]"))
+
+    if spec and spec.is_oauth:
+        action = _get_questionary().select(
+            "OAuth login",
+            choices=["Start OAuth login now", "Skip login for now"],
+            default="Start OAuth login now",
+        ).ask()
+        if action == "Start OAuth login now":
+            _run_oauth_login(provider_name)
+        return
 
     # Custom provider requires explicit apiBase configuration
     if provider_name == "custom":
@@ -769,13 +801,17 @@ def _configure_provider(config: Config, provider_name: str) -> None:
 
 def _configure_providers(config: Config) -> None:
     """Configure LLM providers."""
+    from mira_engine.providers.registry import find_by_name
 
     def get_provider_choices() -> list[str]:
         """Build provider choices with config status indicators."""
         choices = []
         for name, display in _get_provider_names().items():
             provider = getattr(config.providers, name, None)
-            if provider and provider.api_key:
+            spec = find_by_name(name)
+            if spec and spec.is_oauth and config.agents.defaults.provider == name:
+                choices.append(f"{display} *")
+            elif provider and provider.api_key:
                 choices.append(f"{display} *")
             else:
                 choices.append(display)
@@ -784,7 +820,10 @@ def _configure_providers(config: Config) -> None:
     while True:
         try:
             console.clear()
-            _show_section_header("LLM Providers", "Select a provider to configure API key and endpoint")
+            _show_section_header(
+                "LLM Providers",
+                "Select a provider to configure API key, OAuth, and endpoint",
+            )
             choices = get_provider_choices()
             answer = _select_with_back("Select provider:", choices)
 
@@ -957,13 +996,27 @@ def _print_summary_panel(rows: list[tuple[str, str]], title: str) -> None:
 
 def _show_summary(config: Config) -> None:
     """Display configuration summary using rich."""
+    from mira_engine.providers.registry import find_by_name
+
     console.print()
 
     # Providers
     provider_rows = []
     for name, display in _get_provider_names().items():
+        spec = find_by_name(name)
         provider = getattr(config.providers, name, None)
-        status = "[green]configured[/green]" if (provider and provider.api_key) else "[dim]not configured[/dim]"
+        if spec and spec.is_oauth:
+            status = (
+                "[green]selected (OAuth)[/green]"
+                if config.agents.defaults.provider == name
+                else "[dim]not selected[/dim]"
+            )
+        else:
+            status = (
+                "[green]configured[/green]"
+                if (provider and provider.api_key)
+                else "[dim]not configured[/dim]"
+            )
         provider_rows.append((display, status))
     _print_summary_panel(provider_rows, "LLM Providers")
 
