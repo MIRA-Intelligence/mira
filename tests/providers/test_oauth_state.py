@@ -26,6 +26,7 @@ def test_ensure_oauth_state_dirs_does_not_override_native_home(monkeypatch, tmp_
 def test_ensure_oauth_state_dirs_expands_existing_xdg_dirs(monkeypatch, tmp_path) -> None:
     _clear_xdg_env(monkeypatch)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "native-home"))
     monkeypatch.setenv("XDG_CONFIG_HOME", "~/xdg-config")
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
 
@@ -36,3 +37,4 @@ def test_ensure_oauth_state_dirs_expands_existing_xdg_dirs(monkeypatch, tmp_path
     assert "XDG_CACHE_HOME" not in oauth_state.os.environ
     assert (tmp_path / "xdg-config" / "litellm").is_dir()
     assert (tmp_path / "xdg-data").is_dir()
+    assert not (tmp_path / "native-home" / "xdg-config").exists()
