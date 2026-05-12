@@ -265,12 +265,12 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
         is_oauth=True,  # OAuth-based authentication
     ),
-    # Github Copilot: uses OAuth, not API key.
+    # GitHub Copilot: uses OAuth, not API key.
     ProviderSpec(
         name="github_copilot",
         keywords=("github_copilot", "copilot"),
         env_key="",  # OAuth-based, no API key
-        display_name="Github Copilot",
+        display_name="GitHub Copilot",
         litellm_prefix="github_copilot",  # github_copilot/model → github_copilot/model
         skip_prefixes=("github_copilot/",),
         env_extras=(),
