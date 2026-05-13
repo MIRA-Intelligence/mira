@@ -1,5 +1,6 @@
 """Interactive onboarding questionnaire for mira."""
 
+import asyncio
 import json
 import types
 from dataclasses import dataclass
@@ -717,6 +718,50 @@ def _run_oauth_login(provider_name: str) -> None:
     run_oauth_login(provider_name)
 
 
+def _maybe_fetch_provider_models(config: Config, provider_name: str) -> None:
+    """Optionally fetch provider models after credentials are configured."""
+    action = _get_questionary().select(
+        "Model list",
+        choices=["Fetch models now", "Skip model fetch"],
+        default="Fetch models now",
+    ).ask()
+    if action != "Fetch models now":
+        return
+
+    from mira_engine.providers.model_fetch import fetch_models_to_cache
+
+    try:
+        cache, cache_path = asyncio.run(
+            fetch_models_to_cache(config, provider_name, get_config_path())
+        )
+    except Exception as e:
+        console.print(f"[yellow]! Could not fetch models: {e}[/yellow]")
+        return
+
+    console.print(
+        f"[green]+ Fetched {len(cache.models)} models for {provider_name}[/green] "
+        f"[dim]{cache_path}[/dim]"
+    )
+    if not cache.models:
+        return
+
+    select_action = _get_questionary().select(
+        "Default model",
+        choices=["Select from fetched models", "Keep current model"],
+        default="Select from fetched models",
+    ).ask()
+    if select_action != "Select from fetched models":
+        return
+
+    choices = [model.config_model for model in cache.models] + ["<- Back"]
+    selected = _select_with_back("Select model:", choices)
+    if not selected or selected is _BACK_PRESSED or selected == "<- Back":
+        return
+    assert isinstance(selected, str)
+    config.agents.defaults.model = selected
+    _try_auto_fill_context_window(config.agents.defaults, selected)
+
+
 def _configure_provider(config: Config, provider_name: str) -> None:
     """Configure a single LLM provider."""
     from mira_engine.providers.registry import find_by_name
@@ -748,6 +793,7 @@ def _configure_provider(config: Config, provider_name: str) -> None:
         ).ask()
         if action == "Start OAuth login now":
             _run_oauth_login(provider_name)
+            _maybe_fetch_provider_models(config, provider_name)
         return
 
     # Custom provider requires explicit apiBase configuration
@@ -797,6 +843,8 @@ def _configure_provider(config: Config, provider_name: str) -> None:
             provider_config.api_key = api_key.strip()
 
     setattr(config.providers, provider_name, provider_config)
+    if provider_config.api_key or provider_config.api_base or (spec and spec.is_local):
+        _maybe_fetch_provider_models(config, provider_name)
 
 
 def _configure_providers(config: Config) -> None:

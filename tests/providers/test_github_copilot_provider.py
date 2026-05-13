@@ -56,7 +56,7 @@ def test_extract_copilot_api_base_ignores_telemetry_endpoint() -> None:
     assert github_provider._extract_copilot_api_base(payload) is None
 
 
-def test_github_copilot_provider_normalizes_preview_model_alias() -> None:
+def test_github_copilot_provider_strips_prefix_but_keeps_native_model_id() -> None:
     with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
         provider = github_provider.GitHubCopilotProvider(
             default_model="github_copilot/gemini-3.1-pro-preview"
@@ -72,7 +72,7 @@ def test_github_copilot_provider_normalizes_preview_model_alias() -> None:
         tool_choice=None,
     )
 
-    assert kwargs["model"] == "gemini-3.1-pro"
+    assert kwargs["model"] == "gemini-3.1-pro-preview"
 
 
 def test_github_copilot_provider_accepts_configured_api_base_and_proxy() -> None:

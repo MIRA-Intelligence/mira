@@ -13,6 +13,7 @@ from mira_engine.bus.events import OutboundMessage
 from mira_engine.cli.commands import _make_provider, app
 from mira_engine.config.schema import Config
 from mira_engine.cron.types import CronJob, CronPayload
+from mira_engine.providers.model_fetch import ModelCache, ModelInfo, write_model_cache
 from mira_engine.providers.openai_codex_provider import _strip_model_prefix
 from mira_engine.providers.registry import find_by_name
 
@@ -346,6 +347,92 @@ def test_oauth_login_status_treats_missing_token_as_logged_out(monkeypatch):
     monkeypatch.setattr(github_provider, "get_github_copilot_login_status", lambda: None)
 
     assert commands._oauth_login_status("github_copilot") == (False, None)
+
+
+def test_models_list_reads_cached_provider_models(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "provider": "github_copilot",
+                        "model": "github_copilot/gpt-4.1",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_model_cache(
+        ModelCache(
+            provider="github_copilot",
+            fetched_at="2026-05-13T12:00:00Z",
+            models=[
+                ModelInfo(
+                    id="gpt-4.1",
+                    display_name="GPT 4.1",
+                    config_model="github_copilot/gpt-4.1",
+                )
+            ],
+        ),
+        config_path,
+    )
+
+    result = runner.invoke(app, ["models", "list", "github_copilot", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    output = _strip_ansi(result.stdout)
+    assert "github_copilot/gpt-4.1" in output
+
+
+def test_models_select_writes_selected_cached_model(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "provider": "github_copilot",
+                        "model": "github_copilot/gpt-4.1",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_model_cache(
+        ModelCache(
+            provider="github_copilot",
+            fetched_at="2026-05-13T12:00:00Z",
+            models=[
+                ModelInfo(
+                    id="gemini-3.1-pro",
+                    display_name="Gemini 3.1 Pro",
+                    config_model="github_copilot/gemini-3.1-pro",
+                )
+            ],
+        ),
+        config_path,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "models",
+            "select",
+            "github_copilot",
+            "--model",
+            "gemini-3.1-pro",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    saved = Config.model_validate(json.loads(config_path.read_text(encoding="utf-8")))
+    assert saved.agents.defaults.provider == "github_copilot"
+    assert saved.agents.defaults.model == "github_copilot/gemini-3.1-pro"
 
 
 def test_config_matches_explicit_ollama_prefix_without_api_key():

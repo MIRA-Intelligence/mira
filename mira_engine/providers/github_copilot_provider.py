@@ -30,13 +30,6 @@ COPILOT_INTEGRATION_ID = "vscode-chat"
 _EXPIRY_SKEW_SECONDS = 60
 _LONG_LIVED_TOKEN_SECONDS = 315360000
 
-_COPILOT_MODEL_ALIASES = {
-    # Google API IDs include "-preview"; Copilot model IDs currently omit it.
-    "gemini-3.1-pro-preview": "gemini-3.1-pro",
-    "gemini-3-flash-preview": "gemini-3-flash",
-}
-
-
 def _storage() -> FileTokenStorage:
     ensure_oauth_state_dirs_for_runtime()
     return FileTokenStorage(
@@ -103,8 +96,7 @@ def _extract_copilot_api_base(payload: dict[str, Any]) -> str | None:
 
 
 def _normalize_copilot_model_name(model: str) -> str:
-    value = model.split("/")[-1]
-    return _COPILOT_MODEL_ALIASES.get(value, value)
+    return model.split("/")[-1]
 
 
 def _load_github_token() -> OAuthToken | None:
