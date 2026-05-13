@@ -387,7 +387,7 @@ class TestConfigureProviderFlow:
     def test_configure_oauth_provider_runs_login_without_api_key_prompt(self, monkeypatch):
         config = Config()
 
-        select_answers = iter(["Start OAuth login now"])
+        select_answers = iter(["Start OAuth login now", "Skip model fetch"])
         login_calls: list[str] = []
 
         class _Prompt:
@@ -423,7 +423,7 @@ class TestConfigureProviderFlow:
         config.providers.openrouter.api_base = ""
         config.providers.openrouter.api_key = ""
 
-        select_answers = iter(["Update API key"])
+        select_answers = iter(["Skip model fetch"])
         password_answers = iter(["sk-or-test-key"])
 
         class _Prompt:
@@ -454,7 +454,7 @@ class TestConfigureProviderFlow:
         config = Config()
         config.providers.openai.api_key = "existing-key"
 
-        select_answers = iter(["Keep existing API key"])
+        select_answers = iter(["Keep existing API key", "Skip model fetch"])
         password_answers = iter([])
 
         class _Prompt:
