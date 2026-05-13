@@ -2101,6 +2101,29 @@ def channels_login(
 # ============================================================================
 
 
+def _oauth_login_status(provider_name: str) -> tuple[bool, str | None]:
+    """Return local OAuth login state without doing any network calls."""
+    try:
+        if provider_name == "openai_codex":
+            ensure_oauth_state_dirs_for_runtime()
+            from oauth_cli_kit import get_token
+
+            token = get_token()
+        elif provider_name == "github_copilot":
+            from mira_engine.providers.github_copilot_provider import get_github_copilot_login_status
+
+            token = get_github_copilot_login_status()
+        else:
+            return False, None
+    except Exception:
+        return False, None
+
+    if not (token and getattr(token, "access", None)):
+        return False, None
+    account_id = getattr(token, "account_id", None)
+    return True, str(account_id) if account_id else None
+
+
 @app.command()
 def status():
     """Show mira status."""
@@ -2133,7 +2156,12 @@ def status():
             if p is None:
                 continue
             if spec.is_oauth:
-                console.print(f"{spec.label}: [green]✓ (OAuth)[/green]")
+                authenticated, account_id = _oauth_login_status(spec.name)
+                if authenticated:
+                    account_part = f" [dim]{account_id}[/dim]" if account_id else ""
+                    console.print(f"{spec.label}: [green]✓ OAuth[/green]{account_part}")
+                else:
+                    console.print(f"{spec.label}: [dim]not logged in[/dim]")
             elif spec.is_local:
                 # Local deployments show api_base instead of api_key
                 if p.api_base:
