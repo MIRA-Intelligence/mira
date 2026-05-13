@@ -247,6 +247,107 @@ def test_config_dump_excludes_oauth_provider_blocks():
     assert "githubCopilot" not in providers
 
 
+def test_status_reports_oauth_not_logged_in_without_token(tmp_path, monkeypatch):
+    from mira_engine.cli import commands
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "github_copilot",
+                    "model": "github_copilot/gpt-4.1",
+                    "workspace": str(tmp_path / "workspace"),
+                }
+            }
+        }
+    )
+
+    monkeypatch.setattr("mira_engine.config.loader.get_config_path", lambda: config_path)
+    monkeypatch.setattr("mira_engine.config.loader.load_config", lambda: config)
+    monkeypatch.setattr(commands, "_oauth_login_status", lambda _name: (False, None))
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    output = _strip_ansi(result.stdout)
+    assert "OpenAI Codex: not logged in" in output
+    assert "GitHub Copilot: not logged in" in output
+    assert "OpenAI Codex: ✓ (OAuth)" not in output
+    assert "GitHub Copilot: ✓ (OAuth)" not in output
+
+
+def test_status_reports_oauth_authenticated_only_when_token_exists(tmp_path, monkeypatch):
+    from mira_engine.cli import commands
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "github_copilot",
+                    "model": "github_copilot/gpt-4.1",
+                    "workspace": str(tmp_path / "workspace"),
+                }
+            }
+        }
+    )
+
+    def fake_oauth_status(name: str) -> tuple[bool, str | None]:
+        if name == "github_copilot":
+            return True, "octocat"
+        return False, None
+
+    monkeypatch.setattr("mira_engine.config.loader.get_config_path", lambda: config_path)
+    monkeypatch.setattr("mira_engine.config.loader.load_config", lambda: config)
+    monkeypatch.setattr(commands, "_oauth_login_status", fake_oauth_status)
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    output = _strip_ansi(result.stdout)
+    assert "OpenAI Codex: not logged in" in output
+    assert "GitHub Copilot: ✓ OAuth octocat" in output
+
+
+def test_oauth_login_status_reads_github_copilot_token(monkeypatch):
+    from mira_engine.cli import commands
+    import mira_engine.providers.github_copilot_provider as github_provider
+
+    monkeypatch.setattr(
+        github_provider,
+        "get_github_copilot_login_status",
+        lambda: SimpleNamespace(access="github-token", account_id="octocat"),
+    )
+
+    assert commands._oauth_login_status("github_copilot") == (True, "octocat")
+
+
+def test_oauth_login_status_reads_openai_codex_token(monkeypatch):
+    import oauth_cli_kit
+    from mira_engine.cli import commands
+
+    monkeypatch.setattr(commands, "ensure_oauth_state_dirs_for_runtime", lambda: None)
+    monkeypatch.setattr(
+        oauth_cli_kit,
+        "get_token",
+        lambda: SimpleNamespace(access="codex-token", account_id="acct-123"),
+    )
+
+    assert commands._oauth_login_status("openai_codex") == (True, "acct-123")
+
+
+def test_oauth_login_status_treats_missing_token_as_logged_out(monkeypatch):
+    from mira_engine.cli import commands
+    import mira_engine.providers.github_copilot_provider as github_provider
+
+    monkeypatch.setattr(github_provider, "get_github_copilot_login_status", lambda: None)
+
+    assert commands._oauth_login_status("github_copilot") == (False, None)
+
+
 def test_config_matches_explicit_ollama_prefix_without_api_key():
     config = Config()
     config.agents.defaults.model = "ollama/llama3.2"

@@ -79,3 +79,24 @@ def test_make_provider_falls_back_to_web_proxy_for_openai_codex() -> None:
 
     assert provider.__class__.__name__ == "OpenAICodexProvider"
     assert provider.proxy == "http://127.0.0.1:7890"
+
+
+def test_make_provider_passes_provider_proxy_to_github_copilot() -> None:
+    """GitHub Copilot provider uses providers.proxy for token exchange calls."""
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "github_copilot",
+                    "model": "github_copilot/gemini-3.1-pro-preview",
+                }
+            },
+            "providers": {"proxy": "http://127.0.0.1:7890"},
+            "tools": {"web": {"proxy": "http://127.0.0.1:9999"}},
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "GitHubCopilotProvider"
+    assert provider.proxy == "http://127.0.0.1:7890"

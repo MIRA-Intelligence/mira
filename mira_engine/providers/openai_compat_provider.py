@@ -141,6 +141,7 @@ class OpenAICompatProvider(LLMProvider):
         default_model: str = "gpt-4o",
         extra_headers: dict[str, str] | None = None,
         spec: ProviderSpec | None = None,
+        http_client: Any | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
@@ -158,12 +159,16 @@ class OpenAICompatProvider(LLMProvider):
         if extra_headers:
             default_headers.update(extra_headers)
 
-        self._client = AsyncOpenAI(
-            api_key=api_key or "no-key",
-            base_url=effective_base,
-            default_headers=default_headers,
-            max_retries=0,
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key or "no-key",
+            "base_url": effective_base,
+            "default_headers": default_headers,
+            "max_retries": 0,
+        }
+        if http_client is not None:
+            client_kwargs["http_client"] = http_client
+
+        self._client = AsyncOpenAI(**client_kwargs)
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
         """Set environment variables based on provider spec."""

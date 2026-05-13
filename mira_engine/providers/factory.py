@@ -37,7 +37,11 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
             proxy=resolve_provider_proxy(config),
         )
     if provider_name == "github_copilot" or resolved_model.startswith("github-copilot/"):
-        return GitHubCopilotProvider(default_model=resolved_model)
+        return GitHubCopilotProvider(
+            default_model=resolved_model,
+            api_base=config.get_api_base(resolved_model),
+            proxy=resolve_provider_proxy(config),
+        )
 
     if provider_name == "custom":
         api_base = config.get_api_base(resolved_model)

@@ -129,7 +129,12 @@ def _make_provider(config: Any) -> Any:
     if forced == "github_copilot":
         from mira_engine.providers.github_copilot_provider import GitHubCopilotProvider
 
-        return GitHubCopilotProvider(default_model=model or "github-copilot/gpt-4.1")
+        resolved_model = model or "github-copilot/gpt-4.1"
+        return GitHubCopilotProvider(
+            default_model=resolved_model,
+            api_base=config.get_api_base(resolved_model),
+            proxy=provider_proxy,
+        )
     if forced == "openai_codex":
         from mira_engine.providers.openai_codex_provider import OpenAICodexProvider
 
