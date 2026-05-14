@@ -321,6 +321,18 @@ class SkillsLoader:
 
         return None
 
+    def _parse_frontmatter_list(self, raw: str | None) -> list[str]:
+        """Parse a JSON array string from frontmatter (scenarios, aliases, etc.)."""
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(item) for item in data if isinstance(item, str)]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return []
+
     def suggest_skills(
         self,
         query: str,
@@ -340,16 +352,9 @@ class SkillsLoader:
             return []
 
         recent_names = [name for name in (recent or []) if isinstance(name, str)]
+        available_names = {s["name"] for s in available}
+        recent_set = {n for n in recent_names if n in available_names}
         is_follow_up = self._looks_like_follow_up(text)
-        if is_follow_up and recent_names:
-            picked: list[str] = []
-            for name in recent_names:
-                if any(s["name"] == name for s in available) and name not in picked:
-                    picked.append(name)
-                if len(picked) >= limit:
-                    break
-            if picked:
-                return picked
 
         query_tokens = self._tokenize(text)
         query_lc = text.lower()
@@ -367,8 +372,16 @@ class SkillsLoader:
                 query_tokens=query_tokens,
                 skill_name=name,
                 skill_text=base_text,
+                meta=meta,
             )
-            if score > 0:
+
+            # Session memory: recent skills always get a boost
+            if name in recent_set:
+                score += 15
+                if is_follow_up:
+                    score += 10
+
+            if score >= 4:
                 scored.append((score, name))
 
         scored.sort(key=lambda item: (-item[0], item[1]))
@@ -420,6 +433,7 @@ class SkillsLoader:
         query_tokens: set[str],
         skill_name: str,
         skill_text: str,
+        meta: dict | None = None,
     ) -> int:
         score = 0
         skill_lc = skill_text.lower()
@@ -429,7 +443,32 @@ class SkillsLoader:
         skill_tokens = self._tokenize(skill_text)
         score += len(skill_tokens.intersection(query_tokens)) * 2
 
-        for alias in self._skill_aliases(skill_name):
+        # Aliases from frontmatter (highest priority)
+        fm_aliases: list[str] = []
+        if meta:
+            raw_aliases = meta.get("aliases")
+            if raw_aliases:
+                fm_aliases = self._parse_frontmatter_list(raw_aliases)
+
+        # Scenarios from frontmatter: tokenize and match
+        if meta:
+            raw_scenarios = meta.get("scenarios")
+            if raw_scenarios:
+                scenarios = self._parse_frontmatter_list(raw_scenarios)
+                for scenario in scenarios:
+                    scenario_tokens = self._tokenize(scenario)
+                    score += len(scenario_tokens.intersection(query_tokens)) * 2
+                    scenario_lc = scenario.lower()
+                    if scenario_lc and scenario_lc in query_lc:
+                        score += 4
+
+        # Aliases: use frontmatter first, fall back to hardcoded
+        if fm_aliases:
+            alias_list = fm_aliases
+        else:
+            alias_list = list(self._skill_aliases(skill_name))
+
+        for alias in alias_list:
             alias_lc = alias.lower()
             if alias_lc in query_lc:
                 score += 6
