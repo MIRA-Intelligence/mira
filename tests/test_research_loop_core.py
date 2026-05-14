@@ -245,6 +245,56 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         auto_round=0,
     ) is False
 
+    # when the LLM call itself fails (parameter rejected,
+    # gateway down, all candidates exhausted) the final_content is a system
+    # error and auto-run must halt unconditionally — even when there is
+    # pending work in the plan and strictHeuristics is the default. Without
+    # this guard, a single bad request burns all 20 auto rounds repeatedly
+    # hitting the same error.
+    assert ResearchAgentLoop._looks_like_llm_provider_error(
+        "Error calling LLM: litellm.BadRequestError: Azure_aiException - "
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
+        "\"message\":\"`temperature` is deprecated for this model.\"}}"
+    ) is True
+    assert ResearchAgentLoop._looks_like_llm_provider_error(
+        "Error calling Azure OpenAI: Connection failed"
+    ) is True
+    assert ResearchAgentLoop._looks_like_llm_provider_error(
+        "All candidate models failed for this turn. Last error from "
+        "'azure/anthropic/claude-opus-4-7': Error calling LLM: Request timed out."
+    ) is True
+    # Ordinary experiment outputs that happen to contain the word "error"
+    # must NOT trigger this guard.
+    assert ResearchAgentLoop._looks_like_llm_provider_error(
+        "实验完成，error rate 降至 0.03。继续下一组消融。"
+    ) is False
+    assert ResearchAgentLoop._looks_like_llm_provider_error(None) is False
+
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(project),
+        final_content=(
+            "Error: {'message': 'litellm.BadRequestError: Azure_aiException - "
+            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
+            "\"message\":\"`temperature` is deprecated for this model.\"}}'}"
+        ),
+        auto_round=1,
+    )
+    assert decision is False
+    assert reason == "llm provider error"
+
+    # Even with strictHeuristics disabled the
+    # LLM provider error must still halt.
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="All candidate models failed for this turn. Last error from 'gpt-5.5': Error calling LLM: Request timed out.",
+        auto_round=1,
+        automation_policy=relaxed_policy,
+    )
+    assert decision is False
+    assert reason == "llm provider error"
+
     exhausted_policy = loop._parse_automation_policy(
         {
             "logic": "AND",

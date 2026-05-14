@@ -282,6 +282,104 @@ async def test_routing_prefers_recently_successful_routing_model() -> None:
     assert broken.calls == 1
 
 
+class _RaisingProvider(LLMProvider):
+    """Provider that always raises the same exception."""
+
+    def __init__(self, exc: Exception):
+        super().__init__()
+        self.exc = exc
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse:
+        self.calls += 1
+        raise self.exc
+
+    def get_default_model(self) -> str:
+        return "anthropic/claude-opus-4-5"
+
+
+async def test_chat_falls_back_on_retryable_raised_exception() -> None:
+    """Existing behaviour preserved: a raised retryable exception should
+    still walk through to the next fallback candidate."""
+    raising = _RaisingProvider(TimeoutError("Request timed out"))
+    healthy = _FakeProvider()
+    providers = {
+        "openai/gpt-4.1-mini": raising,
+        "openai/gpt-4.1-nano": healthy,
+    }
+    manager = RoutedProviderManager(
+        default_provider=_FakeProvider(),
+        default_model="anthropic/claude-opus-4-5",
+        router=None,
+        provider_factory=lambda model: providers[model],
+    )
+
+    response, resolved_route = await manager.chat(
+        route=RoutedModel(
+            tier="small",
+            model="openai/gpt-4.1-mini",
+            candidates=("openai/gpt-4.1-mini", "openai/gpt-4.1-nano"),
+            source="test",
+        ),
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert response.content == "ok"
+    assert resolved_route.model == "openai/gpt-4.1-nano"
+    assert raising.calls == 1
+
+
+async def test_chat_does_not_fallback_on_non_retryable_raised_exception() -> None:
+    """Bug 2 regression: when a provider RAISES (rather than returns an error
+    response) with a permanent 4xx like ``invalid_request_error``, the manager
+    must NOT silently burn the remaining fallback chain — the next candidate
+    will fail identically. The exception is re-raised after marking the
+    model failed.
+    """
+    permanent = _RaisingProvider(
+        RuntimeError("400 invalid_request_error: `temperature` is deprecated for this model.")
+    )
+    other = _RaisingProvider(RuntimeError("should not be called"))
+    providers = {
+        "openai/gpt-4.1-mini": permanent,
+        "openai/gpt-4.1-nano": other,
+    }
+    manager = RoutedProviderManager(
+        default_provider=_FakeProvider(),
+        default_model="anthropic/claude-opus-4-5",
+        router=None,
+        provider_factory=lambda model: providers[model],
+    )
+
+    raised: Exception | None = None
+    try:
+        await manager.chat(
+            route=RoutedModel(
+                tier="small",
+                model="openai/gpt-4.1-mini",
+                candidates=("openai/gpt-4.1-mini", "openai/gpt-4.1-nano"),
+                source="test",
+            ),
+            messages=[{"role": "user", "content": "hello"}],
+        )
+    except Exception as exc:
+        raised = exc
+
+    assert raised is not None
+    assert "invalid_request_error" in str(raised)
+    assert permanent.calls == 1
+    # Fallback candidate must NOT have been invoked.
+    assert other.calls == 0
+
+
 async def test_chat_reports_error_when_all_candidate_models_fail() -> None:
     manager = RoutedProviderManager(
         default_provider=_FakeProvider(),

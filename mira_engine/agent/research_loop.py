@@ -321,6 +321,45 @@ class ResearchAgentLoop(BaseAgentLoop):
         )
         return any(k in tail for k in soft_signals)
 
+    @classmethod
+    def _looks_like_llm_provider_error(cls, text: str | None) -> bool:
+        """Detect when ``final_content`` is a system-level LLM call failure.
+
+        These are surfaced by provider error handlers (``_handle_error`` in
+        ``anthropic_provider`` / ``azure_openai_provider`` / etc., and the
+        chain-failure path in ``RoutedProviderManager.chat``) and must always
+        halt auto mode — they are NOT experiment outcomes. Without this
+        guard a parameter-level 4xx (e.g. Azure dropping ``temperature``)
+        gets retried every round until ``_AUTO_MAX_ROUNDS`` (20) is
+        exhausted.
+
+        Unlike :meth:`_looks_like_failure_response`, this check fires
+        regardless of ``strictHeuristics`` because the agent has not even
+        produced a turn — there is nothing to iterate on.
+        """
+        if not text:
+            return False
+        lowered = text.lower()
+        markers = (
+            # Provider wrappers (see anthropic_provider._handle_error,
+            # azure_openai_provider._handle_error, openai_compat_provider,
+            # litellm_provider.chat, openai_codex_provider).
+            "error calling llm",
+            "error calling azure openai",
+            "error calling codex",
+            "error calling github copilot",
+            # Underlying SDK / gateway error types.
+            "litellm.badrequesterror",
+            "azure_aiexception",
+            "invalid_request_error",
+            "bad_request_error",
+            # RoutedProviderManager terminal message.
+            "all candidate models failed for this turn",
+            # base_loop fallback when an error response has no content.
+            "sorry, i encountered an error calling the ai model",
+        )
+        return any(marker in lowered for marker in markers)
+
     # ------------------------------------------------------------------
     # task_plan loaders / inspectors
     # ------------------------------------------------------------------
@@ -874,6 +913,14 @@ class ResearchAgentLoop(BaseAgentLoop):
         """
         if run_mode != "auto":
             return False, None
+        # LLM provider errors must halt the loop unconditionally — the agent
+        # never even produced a turn, so the next round will hit the exact
+        # same failure (parameter rejected, auth invalid, gateway down, ...).
+        # Without this guard a single bad request burns through all 20
+        # auto-run rounds before surfacing the error to the user.
+        if self._looks_like_llm_provider_error(final_content):
+            logger.warning("Auto mode halting: LLM provider error in final response")
+            return False, "llm provider error"
         if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
             return False, "task_plan guardrail blocking"
         if auto_round >= self._AUTO_MAX_ROUNDS:

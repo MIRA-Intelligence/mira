@@ -26,6 +26,7 @@ else:
     from openai import AsyncOpenAI
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.model_compat import model_supports_temperature
 from mira_engine.providers.openai_responses import (
     consume_sdk_stream,
     convert_messages,
@@ -263,10 +264,16 @@ class OpenAICompatProvider(LLMProvider):
     ) -> bool:
         """Return True when the model accepts a temperature parameter.
 
-        GPT-5 family and reasoning models (o1/o3/o4) reject temperature
-        when reasoning_effort is set to anything other than ``"none"``.
+        Combines two rule sets:
+          - GPT-5 / o1 / o3 / o4 deployments (and any non-``"none"``
+            ``reasoning_effort``) reject temperature.
+          - Models flagged in :mod:`providers.model_compat` (e.g.
+            Azure-proxied ``claude-opus-4-7``) reject temperature
+            regardless of the OpenAI-compatible front-end.
         """
         if reasoning_effort and reasoning_effort.lower() != "none":
+            return False
+        if not model_supports_temperature(model_name):
             return False
         name = model_name.lower()
         return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))
