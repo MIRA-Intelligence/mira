@@ -331,7 +331,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         halt auto mode — they are NOT experiment outcomes. Without this
         guard a parameter-level 4xx (e.g. Azure dropping ``temperature``)
         gets retried every round until ``_AUTO_MAX_ROUNDS`` (20) is
-        exhausted, which is what we saw in PRJ-0002 on 2026-05-14.
+        exhausted.
 
         Unlike :meth:`_looks_like_failure_response`, this check fires
         regardless of ``strictHeuristics`` because the agent has not even

@@ -502,6 +502,59 @@ def test_openai_compat_supports_temperature_matches_reasoning_model_rules() -> N
     assert OpenAICompatProvider._supports_temperature("gpt-4o", reasoning_effort="medium") is False
 
 
+def test_openai_compat_supports_temperature_blocks_claude_opus_4_7() -> None:
+    """Bug 1 regression: OpenAI-compatible custom endpoints that proxy to
+    Azure-hosted ``claude-opus-4-7`` must drop ``temperature`` — otherwise
+    Azure returns ``invalid_request_error: \\`temperature\\` is deprecated for
+    this model.``.
+    """
+    assert OpenAICompatProvider._supports_temperature("claude-opus-4-7") is False
+    assert OpenAICompatProvider._supports_temperature("azure/anthropic/claude-opus-4-7") is False
+    assert OpenAICompatProvider._supports_temperature("anthropic/claude-opus-4-7") is False
+
+
+def test_openai_compat_build_kwargs_drops_temperature_for_claude_opus_4_7() -> None:
+    spec = find_by_name("custom")
+    with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="any",
+            default_model="azure/anthropic/claude-opus-4-7",
+            spec=spec,
+        )
+
+    kwargs = provider._build_kwargs(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        model="azure/anthropic/claude-opus-4-7",
+        max_tokens=512,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+    assert "temperature" not in kwargs
+
+
+def test_openai_compat_build_responses_body_drops_temperature_for_claude_opus_4_7() -> None:
+    spec = find_by_name("custom")
+    with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="any",
+            default_model="azure/anthropic/claude-opus-4-7",
+            spec=spec,
+        )
+
+    body = provider._build_responses_body(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        model="azure/anthropic/claude-opus-4-7",
+        max_tokens=512,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+    assert "temperature" not in body
+
+
 def test_openai_compat_build_kwargs_uses_gpt5_safe_parameters() -> None:
     spec = find_by_name("openai")
     with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):

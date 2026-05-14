@@ -91,7 +91,7 @@ def test_supports_temperature_blocks_claude_opus_4_7():
 def test_build_body_drops_temperature_for_claude_opus_4_7():
     """The Responses API body must NOT carry ``temperature`` when the model
     is on the blocklist — otherwise Azure returns ``invalid_request_error``
-    and the agent's auto-run loop wedges (see PRJ-0002 incident 2026-05-14).
+    and the agent's auto-run loop wedges.
     """
     provider = AzureOpenAIProvider(
         api_key="k",

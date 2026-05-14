@@ -245,12 +245,12 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         auto_round=0,
     ) is False
 
-    # Bug 3 regression: when the LLM call itself fails (parameter rejected,
+    # when the LLM call itself fails (parameter rejected,
     # gateway down, all candidates exhausted) the final_content is a system
     # error and auto-run must halt unconditionally — even when there is
     # pending work in the plan and strictHeuristics is the default. Without
     # this guard, a single bad request burns all 20 auto rounds repeatedly
-    # hitting the same error (see PRJ-0002 incident 2026-05-14).
+    # hitting the same error.
     assert ResearchAgentLoop._looks_like_llm_provider_error(
         "Error calling LLM: litellm.BadRequestError: Azure_aiException - "
         "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
@@ -283,8 +283,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert decision is False
     assert reason == "llm provider error"
 
-    # Even with strictHeuristics disabled (the production config from PRJ-0002
-    # had no automation_policy, which defaults to relaxed heuristics) the
+    # Even with strictHeuristics disabled the
     # LLM provider error must still halt.
     decision, reason = loop._evaluate_continuation(
         run_mode="auto",
