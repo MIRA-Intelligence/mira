@@ -9,6 +9,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from mira_engine.providers.base import LLMProvider, LLMResponse
+from mira_engine.providers.model_compat import model_supports_temperature
 from mira_engine.providers.openai_responses import (
     consume_sdk_stream,
     convert_messages,
@@ -55,8 +56,19 @@ class AzureOpenAIProvider(LLMProvider):
         deployment_name: str,
         reasoning_effort: str | None = None,
     ) -> bool:
-        """Return True when temperature is likely supported for this deployment."""
+        """Return True when temperature is likely supported for this deployment.
+
+        Combines two rule sets:
+          - Azure-hosted OpenAI reasoning deployments (``gpt-5``, ``o1``,
+            ``o3``, ``o4``) and any call passing ``reasoning_effort`` drop
+            ``temperature``.
+          - Models flagged in :mod:`providers.model_compat` (e.g.
+            Azure-hosted ``claude-opus-4-7``) drop ``temperature`` regardless
+            of deployment prefix.
+        """
         if reasoning_effort:
+            return False
+        if not model_supports_temperature(deployment_name):
             return False
         name = deployment_name.lower()
         return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))

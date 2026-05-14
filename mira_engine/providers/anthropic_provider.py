@@ -13,6 +13,7 @@ from typing import Any
 import json_repair
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.model_compat import model_supports_temperature
 
 _ALNUM = string.ascii_letters + string.digits
 
@@ -380,19 +381,26 @@ class AnthropicProvider(LLMProvider):
         if system:
             kwargs["system"] = system
 
+        # Some models (e.g. claude-opus-4-7 fronted by Azure AI) reject
+        # `temperature` outright with `invalid_request_error`. Resolve this
+        # once via the shared registry so every code path agrees.
+        temperature_allowed = model_supports_temperature(model) and model_supports_temperature(model_name)
+
         if reasoning_effort == "adaptive":
             # Adaptive thinking: model decides when and how much to think
             # Supported on claude-sonnet-4-6 and claude-opus-4-6.
             # Also auto-enables interleaved thinking between tool calls.
             kwargs["thinking"] = {"type": "adaptive"}
-            kwargs["temperature"] = 1.0
+            if temperature_allowed:
+                kwargs["temperature"] = 1.0
         elif thinking_enabled:
             budget_map = {"low": 1024, "medium": 4096, "high": max(8192, max_tokens)}
             budget = budget_map.get(reasoning_effort.lower(), 4096)
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4096)
-            kwargs["temperature"] = 1.0
-        else:
+            if temperature_allowed:
+                kwargs["temperature"] = 1.0
+        elif temperature_allowed:
             kwargs["temperature"] = temperature
 
         if anthropic_tools:

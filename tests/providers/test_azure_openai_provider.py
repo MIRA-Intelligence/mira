@@ -78,6 +78,38 @@ def test_supports_temperature_with_reasoning_effort():
     assert AzureOpenAIProvider._supports_temperature("gpt-4o", reasoning_effort="medium") is False
 
 
+def test_supports_temperature_blocks_claude_opus_4_7():
+    """Bug 1 regression: Azure-hosted ``claude-opus-4-7`` deployments reject
+    ``temperature`` outright. The blocklist (via providers.model_compat) must
+    catch the deployment under every prefix variant.
+    """
+    assert AzureOpenAIProvider._supports_temperature("claude-opus-4-7") is False
+    assert AzureOpenAIProvider._supports_temperature("azure/anthropic/claude-opus-4-7") is False
+    assert AzureOpenAIProvider._supports_temperature("anthropic/claude-opus-4-7") is False
+
+
+def test_build_body_drops_temperature_for_claude_opus_4_7():
+    """The Responses API body must NOT carry ``temperature`` when the model
+    is on the blocklist — otherwise Azure returns ``invalid_request_error``
+    and the agent's auto-run loop wedges (see PRJ-0002 incident 2026-05-14).
+    """
+    provider = AzureOpenAIProvider(
+        api_key="k",
+        api_base="https://r.openai.azure.com",
+        default_model="claude-opus-4-7",
+    )
+    body = provider._build_body(
+        [{"role": "user", "content": "hi"}],
+        None,
+        "azure/anthropic/claude-opus-4-7",
+        4096,
+        0.7,
+        None,
+        None,
+    )
+    assert "temperature" not in body
+
+
 # ---------------------------------------------------------------------------
 # _build_body — Responses API body construction
 # ---------------------------------------------------------------------------

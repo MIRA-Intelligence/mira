@@ -12,6 +12,7 @@ from litellm import acompletion
 from loguru import logger
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.model_compat import model_supports_temperature
 from mira_engine.providers.registry import find_by_model, find_gateway
 
 # Standard chat-completion message keys.
@@ -246,6 +247,14 @@ class LiteLLMProvider(LLMProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+
+        # Strip `temperature` for models that reject it (e.g.
+        # ``azure/anthropic/claude-opus-4-7`` returns
+        # ``invalid_request_error: \`temperature\` is deprecated for this model.``).
+        # Done before _apply_model_overrides so a registry override can still
+        # re-add it intentionally if some future provider needs that.
+        if not model_supports_temperature(original_model) or not model_supports_temperature(model):
+            kwargs.pop("temperature", None)
 
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)

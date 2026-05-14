@@ -281,14 +281,26 @@ class RoutedProviderManager:
             except Exception as exc:
                 last_error = exc
                 self._mark_model_failed(model)
-                if index < len(candidates) - 1:
+                # Mirror the response-path classification so a permanent 4xx
+                # (auth, invalid_request_error, bad request, ...) does not
+                # blindly burn the rest of the fallback chain — those errors
+                # will fail identically on every other candidate.
+                exc_text = str(exc) or exc.__class__.__name__
+                is_retryable = self._should_retry_with_fallback(exc_text)
+                if is_retryable and index < len(candidates) - 1:
                     logger.warning(
-                        "Model '{}' raised '{}'; trying fallback model '{}'",
+                        "Model '{}' raised retryable error '{}'; trying fallback model '{}'",
                         model,
                         exc,
                         candidates[index + 1],
                     )
                     continue
+                if not is_retryable:
+                    logger.warning(
+                        "Model '{}' raised non-retryable error '{}'; skipping fallback candidates",
+                        model,
+                        exc,
+                    )
                 raise
 
             if response.finish_reason != "error" or not self._should_retry_with_fallback(response.content):
