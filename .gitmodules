@@ -1,6 +1,6 @@
 [submodule "UI"]
 	path = UI
-	url = git@github.com:MIRA-Intelligence/mira-ui.git
+	url = https://github.com/MIRA-Intelligence/mira-ui.git
 	branch = dev
 [submodule "mira_engine/skills"]
 	path = mira_engine/skills
