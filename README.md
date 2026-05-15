@@ -10,7 +10,7 @@ Powered by an underlying micro-agent framework, Mira is designed to execute comp
 ## 🔬 Built-in Medical Skills
 
 Mira comes pre-loaded with specialized medical skills:
-1. **`medical-image-dl-pipeline`**: End-to-end deep learning pipeline (classification, segmentation, detection) built on MONAI and PyTorch. Features robust 5-Fold Cross-Validation and early stopping.
+1. **`medical-image-analysis`**: End-to-end deep learning pipeline (classification, segmentation, detection) built on MONAI and PyTorch. Features robust 5-Fold Cross-Validation and early stopping.
 2. **`radiomics`**: High-dimensional radiomic feature extraction using PyRadiomics, combined with LASSO/mRMR feature selection.
 3. **`survival-analysis`**: Time-to-event statistical modeling, Kaplan-Meier curves, and Cox Proportional Hazards models via lifelines.
 

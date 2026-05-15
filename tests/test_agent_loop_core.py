@@ -109,7 +109,7 @@ def _make_real_loop(tmp_path: Path) -> BaseAgentLoop:
 def test_restrict_workspace_allows_nested_workspace_mira_skills_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
-    nested_skills = workspace / ".mira" / "skills" / "medical-imaging" / "medical-image-dl-pipeline"
+    nested_skills = workspace / ".mira" / "skills" / "medical-imaging" / "medical-image-analysis"
     nested_skills.mkdir(parents=True)
     skill_file = nested_skills / "SKILL.md"
     skill_file.write_text("# skill", encoding="utf-8")
@@ -430,7 +430,7 @@ async def test_process_message_updates_recent_skills_metadata(monkeypatch, tmp_p
 
     async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
         if audit_hook:
-            await audit_hook({"tool": "read_file", "skill_name": "medical-image-dl-pipeline", "path": "/tmp/SKILL.md"})
+            await audit_hook({"tool": "read_file", "skill_name": "medical-image-analysis", "path": "/tmp/SKILL.md"})
         return "done", [], messages + [{"role": "assistant", "content": "done"}]
 
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
@@ -438,7 +438,7 @@ async def test_process_message_updates_recent_skills_metadata(monkeypatch, tmp_p
     out = await loop._process_message(msg)
     assert out.content == "done"
     session = loop.sessions.get_or_create("ui:PRJ-7")
-    assert session.metadata.get("_recent_skills") == ["medical-image-dl-pipeline"]
+    assert session.metadata.get("_recent_skills") == ["medical-image-analysis"]
 
 
 async def test_process_message_injects_active_skills_into_context(monkeypatch, tmp_path: Path) -> None:
@@ -466,7 +466,7 @@ async def test_process_message_injects_active_skills_into_context(monkeypatch, t
     out = await loop._process_message(msg)
     assert out.content == "done"
     assert captured.get("skill_names")
-    assert "medical-image-dl-pipeline" in captured["skill_names"]
+    assert "medical-image-analysis" in captured["skill_names"]
 
 
 async def test_process_message_new_failure_and_message_tool_short_circuit(monkeypatch, tmp_path: Path) -> None:
