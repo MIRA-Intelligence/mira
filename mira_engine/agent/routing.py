@@ -341,7 +341,6 @@ class RoutedProviderManager:
         if not self._router:
             return RoutedModel("default", self._default_model, (self._default_model,), source="default")
 
-        last_error: Exception | None = None
         routing_candidates = self._ordered_candidate_models(self._router.routing_candidates)
         for index, routing_model in enumerate(routing_candidates):
             try:
@@ -356,7 +355,6 @@ class RoutedProviderManager:
                 self._mark_model_success(routing_model)
                 return route
             except Exception as exc:
-                last_error = exc
                 self._mark_model_failed(routing_model)
                 if index < len(routing_candidates) - 1:
                     logger.warning(

@@ -109,6 +109,7 @@ include = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["mira_engine/skills"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
