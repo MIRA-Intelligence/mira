@@ -7,6 +7,7 @@ from mira_engine.cli.agent_service import (
     WINDOWS_SERVICE_NAME,
     AgentPaths,
     SystemdUserServiceManager,
+    WindowsBackgroundProcessManager,
     WindowsServiceManager,
 )
 
@@ -39,7 +40,7 @@ def test_systemd_manager_install_and_status(monkeypatch, tmp_path):
     assert any(cmd[-2:] == ["enable", SYSTEMD_UNIT_NAME] for cmd in calls)
 
 
-def test_windows_manager_install_and_status(monkeypatch, tmp_path):
+def test_windows_background_manager_install_and_status(monkeypatch, tmp_path):
     import mira_engine.cli.agent_service as agent_service
 
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -67,7 +68,7 @@ def test_windows_manager_install_and_status(monkeypatch, tmp_path):
     monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.Popen", fake_popen)
     monkeypatch.setattr("mira_engine.cli.agent_service.time.sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("builtins.open", mock_open())
-    manager = WindowsServiceManager(AgentPaths.default())
+    manager = WindowsBackgroundProcessManager(AgentPaths.default())
 
     code, _ = manager.install_service()
     assert code == EXIT_OK
@@ -84,3 +85,56 @@ def test_windows_manager_install_and_status(monkeypatch, tmp_path):
     assert popen_calls[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
     assert popen_calls[0][1]["env"]["PYTHONUNBUFFERED"] == "1"
     assert any(cmd[:2] == ["tasklist", "/FI"] for cmd in calls)
+
+
+def test_windows_service_manager_installs_winsw_service(monkeypatch, tmp_path):
+    import mira_engine.cli.agent_service as agent_service
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    engine = tmp_path / "app" / "mira-engine.exe"
+    wrapper = engine.with_name("MiraEngineService.exe")
+    wrapper.parent.mkdir(parents=True)
+    engine.write_text("engine", encoding="utf-8")
+    wrapper.write_text("winsw", encoding="utf-8")
+    monkeypatch.setattr(agent_service.sys, "executable", str(engine))
+    monkeypatch.setattr(agent_service.sys, "frozen", True, raising=False)
+
+    calls = []
+
+    def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+        calls.append(cmd)
+        command = cmd[-1]
+        if command == "status":
+            return _cp(returncode=0, stdout="Started")
+        return _cp(returncode=0)
+
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
+    manager = WindowsServiceManager(AgentPaths.default())
+
+    code, message = manager.install_service(
+        host="127.0.0.1",
+        port=18790,
+        home=str(tmp_path),
+    )
+
+    assert code == EXIT_OK
+    assert "Windows service installed" in message
+    staged_wrapper = tmp_path / ".mira" / "runtime" / "MiraEngineService.exe"
+    service_xml = tmp_path / ".mira" / "runtime" / "MiraEngineService.xml"
+    assert staged_wrapper.is_file()
+    xml = service_xml.read_text(encoding="utf-8")
+    assert f"<id>{WINDOWS_SERVICE_NAME}</id>" in xml
+    assert "run-gateway --host 127.0.0.1 --port 18790" in xml
+    assert f'name="USERPROFILE" value="{tmp_path}"' in xml
+
+    start_code, _ = manager.start()
+    assert start_code == EXIT_OK
+
+    status_code, payload = manager.status()
+    assert status_code == EXIT_OK
+    assert payload["service_mode"] == "windows-service"
+    assert payload["installed"] is True
+    assert payload["running"] is True
+    assert payload["windows_service"] == WINDOWS_SERVICE_NAME
+    assert any(cmd[-1] == "install" for cmd in calls)
+    assert any(cmd[-1] == "start" for cmd in calls)
