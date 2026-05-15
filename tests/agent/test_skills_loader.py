@@ -204,14 +204,14 @@ def test_list_skills_discovers_nested_workspace_skill_directories(tmp_path: Path
     workspace = tmp_path / "ws"
     nested_root = workspace / ".mira" / "skills" / "medical-imaging"
     nested_root.mkdir(parents=True)
-    nested_skill = _write_skill(nested_root, "medical-image-dl-pipeline", body="# nested")
+    nested_skill = _write_skill(nested_root, "medical-image-analysis", body="# nested")
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
     loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
     entries = loader.list_skills(filter_unavailable=False)
     assert {
-        "name": "medical-image-dl-pipeline",
+        "name": "medical-image-analysis",
         "path": str(nested_skill),
         "source": "workspace",
     } in entries
@@ -269,13 +269,13 @@ def test_list_skills_openclaw_metadata_parsed_for_requirements(
     ]
 
 
-def test_suggest_skills_prefers_medical_dl_pipeline_for_medical_imaging_query(tmp_path: Path) -> None:
+def test_suggest_skills_prefers_medical_analysis_for_medical_imaging_query(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     skills_root = workspace / ".mira" / "skills" / "medical-imaging"
     skills_root.mkdir(parents=True)
     _write_skill(
         skills_root,
-        "medical-image-dl-pipeline",
+        "medical-image-analysis",
         body="# pipeline",
     )
     _write_skill(
@@ -289,16 +289,16 @@ def test_suggest_skills_prefers_medical_dl_pipeline_for_medical_imaging_query(tm
     loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
     suggested = loader.suggest_skills("用 MONAI 做 MRI 呼吸伪影去除的2.5D训练流程", limit=2)
     assert suggested
-    assert suggested[0] == "medical-image-dl-pipeline"
+    assert suggested[0] == "medical-image-analysis"
 
 
 def test_suggest_skills_prefers_recent_skills_for_follow_up(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
-    _write_skill(workspace / "skills", "medical-image-dl-pipeline", body="# pipeline")
+    _write_skill(workspace / "skills", "medical-image-analysis", body="# pipeline")
     _write_skill(workspace / "skills", "other-skill", body="# other")
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
     loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
-    suggested = loader.suggest_skills("继续之前的任务", recent=["medical-image-dl-pipeline"], limit=2)
-    assert suggested == ["medical-image-dl-pipeline"]
+    suggested = loader.suggest_skills("继续之前的任务", recent=["medical-image-analysis"], limit=2)
+    assert suggested == ["medical-image-analysis"]

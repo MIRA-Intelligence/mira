@@ -416,7 +416,7 @@ class SkillsLoader:
     @staticmethod
     def _skill_aliases(skill_name: str) -> tuple[str, ...]:
         aliases: dict[str, tuple[str, ...]] = {
-            "medical-image-dl-pipeline": (
+            "medical-image-analysis": (
                 "medical", "imaging", "mri", "ct", "dicom", "nifti", "monai", "artifact", "motion",
                 "ghost", "k-space", "2.5d", "3d", "unet", "radiology", "医学", "影像", "伪影", "呼吸", "运动",
                 "去伪影",
