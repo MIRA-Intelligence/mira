@@ -341,7 +341,6 @@ class RoutedProviderManager:
         if not self._router:
             return RoutedModel("default", self._default_model, (self._default_model,), source="default")
 
-        last_error: Exception | None = None
         routing_candidates = self._ordered_candidate_models(self._router.routing_candidates)
         for index, routing_model in enumerate(routing_candidates):
             try:
