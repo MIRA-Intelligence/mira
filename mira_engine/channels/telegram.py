@@ -675,20 +675,15 @@ class TelegramChannel(BaseChannel):
 
         # Handle media files
         media_file = None
-        media_type = None
 
         if message.photo:
             media_file = message.photo[-1]  # Largest photo
-            media_type = "image"
         elif message.voice:
             media_file = message.voice
-            media_type = "voice"
         elif message.audio:
             media_file = message.audio
-            media_type = "audio"
         elif message.document:
             media_file = message.document
-            media_type = "file"
 
         # Download media if present
         if media_file and self._app:

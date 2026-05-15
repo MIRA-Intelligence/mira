@@ -356,7 +356,6 @@ class RoutedProviderManager:
                 self._mark_model_success(routing_model)
                 return route
             except Exception as exc:
-                last_error = exc
                 self._mark_model_failed(routing_model)
                 if index < len(routing_candidates) - 1:
                     logger.warning(

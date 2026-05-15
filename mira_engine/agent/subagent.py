@@ -1,7 +1,6 @@
 """Subagent manager for background task execution."""
 
 import asyncio
-import json
 import uuid
 from pathlib import Path
 from typing import Any, Callable

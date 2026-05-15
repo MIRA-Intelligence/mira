@@ -824,7 +824,6 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
             running_seen = True
 
         recovered = _recover_results(project_dir, exp_id)
-        auto_promoted = False
         has_recoverable_evidence = recovered.get("metrics") is not None or bool(
             recovered.get("artifacts")
         )
@@ -836,7 +835,6 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
             item["status"] = "completed"
             status = "completed"
             changed = True
-            auto_promoted = True
         merged_results = _merge_results(item.get("results"), recovered)
         if merged_results and item.get("results") != merged_results:
             item["results"] = merged_results
