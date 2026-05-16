@@ -68,6 +68,10 @@ TARGETS: dict[str, dict[str, str]] = {
         "asset": "uv-x86_64-pc-windows-msvc.zip",
         "binary": "uv.exe",
     },
+    "windows-arm64": {
+        "asset": "uv-aarch64-pc-windows-msvc.zip",
+        "binary": "uv.exe",
+    },
 }
 
 
@@ -77,7 +81,7 @@ def detect_host_target() -> str:
     if sys.platform == "darwin":
         return "macos-arm64" if machine in {"arm64", "aarch64"} else "macos-x86_64"
     if sys.platform == "win32":
-        return "windows-x86_64"
+        return "windows-arm64" if machine in {"arm64", "aarch64"} else "windows-x86_64"
     if sys.platform.startswith("linux"):
         return "linux-aarch64" if machine in {"arm64", "aarch64"} else "linux-x86_64"
     raise SystemExit(f"Unsupported host platform: {sys.platform}/{machine}")
