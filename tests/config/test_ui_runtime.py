@@ -52,6 +52,25 @@ def test_build_ui_runtime_payload_marks_missing_required_provider_config() -> No
     assert payload["runtime"]["setup_subject"] == "Azure OpenAI"
 
 
+def test_build_ui_runtime_payload_marks_bundle_placeholder_as_setup_required() -> None:
+    cfg = Config()
+    cfg.agents.defaults.provider = "custom"
+    cfg.agents.defaults.model = "custom/mira-ui-bundle-setup"
+    cfg.providers.custom.api_base = "http://127.0.0.1:9/v1"
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=True,
+    )
+
+    assert payload["runtime"]["setup_required"] is True
+    assert "model access is still unconfigured" in payload["runtime"]["setup_message"]
+    assert payload["runtime"]["setup_code"] == "missing_api_base"
+    assert payload["runtime"]["setup_subject"] == "Custom"
+
+
 def test_apply_ui_runtime_update_accepts_new_provider_names() -> None:
     cfg = Config()
 

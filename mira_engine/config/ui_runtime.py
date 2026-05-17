@@ -12,6 +12,9 @@ from mira_engine.config.schema import AgentDefaults, Config, ProvidersConfig
 from mira_engine.providers.registry import find_by_name
 
 _ALLOWED_REASONING_EFFORTS = {"low", "medium", "high", "adaptive"}
+_BUNDLE_SETUP_PROVIDER = "custom"
+_BUNDLE_SETUP_MODEL = "custom/mira-ui-bundle-setup"
+_BUNDLE_SETUP_API_BASE = "http://127.0.0.1:9/v1"
 
 
 def _mask_secret(value: str) -> str | None:
@@ -185,8 +188,16 @@ def _runtime_setup_status(
             provider_name,
         )
 
-    if provider_name == "custom":
+    if provider_name == _BUNDLE_SETUP_PROVIDER:
         custom_base = providers_payload.get("custom", {}).get("api_base")
+        normalized_base = custom_base.rstrip("/") if isinstance(custom_base, str) else ""
+        if model == _BUNDLE_SETUP_MODEL or normalized_base == _BUNDLE_SETUP_API_BASE.rstrip("/"):
+            return (
+                True,
+                "Local engine is running, but model access is still unconfigured. Open Settings > Local Runtime Config and choose a provider before retrying.",
+                "missing_api_base",
+                "Custom",
+            )
         if not isinstance(custom_base, str) or not custom_base.strip():
             return (
                 True,
