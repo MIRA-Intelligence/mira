@@ -825,9 +825,6 @@ def gateway(
 
     config = _load_runtime_config(config, workspace)
 
-    from mira_engine.utils.env import auto_activate_env
-    auto_activate_env(config.workspace_path)
-
     if host is not None:
         config.gateway.host = host
 
@@ -1390,9 +1387,6 @@ def agent(
 
     config = _load_runtime_config(config, workspace)
 
-    from mira_engine.utils.env import auto_activate_env
-    auto_activate_env(config.workspace_path)
-
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
@@ -1501,9 +1495,6 @@ def research(
             workspace = os.getcwd()
 
     config = _load_runtime_config(config, workspace)
-
-    from mira_engine.utils.env import auto_activate_env
-    auto_activate_env(config.workspace_path)
 
     sync_workspace_templates(config.workspace_path)
 
