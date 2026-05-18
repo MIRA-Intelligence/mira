@@ -73,7 +73,8 @@ class AgentPaths:
 
     @classmethod
     def for_home(cls, home: Path) -> "AgentPaths":
-        root = home.expanduser() / ".mira"
+        home_path = home.expanduser()
+        root = home_path / ".mira"
         return cls(
             root=root,
             config_dir=root / "config",
@@ -82,8 +83,8 @@ class AgentPaths:
             runtime_dir=root / "runtime",
             state_file=root / "runtime" / "agent-service-state.json",
             log_file=root / "logs" / "agent-service.log",
-            launchd_plist=Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
-            systemd_unit=Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME,
+            launchd_plist=home_path / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
+            systemd_unit=home_path / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME,
             backups_dir=root / "runtime" / "backups",
         )
 
@@ -861,8 +862,21 @@ class LaunchdServiceManager(LocalServiceManager):
             check=False,
         )
 
-    def _write_plist(self, host: str, port: int) -> None:
+    def _write_plist(
+        self,
+        host: str,
+        port: int,
+        *,
+        home: str | None,
+        config_path: str | None,
+    ) -> None:
         self.paths.launchd_plist.parent.mkdir(parents=True, exist_ok=True)
+        home_path = Path(home).expanduser() if home else self.paths.root.parent
+        config_file = (
+            Path(config_path).expanduser()
+            if config_path
+            else home_path / ".mira" / "config.json"
+        )
         payload = {
             "Label": LAUNCHD_LABEL,
             "ProgramArguments": _gateway_service_args(host, port),
@@ -870,7 +884,12 @@ class LaunchdServiceManager(LocalServiceManager):
             "KeepAlive": True,
             "StandardOutPath": str(self.paths.log_file),
             "StandardErrorPath": str(self.paths.log_file),
-            "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
+            "EnvironmentVariables": {
+                "HOME": str(home_path),
+                "MIRA_CONFIG_PATH": str(config_file),
+                "PYINSTALLER_RESET_ENVIRONMENT": "1",
+                "PYTHONUNBUFFERED": "1",
+            },
         }
         with self.paths.launchd_plist.open("wb") as fp:
             plistlib.dump(payload, fp)
@@ -886,9 +905,17 @@ class LaunchdServiceManager(LocalServiceManager):
         if code != EXIT_OK:
             return code, msg
         state = self.load_state()
+        service_home = state.get("home") if isinstance(state.get("home"), str) else home
+        service_config_path = (
+            state.get("config_path")
+            if isinstance(state.get("config_path"), str)
+            else config_path
+        )
         self._write_plist(
             str(state.get("host", "127.0.0.1")),
-            int(state.get("port", DEFAULT_PORT))
+            int(state.get("port", DEFAULT_PORT)),
+            home=service_home,
+            config_path=service_config_path,
         )
         bootstrap = self._run_launchctl("bootstrap", self._domain, str(self.paths.launchd_plist))
         # launchd returns non-zero when already loaded; try cleanup then retry once.

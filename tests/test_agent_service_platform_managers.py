@@ -1,11 +1,14 @@
+import plistlib
 from types import SimpleNamespace
 from unittest.mock import mock_open
 
 from mira_engine.cli.agent_service import (
     EXIT_OK,
+    LAUNCHD_LABEL,
     SYSTEMD_UNIT_NAME,
     WINDOWS_SERVICE_NAME,
     AgentPaths,
+    LaunchdServiceManager,
     SystemdUserServiceManager,
     WindowsBackgroundProcessManager,
     WindowsServiceManager,
@@ -39,6 +42,60 @@ def test_systemd_manager_install_and_status(monkeypatch, tmp_path):
     assert payload["service_mode"] == "systemd-user"
     assert payload["running"] is True
     assert any(cmd[-2:] == ["enable", SYSTEMD_UNIT_NAME] for cmd in calls)
+
+
+def test_launchd_manager_writes_bundle_environment(monkeypatch, tmp_path):
+    import mira_engine.cli.agent_service as agent_service
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(agent_service.os, "getuid", lambda: 501, raising=False)
+    engine = tmp_path / "app" / "mira-engine"
+    engine.parent.mkdir(parents=True)
+    engine.write_text("engine", encoding="utf-8")
+    config_path = tmp_path / ".mira" / "config.json"
+    monkeypatch.setattr(agent_service.sys, "executable", str(engine))
+    monkeypatch.setattr(agent_service.sys, "frozen", True, raising=False)
+
+    calls = []
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
+        calls.append(cmd)
+        return _cp(returncode=0)
+
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
+    manager = LaunchdServiceManager(AgentPaths.for_home(tmp_path))
+
+    code, message = manager.install_service(
+        host="127.0.0.1",
+        port=18790,
+        home=str(tmp_path),
+        config_path=str(config_path),
+    )
+
+    assert code == EXIT_OK
+    assert "launchd service installed" in message
+    payload = plistlib.loads(manager.paths.launchd_plist.read_bytes())
+    assert payload["Label"] == LAUNCHD_LABEL
+    assert payload["ProgramArguments"] == [
+        str(engine),
+        "run-gateway",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18790",
+    ]
+    assert payload["RunAtLoad"] is True
+    assert payload["KeepAlive"] is True
+    assert payload["StandardOutPath"] == str(tmp_path / ".mira" / "logs" / "agent-service.log")
+    assert payload["StandardErrorPath"] == str(tmp_path / ".mira" / "logs" / "agent-service.log")
+    assert payload["EnvironmentVariables"] == {
+        "HOME": str(tmp_path),
+        "MIRA_CONFIG_PATH": str(config_path),
+        "PYINSTALLER_RESET_ENVIRONMENT": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
+    assert ["launchctl", "bootstrap", "gui/501", str(manager.paths.launchd_plist)] in calls
 
 
 def test_windows_background_manager_install_and_status(monkeypatch, tmp_path):
