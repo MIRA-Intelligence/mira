@@ -18,6 +18,7 @@ def _cp(returncode=0, stdout="", stderr=""):
 
 def test_systemd_manager_install_and_status(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     calls = []
 
     def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
@@ -44,6 +45,7 @@ def test_windows_background_manager_install_and_status(monkeypatch, tmp_path):
     import mira_engine.cli.agent_service as agent_service
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     calls = []
     popen_calls = []
     running_pids = {4321}
@@ -91,6 +93,7 @@ def test_windows_service_manager_installs_winsw_service(monkeypatch, tmp_path):
     import mira_engine.cli.agent_service as agent_service
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     engine = tmp_path / "app" / "mira-engine.exe"
     wrapper = engine.with_name("MiraEngineService.exe")
     wrapper.parent.mkdir(parents=True)
