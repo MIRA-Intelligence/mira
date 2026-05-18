@@ -34,6 +34,24 @@ def test_build_ui_runtime_payload_includes_dynamic_provider_metadata() -> None:
     assert payload["provider_proxy"] == "http://127.0.0.1:7890"
 
 
+def test_build_ui_runtime_payload_returns_raw_and_resolved_workspace(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    cfg = Config()
+    cfg.agents.defaults.workspace = "~/.mira/workspace"
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=home / ".mira" / "workspace",
+        config_path=home / ".mira" / "config.json",
+        persisted=False,
+    )
+
+    assert payload["projects_root"] == str(home / ".mira" / "workspace")
+    assert payload["runtime"]["workspace"] == "~/.mira/workspace"
+    assert payload["runtime"]["workspace_resolved"] == str(home / ".mira" / "workspace")
+
+
 def test_build_ui_runtime_payload_marks_missing_required_provider_config() -> None:
     cfg = Config()
     cfg.agents.defaults.provider = "azure_openai"
@@ -152,7 +170,7 @@ def test_apply_ui_runtime_update_to_raw_data_preserves_routing_models() -> None:
     defaults = data["agents"]["defaults"]
     assert changed is True
     assert next_root == Path("/tmp/new").resolve()
-    assert defaults["workspace"] == str(Path("/tmp/new").resolve())
+    assert defaults["workspace"] == "/tmp/new"
     assert defaults["model"] == ["claude-3-opus", "anthropic/claude-sonnet-4-5"]
     assert defaults["routeModel"] == ["openai/gpt-4.1-mini", "openai/gpt-4.1-nano"]
     assert defaults["smallModel"] == ["deepseek/deepseek-chat", "openai/gpt-4.1-mini"]

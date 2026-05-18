@@ -746,6 +746,23 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
     return loaded
 
 
+def _sync_workspace_templates_or_exit(workspace: Path) -> None:
+    """Initialize workspace templates or fail with an actionable config error."""
+    try:
+        sync_workspace_templates(workspace)
+    except OSError as exc:
+        from mira_engine.config.loader import get_config_path
+
+        console.print("[red]Error: Mira workspace is not accessible.[/red]")
+        console.print(f"Workspace: {workspace}")
+        console.print(f"Config: {get_config_path()}")
+        console.print(
+            "Update agents.defaults.workspace in the active config, or choose a valid Workspace path in MIRA Settings."
+        )
+        console.print(f"Original error: {exc}")
+        raise typer.Exit(1) from exc
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -840,7 +857,7 @@ def gateway(
     _gateway_failsafe_check(gateway_host, gateway_port, verbose)
 
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
-    sync_workspace_templates(config.workspace_path)
+    _sync_workspace_templates_or_exit(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
     model_router = ModelRouter(config.agents.defaults)

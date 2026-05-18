@@ -239,13 +239,16 @@ def build_ui_runtime_payload(
     defaults = config.agents.defaults
     providers = _build_provider_payload(config)
     setup_required, setup_message, setup_code, setup_subject = _runtime_setup_status(config, providers)
+    resolved_projects_root = projects_root.expanduser().resolve(strict=False)
+    raw_workspace = _workspace_payload_value(defaults.workspace, resolved_projects_root)
 
     return {
-        "projects_root": str(projects_root),
+        "projects_root": str(resolved_projects_root),
         "config_path": str(config_path),
         "persisted": persisted,
         "runtime": {
-            "workspace": str(projects_root),
+            "workspace": raw_workspace,
+            "workspace_resolved": str(resolved_projects_root),
             "provider": defaults.provider,
             "model": defaults.model,
             "reasoning_effort": defaults.reasoning_effort,
@@ -259,6 +262,21 @@ def build_ui_runtime_payload(
         "providers": providers,
         "provider_proxy": config.providers.proxy,
     }
+
+
+def _workspace_payload_value(raw_workspace: str, projects_root: Path) -> str:
+    """Expose the configured workspace when it resolves to the active projects root."""
+    if not isinstance(raw_workspace, str) or not raw_workspace.strip():
+        return str(projects_root)
+
+    try:
+        configured = Path(raw_workspace).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return str(projects_root)
+
+    if configured == projects_root.expanduser().resolve(strict=False):
+        return raw_workspace
+    return str(projects_root)
 
 
 def apply_ui_runtime_update_to_raw_data(
@@ -275,15 +293,17 @@ def apply_ui_runtime_update_to_raw_data(
 
     raw_projects_root = payload.get("projects_root")
     if raw_projects_root is not None:
-        projects_root = Path(str(raw_projects_root)).expanduser().resolve()
-        defaults["workspace"] = str(projects_root)
+        raw_workspace = str(raw_projects_root)
+        projects_root = Path(raw_workspace).expanduser().resolve()
+        defaults["workspace"] = raw_workspace
         changed = True
 
     runtime_payload = payload.get("runtime")
     if isinstance(runtime_payload, dict):
         if "workspace" in runtime_payload:
-            projects_root = Path(str(runtime_payload["workspace"])).expanduser().resolve()
-            defaults["workspace"] = str(projects_root)
+            raw_workspace = str(runtime_payload["workspace"])
+            projects_root = Path(raw_workspace).expanduser().resolve()
+            defaults["workspace"] = raw_workspace
             changed = True
 
         if "provider" in runtime_payload:
@@ -392,7 +412,7 @@ def apply_ui_runtime_update(
         if not isinstance(raw_projects_root, str):
             raise ValueError("projects_root must be a string")
         projects_root = Path(raw_projects_root).expanduser().resolve()
-        config.agents.defaults.workspace = str(projects_root)
+        config.agents.defaults.workspace = raw_projects_root
         changed = True
 
     runtime_payload = payload.get("runtime")
@@ -405,7 +425,7 @@ def apply_ui_runtime_update(
             if not isinstance(raw_workspace, str):
                 raise ValueError("runtime.workspace must be a string")
             projects_root = Path(raw_workspace).expanduser().resolve()
-            config.agents.defaults.workspace = str(projects_root)
+            config.agents.defaults.workspace = raw_workspace
             changed = True
 
         if "provider" in runtime_payload:

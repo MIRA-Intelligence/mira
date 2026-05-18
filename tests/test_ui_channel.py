@@ -983,6 +983,7 @@ async def test_handle_get_config_returns_runtime_payload(
     body = json.loads(resp.text)
     assert body["projects_root"] == str(ui_channel.projects_root)
     assert body["runtime"]["workspace"] == str(ui_channel.projects_root)
+    assert body["runtime"]["workspace_resolved"] == str(ui_channel.projects_root)
     assert body["runtime"]["provider"] == "openrouter"
     assert body["runtime"]["reasoning_effort"] == "adaptive"
     assert body["runtime"]["max_tool_iterations"] == 88
@@ -1092,7 +1093,7 @@ async def test_handle_config_preserves_raw_routing_models_on_runtime_save(
     assert resp.status == 200
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     defaults = saved["agents"]["defaults"]
-    assert defaults["workspace"] == str(new_root.resolve())
+    assert defaults["workspace"] == str(new_root)
     assert defaults["model"] == ["claude-3-opus", "anthropic/claude-sonnet-4-5"]
     assert defaults["routeModel"] == ["openai/gpt-4.1-mini", "openai/gpt-4.1-nano"]
     assert defaults["smallModel"] == ["deepseek/deepseek-chat", "openai/gpt-4.1-mini"]
