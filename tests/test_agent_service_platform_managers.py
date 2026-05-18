@@ -20,7 +20,7 @@ def test_systemd_manager_install_and_status(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     calls = []
 
-    def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
         calls.append(cmd)
         if cmd[-2:] == ["is-active", SYSTEMD_UNIT_NAME]:
             return _cp(returncode=0, stdout="active\n")
@@ -48,7 +48,7 @@ def test_windows_background_manager_install_and_status(monkeypatch, tmp_path):
     popen_calls = []
     running_pids = {4321}
 
-    def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
         calls.append(cmd)
         if cmd[:2] == ["tasklist", "/FI"]:
             pid = int(cmd[2].split()[-1])
@@ -101,7 +101,7 @@ def test_windows_service_manager_installs_winsw_service(monkeypatch, tmp_path):
 
     calls = []
 
-    def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
         calls.append(cmd)
         command = cmd[-1]
         if command == "status":
