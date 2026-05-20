@@ -294,17 +294,49 @@ def _init_prompt_session() -> None:
     )
 
 
-def _print_agent_response(
-    response: str,
-    render_markdown: bool,
-    metadata: dict | None = None,
+def _is_llm_error(text: str) -> bool:
+    """Return True when the response looks like a provider/LLM error."""
+    if not text:
+        return False
+    t = text.strip()
+    return (
+        t.startswith("Error:")
+        or t.startswith("Error calling LLM:")
+        or "Internal Server Error" in t
+        or t.startswith("Sorry, I encountered an error calling the AI model.")
+    )
+
+
+def _print_llm_error(
+    error_text: str,
+    *,
+    model: str | None = None,
+    provider_name: str | None = None,
 ) -> None:
-    """Render assistant response with consistent terminal styling."""
-    content = response or ""
-    body = _response_renderable(content, render_markdown, metadata=metadata)
+    """Print a provider/LLM error with actionable context."""
+    raw = error_text.strip()
+
+    # Extract the underlying detail after "Error: "
+    detail = raw
+    for prefix in ("Error calling LLM: ", "Error: "):
+        if raw.startswith(prefix):
+            detail = raw[len(prefix):]
+            break
+
     console.print()
-    console.print(f"[cyan]{__logo__} mira[/cyan]")
-    console.print(body)
+    console.print(f"[red]{__logo__} mira — LLM error[/red]")
+    console.print()
+
+    if provider_name:
+        console.print(f"  [cyan]Provider:[/cyan] {provider_name}")
+    if model:
+        console.print(f"  [cyan]Model:[/cyan] {model}")
+
+    console.print()
+    console.print(f"  [bold red]{detail}[/bold red]")
+    console.print()
+    console.print("  [dim]The AI model failed to respond. Try again or check your[/dim]")
+    console.print("  [dim]API key and network connection.[/dim]")
     console.print()
 
 
@@ -1137,6 +1169,8 @@ def _run_cli_agent_session(
     logs_mode: bool,
     inbound_metadata: dict[str, object] | None = None,
     interactive_banner: str | None = None,
+    model_name: str | None = None,
+    provider_name: str | None = None,
 ) -> None:
     """Drive a single message or REPL session against ``agent_loop``.
 
@@ -1193,13 +1227,24 @@ def _run_cli_agent_session(
                         metadata=inbound_metadata,
                     )
             if hasattr(response, "content"):
-                _print_agent_response(
-                    getattr(response, "content", ""),
-                    render_markdown=markdown,
-                    metadata=getattr(response, "metadata", {}) or {},
+                resp_text = getattr(response, "content", "")
+                resp_meta = getattr(response, "metadata", {}) or {}
+            else:
+                resp_text = str(response)
+                resp_meta = {}
+
+            if _is_llm_error(resp_text):
+                _print_llm_error(
+                    resp_text,
+                    model=model_name or getattr(agent_loop, "model", None),
+                    provider_name=provider_name,
                 )
             else:
-                _print_agent_response(str(response), render_markdown=markdown, metadata={})
+                _print_agent_response(
+                    resp_text,
+                    render_markdown=markdown,
+                    metadata=resp_meta,
+                )
             if verbose_mode:
                 used = ", ".join(sorted(invoked_skills)) if invoked_skills else "none"
                 console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
@@ -1422,6 +1467,8 @@ def agent(
         verbose_mode=verbose_mode,
         logs_mode=logs_mode,
         inbound_metadata=None,
+        model_name=config.agents.defaults.primary_model,
+        provider_name=config.agents.defaults.provider,
     )
 
 
@@ -1542,6 +1589,8 @@ def research(
         logs_mode=logs_mode,
         inbound_metadata=inbound_metadata,
         interactive_banner=banner,
+        model_name=config.agents.defaults.primary_model,
+        provider_name=config.agents.defaults.provider,
     )
 
 
