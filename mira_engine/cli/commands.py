@@ -340,6 +340,20 @@ def _print_llm_error(
     console.print()
 
 
+def _print_agent_response(
+    response: str,
+    render_markdown: bool,
+    metadata: dict | None = None,
+) -> None:
+    """Render assistant response with consistent terminal styling."""
+    content = response or ""
+    body = _response_renderable(content, render_markdown, metadata=metadata)
+    console.print()
+    console.print(f"[cyan]{__logo__} mira[/cyan]")
+    console.print(body)
+    console.print()
+
+
 def _response_renderable(
     response: str,
     render_markdown: bool,
