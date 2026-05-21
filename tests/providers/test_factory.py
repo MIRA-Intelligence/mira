@@ -27,6 +27,21 @@ def test_make_provider_raises_error_for_custom_without_api_base() -> None:
         make_provider(config)
 
 
+async def test_make_provider_uses_bundle_setup_placeholder_without_network_call() -> None:
+    """The bundle setup sentinel keeps the gateway alive but fails model calls clearly."""
+    config = Config()
+    config.agents.defaults.model = "custom/mira-ui-bundle-setup"
+    config.agents.defaults.provider = "custom"
+    config.providers.custom.api_base = "http://127.0.0.1:9/v1"
+
+    provider = make_provider(config)
+    response = await provider.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert provider.get_default_model() == "custom/mira-ui-bundle-setup"
+    assert response.finish_reason == "error"
+    assert "Bundle runtime provider is not configured" in (response.content or "")
+
+
 def test_make_provider_succeeds_for_custom_with_api_base() -> None:
     """Custom provider works when apiBase is configured."""
     config = Config()

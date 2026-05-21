@@ -2,8 +2,39 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from mira_engine.config.schema import Config, primary_model_candidate
-from mira_engine.providers.base import LLMProvider
+from mira_engine.providers.base import LLMProvider, LLMResponse
+
+_BUNDLE_SETUP_MODEL = "custom/mira-ui-bundle-setup"
+_BUNDLE_SETUP_API_BASE = "http://127.0.0.1:9/v1"
+_BUNDLE_SETUP_MESSAGE = (
+    "Bundle runtime provider is not configured. Open Settings > Local Runtime Config "
+    "and choose a provider before retrying."
+)
+
+
+class BundleSetupRequiredProvider(LLMProvider):
+    """Placeholder provider that keeps the bundle gateway alive until UI setup."""
+
+    def __init__(self, default_model: str = _BUNDLE_SETUP_MODEL):
+        self.default_model = default_model
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse:
+        return LLMResponse(content=_BUNDLE_SETUP_MESSAGE, finish_reason="error")
+
+    def get_default_model(self) -> str:
+        return self.default_model
 
 
 def resolve_provider_proxy(config: Config) -> str | None:
@@ -41,6 +72,9 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
 
     if provider_name == "custom":
         api_base = config.get_api_base(resolved_model)
+        normalized_base = api_base.rstrip("/") if isinstance(api_base, str) else ""
+        if resolved_model == _BUNDLE_SETUP_MODEL or normalized_base == _BUNDLE_SETUP_API_BASE.rstrip("/"):
+            return BundleSetupRequiredProvider(default_model=resolved_model)
         # Require explicit apiBase configuration for custom provider
         if not api_base:
             raise ValueError(

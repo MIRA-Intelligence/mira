@@ -19,7 +19,7 @@ import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 from loguru import logger
@@ -31,7 +31,7 @@ from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.config import loader as config_loader
 from mira_engine.config.paths import get_runtime_subdir
-from mira_engine.config.schema import UiChannelConfig
+from mira_engine.config.schema import Config, UiChannelConfig
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
     build_ui_runtime_payload,
@@ -497,6 +497,7 @@ class UiChannel(BaseChannel):
         bind_host: str | None = None,
         bind_port: int | None = None,
         restrict_to_workspace: bool = True,
+        on_runtime_config_updated: Callable[[Config, Path], Awaitable[None]] | None = None,
     ):
         super().__init__(config, bus)
         self.config: UiChannelConfig = config
@@ -511,6 +512,7 @@ class UiChannel(BaseChannel):
             bind_port if bind_port is not None else (legacy_port if isinstance(legacy_port, int) else 18790)
         )
         self.restrict_to_workspace: bool = restrict_to_workspace
+        self._on_runtime_config_updated = on_runtime_config_updated
         default_root = workspace or Path("~/.mira/workspace")
         self.projects_root: Path = default_root.expanduser().resolve()
         self._project_dir_index_path: Path = _resolve_project_dir_index_path()
@@ -1644,6 +1646,20 @@ class UiChannel(BaseChannel):
                     },
                     status=500,
                 )
+
+            if self._on_runtime_config_updated is not None:
+                try:
+                    await self._on_runtime_config_updated(runtime_config, self.projects_root)
+                except Exception as exc:
+                    logger.exception("Failed to apply runtime config update")
+                    return web.json_response(
+                        {
+                            "error": f"failed to apply runtime config: {exc}",
+                            "projects_root": str(self.projects_root),
+                            "config_path": str(config_path),
+                        },
+                        status=500,
+                    )
 
         return web.json_response(
             build_ui_runtime_payload(

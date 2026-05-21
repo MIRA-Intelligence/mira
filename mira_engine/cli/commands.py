@@ -31,6 +31,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
+from loguru import logger
 
 from mira_engine import __logo__, __version__
 from mira_engine.agent.routing import ModelRouter
@@ -861,6 +862,7 @@ def gateway(
     bus = MessageBus()
     provider = _make_provider(config)
     model_router = ModelRouter(config.agents.defaults)
+    provider_factory = lambda model: _make_provider_for_model(config, model)
     default_tz = config.agents.defaults.timezone
     session_manager = SessionManager(config.workspace_path)
 
@@ -888,7 +890,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        provider_factory=lambda model: _make_provider_for_model(config, model),
+        provider_factory=provider_factory,
         model_router=model_router,
     )
 
@@ -946,9 +948,6 @@ def gateway(
         return response
     cron.on_job = on_cron_job
 
-    # Create channel manager
-    channels = ChannelManager(config, bus)
-
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
@@ -998,6 +997,55 @@ def gateway(
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
+    )
+
+    async def on_ui_runtime_config_updated(next_config: Config, projects_root: Path) -> None:
+        nonlocal config, provider, model_router, provider_factory, default_tz, session_manager
+
+        next_provider = _make_provider(next_config)
+        next_model_router = ModelRouter(next_config.agents.defaults)
+        next_provider_factory = lambda model: _make_provider_for_model(next_config, model)
+        next_tz = next_config.agents.defaults.timezone
+        next_workspace = projects_root.expanduser()
+
+        await agent.reconfigure_runtime(
+            provider=next_provider,
+            model=next_config.agents.defaults.primary_model,
+            provider_factory=next_provider_factory,
+            model_router=next_model_router,
+            workspace=next_workspace,
+            max_iterations=next_config.agents.defaults.max_tool_iterations,
+            max_tokens=next_config.agents.defaults.max_tokens,
+            reasoning_effort=next_config.agents.defaults.reasoning_effort,
+            restrict_to_workspace=next_config.tools.restrict_to_workspace,
+            brave_api_key=next_config.tools.web.search.api_key or None,
+            web_proxy=next_config.tools.web.proxy or None,
+            exec_config=next_config.tools.exec,
+            timezone=next_tz,
+            channels_config=next_config.channels,
+            context_window_tokens=next_config.agents.defaults.context_window_tokens,
+        )
+
+        heartbeat.provider = next_provider
+        heartbeat.model = agent.model
+        heartbeat.workspace = next_workspace
+        heartbeat.interval_s = next_config.gateway.heartbeat.interval_s
+        heartbeat.enabled = next_config.gateway.heartbeat.enabled
+        session_manager = agent.sessions
+
+        config = next_config
+        provider = next_provider
+        model_router = next_model_router
+        provider_factory = next_provider_factory
+        default_tz = next_tz
+        logger.info("Gateway runtime config reloaded from UI settings")
+
+    # Create channel manager after the reload callback exists so UI config
+    # saves can update the live agent runtime without restarting the service.
+    channels = ChannelManager(
+        config,
+        bus,
+        on_ui_runtime_config_updated=on_ui_runtime_config_updated,
     )
 
     if channels.enabled_channels:
