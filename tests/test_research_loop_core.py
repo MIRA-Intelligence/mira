@@ -174,6 +174,12 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert ResearchAgentLoop._looks_like_failure_response("出现错误但已捕获，继续下一步。") is False
     # System-level blockers and explicit "I cannot continue" verdicts still halt.
     assert ResearchAgentLoop._looks_like_failure_response("Tool call failed: provider unreachable.") is True
+    assert (
+        ResearchAgentLoop._looks_like_failure_response(
+            "Error calling LLM: Error -3 while decompressing data: incorrect header check"
+        )
+        is True
+    )
     assert ResearchAgentLoop._looks_like_failure_response("Memory archival failed during /new.") is True
     assert (
         ResearchAgentLoop._looks_like_failure_response(

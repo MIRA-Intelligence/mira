@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
 import plistlib
-import shutil
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -52,6 +53,49 @@ DIAGNOSTICS_LOG_TAIL_LINES = 200
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _engine_manifest_path() -> Path:
+    return Path(sys.executable).with_name("mira-engine.manifest.json")
+
+
+def _load_engine_manifest() -> dict[str, Any] | None:
+    path = _engine_manifest_path()
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fp:
+            for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _current_engine_identity() -> dict[str, Any]:
+    executable = Path(sys.executable)
+    manifest = _load_engine_manifest()
+    identity: dict[str, Any] = {
+        "engine_executable": str(executable),
+        "engine_manifest_path": str(_engine_manifest_path()),
+    }
+    if manifest is not None:
+        identity["engine_manifest"] = manifest
+        identity["engine_sha256"] = manifest.get("sha256")
+        return identity
+
+    identity["engine_manifest"] = None
+    identity["engine_sha256"] = _sha256_file(executable)
+    return identity
 
 
 @dataclass
@@ -181,6 +225,7 @@ class LocalServiceManager:
             state["home"] = str(Path(home).expanduser())
         if config_path is not None:
             state["config_path"] = str(Path(config_path).expanduser())
+        state.update(_current_engine_identity())
         self.save_state(state)
         self._append_log("install_service", installed=True)
         return EXIT_OK, "service metadata installed"
@@ -229,6 +274,10 @@ class LocalServiceManager:
             "installed_at": state.get("installed_at"),
             "last_started_at": state.get("last_started_at"),
             "last_stopped_at": state.get("last_stopped_at"),
+            "engine_executable": state.get("engine_executable"),
+            "engine_manifest_path": state.get("engine_manifest_path"),
+            "engine_manifest": state.get("engine_manifest"),
+            "engine_sha256": state.get("engine_sha256"),
         }
 
     def doctor(self) -> tuple[int, dict[str, Any]]:
@@ -974,6 +1023,14 @@ class LaunchdServiceManager(LocalServiceManager):
         payload["service_mode"] = "launchd"
         payload["launchd_label"] = LAUNCHD_LABEL
         payload["launchd_plist"] = str(self.paths.launchd_plist)
+        try:
+            with self.paths.launchd_plist.open("rb") as fp:
+                plist = plistlib.load(fp)
+            args = plist.get("ProgramArguments") if isinstance(plist, dict) else None
+            if isinstance(args, list) and args:
+                payload["launchd_program"] = args[0]
+        except (OSError, plistlib.InvalidFileException):
+            pass
         if result.returncode != 0 and payload.get("installed"):
             payload["last_launchctl_error"] = result.stderr.strip()
         return base_code, payload

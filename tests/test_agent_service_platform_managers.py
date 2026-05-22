@@ -1,3 +1,4 @@
+import json
 import plistlib
 from types import SimpleNamespace
 from unittest.mock import mock_open
@@ -53,6 +54,11 @@ def test_launchd_manager_writes_bundle_environment(monkeypatch, tmp_path):
     engine = tmp_path / "app" / "mira-engine"
     engine.parent.mkdir(parents=True)
     engine.write_text("engine", encoding="utf-8")
+    manifest = {"schema": 1, "sha256": "abc123", "uiBundleVersion": "0.4.0-rc.3"}
+    (engine.parent / "mira-engine.manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
     config_path = tmp_path / ".mira" / "config.json"
     monkeypatch.setattr(agent_service.sys, "executable", str(engine))
     monkeypatch.setattr(agent_service.sys, "frozen", True, raising=False)
@@ -95,6 +101,12 @@ def test_launchd_manager_writes_bundle_environment(monkeypatch, tmp_path):
         "PYINSTALLER_RESET_ENVIRONMENT": "1",
         "PYTHONUNBUFFERED": "1",
     }
+    status_code, status_payload = manager.status()
+    assert status_code == EXIT_OK
+    assert status_payload["engine_executable"] == str(engine)
+    assert status_payload["engine_manifest"] == manifest
+    assert status_payload["engine_sha256"] == "abc123"
+    assert status_payload["launchd_program"] == str(engine)
     assert ["launchctl", "bootstrap", "gui/501", str(manager.paths.launchd_plist)] in calls
 
 

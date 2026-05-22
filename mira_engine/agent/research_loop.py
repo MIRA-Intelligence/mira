@@ -303,6 +303,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         hard_signals = (
             "traceback (most recent call last)",
             "sorry, i encountered an error",
+            "error calling llm",
             "memory archival failed",
             "tool call failed",
             "unrecoverable error",
