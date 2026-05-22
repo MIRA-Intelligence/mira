@@ -75,16 +75,22 @@ class CronService:
         self.on_job = on_job
         self.max_sleep_ms = max(1, max_sleep_ms)
         self._store: CronStore | None = None
-        self._last_mtime_ns: int = 0
+        self._last_store_signature: tuple[int, int] = (0, 0)
         self._timer_task: asyncio.Task | None = None
         self._running = False
         self._protected_job_ids: set[str] = set()
 
+    def _store_file_signature(self) -> tuple[int, int]:
+        if not self.store_path.exists():
+            return (0, 0)
+        stat = self.store_path.stat()
+        return (stat.st_mtime_ns, stat.st_size)
+
     def _load_store(self) -> CronStore:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
         if self._store and self.store_path.exists():
-            mtime_ns = self.store_path.stat().st_mtime_ns
-            if mtime_ns != self._last_mtime_ns:
+            signature = self._store_file_signature()
+            if signature != self._last_store_signature:
                 logger.info("Cron: jobs.json modified externally, reloading")
                 self._store = None
         if self._store:
@@ -93,10 +99,10 @@ class CronService:
         if self.store_path.exists():
             parsed = self._read_store_from_disk()
             self._store = parsed if parsed is not None else CronStore()
-            self._last_mtime_ns = self.store_path.stat().st_mtime_ns
+            self._last_store_signature = self._store_file_signature()
         else:
             self._store = CronStore()
-            self._last_mtime_ns = 0
+            self._last_store_signature = (0, 0)
 
         return self._store
 
@@ -153,9 +159,9 @@ class CronService:
         if not self._store:
             return
 
-        if self.store_path.exists() and self._last_mtime_ns:
-            current_mtime_ns = self.store_path.stat().st_mtime_ns
-            if current_mtime_ns != self._last_mtime_ns:
+        if self.store_path.exists() and self._last_store_signature != (0, 0):
+            current_signature = self._store_file_signature()
+            if current_signature != self._last_store_signature:
                 external = self._read_store_from_disk()
                 if external is not None:
                     local_ids = {job.id for job in self._store.jobs}
@@ -210,7 +216,7 @@ class CronService:
         }
 
         self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        self._last_mtime_ns = self.store_path.stat().st_mtime_ns
+        self._last_store_signature = self._store_file_signature()
     
     async def start(self) -> None:
         """Start the cron service."""
@@ -291,9 +297,8 @@ class CronService:
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
         try:
-            response = None
             if self.on_job:
-                response = await self.on_job(job)
+                await self.on_job(job)
 
             job.state.last_status = "ok"
             job.state.last_error = None

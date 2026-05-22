@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -19,9 +20,16 @@ from mira_engine.utils.restart import consume_restart_notice_from_env, format_re
 class ChannelManager:
     """Manage channel lifecycle and outbound delivery."""
 
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        *,
+        on_ui_runtime_config_updated: Callable[[Config, Path], Awaitable[None]] | None = None,
+    ):
         self.config = config
         self.bus = bus
+        self.on_ui_runtime_config_updated = on_ui_runtime_config_updated
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._init_channels()
@@ -103,6 +111,7 @@ class ChannelManager:
                     kwargs["workspace"] = self.config.workspace_path
                     kwargs["bind_host"] = self.config.gateway.host
                     kwargs["bind_port"] = self.config.gateway.port
+                    kwargs["on_runtime_config_updated"] = self.on_ui_runtime_config_updated
                 self.channels[name] = cls(self._to_ns(section), self.bus, **kwargs)
                 logger.info("{} channel enabled", name)
             except ImportError as e:

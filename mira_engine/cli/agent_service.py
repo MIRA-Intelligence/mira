@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
 import plistlib
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -18,6 +20,7 @@ from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape as xml_escape
 
 import typer
 from rich.console import Console
@@ -39,6 +42,9 @@ EXIT_NOT_INSTALLED = 2
 LAUNCHD_LABEL = "com.projectmira.engine"
 SYSTEMD_UNIT_NAME = "mira-engine.service"
 WINDOWS_SERVICE_NAME = "MiraEngine"
+WINDOWS_SERVICE_DISPLAY_NAME = "Mira Engine"
+WINDOWS_SERVICE_WRAPPER_NAME = "MiraEngineService.exe"
+WINDOWS_SERVICE_CONFIG_NAME = "MiraEngineService.xml"
 DEFAULT_PORT = 18790
 LOG_ROTATE_BYTES = 1_000_000
 LOG_ROTATE_FILES = 3
@@ -47,6 +53,49 @@ DIAGNOSTICS_LOG_TAIL_LINES = 200
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _engine_manifest_path() -> Path:
+    return Path(sys.executable).with_name("mira-engine.manifest.json")
+
+
+def _load_engine_manifest() -> dict[str, Any] | None:
+    path = _engine_manifest_path()
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fp:
+            for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _current_engine_identity() -> dict[str, Any]:
+    executable = Path(sys.executable)
+    manifest = _load_engine_manifest()
+    identity: dict[str, Any] = {
+        "engine_executable": str(executable),
+        "engine_manifest_path": str(_engine_manifest_path()),
+    }
+    if manifest is not None:
+        identity["engine_manifest"] = manifest
+        identity["engine_sha256"] = manifest.get("sha256")
+        return identity
+
+    identity["engine_manifest"] = None
+    identity["engine_sha256"] = _sha256_file(executable)
+    return identity
 
 
 @dataclass
@@ -64,7 +113,12 @@ class AgentPaths:
 
     @classmethod
     def default(cls) -> "AgentPaths":
-        root = Path.home() / ".mira"
+        return cls.for_home(Path.home())
+
+    @classmethod
+    def for_home(cls, home: Path) -> "AgentPaths":
+        home_path = home.expanduser()
+        root = home_path / ".mira"
         return cls(
             root=root,
             config_dir=root / "config",
@@ -73,8 +127,8 @@ class AgentPaths:
             runtime_dir=root / "runtime",
             state_file=root / "runtime" / "agent-service-state.json",
             log_file=root / "logs" / "agent-service.log",
-            launchd_plist=Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
-            systemd_unit=Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME,
+            launchd_plist=home_path / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
+            systemd_unit=home_path / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME,
             backups_dir=root / "runtime" / "backups",
         )
 
@@ -152,7 +206,13 @@ class LocalServiceManager:
             encoding="utf-8",
         )
 
-    def install_service(self, host: str | None = None, port: int | None = None) -> tuple[int, str]:
+    def install_service(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        home: str | None = None,
+        config_path: str | None = None,
+    ) -> tuple[int, str]:
         state = self.load_state()
         self.paths.ensure()
         state["installed"] = True
@@ -161,6 +221,11 @@ class LocalServiceManager:
             state["host"] = host
         if port is not None:
             state["port"] = port
+        if home is not None:
+            state["home"] = str(Path(home).expanduser())
+        if config_path is not None:
+            state["config_path"] = str(Path(config_path).expanduser())
+        state.update(_current_engine_identity())
         self.save_state(state)
         self._append_log("install_service", installed=True)
         return EXIT_OK, "service metadata installed"
@@ -209,6 +274,10 @@ class LocalServiceManager:
             "installed_at": state.get("installed_at"),
             "last_started_at": state.get("last_started_at"),
             "last_stopped_at": state.get("last_stopped_at"),
+            "engine_executable": state.get("engine_executable"),
+            "engine_manifest_path": state.get("engine_manifest_path"),
+            "engine_manifest": state.get("engine_manifest"),
+            "engine_sha256": state.get("engine_sha256"),
         }
 
     def doctor(self) -> tuple[int, dict[str, Any]]:
@@ -289,8 +358,14 @@ WantedBy=default.target
 """
         self.paths.systemd_unit.write_text(content, encoding="utf-8")
 
-    def install_service(self, host: str | None = None, port: int | None = None) -> tuple[int, str]:
-        code, msg = super().install_service(host, port)
+    def install_service(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        home: str | None = None,
+        config_path: str | None = None,
+    ) -> tuple[int, str]:
+        code, msg = super().install_service(host, port, home, config_path)
         if code != EXIT_OK:
             return code, msg
         state = self.load_state()
@@ -357,8 +432,8 @@ WantedBy=default.target
         return base_code, payload
 
 
-class WindowsServiceManager(LocalServiceManager):
-    """Windows detached background-process manager."""
+class WindowsBackgroundProcessManager(LocalServiceManager):
+    """Legacy Windows detached background-process manager."""
 
     SERVICE_MODE = "windows-background"
 
@@ -382,8 +457,14 @@ class WindowsServiceManager(LocalServiceManager):
     def _terminate_pid(self, pid: int) -> subprocess.CompletedProcess[str]:
         return self._run_windows_tool("taskkill", "/PID", str(pid), "/T", "/F")
 
-    def install_service(self, host: str | None = None, port: int | None = None) -> tuple[int, str]:
-        code, msg = super().install_service(host, port)
+    def install_service(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        home: str | None = None,
+        config_path: str | None = None,
+    ) -> tuple[int, str]:
+        code, msg = super().install_service(host, port, home, config_path)
         if code != EXIT_OK:
             return code, msg
         state = self.load_state()
@@ -420,7 +501,11 @@ class WindowsServiceManager(LocalServiceManager):
 
         host = str(state.get("host", "127.0.0.1"))
         port = int(state.get("port", DEFAULT_PORT))
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+        creationflags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
         log_fp = self.paths.log_file.open("a", encoding="utf-8")
         try:
             proc = subprocess.Popen(
@@ -494,6 +579,317 @@ class WindowsServiceManager(LocalServiceManager):
         return base_code, payload
 
 
+class WindowsServiceManager(LocalServiceManager):
+    """Windows Service manager backed by a bundled WinSW service wrapper."""
+
+    SERVICE_MODE = "windows-service"
+
+    def __init__(self, paths: AgentPaths) -> None:
+        super().__init__(paths)
+        self._fallback = WindowsBackgroundProcessManager(paths)
+
+    def _background_fallback_enabled(self) -> bool:
+        value = os.environ.get("MIRA_ENGINE_WINDOWS_BACKGROUND_FALLBACK", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _run_windows_tool(self, *args: str) -> subprocess.CompletedProcess[str]:
+        kwargs: dict[str, Any] = {
+            "capture_output": True,
+            "text": True,
+            "check": False,
+        }
+        if platform.system().lower() == "windows":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return subprocess.run(list(args), **kwargs)
+
+    def _wrapper_candidates(self) -> list[Path]:
+        candidates: list[Path] = []
+        env_path = os.environ.get("MIRA_ENGINE_SERVICE_WRAPPER", "").strip()
+        if env_path:
+            candidates.append(Path(env_path).expanduser())
+        candidates.append(Path(sys.executable).resolve().with_name(WINDOWS_SERVICE_WRAPPER_NAME))
+        meipass = getattr(sys, "_MEIPASS", None)
+        if isinstance(meipass, str) and meipass:
+            candidates.append(Path(meipass) / WINDOWS_SERVICE_WRAPPER_NAME)
+        candidates.append(self.paths.runtime_dir / WINDOWS_SERVICE_WRAPPER_NAME)
+        seen: set[Path] = set()
+        unique: list[Path] = []
+        for candidate in candidates:
+            normalized = candidate.expanduser()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append(normalized)
+        return unique
+
+    def _resolve_wrapper_source(self) -> Path | None:
+        for candidate in self._wrapper_candidates():
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _staged_wrapper_path(self) -> Path:
+        return self.paths.runtime_dir / WINDOWS_SERVICE_WRAPPER_NAME
+
+    def _service_xml_path(self, wrapper_path: Path) -> Path:
+        return wrapper_path.with_name(WINDOWS_SERVICE_CONFIG_NAME)
+
+    def _stage_wrapper(self, source: Path) -> Path:
+        self.paths.ensure()
+        target = self._staged_wrapper_path()
+        if source.resolve(strict=False) != target.resolve(strict=False):
+            shutil.copy2(source, target)
+        return target
+
+    def _write_service_xml(
+        self,
+        wrapper_path: Path,
+        *,
+        host: str,
+        port: int,
+        home: str | None,
+        config_path: str | None,
+    ) -> tuple[Path, Path]:
+        home_path = Path(home).expanduser() if home else Path.home()
+        config_file = (
+            Path(config_path).expanduser()
+            if config_path
+            else home_path / ".mira" / "config.json"
+        )
+        command = _gateway_service_args(host, port)
+        executable = Path(command[0]).expanduser()
+        arguments = subprocess.list2cmdline(command[1:])
+        log_dir = self.paths.log_file.parent
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        def esc(value: object) -> str:
+            return xml_escape(str(value), {'"': "&quot;"})
+
+        payload = f"""<service>
+  <id>{esc(WINDOWS_SERVICE_NAME)}</id>
+  <name>{esc(WINDOWS_SERVICE_DISPLAY_NAME)}</name>
+  <description>Mira local engine gateway for the desktop bundle.</description>
+  <executable>{esc(executable)}</executable>
+  <arguments>{esc(arguments)}</arguments>
+  <workingdirectory>{esc(executable.parent)}</workingdirectory>
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="5 sec" />
+  <resetfailure>1 hour</resetfailure>
+  <env name="PYTHONUNBUFFERED" value="1" />
+  <env name="PYINSTALLER_RESET_ENVIRONMENT" value="1" />
+  <env name="HOME" value="{esc(home_path)}" />
+  <env name="USERPROFILE" value="{esc(home_path)}" />
+  <env name="MIRA_CONFIG_PATH" value="{esc(config_file)}" />
+  <logpath>{esc(log_dir)}</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>{LOG_ROTATE_BYTES}</sizeThreshold>
+    <keepFiles>{LOG_ROTATE_FILES}</keepFiles>
+  </log>
+</service>
+"""
+        xml_path = self._service_xml_path(wrapper_path)
+        xml_path.write_text(payload, encoding="utf-8")
+        return home_path, config_file
+
+    def _run_wrapper(self, command: str) -> subprocess.CompletedProcess[str]:
+        wrapper = self._staged_wrapper_path()
+        return self._run_windows_tool(str(wrapper), command)
+
+    def _wrapper_status(self) -> tuple[bool, bool, str]:
+        wrapper = self._staged_wrapper_path()
+        if not wrapper.is_file():
+            return False, False, "service wrapper is not staged"
+        result = self._run_wrapper("status")
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        normalized = output.lower()
+        installed = result.returncode == 0 and not any(
+            marker in normalized
+            for marker in ("nonexistent", "not installed", "does not exist")
+        )
+        running = any(marker in normalized for marker in ("started", "running"))
+        return installed, running, output
+
+    def _stop_legacy_background_if_needed(self) -> None:
+        state = self.load_state()
+        if state.get("service_mode") == WindowsBackgroundProcessManager.SERVICE_MODE:
+            self._fallback.stop()
+
+    def _fallback_install(
+        self,
+        *,
+        host: str | None,
+        port: int | None,
+        home: str | None,
+        config_path: str | None,
+        reason: str,
+    ) -> tuple[int, str]:
+        if not self._background_fallback_enabled():
+            return EXIT_ERROR, reason
+        code, message = self._fallback.install_service(host, port, home, config_path)
+        state = self.load_state()
+        state["fallback_reason"] = reason
+        self.save_state(state)
+        self._append_log("windows_service_fallback_to_background", reason=reason)
+        return code, f"{message} (fallback: {reason})"
+
+    def install_service(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        home: str | None = None,
+        config_path: str | None = None,
+    ) -> tuple[int, str]:
+        service_host = host or "127.0.0.1"
+        service_port = port or DEFAULT_PORT
+        source = self._resolve_wrapper_source()
+        if source is None:
+            return self._fallback_install(
+                host=host,
+                port=port,
+                home=home,
+                config_path=config_path,
+                reason=f"{WINDOWS_SERVICE_WRAPPER_NAME} not found",
+            )
+
+        self._stop_legacy_background_if_needed()
+        wrapper_path = self._stage_wrapper(source)
+        home_path, config_file = self._write_service_xml(
+            wrapper_path,
+            host=service_host,
+            port=service_port,
+            home=home,
+            config_path=config_path,
+        )
+
+        self._run_wrapper("stop")
+        self._run_wrapper("uninstall")
+        install = self._run_wrapper("install")
+        if install.returncode != 0:
+            message = install.stderr.strip() or install.stdout.strip() or "failed to install Windows service"
+            return self._fallback_install(
+                host=host,
+                port=port,
+                home=home,
+                config_path=config_path,
+                reason=message,
+            )
+
+        code, _ = super().install_service(
+            service_host,
+            service_port,
+            str(home_path),
+            str(config_file),
+        )
+        state = self.load_state()
+        state["service_mode"] = self.SERVICE_MODE
+        state["windows_service"] = WINDOWS_SERVICE_NAME
+        state["windows_service_wrapper"] = str(wrapper_path)
+        state["windows_service_config"] = str(self._service_xml_path(wrapper_path))
+        state["engine_executable"] = _gateway_service_args(service_host, service_port)[0]
+        state["running"] = False
+        state["pid"] = None
+        self.save_state(state)
+        self._append_log(
+            "windows_service_install",
+            wrapper=str(wrapper_path),
+            config=str(self._service_xml_path(wrapper_path)),
+            home=str(home_path),
+            config_path=str(config_file),
+        )
+        return code, f"Windows service installed ({WINDOWS_SERVICE_NAME})"
+
+    def uninstall_service(self) -> tuple[int, str]:
+        state = self.load_state()
+        if state.get("service_mode") == WindowsBackgroundProcessManager.SERVICE_MODE:
+            return self._fallback.uninstall_service()
+        self._run_wrapper("stop")
+        result = self._run_wrapper("uninstall")
+        if result.returncode != 0:
+            message = result.stderr.strip() or result.stdout.strip() or "failed to uninstall Windows service"
+            self._append_log("windows_service_uninstall_failed", error=message)
+            return EXIT_ERROR, message
+        code, msg = super().uninstall_service()
+        state = self.load_state()
+        state["service_mode"] = self.SERVICE_MODE
+        state["pid"] = None
+        state["windows_service"] = WINDOWS_SERVICE_NAME
+        self.save_state(state)
+        self._append_log("windows_service_uninstall", service=WINDOWS_SERVICE_NAME)
+        return code, msg
+
+    def start(self) -> tuple[int, str]:
+        state = self.load_state()
+        if state.get("service_mode") == WindowsBackgroundProcessManager.SERVICE_MODE:
+            return self._fallback.start()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_wrapper("start")
+        if result.returncode != 0:
+            message = result.stderr.strip() or result.stdout.strip() or "failed to start Windows service"
+            self._append_log("windows_service_start_failed", error=message)
+            return EXIT_ERROR, message
+        state["running"] = True
+        state["service_mode"] = self.SERVICE_MODE
+        state["last_started_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("windows_service_start", running=True)
+        return EXIT_OK, "Windows service started"
+
+    def stop(self) -> tuple[int, str]:
+        state = self.load_state()
+        if state.get("service_mode") == WindowsBackgroundProcessManager.SERVICE_MODE:
+            return self._fallback.stop()
+        if not state.get("installed"):
+            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        result = self._run_wrapper("stop")
+        if result.returncode != 0:
+            message = result.stderr.strip() or result.stdout.strip() or "failed to stop Windows service"
+            self._append_log("windows_service_stop_failed", error=message)
+            return EXIT_ERROR, message
+        state["running"] = False
+        state["service_mode"] = self.SERVICE_MODE
+        state["last_stopped_at"] = _now_iso()
+        self.save_state(state)
+        self._append_log("windows_service_stop", running=False)
+        return EXIT_OK, "Windows service stopped"
+
+    def status(self) -> tuple[int, dict[str, Any]]:
+        state = self.load_state()
+        if state.get("service_mode") == WindowsBackgroundProcessManager.SERVICE_MODE:
+            return self._fallback.status()
+        base_code, payload = super().status()
+        installed, running, status_output = self._wrapper_status()
+        if payload.get("installed") != installed or payload.get("running") != running:
+            state["installed"] = installed
+            state["running"] = running
+            self.save_state(state)
+        payload["installed"] = installed
+        payload["running"] = running
+        payload["service_mode"] = self.SERVICE_MODE
+        payload["windows_service"] = WINDOWS_SERVICE_NAME
+        payload["windows_service_wrapper"] = str(self._staged_wrapper_path())
+        payload["windows_service_config"] = str(self._service_xml_path(self._staged_wrapper_path()))
+        if status_output:
+            payload["windows_service_status"] = status_output
+        return base_code, payload
+
+    def doctor(self) -> tuple[int, dict[str, Any]]:
+        code, payload = super().doctor()
+        checks = payload.get("checks", {})
+        if isinstance(checks, dict):
+            installed, running, status_output = self._wrapper_status()
+            checks["windows_service_wrapper_present"] = self._staged_wrapper_path().is_file()
+            checks["windows_service_config_present"] = self._service_xml_path(self._staged_wrapper_path()).is_file()
+            checks["windows_service_installed"] = installed
+            checks["windows_service_running"] = running
+            payload["checks"] = checks
+            payload["healthy"] = all(bool(v) for v in checks.values())
+            payload["windows_service_status"] = status_output
+        payload["windows_service"] = WINDOWS_SERVICE_NAME
+        payload["windows_service_wrapper"] = str(self._staged_wrapper_path())
+        return (EXIT_OK if payload.get("healthy") else EXIT_ERROR), payload
+
+
 class LaunchdServiceManager(LocalServiceManager):
     """macOS launchd-backed lifecycle manager."""
 
@@ -515,8 +911,21 @@ class LaunchdServiceManager(LocalServiceManager):
             check=False,
         )
 
-    def _write_plist(self, host: str, port: int) -> None:
+    def _write_plist(
+        self,
+        host: str,
+        port: int,
+        *,
+        home: str | None,
+        config_path: str | None,
+    ) -> None:
         self.paths.launchd_plist.parent.mkdir(parents=True, exist_ok=True)
+        home_path = Path(home).expanduser() if home else self.paths.root.parent
+        config_file = (
+            Path(config_path).expanduser()
+            if config_path
+            else home_path / ".mira" / "config.json"
+        )
         payload = {
             "Label": LAUNCHD_LABEL,
             "ProgramArguments": _gateway_service_args(host, port),
@@ -524,19 +933,38 @@ class LaunchdServiceManager(LocalServiceManager):
             "KeepAlive": True,
             "StandardOutPath": str(self.paths.log_file),
             "StandardErrorPath": str(self.paths.log_file),
-            "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
+            "EnvironmentVariables": {
+                "HOME": str(home_path),
+                "MIRA_CONFIG_PATH": str(config_file),
+                "PYINSTALLER_RESET_ENVIRONMENT": "1",
+                "PYTHONUNBUFFERED": "1",
+            },
         }
         with self.paths.launchd_plist.open("wb") as fp:
             plistlib.dump(payload, fp)
 
-    def install_service(self, host: str | None = None, port: int | None = None) -> tuple[int, str]:
-        code, msg = super().install_service(host, port)
+    def install_service(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        home: str | None = None,
+        config_path: str | None = None,
+    ) -> tuple[int, str]:
+        code, msg = super().install_service(host, port, home, config_path)
         if code != EXIT_OK:
             return code, msg
         state = self.load_state()
+        service_home = state.get("home") if isinstance(state.get("home"), str) else home
+        service_config_path = (
+            state.get("config_path")
+            if isinstance(state.get("config_path"), str)
+            else config_path
+        )
         self._write_plist(
             str(state.get("host", "127.0.0.1")),
-            int(state.get("port", DEFAULT_PORT))
+            int(state.get("port", DEFAULT_PORT)),
+            home=service_home,
+            config_path=service_config_path,
         )
         bootstrap = self._run_launchctl("bootstrap", self._domain, str(self.paths.launchd_plist))
         # launchd returns non-zero when already loaded; try cleanup then retry once.
@@ -595,6 +1023,14 @@ class LaunchdServiceManager(LocalServiceManager):
         payload["service_mode"] = "launchd"
         payload["launchd_label"] = LAUNCHD_LABEL
         payload["launchd_plist"] = str(self.paths.launchd_plist)
+        try:
+            with self.paths.launchd_plist.open("rb") as fp:
+                plist = plistlib.load(fp)
+            args = plist.get("ProgramArguments") if isinstance(plist, dict) else None
+            if isinstance(args, list) and args:
+                payload["launchd_program"] = args[0]
+        except (OSError, plistlib.InvalidFileException):
+            pass
         if result.returncode != 0 and payload.get("installed"):
             payload["last_launchctl_error"] = result.stderr.strip()
         return base_code, payload
@@ -612,15 +1048,17 @@ class LaunchdServiceManager(LocalServiceManager):
         return (EXIT_OK if payload.get("healthy") else EXIT_ERROR), payload
 
 
-def _manager() -> LocalServiceManager:
+def _manager(paths: AgentPaths | None = None) -> LocalServiceManager:
     mode = os.environ.get("MIRA_AGENT_SERVICE_MODE", "auto").strip().lower()
-    paths = AgentPaths.default()
+    paths = paths or AgentPaths.default()
     if mode == "launchd":
         return LaunchdServiceManager(paths)
     if mode == "systemd":
         return SystemdUserServiceManager(paths)
     if mode == "windows":
         return WindowsServiceManager(paths)
+    if mode == "windows-background":
+        return WindowsBackgroundProcessManager(paths)
     if mode == "local":
         return LocalServiceManager(paths)
     platform_name = platform.system().lower()
@@ -631,6 +1069,11 @@ def _manager() -> LocalServiceManager:
     if platform_name == "windows":
         return WindowsServiceManager(paths)
     return LocalServiceManager(paths)
+
+
+def _manager_for_home(home: str | None = None) -> LocalServiceManager:
+    paths = AgentPaths.for_home(Path(home)) if home else None
+    return _manager(paths)
 
 
 def _current_version(package: str) -> str | None:
@@ -702,43 +1145,68 @@ def _health_check(port: int, timeout_s: float = 3.0) -> bool:
 def install_service(
     host: str = typer.Option("127.0.0.1", "--host", help="Gateway host"),
     port: int = typer.Option(DEFAULT_PORT, "--port", "-p", help="Gateway port"),
+    home: str | None = typer.Option(
+        None,
+        "--home",
+        help="User home directory for Windows service environment.",
+    ),
+    config_path: str | None = typer.Option(
+        None,
+        "--config",
+        help="Config path for Windows service environment.",
+    ),
 ) -> None:
-    code, message = _manager().install_service(host=host, port=port)
+    code, message = _manager_for_home(home).install_service(
+        host=host,
+        port=port,
+        home=home,
+        config_path=config_path,
+    )
     console.print(message)
     raise typer.Exit(code)
 
 
 @app.command()
-def uninstall_service() -> None:
-    code, message = _manager().uninstall_service()
+def uninstall_service(
+    home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
+) -> None:
+    code, message = _manager_for_home(home).uninstall_service()
     console.print(message)
     raise typer.Exit(code)
 
 
 @app.command()
-def start() -> None:
-    code, message = _manager().start()
+def start(
+    home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
+) -> None:
+    code, message = _manager_for_home(home).start()
     console.print(message)
     raise typer.Exit(code)
 
 
 @app.command()
-def stop() -> None:
-    code, message = _manager().stop()
+def stop(
+    home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
+) -> None:
+    code, message = _manager_for_home(home).stop()
     console.print(message)
     raise typer.Exit(code)
 
 
 @app.command()
-def status() -> None:
-    code, payload = _manager().status()
+def status(
+    home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
+) -> None:
+    code, payload = _manager_for_home(home).status()
     console.print_json(data=payload)
     raise typer.Exit(code)
 
 
 @app.command()
-def logs() -> None:
-    path = _manager().paths.log_file
+def logs(
+    home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
+) -> None:
+    path = _manager_for_home(home).paths.log_file
     console.print(str(path))
     raise typer.Exit(EXIT_OK)
 
@@ -746,8 +1214,9 @@ def logs() -> None:
 @app.command()
 def doctor(
     export: bool = typer.Option(False, "--export", help="Export diagnostics bundle."),
+    home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
 ) -> None:
-    manager = _manager()
+    manager = _manager_for_home(home)
     code, payload = manager.doctor()
     if export:
         export_code, bundle_path = manager.export_diagnostics()

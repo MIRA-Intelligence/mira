@@ -926,6 +926,30 @@ def test_gateway_workspace_option_overrides_config(monkeypatch, tmp_path: Path) 
     assert config.workspace_path == override
 
 
+def test_gateway_reports_workspace_bootstrap_failure(monkeypatch, tmp_path: Path) -> None:
+    config_file = _write_instance_config(tmp_path)
+    config = Config()
+    config.agents.defaults.workspace = "/homes/clwang/.mira/workspace"
+
+    def _fail_workspace_sync(_workspace: Path) -> None:
+        raise OSError(30, "Read-only file system", "/homes")
+
+    _patch_cli_command_runtime(
+        monkeypatch,
+        config,
+        sync_templates=_fail_workspace_sync,
+    )
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert result.exit_code == 1
+    stripped_output = _strip_ansi(result.stdout)
+    assert "Mira workspace is not accessible" in stripped_output
+    assert "/homes/clwang/.mira/workspace" in stripped_output
+    assert "agents.defaults.workspace" in stripped_output
+    assert "Read-only file system" in stripped_output
+
+
 def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Path) -> None:
     config_file = _write_instance_config(tmp_path)
     config = Config()

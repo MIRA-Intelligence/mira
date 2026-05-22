@@ -17,6 +17,7 @@ from mira_engine.providers.openai_responses import (
 )
 
 _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
+_DEFAULT_ACCEPT_ENCODING = "identity"
 
 
 class AzureOpenAIProvider(LLMProvider):
@@ -46,6 +47,7 @@ class AzureOpenAIProvider(LLMProvider):
             default_headers={
                 "api-key": api_key,
                 "x-session-affinity": uuid.uuid4().hex,
+                "Accept-Encoding": _DEFAULT_ACCEPT_ENCODING,
             },
             max_retries=0,
         )

@@ -31,6 +31,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
+from loguru import logger
 
 from mira_engine import __logo__, __version__
 from mira_engine.agent.routing import ModelRouter
@@ -292,6 +293,52 @@ def _init_prompt_session() -> None:
         enable_open_in_editor=False,
         multiline=False,   # Enter submits (single line mode)
     )
+
+
+def _is_llm_error(text: str) -> bool:
+    """Return True when the response looks like a provider/LLM error."""
+    if not text:
+        return False
+    t = text.strip()
+    return (
+        t.startswith("Error:")
+        or t.startswith("Error calling LLM:")
+        or "Internal Server Error" in t
+        or t.startswith("Sorry, I encountered an error calling the AI model.")
+    )
+
+
+def _print_llm_error(
+    error_text: str,
+    *,
+    model: str | None = None,
+    provider_name: str | None = None,
+) -> None:
+    """Print a provider/LLM error with actionable context."""
+    raw = error_text.strip()
+
+    # Extract the underlying detail after "Error: "
+    detail = raw
+    for prefix in ("Error calling LLM: ", "Error: "):
+        if raw.startswith(prefix):
+            detail = raw[len(prefix):]
+            break
+
+    console.print()
+    console.print(f"[red]{__logo__} mira — LLM error[/red]")
+    console.print()
+
+    if provider_name:
+        console.print(f"  [cyan]Provider:[/cyan] {provider_name}")
+    if model:
+        console.print(f"  [cyan]Model:[/cyan] {model}")
+
+    console.print()
+    console.print(f"  [bold red]{detail}[/bold red]")
+    console.print()
+    console.print("  [dim]The AI model failed to respond. Try again or check your[/dim]")
+    console.print("  [dim]API key and network connection.[/dim]")
+    console.print()
 
 
 def _print_agent_response(
@@ -746,6 +793,23 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
     return loaded
 
 
+def _sync_workspace_templates_or_exit(workspace: Path) -> None:
+    """Initialize workspace templates or fail with an actionable config error."""
+    try:
+        sync_workspace_templates(workspace)
+    except OSError as exc:
+        from mira_engine.config.loader import get_config_path
+
+        console.print("[red]Error: Mira workspace is not accessible.[/red]")
+        console.print(f"Workspace: {workspace}")
+        console.print(f"Config: {get_config_path()}")
+        console.print(
+            "Update agents.defaults.workspace in the active config, or choose a valid Workspace path in MIRA Settings."
+        )
+        console.print(f"Original error: {exc}")
+        raise typer.Exit(1) from exc
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -825,9 +889,6 @@ def gateway(
 
     config = _load_runtime_config(config, workspace)
 
-    from mira_engine.utils.env import auto_activate_env
-    auto_activate_env(config.workspace_path)
-
     if host is not None:
         config.gateway.host = host
 
@@ -840,10 +901,11 @@ def gateway(
     _gateway_failsafe_check(gateway_host, gateway_port, verbose)
 
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
-    sync_workspace_templates(config.workspace_path)
+    _sync_workspace_templates_or_exit(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
     model_router = ModelRouter(config.agents.defaults)
+    provider_factory = lambda model: _make_provider_for_model(config, model)
     default_tz = config.agents.defaults.timezone
     session_manager = SessionManager(config.workspace_path)
 
@@ -871,7 +933,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        provider_factory=lambda model: _make_provider_for_model(config, model),
+        provider_factory=provider_factory,
         model_router=model_router,
     )
 
@@ -929,9 +991,6 @@ def gateway(
         return response
     cron.on_job = on_cron_job
 
-    # Create channel manager
-    channels = ChannelManager(config, bus)
-
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
@@ -981,6 +1040,55 @@ def gateway(
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
+    )
+
+    async def on_ui_runtime_config_updated(next_config: Config, projects_root: Path) -> None:
+        nonlocal config, provider, model_router, provider_factory, default_tz, session_manager
+
+        next_provider = _make_provider(next_config)
+        next_model_router = ModelRouter(next_config.agents.defaults)
+        next_provider_factory = lambda model: _make_provider_for_model(next_config, model)
+        next_tz = next_config.agents.defaults.timezone
+        next_workspace = projects_root.expanduser()
+
+        await agent.reconfigure_runtime(
+            provider=next_provider,
+            model=next_config.agents.defaults.primary_model,
+            provider_factory=next_provider_factory,
+            model_router=next_model_router,
+            workspace=next_workspace,
+            max_iterations=next_config.agents.defaults.max_tool_iterations,
+            max_tokens=next_config.agents.defaults.max_tokens,
+            reasoning_effort=next_config.agents.defaults.reasoning_effort,
+            restrict_to_workspace=next_config.tools.restrict_to_workspace,
+            brave_api_key=next_config.tools.web.search.api_key or None,
+            web_proxy=next_config.tools.web.proxy or None,
+            exec_config=next_config.tools.exec,
+            timezone=next_tz,
+            channels_config=next_config.channels,
+            context_window_tokens=next_config.agents.defaults.context_window_tokens,
+        )
+
+        heartbeat.provider = next_provider
+        heartbeat.model = agent.model
+        heartbeat.workspace = next_workspace
+        heartbeat.interval_s = next_config.gateway.heartbeat.interval_s
+        heartbeat.enabled = next_config.gateway.heartbeat.enabled
+        session_manager = agent.sessions
+
+        config = next_config
+        provider = next_provider
+        model_router = next_model_router
+        provider_factory = next_provider_factory
+        default_tz = next_tz
+        logger.info("Gateway runtime config reloaded from UI settings")
+
+    # Create channel manager after the reload callback exists so UI config
+    # saves can update the live agent runtime without restarting the service.
+    channels = ChannelManager(
+        config,
+        bus,
+        on_ui_runtime_config_updated=on_ui_runtime_config_updated,
     )
 
     if channels.enabled_channels:
@@ -1140,6 +1248,8 @@ def _run_cli_agent_session(
     logs_mode: bool,
     inbound_metadata: dict[str, object] | None = None,
     interactive_banner: str | None = None,
+    model_name: str | None = None,
+    provider_name: str | None = None,
 ) -> None:
     """Drive a single message or REPL session against ``agent_loop``.
 
@@ -1196,13 +1306,24 @@ def _run_cli_agent_session(
                         metadata=inbound_metadata,
                     )
             if hasattr(response, "content"):
-                _print_agent_response(
-                    getattr(response, "content", ""),
-                    render_markdown=markdown,
-                    metadata=getattr(response, "metadata", {}) or {},
+                resp_text = getattr(response, "content", "")
+                resp_meta = getattr(response, "metadata", {}) or {}
+            else:
+                resp_text = str(response)
+                resp_meta = {}
+
+            if _is_llm_error(resp_text):
+                _print_llm_error(
+                    resp_text,
+                    model=model_name or getattr(agent_loop, "model", None),
+                    provider_name=provider_name,
                 )
             else:
-                _print_agent_response(str(response), render_markdown=markdown, metadata={})
+                _print_agent_response(
+                    resp_text,
+                    render_markdown=markdown,
+                    metadata=resp_meta,
+                )
             if verbose_mode:
                 used = ", ".join(sorted(invoked_skills)) if invoked_skills else "none"
                 console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
@@ -1390,9 +1511,6 @@ def agent(
 
     config = _load_runtime_config(config, workspace)
 
-    from mira_engine.utils.env import auto_activate_env
-    auto_activate_env(config.workspace_path)
-
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
@@ -1428,6 +1546,8 @@ def agent(
         verbose_mode=verbose_mode,
         logs_mode=logs_mode,
         inbound_metadata=None,
+        model_name=config.agents.defaults.primary_model,
+        provider_name=config.agents.defaults.provider,
     )
 
 
@@ -1502,9 +1622,6 @@ def research(
 
     config = _load_runtime_config(config, workspace)
 
-    from mira_engine.utils.env import auto_activate_env
-    auto_activate_env(config.workspace_path)
-
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
@@ -1551,6 +1668,8 @@ def research(
         logs_mode=logs_mode,
         inbound_metadata=inbound_metadata,
         interactive_banner=banner,
+        model_name=config.agents.defaults.primary_model,
+        provider_name=config.agents.defaults.provider,
     )
 
 

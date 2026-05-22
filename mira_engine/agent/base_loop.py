@@ -29,6 +29,7 @@ from mira_engine.agent.context import ContextBuilder
 from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
 from mira_engine.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from mira_engine.agent.memory import Consolidator, Dream, MemoryStore
+from mira_engine.agent.runner import AgentRunner
 from mira_engine.agent.routing import ModelRouter, RoutedProviderManager
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
@@ -195,6 +196,108 @@ class BaseAgentLoop:
             provider=self.provider,
             model=self.model,
         )
+
+    def _rebuild_memory_helpers(self) -> None:
+        generation_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", None)
+        completion_tokens = (
+            int(generation_max_tokens)
+            if isinstance(generation_max_tokens, int | float)
+            else self.max_tokens
+        )
+        self.consolidator = Consolidator(
+            store=MemoryStore(self.workspace),
+            provider=self.provider,
+            model=self.model,
+            sessions=self.sessions,
+            context_window_tokens=self.context_window_tokens,
+            build_messages=self.context.build_messages,
+            get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=completion_tokens,
+        )
+        self.dream = Dream(
+            store=self.consolidator.store,
+            provider=self.provider,
+            model=self.model,
+        )
+
+    async def reconfigure_runtime(
+        self,
+        *,
+        provider: LLMProvider,
+        model: str,
+        provider_factory: Callable[[str], LLMProvider] | None,
+        model_router: ModelRouter | None,
+        workspace: Path,
+        max_iterations: int,
+        max_tokens: int,
+        reasoning_effort: str | None,
+        restrict_to_workspace: bool,
+        brave_api_key: str | None = None,
+        web_proxy: str | None = None,
+        exec_config: ExecToolConfig | None = None,
+        timezone: str | None = None,
+        channels_config: ChannelsConfig | None = None,
+        context_window_tokens: int | None = None,
+    ) -> None:
+        """Apply UI-saved runtime config to the live agent loop."""
+        async with self._processing_lock:
+            next_workspace = workspace.expanduser()
+            workspace_changed = next_workspace != self.workspace
+
+            if self._mcp_stack:
+                try:
+                    await self._mcp_stack.aclose()
+                finally:
+                    self._mcp_stack = None
+                    self._mcp_connected = False
+                    self._mcp_connecting = False
+
+            self.provider = provider
+            self.model = model or provider.get_default_model()
+            self.provider_factory = provider_factory
+            self.model_router = model_router
+            self.workspace = next_workspace
+            self.max_iterations = max_iterations
+            self.max_tokens = max_tokens
+            self.reasoning_effort = reasoning_effort
+            self.brave_api_key = brave_api_key
+            self.web_proxy = web_proxy
+            if exec_config is not None:
+                self.exec_config = exec_config
+            self.timezone = timezone
+            self.restrict_to_workspace = restrict_to_workspace
+            if channels_config is not None:
+                self.channels_config = channels_config
+            if context_window_tokens is not None:
+                self.context_window_tokens = context_window_tokens
+
+            if workspace_changed:
+                self.context = ContextBuilder(next_workspace)
+                self.sessions = SessionManager(next_workspace)
+                self._project_sessions.clear()
+
+            self._session_model_runtimes.clear()
+
+            self.subagents.provider = provider
+            self.subagents.model = self.model
+            self.subagents.workspace = next_workspace
+            self.subagents.temperature = self.temperature
+            self.subagents.max_tokens = self.max_tokens
+            self.subagents.reasoning_effort = self.reasoning_effort
+            self.subagents.brave_api_key = self.brave_api_key
+            self.subagents.web_proxy = self.web_proxy
+            self.subagents.exec_config = self.exec_config
+            self.subagents.restrict_to_workspace = self.restrict_to_workspace
+            self.subagents.provider_factory = provider_factory
+            self.subagents.model_router = model_router
+            self.subagents.runner = AgentRunner(provider)
+            self.subagents._session_runtimes.clear()
+
+            self.tools = ToolRegistry()
+            self._register_default_tools()
+            self._rebuild_memory_helpers()
+
+            logger.info("Agent runtime reconfigured: model={}, workspace={}", self.model, self.workspace)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""

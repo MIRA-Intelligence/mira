@@ -148,10 +148,18 @@ On Linux, `install-service` registers a user systemd unit:
 ~/.config/systemd/user/mira-engine.service
 ```
 
-On Windows, `install-service` registers service name:
+On Windows, bundle builds use a WinSW-backed Windows Service. `install-service`
+registers service name:
 
 ```bash
 MiraEngine
+```
+
+When installing from an elevated desktop bundle installer, pass the target user
+home so the service reads and writes that user's `~/.mira` data:
+
+```bash
+mira-engine install-service --home "%USERPROFILE%" --config "%USERPROFILE%\.mira\config.json"
 ```
 
 Local engine logs and diagnostics:

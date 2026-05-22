@@ -49,6 +49,7 @@ _DEFAULT_OPENROUTER_HEADERS = {
     "X-OpenRouter-Title": "mira",
     "X-OpenRouter-Categories": "cli-agent,personal-agent",
 }
+_DEFAULT_ACCEPT_ENCODING = "identity"
 
 
 def _short_tool_id() -> str:
@@ -152,7 +153,13 @@ class OpenAICompatProvider(LLMProvider):
 
         effective_base = api_base or (spec.default_api_base if spec else None) or None
         self._effective_base = effective_base
-        default_headers = {"x-session-affinity": uuid.uuid4().hex}
+        default_headers = {
+            "x-session-affinity": uuid.uuid4().hex,
+            # Some OpenAI-compatible gateways and local proxies advertise gzip
+            # while returning plain JSON/SSE, which makes httpx fail before the
+            # SDK can expose the response body. Prefer uncompressed responses.
+            "Accept-Encoding": _DEFAULT_ACCEPT_ENCODING,
+        }
         if _uses_openrouter_attribution(spec, effective_base):
             default_headers.update(_DEFAULT_OPENROUTER_HEADERS)
         if extra_headers:
