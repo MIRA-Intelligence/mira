@@ -930,6 +930,7 @@ def test_gateway_reports_workspace_bootstrap_failure(monkeypatch, tmp_path: Path
     config_file = _write_instance_config(tmp_path)
     config = Config()
     config.agents.defaults.workspace = "/homes/clwang/.mira/workspace"
+    expected_workspace = str(Path(config.agents.defaults.workspace).expanduser())
 
     def _fail_workspace_sync(_workspace: Path) -> None:
         raise OSError(30, "Read-only file system", "/homes")
@@ -945,7 +946,7 @@ def test_gateway_reports_workspace_bootstrap_failure(monkeypatch, tmp_path: Path
     assert result.exit_code == 1
     stripped_output = _strip_ansi(result.stdout)
     assert "Mira workspace is not accessible" in stripped_output
-    assert "/homes/clwang/.mira/workspace" in stripped_output
+    assert expected_workspace in stripped_output
     assert "agents.defaults.workspace" in stripped_output
     assert "Read-only file system" in stripped_output
 

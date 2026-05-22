@@ -37,6 +37,7 @@ def test_build_ui_runtime_payload_includes_dynamic_provider_metadata() -> None:
 def test_build_ui_runtime_payload_returns_raw_and_resolved_workspace(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     cfg = Config()
     cfg.agents.defaults.workspace = "~/.mira/workspace"
 
