@@ -303,6 +303,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         hard_signals = (
             "traceback (most recent call last)",
             "sorry, i encountered an error",
+            "error calling llm",
             "memory archival failed",
             "tool call failed",
             "unrecoverable error",
@@ -937,8 +938,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         moment the model forgets to append the next experiment:
 
         - With pending work in the plan, never replan (caller handles it).
-        - With no policy at all, replan — ``_AUTO_MAX_ROUNDS`` already bounds
-          the runaway and ``strictHeuristics`` still gates the heuristics.
+        - With no policy at all, stop once the explicit queue is exhausted.
         - With a policy whose stop conditions (goals / maxExperiments /
           maxTokens) are already met, do not replan.
         - With a policy that has goals not yet reached, replan regardless of
@@ -954,7 +954,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         if cls._plan_has_pending_work(plan):
             return False
         if policy is None:
-            return True
+            return False
         if cls._evaluate_automation_stop_policy(policy, plan=plan, tokens_used=tokens_used):
             return False
         goals = policy.get("goals") if isinstance(policy.get("goals"), list) else []

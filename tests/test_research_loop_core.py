@@ -174,6 +174,12 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert ResearchAgentLoop._looks_like_failure_response("出现错误但已捕获，继续下一步。") is False
     # System-level blockers and explicit "I cannot continue" verdicts still halt.
     assert ResearchAgentLoop._looks_like_failure_response("Tool call failed: provider unreachable.") is True
+    assert (
+        ResearchAgentLoop._looks_like_failure_response(
+            "Error calling LLM: Error -3 while decompressing data: incorrect header check"
+        )
+        is True
+    )
     assert ResearchAgentLoop._looks_like_failure_response("Memory archival failed during /new.") is True
     assert (
         ResearchAgentLoop._looks_like_failure_response(
@@ -318,7 +324,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         automation_policy=goals_only_policy,
     ) is True
 
-    # PR 2: replan when queue empty + no policy at all (rely on _AUTO_MAX_ROUNDS).
+    # Queue empty + no policy should stop instead of replanning generic chat.
     (project / "task_plan.json").write_text(
         json.dumps(
             {
@@ -338,7 +344,15 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         project_dir=str(project),
         final_content="all good",
         auto_round=0,
-    ) is True
+    ) is False
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=0,
+    )
+    assert decision is False
+    assert reason == "queue exhausted, no replan condition met"
 
     # PR 2: structured stop reasons surface from _evaluate_continuation.
     decision, reason = loop._evaluate_continuation(

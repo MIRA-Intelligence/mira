@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from mira_engine.agent.base_loop import BaseAgentLoop
 from mira_engine.agent.context import ContextBuilder
 from mira_engine.agent.routing import RoutedModel
@@ -78,6 +80,11 @@ class _RuntimeStub:
         return response, route
 
 
+@pytest.fixture(autouse=True)
+def _isolate_mira_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+
 def _make_loop(tmp_path: Path) -> BaseAgentLoop:
     """Build a BaseAgentLoop without running ``__init__`` (fast unit tests)."""
     loop = BaseAgentLoop.__new__(BaseAgentLoop)
@@ -104,6 +111,64 @@ def _make_real_loop(tmp_path: Path) -> BaseAgentLoop:
         exec_config=ExecToolConfig(timeout=5),
         session_manager=SessionManager(tmp_path),
     )
+
+
+async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    old_workspace = tmp_path / "old"
+    new_workspace = tmp_path / "new"
+    old_workspace.mkdir()
+    new_workspace.mkdir()
+    loop = _make_real_loop(old_workspace)
+    new_provider = _NoopProvider()
+    new_router = SimpleNamespace(enabled=True)
+    new_factory = lambda _model: new_provider
+
+    loop._session_model_runtimes["ui:user"] = object()  # type: ignore[assignment]
+    loop.subagents._session_runtimes["ui:user"] = object()  # type: ignore[assignment]
+
+    await loop.reconfigure_runtime(
+        provider=new_provider,
+        model="custom/new-model",
+        provider_factory=new_factory,
+        model_router=new_router,
+        workspace=new_workspace,
+        max_iterations=64,
+        max_tokens=2048,
+        reasoning_effort="high",
+        restrict_to_workspace=True,
+        web_proxy="http://127.0.0.1:7890",
+        exec_config=ExecToolConfig(timeout=9),
+        timezone="Asia/Shanghai",
+        channels_config=ChannelsConfig(),
+        context_window_tokens=12345,
+    )
+
+    assert loop.provider is new_provider
+    assert loop.model == "custom/new-model"
+    assert loop.provider_factory is new_factory
+    assert loop.model_router is new_router
+    assert loop.workspace == new_workspace
+    assert loop.max_iterations == 64
+    assert loop.max_tokens == 2048
+    assert loop.reasoning_effort == "high"
+    assert loop.restrict_to_workspace is True
+    assert loop._session_model_runtimes == {}
+    assert loop.subagents.provider is new_provider
+    assert loop.subagents.provider_factory is new_factory
+    assert loop.subagents.model_router is new_router
+    assert loop.subagents._session_runtimes == {}
+    assert loop.subagents.runner.provider is new_provider
+    assert loop.consolidator.provider is new_provider
+    assert loop.consolidator.model == "custom/new-model"
+    assert loop.dream.provider is new_provider
+    read_tool = loop.tools.get("read_file")
+    assert read_tool is not None
+    assert read_tool._workspace == new_workspace
+    assert read_tool._allowed_dir == new_workspace
 
 
 def test_restrict_workspace_allows_nested_workspace_mira_skills_path(tmp_path: Path) -> None:

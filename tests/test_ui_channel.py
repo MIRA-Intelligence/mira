@@ -983,6 +983,7 @@ async def test_handle_get_config_returns_runtime_payload(
     body = json.loads(resp.text)
     assert body["projects_root"] == str(ui_channel.projects_root)
     assert body["runtime"]["workspace"] == str(ui_channel.projects_root)
+    assert body["runtime"]["workspace_resolved"] == str(ui_channel.projects_root)
     assert body["runtime"]["provider"] == "openrouter"
     assert body["runtime"]["reasoning_effort"] == "adaptive"
     assert body["runtime"]["max_tool_iterations"] == 88
@@ -1036,6 +1037,47 @@ async def test_handle_config_updates_runtime_fields_and_provider_secrets(
     assert body["providers"]["custom"]["api_key_preview"] == "cust...et"
     assert saved_configs[-1].providers.custom.api_key == "custom-secret"
     assert saved_configs[-1].providers.custom.api_base == "https://llm.example.com/v1"
+
+
+async def test_handle_config_reloads_live_runtime_after_persist(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config_runtime.json"
+    reloads: list[tuple[Config, Path]] = []
+
+    async def _reload_runtime(next_config: Config, projects_root: Path) -> None:
+        reloads.append((next_config.model_copy(deep=True), projects_root))
+
+    ui_channel._on_runtime_config_updated = _reload_runtime
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod, "save_ui_runtime_update", lambda *_args, **_kwargs: None)
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={
+        "runtime": {
+            "workspace": str(tmp_path / "bundle-workspace"),
+            "provider": "custom",
+            "model": "custom/qwen2.5-72b",
+            "max_tool_iterations": 64,
+        },
+        "providers": {
+            "custom": {
+                "api_base": "https://llm.example.com/v1",
+            }
+        },
+    })
+
+    resp = await ui_channel._handle_config(req)
+
+    assert resp.status == 200
+    assert len(reloads) == 1
+    reloaded_config, reloaded_root = reloads[0]
+    assert reloaded_config.agents.defaults.provider == "custom"
+    assert reloaded_config.agents.defaults.model == "custom/qwen2.5-72b"
+    assert reloaded_config.providers.custom.api_base == "https://llm.example.com/v1"
+    assert reloaded_root == (tmp_path / "bundle-workspace").resolve()
 
 
 async def test_handle_config_preserves_raw_routing_models_on_runtime_save(
@@ -1092,7 +1134,7 @@ async def test_handle_config_preserves_raw_routing_models_on_runtime_save(
     assert resp.status == 200
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     defaults = saved["agents"]["defaults"]
-    assert defaults["workspace"] == str(new_root.resolve())
+    assert defaults["workspace"] == str(new_root)
     assert defaults["model"] == ["claude-3-opus", "anthropic/claude-sonnet-4-5"]
     assert defaults["routeModel"] == ["openai/gpt-4.1-mini", "openai/gpt-4.1-nano"]
     assert defaults["smallModel"] == ["deepseek/deepseek-chat", "openai/gpt-4.1-mini"]

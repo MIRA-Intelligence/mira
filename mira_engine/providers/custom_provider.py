@@ -10,6 +10,8 @@ from openai import AsyncOpenAI
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
+_DEFAULT_ACCEPT_ENCODING = "identity"
+
 
 class CustomProvider(LLMProvider):
 
@@ -23,7 +25,10 @@ class CustomProvider(LLMProvider):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         # Keep affinity stable for this provider instance to improve backend cache locality.
-        headers = {"x-session-affinity": uuid.uuid4().hex}
+        headers = {
+            "x-session-affinity": uuid.uuid4().hex,
+            "Accept-Encoding": _DEFAULT_ACCEPT_ENCODING,
+        }
         if extra_headers:
             headers.update(extra_headers)
         self._client = AsyncOpenAI(
