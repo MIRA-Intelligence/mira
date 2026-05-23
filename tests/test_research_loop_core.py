@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from mira_engine.agent.base_loop import BaseAgentLoop
 from mira_engine.agent.context import ContextBuilder
 from mira_engine.agent.research_loop import ResearchAgentLoop
 from mira_engine.agent.tools.registry import ToolRegistry
@@ -77,9 +78,10 @@ def test_run_mode_profile_and_contract_helpers(tmp_path: Path) -> None:
     assert loop._resolve_session_run_mode("k", None) == "auto"
     assert loop._resolve_session_agent_profile("k", "engineer") == "engineer"
     assert loop._resolve_session_agent_profile("k", None) == "engineer"
+    assert loop._resolve_session_agent_profile("new", None) == "research"
     assert loop._agent_profile_to_agents_filename("research") == "AGENTS_RS.md"
     assert loop._agent_profile_to_agents_filename("engineer") == "AGENTS_EG.md"
-    assert loop._agent_profile_to_agents_filename("default") == "AGENTS.md"
+    assert loop._agent_profile_to_agents_filename("default") == "AGENTS_RS.md"
 
     project = tmp_path / "PRJ-9"
     (project / ".mira").mkdir(parents=True)
@@ -123,7 +125,7 @@ def test_run_mode_profile_and_contract_helpers(tmp_path: Path) -> None:
     ) is True
     assert loop._is_strict_contract_enforced(
         project_dir=None,
-        agent_profile="default",
+        agent_profile="research",
     ) is False
 
 
@@ -147,6 +149,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         )
         is False
     )
+
     assert (
         ResearchAgentLoop._looks_like_user_input_request(
             "实验完成。\n\n继续下一步实验，无需你介入。"
@@ -466,6 +469,41 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert status_restored.get("status") == "in_progress"
     persisted = json.loads(plan_file.read_text(encoding="utf-8"))
     assert persisted.get("status") == "in_progress"
+
+
+async def test_normal_loop_mode_uses_base_loop_without_project_metadata(
+    monkeypatch, tmp_path: Path
+) -> None:
+    loop = _make_real_loop(tmp_path)
+    captured: dict[str, Any] = {}
+
+    async def _base_process(self, msg, *args, **kwargs):
+        captured["metadata"] = dict(msg.metadata)
+        captured["session_key"] = msg.session_key
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="base ok")
+
+    monkeypatch.setattr(BaseAgentLoop, "_process_message", _base_process)
+    msg = InboundMessage(
+        channel="ui",
+        sender_id="u1",
+        chat_id="__normal__",
+        content="hello",
+        metadata={
+            "loop_mode": "normal",
+            "project_dir": str(tmp_path / "PRJ-1"),
+            "_ui_system_instructions": "research ui prompt",
+        },
+        session_key_override="ui:__normal__",
+    )
+
+    out = await loop._process_message(msg)
+
+    assert out is not None
+    assert out.content == "base ok"
+    assert captured["session_key"] == "ui:__normal__"
+    assert captured["metadata"]["loop_mode"] == "normal"
+    assert "project_dir" not in captured["metadata"]
+    assert "_ui_system_instructions" not in captured["metadata"]
 
 
 def test_automation_policy_helpers(tmp_path: Path) -> None:

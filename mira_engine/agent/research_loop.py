@@ -77,7 +77,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         """Parse agent profile, returning None when absent/invalid."""
         if isinstance(value, str):
             profile = value.strip().lower()
-            if profile in {"engineer", "default", "research"}:
+            if profile in {"engineer", "research"}:
                 return profile
         return None
 
@@ -166,7 +166,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         if explicit:
             self._session_agent_profiles[session_key] = explicit
             return explicit
-        return self._session_agent_profiles.get(session_key, "default")
+        return self._session_agent_profiles.get(session_key, "research")
 
     def _resolve_session_automation_policy(
         self,
@@ -220,7 +220,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             return "AGENTS_EG.md"
         if profile == "research":
             return "AGENTS_RS.md"
-        return "AGENTS.md"
+        return "AGENTS_RS.md"
 
     # ------------------------------------------------------------------
     # Heuristic content classifiers
@@ -701,7 +701,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         agent_profile: str | None,
     ) -> str:
         """Build a concise contract hint for auto-run task_plan updates."""
-        profile = self._parse_agent_profile(agent_profile) or "default"
+        profile = self._parse_agent_profile(agent_profile) or "research"
         contract_version = self._load_project_contract_version(project_dir)
         contract = get_task_plan_contract(
             profile=profile,
@@ -733,7 +733,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         self, *, project_dir: str | None, agent_profile: str | None
     ) -> bool:
         """Whether current project is in strict contract mode with required fields."""
-        profile = self._parse_agent_profile(agent_profile) or "default"
+        profile = self._parse_agent_profile(agent_profile) or "research"
         contract_version = self._load_project_contract_version(project_dir)
         contract = get_task_plan_contract(
             profile=profile,
@@ -1035,6 +1035,30 @@ class ResearchAgentLoop(BaseAgentLoop):
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = msg.metadata or {}
+        if meta.get("loop_mode") == "normal":
+            base_meta = dict(meta)
+            base_meta.pop("project_dir", None)
+            base_meta.pop("_ui_system_instructions", None)
+            normal_msg = InboundMessage(
+                channel=msg.channel,
+                sender_id=msg.sender_id,
+                chat_id=msg.chat_id,
+                content=msg.content,
+                timestamp=msg.timestamp,
+                media=list(msg.media),
+                metadata=base_meta,
+                session_key_override=msg.session_key_override,
+            )
+            return await BaseAgentLoop._process_message(
+                self,
+                normal_msg,
+                session_key=session_key,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                audit_hook=audit_hook,
+            )
+
         project_dir = meta.get("project_dir")
         key = session_key or msg.session_key
         run_mode = self._resolve_session_run_mode(key, meta.get("run_mode"))

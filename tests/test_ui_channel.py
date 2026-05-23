@@ -25,6 +25,7 @@ from mira_engine.channels.ui import (
     _load_ui_instructions,
     _normalize_agent_profile,
     _normalize_contract_version,
+    _normalize_loop_mode,
     _normalize_run_mode,
     _safe_upload_name,
     _stringify_history_content,
@@ -114,13 +115,12 @@ def test_load_ui_instructions_skips_missing_files(monkeypatch: pytest.MonkeyPatc
 
 def test_normalize_agent_profile_accepts_known_values() -> None:
     assert _normalize_agent_profile("engineer") == "engineer"
-    assert _normalize_agent_profile("default") == "default"
     assert _normalize_agent_profile("research") == "research"
 
 
 def test_normalize_agent_profile_falls_back_to_default() -> None:
-    assert _normalize_agent_profile("unknown") == "default"
-    assert _normalize_agent_profile(None) == "default"
+    assert _normalize_agent_profile("unknown") == "research"
+    assert _normalize_agent_profile(None) == "research"
 
 
 def test_normalize_contract_version_accepts_known_values() -> None:
@@ -702,7 +702,7 @@ async def test_handle_history_uses_bound_project_dir_after_projects_root_change(
     ui_channel._persist_project_runtime_preferences(
         project_dir,
         run_mode="auto",
-        agent_profile="default",
+        agent_profile="research",
         contract_version=1,
         automation_policy=None,
     )
@@ -804,7 +804,7 @@ async def test_project_dir_index_survives_channel_restart_after_root_change(
     ui_channel._persist_project_runtime_preferences(
         project_dir,
         run_mode="auto",
-        agent_profile="default",
+        agent_profile="research",
         contract_version=1,
         automation_policy=None,
     )
@@ -1240,14 +1240,14 @@ async def test_handle_project_meta_updates_display_name(ui_channel: UiChannel) -
     body = json.loads(resp.text)
     assert body["display_name"] == "Lung CT baseline"
     assert body["run_mode"] == "auto"
-    assert body["agent_profile"] == "default"
+    assert body["agent_profile"] == "research"
     assert body["contract_version"] == 1
 
     meta_file = project_dir / ".mira" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["display_name"] == "Lung CT baseline"
     assert meta["run_mode"] == "auto"
-    assert meta["agent_profile"] == "default"
+    assert meta["agent_profile"] == "research"
     assert meta["contract_version"] == 1
 
 
@@ -1714,8 +1714,10 @@ async def test_send_send_json_failure_swallowed(ui_channel: UiChannel) -> None:
 def test_web_helpers_cover_normalization_and_formatting() -> None:
     assert _normalize_run_mode(" AUTO ") == "auto"
     assert _normalize_run_mode("unknown") == "manual"
+    assert _normalize_loop_mode(" NORMAL ") == "normal"
+    assert _normalize_loop_mode("unknown") == "project"
     assert _normalize_agent_profile(" ENGINEER ") == "engineer"
-    assert _normalize_agent_profile("bad") == "default"
+    assert _normalize_agent_profile("bad") == "research"
     assert _normalize_contract_version(2) == 2
     assert _normalize_contract_version(None) == 1
     assert _safe_upload_name("../x.txt") == "x.txt"
@@ -1854,6 +1856,45 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
 
 
+async def test_ws_handler_normal_message_skips_project_runtime_state(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "__normal__"
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "message",
+                    "session_id": session_id,
+                    "user_id": "u1",
+                    "loop_mode": "normal",
+                    "mode": "auto",
+                    "agent_profile": "research",
+                    "content": "general question",
+                    "media": [],
+                }
+            ),
+        ),
+    ])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    ui_channel._ui_instructions = "UI instruction"
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    req = MagicMock(spec=web.Request)
+    await ui_channel._ws_handler(req)
+
+    assert captured["chat_id"] == session_id
+    assert captured["metadata"]["loop_mode"] == "normal"
+    assert "project_dir" not in captured["metadata"]
+    assert "_ui_system_instructions" not in captured["metadata"]
+    assert not (ui_channel.projects_root / session_id).exists()
+
+
 async def test_ws_handler_injects_guard_notice_on_id_reassignment(
     ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1883,7 +1924,7 @@ async def test_ws_handler_injects_guard_notice_on_id_reassignment(
                     "session_id": session_id,
                     "user_id": "u1",
                     "mode": "auto",
-                    "agent_profile": "default",
+                    "agent_profile": "research",
                     "content": "check latest exp ids",
                     "media": [],
                 }
