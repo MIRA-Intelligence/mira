@@ -190,6 +190,52 @@ async def test_handle_version_returns_contract_payload(ui_channel: UiChannel) ->
     assert body["api_contract"] == _API_CONTRACT_VERSION
     assert isinstance(body["uptime_seconds"], int)
     assert body["uptime_seconds"] >= 0
+    # Engine identity is surfaced so the desktop UI's fast-path health
+    # probe can verify the live engine matches the bundled manifest
+    # without invoking the slower `mira-engine status` CLI.
+    assert "engine_sha256" in body
+    assert "engine_manifest" in body
+    assert "engine_executable" in body
+    # `engine_sha256_at_boot` proves the engine snapshots its identity at
+    # startup. The desktop UI uses its presence as a guarantee that
+    # `engine_sha256` is a real boot snapshot (rather than a stale disk
+    # re-read produced by an in-place DMG swap of the manifest file).
+    assert "engine_sha256_at_boot" in body
+
+
+async def test_handle_version_snapshots_identity_at_boot(
+    monkeypatch, ui_channel: UiChannel
+) -> None:
+    """A DMG re-install overwrites the on-disk manifest in place. The
+    running engine must keep reporting the identity it had *at boot* via
+    /version, not whatever the new manifest now claims, otherwise the
+    desktop UI would falsely believe the live engine already matches."""
+    import mira_engine.channels.ui as ui_module
+
+    captured_at_boot = ui_channel._engine_identity
+
+    # Simulate the manifest being swapped out under the running engine
+    # — a fresh `_current_engine_identity()` call would now return the
+    # *new* SHA. The snapshot stored on the channel must shield us.
+    monkeypatch.setattr(
+        ui_module,
+        "_current_engine_identity",
+        lambda: {
+            "engine_executable": "/opt/mira/mira-engine",
+            "engine_manifest_path": "/opt/mira/mira-engine.manifest.json",
+            "engine_manifest": {"sha256": "new-sha-after-dmg-swap"},
+            "engine_sha256": "new-sha-after-dmg-swap",
+        },
+    )
+    req = MagicMock(spec=web.Request)
+    resp = await ui_channel._handle_version(req)
+    body = json.loads(resp.text)
+
+    # Boot-snapshot fields are stable across an in-place manifest swap.
+    assert body["engine_sha256"] == captured_at_boot.get("engine_sha256")
+    assert body["engine_sha256_at_boot"] == captured_at_boot.get("engine_sha256")
+    assert body["engine_manifest"] == captured_at_boot.get("engine_manifest")
+    assert body["engine_executable"] == captured_at_boot.get("engine_executable")
 
 
 def test_audit_writes_global_and_project_logs(ui_channel: UiChannel) -> None:

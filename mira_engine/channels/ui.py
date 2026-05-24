@@ -26,6 +26,7 @@ from loguru import logger
 
 from mira_engine import __version__
 from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
+from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
@@ -528,6 +529,13 @@ class UiChannel(BaseChannel):
         self._project_dirs: dict[str, Path] = {}
         self._known_project_roots: set[Path] = {self.projects_root}
         self._boot_ts: float = time.monotonic()
+        # Snapshot the engine identity at boot so the desktop UI can detect
+        # an in-place binary swap (DMG re-install) even before our process
+        # exits. ``_current_engine_identity`` reads the on-disk manifest,
+        # which the new bundle overwrites in place — re-reading it on every
+        # ``/version`` would make the old, still-running engine appear to
+        # match the new bundled identity and skip the reinstall flow.
+        self._engine_identity: dict[str, Any] = _current_engine_identity()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
         self._client_project_dirs: dict[str, Path | None] = {}
@@ -1417,11 +1425,28 @@ class UiChannel(BaseChannel):
         })
 
     async def _handle_version(self, _request: web.Request) -> web.Response:
+        # Return the identity snapshot captured at boot — see __init__. Using
+        # a live ``_current_engine_identity()`` here would let an in-place
+        # binary swap masquerade as "already matching" and the desktop UI
+        # would skip the reinstall.
+        #
+        # ``engine_sha256_at_boot`` is the authoritative identity field for
+        # the desktop UI's fast path: it is *only* exposed by engines that
+        # cache the manifest at startup, so its presence proves to the UI
+        # that ``engine_sha256`` is a real boot snapshot rather than a stale
+        # disk re-read. Older engines that pre-date this change still set
+        # ``engine_sha256`` but lack ``engine_sha256_at_boot``, and the UI
+        # treats those as untrusted and forces a one-time reinstall.
+        identity = self._engine_identity
         return web.json_response({
             "service": "mira-gateway",
             "agent_version": __version__,
             "api_contract": _API_CONTRACT_VERSION,
             "uptime_seconds": int(max(time.monotonic() - self._boot_ts, 0)),
+            "engine_sha256": identity.get("engine_sha256"),
+            "engine_sha256_at_boot": identity.get("engine_sha256"),
+            "engine_manifest": identity.get("engine_manifest"),
+            "engine_executable": identity.get("engine_executable"),
         })
 
     async def _handle_status(self, _request: web.Request) -> web.Response:

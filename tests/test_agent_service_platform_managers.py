@@ -107,6 +107,8 @@ def test_launchd_manager_writes_bundle_environment(monkeypatch, tmp_path):
     assert status_payload["engine_manifest"] == manifest
     assert status_payload["engine_sha256"] == "abc123"
     assert status_payload["launchd_program"] == str(engine)
+    assert ["launchctl", "bootout", "gui/501/com.projectmira.engine"] in calls
+    assert ["launchctl", "remove", LAUNCHD_LABEL] in calls
     assert ["launchctl", "bootstrap", "gui/501", str(manager.paths.launchd_plist)] in calls
 
 
