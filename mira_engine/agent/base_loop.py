@@ -415,8 +415,6 @@ class BaseAgentLoop:
         )
         if supports_activity_ping:
             await on_progress("Mira is working...", activity_ping=True)
-        else:
-            await on_progress("Mira is working...")
 
     @classmethod
     async def _activity_ping_loop(
