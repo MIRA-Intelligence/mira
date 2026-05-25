@@ -58,6 +58,28 @@ class TestSanitizeToolPairs:
             {"role": "user", "content": "hi"},
         ]
 
+    def test_strips_missing_result_preserves_reasoning_metadata(self) -> None:
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "keep me",
+                "reasoning_content": "hidden reasoning",
+                "thinking_blocks": [{"type": "thinking", "signature": "sig"}],
+                "tool_calls": [_tc("a")],
+            },
+            {"role": "user", "content": "hi"},
+        ]
+
+        assert ContextBuilder._sanitize_tool_pairs(msgs) == [
+            {
+                "role": "assistant",
+                "content": "keep me",
+                "reasoning_content": "hidden reasoning",
+                "thinking_blocks": [{"type": "thinking", "signature": "sig"}],
+            },
+            {"role": "user", "content": "hi"},
+        ]
+
     def test_strips_partial_results(self) -> None:
         msgs = [
             {

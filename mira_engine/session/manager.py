@@ -100,7 +100,13 @@ class Session:
         pending_tool_calls: set[str] = set()
         for m in sliced:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
-            for k in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
+            for k in (
+                "tool_calls",
+                "tool_call_id",
+                "name",
+                "reasoning_content",
+                "thinking_blocks",
+            ):
                 if k in m:
                     entry[k] = m[k]
 
@@ -160,9 +166,9 @@ class Session:
                 else:
                     # Drop tool_calls and keep only text content (if any).
                     # Also skip the orphaned tool results.
-                    content = msg.get("content")
-                    if content:
-                        result.append({"role": "assistant", "content": content})
+                    fallback = Session._assistant_without_tool_calls(msg)
+                    if fallback is not None:
+                        result.append(fallback)
                     i = j  # skip past the orphaned tool results
                     continue
             else:
@@ -194,9 +200,33 @@ class Session:
                     prev["tool_call_id"] = msg["tool_call_id"]
                 if msg.get("name"):
                     prev["name"] = msg["name"]
+                if msg.get("reasoning_content"):
+                    prev_reasoning = prev.get("reasoning_content")
+                    if isinstance(prev_reasoning, str) and prev_reasoning:
+                        prev["reasoning_content"] = f"{prev_reasoning}\n\n{msg['reasoning_content']}"
+                    else:
+                        prev["reasoning_content"] = msg["reasoning_content"]
+                if isinstance(msg.get("thinking_blocks"), list):
+                    prev_blocks = prev.get("thinking_blocks")
+                    if isinstance(prev_blocks, list):
+                        prev["thinking_blocks"] = [*prev_blocks, *msg["thinking_blocks"]]
+                    else:
+                        prev["thinking_blocks"] = msg["thinking_blocks"]
             else:
                 result.append(msg)
         return result
+
+    @staticmethod
+    def _assistant_without_tool_calls(msg: dict[str, Any]) -> dict[str, Any] | None:
+        """Keep assistant text plus provider reasoning metadata after dropping invalid tool calls."""
+        content = msg.get("content")
+        if not content:
+            return None
+        fallback: dict[str, Any] = {"role": "assistant", "content": content}
+        for key in ("reasoning_content", "thinking_blocks"):
+            if key in msg:
+                fallback[key] = msg[key]
+        return fallback
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
