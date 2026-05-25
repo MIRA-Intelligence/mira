@@ -589,7 +589,7 @@ class WindowsServiceManager(LocalServiceManager):
         self._fallback = WindowsBackgroundProcessManager(paths)
 
     def _background_fallback_enabled(self) -> bool:
-        value = os.environ.get("MIRA_ENGINE_WINDOWS_BACKGROUND_FALLBACK", "1").strip().lower()
+        value = os.environ.get("MIRA_ENGINE_WINDOWS_BACKGROUND_FALLBACK", "0").strip().lower()
         return value not in {"0", "false", "no", "off"}
 
     def _run_windows_tool(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -634,11 +634,29 @@ class WindowsServiceManager(LocalServiceManager):
     def _service_xml_path(self, wrapper_path: Path) -> Path:
         return wrapper_path.with_name(WINDOWS_SERVICE_CONFIG_NAME)
 
+    def _release_staged_wrapper_for_update(self, source: Path) -> None:
+        target = self._staged_wrapper_path()
+        if source.resolve(strict=False) == target.resolve(strict=False):
+            return
+        if not target.is_file():
+            return
+        self._append_log("windows_service_prepare_wrapper_update", wrapper=str(target))
+        self._run_wrapper("stop")
+        self._run_wrapper("uninstall")
+
     def _stage_wrapper(self, source: Path) -> Path:
         self.paths.ensure()
         target = self._staged_wrapper_path()
         if source.resolve(strict=False) != target.resolve(strict=False):
-            shutil.copy2(source, target)
+            for attempt in range(1, 4):
+                try:
+                    shutil.copy2(source, target)
+                    break
+                except PermissionError:
+                    if attempt >= 3:
+                        raise
+                    self._release_staged_wrapper_for_update(source)
+                    time.sleep(0.5)
         return target
 
     def _write_service_xml(
@@ -724,7 +742,12 @@ class WindowsServiceManager(LocalServiceManager):
         reason: str,
     ) -> tuple[int, str]:
         if not self._background_fallback_enabled():
-            return EXIT_ERROR, reason
+            return (
+                EXIT_ERROR,
+                f"{reason}; Windows background fallback is disabled because "
+                "Mira requires a real Windows service. Approve the administrator "
+                "prompt and retry.",
+            )
         code, message = self._fallback.install_service(host, port, home, config_path)
         state = self.load_state()
         state["fallback_reason"] = reason
@@ -752,7 +775,23 @@ class WindowsServiceManager(LocalServiceManager):
             )
 
         self._stop_legacy_background_if_needed()
-        wrapper_path = self._stage_wrapper(source)
+        self._release_staged_wrapper_for_update(source)
+        try:
+            wrapper_path = self._stage_wrapper(source)
+        except OSError as exc:
+            message = (
+                f"failed to stage {WINDOWS_SERVICE_WRAPPER_NAME}; "
+                "the existing service wrapper may still be locked. "
+                "Stop the Mira Engine service or restart Windows, then retry. "
+                f"{exc}"
+            )
+            self._append_log(
+                "windows_service_stage_wrapper_failed",
+                source=str(source),
+                target=str(self._staged_wrapper_path()),
+                error=str(exc),
+            )
+            return EXIT_ERROR, message
         home_path, config_file = self._write_service_xml(
             wrapper_path,
             host=service_host,
@@ -774,6 +813,12 @@ class WindowsServiceManager(LocalServiceManager):
                 reason=message,
             )
 
+        start = self._run_wrapper("start")
+        service_started = start.returncode == 0
+        if not service_started:
+            message = start.stderr.strip() or start.stdout.strip() or "failed to start Windows service"
+            self._append_log("windows_service_start_after_install_failed", error=message)
+
         code, _ = super().install_service(
             service_host,
             service_port,
@@ -786,7 +831,7 @@ class WindowsServiceManager(LocalServiceManager):
         state["windows_service_wrapper"] = str(wrapper_path)
         state["windows_service_config"] = str(self._service_xml_path(wrapper_path))
         state["engine_executable"] = _gateway_service_args(service_host, service_port)[0]
-        state["running"] = False
+        state["running"] = service_started
         state["pid"] = None
         self.save_state(state)
         self._append_log(
@@ -795,7 +840,10 @@ class WindowsServiceManager(LocalServiceManager):
             config=str(self._service_xml_path(wrapper_path)),
             home=str(home_path),
             config_path=str(config_file),
+            running=service_started,
         )
+        if service_started:
+            return code, f"Windows service installed and started ({WINDOWS_SERVICE_NAME})"
         return code, f"Windows service installed ({WINDOWS_SERVICE_NAME})"
 
     def uninstall_service(self) -> tuple[int, str]:
