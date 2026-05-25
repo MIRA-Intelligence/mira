@@ -438,6 +438,14 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     decision, reason = loop._evaluate_continuation(
         run_mode="auto",
         project_dir=str(project),
+        final_content="Error calling LLM: DeepseekException - reasoning_content missing",
+        auto_round=0,
+    )
+    assert decision is False
+    assert reason == "provider error"
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(project),
         final_content="Tool call failed: provider unreachable.",
         auto_round=0,
     )

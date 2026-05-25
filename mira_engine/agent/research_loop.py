@@ -325,6 +325,14 @@ class ResearchAgentLoop(BaseAgentLoop):
         )
         return any(k in tail for k in soft_signals)
 
+    @staticmethod
+    def _looks_like_provider_error(text: str | None) -> bool:
+        """Detect provider/runtime errors so stop reasons stay actionable."""
+        if not text:
+            return False
+        lowered = text.lower()
+        return "error calling llm" in lowered or "all candidate models failed" in lowered
+
     # ------------------------------------------------------------------
     # task_plan loaders / inspectors
     # ------------------------------------------------------------------
@@ -897,6 +905,8 @@ class ResearchAgentLoop(BaseAgentLoop):
             logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
             return False, f"max rounds reached ({self._AUTO_MAX_ROUNDS})"
         strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
+        if strict_heuristics and self._looks_like_provider_error(final_content):
+            return False, "provider error"
         if strict_heuristics and self._looks_like_failure_response(final_content):
             return False, "failure heuristic matched"
         if strict_heuristics and self._looks_like_user_input_request(final_content):

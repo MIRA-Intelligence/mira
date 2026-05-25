@@ -27,7 +27,7 @@ def _short_tool_id() -> str:
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
-    
+
     Supports OpenRouter, Anthropic, OpenAI, Gemini, MiniMax, and many other providers through
     a unified interface.  Provider-specific logic is driven by the registry
     (see providers/registry.py) — no if-elif chains needed here.
@@ -206,6 +206,101 @@ class LiteLLMProvider(LLMProvider):
                 clean["tool_call_id"] = map_id(clean["tool_call_id"])
         return sanitized
 
+    @staticmethod
+    def _maybe_mapping(value: Any) -> dict[str, Any] | None:
+        """Best-effort conversion for SDK/Pydantic response objects."""
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        for method in ("model_dump", "dict", "to_dict", "json"):
+            fn = getattr(value, method, None)
+            if not callable(fn):
+                continue
+            try:
+                dumped = fn()
+            except TypeError:
+                continue
+            if isinstance(dumped, dict):
+                return dumped
+        return None
+
+    @classmethod
+    def _message_value(cls, message: Any, key: str) -> Any:
+        """Read a message field from top level or provider-specific metadata.
+
+        LiteLLM sometimes keeps provider-only fields such as DeepSeek
+        ``reasoning_content`` under ``provider_specific_fields`` instead of
+        exposing them as direct attributes.  The next DeepSeek thinking-mode
+        request must pass that field back, so parse both locations.
+        """
+        message_map = cls._maybe_mapping(message)
+        if message_map is not None and message_map.get(key) is not None:
+            return message_map.get(key)
+
+        value = getattr(message, key, None)
+        if value is not None:
+            return value
+
+        for nested_key in (
+            "provider_specific_fields",
+            "model_extra",
+            "additional_kwargs",
+        ):
+            nested = None
+            if message_map is not None:
+                nested = message_map.get(nested_key)
+            if nested is None:
+                nested = getattr(message, nested_key, None)
+            nested_map = cls._maybe_mapping(nested)
+            if nested_map is not None and nested_map.get(key) is not None:
+                return nested_map.get(key)
+        return None
+
+    @staticmethod
+    def _is_deepseek_model(*models: str | None) -> bool:
+        return any(
+            isinstance(model, str) and "deepseek" in model.lower()
+            for model in models
+        )
+
+    @staticmethod
+    def _is_deepseek_reasoning_roundtrip_error(error: Exception) -> bool:
+        text = str(error).lower()
+        return (
+            "deepseek" in text
+            and "reasoning_content" in text
+            and "thinking mode" in text
+            and "must be passed back" in text
+        )
+
+    @staticmethod
+    def _backfill_missing_reasoning_content(
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Add minimal reasoning_content to legacy assistant tool-call messages.
+
+        DeepSeek thinking mode validates assistant tool-call turns and rejects
+        follow-up requests when those turns are missing ``reasoning_content``.
+        New responses should preserve the real field; this fallback only repairs
+        older/in-memory turns that already lost it.
+        """
+        patched: list[dict[str, Any]] = []
+        count = 0
+        for msg in messages:
+            if (
+                msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and not msg.get("reasoning_content")
+            ):
+                repaired = dict(msg)
+                repaired["reasoning_content"] = " "
+                patched.append(repaired)
+                count += 1
+            else:
+                patched.append(msg)
+        return patched, count
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -261,11 +356,11 @@ class LiteLLMProvider(LLMProvider):
         # Pass extra headers (e.g. APP-Code for AiHubMix)
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
-        
+
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
             kwargs["drop_params"] = True
-        
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice if tool_choice is not None else "auto"
@@ -274,6 +369,26 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
+            if (
+                self._is_deepseek_model(original_model, model)
+                and self._is_deepseek_reasoning_roundtrip_error(e)
+            ):
+                repaired_messages, repaired_count = (
+                    self._backfill_missing_reasoning_content(kwargs["messages"])
+                )
+                if repaired_count:
+                    logger.warning(
+                        "Retrying DeepSeek request after backfilling missing reasoning_content "
+                        "on {} assistant tool-call message(s)",
+                        repaired_count,
+                    )
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs["messages"] = repaired_messages
+                    try:
+                        response = await acompletion(**retry_kwargs)
+                        return self._parse_response(response)
+                    except Exception as retry_error:
+                        e = retry_error
             # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
@@ -324,8 +439,10 @@ class LiteLLMProvider(LLMProvider):
                 "total_tokens": response.usage.total_tokens,
             }
 
-        reasoning_content = getattr(message, "reasoning_content", None) or None
-        thinking_blocks = getattr(message, "thinking_blocks", None) or None
+        reasoning_content = self._message_value(message, "reasoning_content") or None
+        if not reasoning_content:
+            reasoning_content = self._message_value(message, "reasoning") or None
+        thinking_blocks = self._message_value(message, "thinking_blocks") or None
 
         return LLMResponse(
             content=content,
