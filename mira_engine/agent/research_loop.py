@@ -42,7 +42,10 @@ class ResearchAgentLoop(BaseAgentLoop):
         self._session_agent_profiles: dict[str, str] = {}
         self._session_automation_policies: dict[str, dict[str, Any] | None] = {}
         self._last_task_plan_guard_issues: list[str] = []
+        self._last_task_plan_guard_repairable_issues: list[str] = []
+        self._last_task_plan_guard_fatal_issues: list[str] = []
         self._last_task_plan_guard_fixed: bool = False
+        self._last_task_plan_guard_blocking: bool = False
         # Cumulative tokens consumed by each session, surfaced to UI clients
         # via progress / response metadata so users can monitor usage against
         # their automation token budget. Cleared when the session is reset
@@ -659,19 +662,27 @@ class ResearchAgentLoop(BaseAgentLoop):
         """Apply task_plan guardrails before auto-continue rounds."""
         if not project_dir:
             self._last_task_plan_guard_issues = []
+            self._last_task_plan_guard_repairable_issues = []
+            self._last_task_plan_guard_fatal_issues = []
             self._last_task_plan_guard_fixed = False
+            self._last_task_plan_guard_blocking = False
             return True
         result = guard_task_plan_file(Path(project_dir), auto_fix=auto_fix, profile=profile)
         issues = list(result.get("issues") or [])
+        repairable_issues = list(result.get("repairable_issues") or [])
+        fatal_issues = list(result.get("fatal_issues") or [])
         self._last_task_plan_guard_issues = issues
+        self._last_task_plan_guard_repairable_issues = repairable_issues
+        self._last_task_plan_guard_fatal_issues = fatal_issues
         self._last_task_plan_guard_fixed = bool(result.get("fixed"))
+        self._last_task_plan_guard_blocking = bool(result.get("blocking"))
         if result.get("fixed"):
             logger.info("task_plan guardrails auto-fixed {}", project_dir)
         if result.get("blocking"):
             logger.warning(
                 "task_plan guardrails blocked auto-continue for {}: {}",
                 project_dir,
-                issues[:3],
+                list(result.get("blocking_issues") or issues)[:3],
             )
             return False
         return True
@@ -724,9 +735,14 @@ class ResearchAgentLoop(BaseAgentLoop):
                 "- when conclusion indicates rejection/failure, also include: "
                 + ", ".join(str(item) for item in required_falsify)
             )
-        lines.append(
-            "- do not mark an experiment as completed unless required contract fields are present."
-        )
+        if required_completed or required_falsify:
+            lines.append(
+                "- do not mark an experiment as completed unless required contract fields are present."
+            )
+        else:
+            lines.append(
+                "- compat mode: contract-specific research/engineer fields are guidance, not blockers."
+            )
         return "\n".join(lines)
 
     def _is_strict_contract_enforced(
@@ -1374,119 +1390,71 @@ class ResearchAgentLoop(BaseAgentLoop):
                 tokens_used=total_tokens_used,
             )
             if not should_continue:
-                if current_mode == "auto" and continuation_reason:
-                    await progress_cb(
-                        f"auto-run stop reason: {continuation_reason}"
-                    )
-                guard_issues = list(getattr(self, "_last_task_plan_guard_issues", []))
-                continue_despite_guard = False
+                repairable_guard_issues = list(
+                    getattr(self, "_last_task_plan_guard_repairable_issues", [])
+                )
+                fatal_guard_issues = list(
+                    getattr(self, "_last_task_plan_guard_fatal_issues", [])
+                )
                 strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
                 heuristic_block = strict_heuristics and (
                     self._looks_like_failure_response(final_content)
                     or self._looks_like_user_input_request(final_content)
                 )
-                if (
+                can_repair_guard = (
                     current_mode == "auto"
-                    and guard_issues
+                    and continuation_reason == "task_plan guardrail blocking"
+                    and repairable_guard_issues
+                    and not fatal_guard_issues
                     and not heuristic_block
-                ):
-                    if guard_repair_round < self._AUTO_GUARD_REPAIR_MAX:
-                        guard_repair_round += 1
-                        auto_round += 1
-                        await progress_cb(
-                            f"auto-run guardrail repair {guard_repair_round}: "
-                            "filling required evidence fields"
-                        )
-                        all_msgs.append({
-                            "role": "user",
-                            "content": self._build_auto_guardrail_repair_message(
-                                channel=msg.channel,
-                                chat_id=msg.chat_id,
-                                project_dir=project_dir,
-                                run_mode=current_mode,
-                                issues=guard_issues,
-                            ),
-                        })
-                        guard_plan_before = round_plan_after
-                        final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
-                        total_tokens_used += self._last_loop_tokens_used
-                        self._accumulate_session_tokens(key, self._last_loop_tokens_used)
-                        round_plan_after = self._load_task_plan(project_dir)
-                        round_plan_before = guard_plan_before
-                        if msg.channel == "ui" and not allow_result_write:
-                            round_plan_after, restored = self._restore_result_section(
-                                project_dir,
-                                before_plan=guard_plan_before,
-                                after_plan=round_plan_after,
-                            )
-                            if restored:
-                                await progress_cb(
-                                    "auto-run guard: skipped task_plan.result update without explicit export request"
-                                )
-                            round_plan_after, status_restored = self._restore_completion_status(
-                                project_dir,
-                                after_plan=round_plan_after,
-                            )
-                            if status_restored:
-                                await progress_cb(
-                                    "auto-run guard: kept task_plan.status=in_progress until explicit export request"
-                                )
-                        continue
-                    has_pending = self._plan_has_pending_work(self._load_task_plan(project_dir))
-                    strict_contract = self._is_strict_contract_enforced(
-                        project_dir=project_dir,
-                        agent_profile=agent_profile,
+                )
+                if can_repair_guard and guard_repair_round < self._AUTO_GUARD_REPAIR_MAX:
+                    guard_repair_round += 1
+                    auto_round += 1
+                    await progress_cb(
+                        f"auto-run guardrail repair {guard_repair_round}: "
+                        "completing strict task_plan contract fields"
                     )
-                    if strict_contract and has_pending and auto_round < self._AUTO_MAX_ROUNDS:
-                        guard_repair_round = 0
-                        auto_round += 1
-                        await progress_cb(
-                            "auto-run strict contract repair: required fields still missing; "
-                            "requesting targeted completion before next experiment"
+                    all_msgs.append({
+                        "role": "user",
+                        "content": self._build_auto_guardrail_repair_message(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            project_dir=project_dir,
+                            run_mode=current_mode,
+                            issues=repairable_guard_issues,
+                        ),
+                    })
+                    guard_plan_before = round_plan_after
+                    final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
+                    total_tokens_used += self._last_loop_tokens_used
+                    self._accumulate_session_tokens(key, self._last_loop_tokens_used)
+                    round_plan_after = self._load_task_plan(project_dir)
+                    round_plan_before = guard_plan_before
+                    if msg.channel == "ui" and not allow_result_write:
+                        round_plan_after, restored = self._restore_result_section(
+                            project_dir,
+                            before_plan=guard_plan_before,
+                            after_plan=round_plan_after,
                         )
-                        all_msgs.append({
-                            "role": "user",
-                            "content": self._build_auto_guardrail_repair_message(
-                                channel=msg.channel,
-                                chat_id=msg.chat_id,
-                                project_dir=project_dir,
-                                run_mode=current_mode,
-                                issues=guard_issues,
-                            ),
-                        })
-                        guard_plan_before = round_plan_after
-                        final_content, _, all_msgs = await self._run_agent_loop(all_msgs, **run_kwargs)
-                        total_tokens_used += self._last_loop_tokens_used
-                        self._accumulate_session_tokens(key, self._last_loop_tokens_used)
-                        round_plan_after = self._load_task_plan(project_dir)
-                        round_plan_before = guard_plan_before
-                        if msg.channel == "ui" and not allow_result_write:
-                            round_plan_after, restored = self._restore_result_section(
-                                project_dir,
-                                before_plan=guard_plan_before,
-                                after_plan=round_plan_after,
+                        if restored:
+                            await progress_cb(
+                                "auto-run guard: skipped task_plan.result update without explicit export request"
                             )
-                            if restored:
-                                await progress_cb(
-                                    "auto-run guard: skipped task_plan.result update without explicit export request"
-                                )
-                            round_plan_after, status_restored = self._restore_completion_status(
-                                project_dir,
-                                after_plan=round_plan_after,
-                            )
-                            if status_restored:
-                                await progress_cb(
-                                    "auto-run guard: kept task_plan.status=in_progress until explicit export request"
-                                )
-                        continue
-                    if has_pending and auto_round < self._AUTO_MAX_ROUNDS:
-                        continue_despite_guard = True
-                        await progress_cb(
-                            "auto-run guard warning: contract issues remain after repair; "
-                            "continuing and deferring strict cleanup"
+                        round_plan_after, status_restored = self._restore_completion_status(
+                            project_dir,
+                            after_plan=round_plan_after,
                         )
-                if not continue_despite_guard:
-                    break
+                        if status_restored:
+                            await progress_cb(
+                                "auto-run guard: kept task_plan.status=in_progress until explicit export request"
+                            )
+                    continue
+                if current_mode == "auto" and continuation_reason:
+                    await progress_cb(
+                        f"auto-run stop reason: {continuation_reason}"
+                    )
+                break
             run_mode = current_mode
             auto_round += 1
             await progress_cb(

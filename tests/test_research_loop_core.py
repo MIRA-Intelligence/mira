@@ -48,7 +48,10 @@ def _make_loop(tmp_path: Path) -> ResearchAgentLoop:
     loop._session_automation_policies = {}
     loop._session_tokens_used = {}
     loop._last_task_plan_guard_issues = []
+    loop._last_task_plan_guard_repairable_issues = []
+    loop._last_task_plan_guard_fatal_issues = []
     loop._last_task_plan_guard_fixed = False
+    loop._last_task_plan_guard_blocking = False
     loop._project_sessions = {}
     loop._TOOL_RESULT_MAX_CHARS = 20
     return loop
@@ -252,6 +255,57 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         final_content="all good",
         auto_round=0,
     ) is False
+
+    compat_project = tmp_path / "PRJ-compat"
+    (compat_project / ".mira").mkdir(parents=True)
+    (compat_project / ".mira" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 1}),
+        encoding="utf-8",
+    )
+    (compat_project / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "experiments": [
+                    {
+                        "id": "Exp001",
+                        "status": "completed",
+                        "results": {"metrics": {"Dice": 0.78}},
+                        "conclusion": "baseline established",
+                    },
+                    {"id": "Exp002", "status": "pending"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(compat_project),
+        final_content="all good",
+        auto_round=0,
+        agent_profile="research",
+    )
+    assert decision is True and reason is None
+
+    strict_project = tmp_path / "PRJ-strict"
+    (strict_project / ".mira").mkdir(parents=True)
+    (strict_project / ".mira" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 2}),
+        encoding="utf-8",
+    )
+    (strict_project / "task_plan.json").write_text(
+        (compat_project / "task_plan.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(strict_project),
+        final_content="all good",
+        auto_round=0,
+        agent_profile="research",
+    )
+    assert decision is False
+    assert reason == "task_plan guardrail blocking"
 
     exhausted_policy = loop._parse_automation_policy(
         {
@@ -693,8 +747,15 @@ async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path
         calls["decide"] += 1
         if calls["decide"] == 1:
             loop._last_task_plan_guard_issues = ["Exp001: missing theoretical_proof"]
+            loop._last_task_plan_guard_repairable_issues = [
+                "Exp001: missing theoretical_proof"
+            ]
+            loop._last_task_plan_guard_fatal_issues = []
+            return False, "task_plan guardrail blocking"
         else:
             loop._last_task_plan_guard_issues = []
+            loop._last_task_plan_guard_repairable_issues = []
+            loop._last_task_plan_guard_fatal_issues = []
         return False, "queue exhausted, no replan condition met"
 
     async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
@@ -717,6 +778,7 @@ async def test_process_message_auto_guardrail_repair_round(monkeypatch, tmp_path
     out = await loop._process_message(msg, on_progress=_progress)
     assert out.content == "round-2"
     assert any("guardrail repair 1" in item for item in progress_events)
+    assert not any("task_plan guardrail blocking" in item for item in progress_events)
 
 
 async def test_process_message_broadcasts_token_usage_and_resets_on_new(

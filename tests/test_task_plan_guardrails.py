@@ -1,6 +1,6 @@
 import json
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 from mira_engine.task_plan.guardrails import get_task_plan_contract, guard_task_plan_file
 
@@ -443,11 +443,77 @@ def test_guard_task_plan_allows_existing_noncanonical_artifacts(tmp_path: Path) 
     assert result["blocking"] is False
 
 
-def test_guard_task_plan_research_profile_requires_evidence_fields(tmp_path: Path) -> None:
+def test_guard_task_plan_research_profile_contract_v1_allows_missing_evidence_fields(
+    tmp_path: Path,
+) -> None:
     project_dir = tmp_path / "PRJ-0100"
     (project_dir / ".mira").mkdir(parents=True)
     (project_dir / ".mira" / "project.json").write_text(
-        json.dumps({"agent_profile": "research"}),
+        json.dumps({"agent_profile": "research", "contract_version": 1}),
+        encoding="utf-8",
+    )
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [
+                    {
+                        "id": "Exp001",
+                        "status": "completed",
+                        "results": {"metrics": {"r2": 0.1}},
+                        "conclusion": "Hypothesis was rejected based on this run.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=False)
+    assert result["ok"] is True
+    assert result["blocking"] is False
+    assert result["issues"] == []
+
+
+def test_guard_task_plan_contract_v1_does_not_block_completion_warnings(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "PRJ-0100A"
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
+        json.dumps({"agent_profile": "default", "contract_version": 1}),
+        encoding="utf-8",
+    )
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "status": "in_progress",
+                "experiments": [{"id": "Exp001", "status": "completed"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=False)
+    assert result["ok"] is True
+    assert result["blocking"] is False
+    assert result["blocking_issues"] == []
+    assert any(
+        "completed experiment missing results/conclusion" in issue
+        for issue in result["issues"]
+    )
+    assert result["repairable_issues"] == result["issues"]
+
+
+def test_guard_task_plan_research_profile_contract_v2_requires_evidence_fields(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "PRJ-0100B"
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
+        json.dumps({"agent_profile": "research", "contract_version": 2}),
         encoding="utf-8",
     )
     (project_dir / "task_plan.json").write_text(
@@ -471,6 +537,8 @@ def test_guard_task_plan_research_profile_requires_evidence_fields(tmp_path: Pat
     result = guard_task_plan_file(project_dir, auto_fix=False)
     assert result["ok"] is False
     assert result["blocking"] is True
+    assert result["fatal_issues"] == []
+    assert result["repairable_issues"]
     joined = "\n".join(result["issues"])
     assert "research profile missing required fields" in joined
     assert "hypothesis rejection requires fields" in joined
@@ -482,7 +550,7 @@ def test_guard_task_plan_engineer_profile_requires_reproducibility_fields(
     project_dir = tmp_path / "PRJ-0101"
     (project_dir / ".mira").mkdir(parents=True)
     (project_dir / ".mira" / "project.json").write_text(
-        json.dumps({"agent_profile": "engineer"}),
+        json.dumps({"agent_profile": "engineer", "contract_version": 2}),
         encoding="utf-8",
     )
     (project_dir / "task_plan.json").write_text(
@@ -517,7 +585,7 @@ def test_guard_task_plan_default_profile_requires_evidence_refs_for_rejection(
     project_dir = tmp_path / "PRJ-0102"
     (project_dir / ".mira").mkdir(parents=True)
     (project_dir / ".mira" / "project.json").write_text(
-        json.dumps({"agent_profile": "default"}),
+        json.dumps({"agent_profile": "default", "contract_version": 2}),
         encoding="utf-8",
     )
     (project_dir / "task_plan.json").write_text(
@@ -578,6 +646,10 @@ def test_guard_task_plan_default_profile_contract_v2_requires_core_fields(
 
 
 def test_get_task_plan_contract_for_research_profile() -> None:
+    compat_contract = get_task_plan_contract(profile="research", contract_version=1)
+    assert compat_contract["required_completed_fields"] == []
+    assert compat_contract["required_falsify_fields"] == []
+
     contract = get_task_plan_contract(profile="research", contract_version=2)
     assert contract["profile"] == "research"
     assert contract["contract_version"] == 2
@@ -590,6 +662,7 @@ def test_get_task_plan_contract_default_profile_uses_contract_version() -> None:
     v1 = get_task_plan_contract(profile="default", contract_version=1)
     v2 = get_task_plan_contract(profile="default", contract_version=2)
     assert v1["required_completed_fields"] == []
+    assert v1["required_falsify_fields"] == []
     assert v2["required_completed_fields"] == [
         "question",
         "hypothesis",
@@ -597,3 +670,4 @@ def test_get_task_plan_contract_default_profile_uses_contract_version() -> None:
         "results",
         "conclusion",
     ]
+    assert v2["required_falsify_fields"] == ["evidence_refs"]

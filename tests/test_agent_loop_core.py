@@ -125,7 +125,9 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
     loop = _make_real_loop(old_workspace)
     new_provider = _NoopProvider()
     new_router = SimpleNamespace(enabled=True)
-    new_factory = lambda _model: new_provider
+
+    def new_factory(_model: str) -> _NoopProvider:
+        return new_provider
 
     loop._session_model_runtimes["ui:user"] = object()  # type: ignore[assignment]
     loop.subagents._session_runtimes["ui:user"] = object()  # type: ignore[assignment]
@@ -234,7 +236,10 @@ def test_base_loop_omits_research_state() -> None:
         "_session_automation_policies",
         "_session_tokens_used",
         "_last_task_plan_guard_issues",
+        "_last_task_plan_guard_repairable_issues",
+        "_last_task_plan_guard_fatal_issues",
         "_last_task_plan_guard_fixed",
+        "_last_task_plan_guard_blocking",
     )
     for attr in research_attrs:
         assert not hasattr(loop, attr), f"BaseAgentLoop unexpectedly carries {attr}"
