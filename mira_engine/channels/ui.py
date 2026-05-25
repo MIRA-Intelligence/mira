@@ -26,10 +26,10 @@ from loguru import logger
 
 from mira_engine import __version__
 from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
-from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
+from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.config import loader as config_loader
 from mira_engine.config.paths import get_runtime_subdir
 from mira_engine.config.schema import Config, UiChannelConfig
@@ -943,13 +943,14 @@ class UiChannel(BaseChannel):
         if project_dir is None:
             project_dir = self._resolve_project_dir(msg.chat_id) if msg.chat_id else None
         is_progress = metadata.get("_progress", False)
+        is_activity_ping = bool(metadata.get("_activity_ping", False))
         msg_type = "progress" if is_progress else "response"
         common_details = {
             "type": msg_type,
             "tool_hint": bool(metadata.get("_tool_hint", False)),
             "content_preview": self._preview(msg.content),
         }
-        if project_dir and project_dir.is_dir():
+        if project_dir and project_dir.is_dir() and not is_activity_ping:
             SessionManager(project_dir).append_ui_event(
                 key=f"ui:{msg.chat_id}",
                 role="assistant",

@@ -691,6 +691,13 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     )
     out = await loop._process_message(msg, on_progress=_progress)
     assert out.content == "round-2"
+    intermediate = await loop.bus.consume_outbound()
+    assert intermediate.channel == "ui"
+    assert intermediate.chat_id == "PRJ-5"
+    assert intermediate.content == "round-1"
+    assert intermediate.metadata["_auto_round_response"] is True
+    assert intermediate.metadata["_auto_round"] == 0
+    assert intermediate.metadata.get("_progress") is not True
     assert any("auto-run round 1" in item for item in progress_events)
     assert any(
         "auto-run stop reason: queue exhausted" in item for item in progress_events
@@ -732,6 +739,7 @@ async def test_process_message_auto_continue_round_non_ui_channel(
     )
     out = await loop._process_message(msg, on_progress=_progress)
     assert out.content == "round-2"
+    assert loop.bus.outbound_size == 0
     assert any("auto-run round 1" in item for item in progress_events)
     assert any(
         "auto-run stop reason: queue exhausted" in item for item in progress_events

@@ -1678,6 +1678,26 @@ async def test_send_progress_type(ui_channel: UiChannel) -> None:
     assert ws.send_json.await_args.args[0]["type"] == "progress"
 
 
+async def test_send_activity_ping_does_not_persist_history(ui_channel: UiChannel) -> None:
+    session_id = "sid-activity"
+    project_dir = ui_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    ws = MagicMock()
+    ws.closed = False
+    ws.send_json = AsyncMock()
+    ui_channel._clients[session_id] = ws
+    msg = OutboundMessage(
+        channel="ui",
+        chat_id=session_id,
+        content="Mira is working...",
+        metadata={"_progress": True, "_activity_ping": True},
+    )
+    await ui_channel.send(msg)
+    assert ws.send_json.await_args.args[0]["type"] == "progress"
+    assert SessionManager(project_dir).get_ui_history(f"ui:{session_id}") == []
+
+
 async def test_send_writes_project_audit_entry(ui_channel: UiChannel) -> None:
     session_id = "sid-log"
     project_dir = ui_channel.projects_root / session_id

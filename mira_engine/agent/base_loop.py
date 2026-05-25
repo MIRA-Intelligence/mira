@@ -14,11 +14,12 @@ from a clean baseline.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import time
 import weakref
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -26,11 +27,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from mira_engine.agent.context import ContextBuilder
-from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
 from mira_engine.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from mira_engine.agent.memory import Consolidator, Dream, MemoryStore
-from mira_engine.agent.runner import AgentRunner
+from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
 from mira_engine.agent.routing import ModelRouter, RoutedProviderManager
+from mira_engine.agent.runner import AgentRunner
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
 from mira_engine.agent.tools.cron import CronTool
@@ -403,6 +404,37 @@ class BaseAgentLoop:
         return cleaned.strip() or None
 
     @staticmethod
+    async def _emit_activity_ping(on_progress: Callable[..., Awaitable[None]]) -> None:
+        """Tell UI clients the engine is active without exposing tool details."""
+        try:
+            params = inspect.signature(on_progress).parameters
+        except (TypeError, ValueError):
+            params = {}
+        supports_activity_ping = "activity_ping" in params or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        )
+        if supports_activity_ping:
+            await on_progress("Mira is working...", activity_ping=True)
+        else:
+            await on_progress("Mira is working...")
+
+    @classmethod
+    async def _activity_ping_loop(
+        cls,
+        on_progress: Callable[..., Awaitable[None]],
+        *,
+        interval_seconds: float = 10.0,
+    ) -> None:
+        """Keep long-running tool calls visibly alive in UI clients."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await cls._emit_activity_ping(on_progress)
+            except Exception as exc:
+                logger.debug("Activity ping failed; stopping heartbeat: {}", exc)
+                return
+
+    @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
         def _fmt(tc):
@@ -634,6 +666,7 @@ class BaseAgentLoop:
 
             if response.has_tool_calls:
                 if on_progress:
+                    await self._emit_activity_ping(on_progress)
                     thought = self._strip_think(response.content)
                     if thought:
                         await on_progress(thought)
@@ -669,7 +702,16 @@ class BaseAgentLoop:
                         )
                         if skill_event:
                             await audit_hook(skill_event)
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    ping_task: asyncio.Task[None] | None = None
+                    if on_progress:
+                        ping_task = asyncio.create_task(self._activity_ping_loop(on_progress))
+                    try:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    finally:
+                        if ping_task is not None:
+                            ping_task.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await ping_task
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -1072,10 +1114,17 @@ class BaseAgentLoop:
             extra_system=extra_system,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+        async def _bus_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            activity_ping: bool = False,
+        ) -> None:
             progress_meta = dict(msg.metadata or {})
             progress_meta["_progress"] = True
             progress_meta["_tool_hint"] = tool_hint
+            if activity_ping:
+                progress_meta["_activity_ping"] = True
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=progress_meta,
             ))
@@ -1114,6 +1163,7 @@ class BaseAgentLoop:
             run_kwargs["on_stream"] = on_stream
         if on_stream_end is not None:
             run_kwargs["on_stream_end"] = on_stream_end
+        await self._emit_activity_ping(progress_cb)
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
 
         if final_content is None:

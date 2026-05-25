@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import pytest
 
@@ -54,6 +54,16 @@ class _EchoTool(Tool):
         }
 
     async def execute(self, value: int, **kwargs: Any) -> str:
+        return f"value={value}"
+
+
+class _SlowEchoTool(_EchoTool):
+    @property
+    def name(self) -> str:
+        return "slow_echo"
+
+    async def execute(self, value: int, **kwargs: Any) -> str:
+        await asyncio.sleep(0.05)
         return f"value={value}"
 
 
@@ -288,6 +298,42 @@ async def test_run_agent_loop_tool_call_and_finish(tmp_path: Path) -> None:
     assert any(item[0] == "working" for item in progress)
     assert any(item[1] for item in progress)
     assert any(m.get("role") == "tool" for m in messages)
+
+
+async def test_run_agent_loop_keeps_long_tool_visibly_active(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    loop = _make_loop(tmp_path)
+    loop.tools.register(_SlowEchoTool())
+    runtime = _RuntimeStub(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCallRequest(id="call-1", name="slow_echo", arguments={"value": 7})],
+            ),
+            LLMResponse(content="done"),
+        ]
+    )
+    progress: list[tuple[str, bool]] = []
+
+    async def _progress(content: str, activity_ping: bool = False, **_: Any) -> None:
+        progress.append((content, activity_ping))
+
+    async def _fast_heartbeat(on_progress: Callable[..., Awaitable[None]]) -> None:
+        await on_progress("Mira is working...", activity_ping=True)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(loop, "_activity_ping_loop", _fast_heartbeat)
+
+    final, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=runtime,
+        on_progress=_progress,
+    )
+
+    assert final == "done"
+    assert sum(1 for _, activity_ping in progress if activity_ping) >= 2
 
 
 async def test_run_agent_loop_error_and_max_iterations(tmp_path: Path) -> None:

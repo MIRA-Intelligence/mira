@@ -1007,6 +1007,35 @@ class ResearchAgentLoop(BaseAgentLoop):
             },
         ))
 
+    async def _emit_auto_round_response(
+        self,
+        msg: InboundMessage,
+        *,
+        content: str | None,
+        auto_round: int,
+        tokens_used: int,
+        automation_policy: dict[str, Any] | None,
+    ) -> None:
+        """Surface an intermediate auto-mode assistant answer to the UI chat."""
+        if msg.channel != "ui" or not content:
+            return
+        text = content.strip()
+        if not text:
+            return
+        metadata = dict(msg.metadata or {})
+        metadata["_auto_round_response"] = True
+        metadata["_auto_round"] = auto_round
+        metadata["tokens_used_session"] = tokens_used
+        max_tokens = self._max_tokens_from_policy(automation_policy)
+        if max_tokens is not None:
+            metadata["max_tokens"] = max_tokens
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=text,
+            metadata=metadata,
+        ))
+
     def _on_session_reset(self, session_key: str) -> None:
         """Drop research-specific per-session caches on /new."""
         super()._on_session_reset(session_key)
@@ -1218,10 +1247,17 @@ class ResearchAgentLoop(BaseAgentLoop):
             extra_system=extra_system,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+        async def _bus_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            activity_ping: bool = False,
+        ) -> None:
             progress_meta = dict(msg.metadata or {})
             progress_meta["_progress"] = True
             progress_meta["_tool_hint"] = tool_hint
+            if activity_ping:
+                progress_meta["_activity_ping"] = True
             progress_meta["tokens_used_session"] = self._session_tokens_used.get(key, 0)
             max_tokens = self._max_tokens_from_policy(automation_policy)
             if max_tokens is not None:
@@ -1265,6 +1301,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             run_kwargs["on_stream"] = on_stream
         if on_stream_end is not None:
             run_kwargs["on_stream_end"] = on_stream_end
+        await self._emit_activity_ping(progress_cb)
         round_plan_before = self._load_task_plan(project_dir)
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
         total_tokens_used = self._last_loop_tokens_used
@@ -1455,6 +1492,13 @@ class ResearchAgentLoop(BaseAgentLoop):
                         f"auto-run stop reason: {continuation_reason}"
                     )
                 break
+            await self._emit_auto_round_response(
+                msg,
+                content=final_content,
+                auto_round=auto_round,
+                tokens_used=total_tokens_used,
+                automation_policy=automation_policy,
+            )
             run_mode = current_mode
             auto_round += 1
             await progress_cb(
