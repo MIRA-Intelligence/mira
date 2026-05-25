@@ -125,18 +125,22 @@ def plan_has_final_result_output(result: object) -> bool:
 def _required_completed_fields_for_profile(
     profile: str, contract_version: int
 ) -> tuple[str, ...]:
+    if contract_version < STRICT_CONTRACT_VERSION:
+        return ()
     if profile == "research":
         return _RESEARCH_REQUIRED_COMPLETED_FIELDS
     if profile == "engineer":
         return _ENGINEER_REQUIRED_COMPLETED_FIELDS
     if profile == "default":
-        if contract_version >= STRICT_CONTRACT_VERSION:
-            return _DEFAULT_STRICT_REQUIRED_COMPLETED_FIELDS
-        return _DEFAULT_REQUIRED_COMPLETED_FIELDS
+        return _DEFAULT_STRICT_REQUIRED_COMPLETED_FIELDS
     return ()
 
 
-def _required_falsify_fields_for_profile(profile: str) -> tuple[str, ...]:
+def _required_falsify_fields_for_profile(
+    profile: str, contract_version: int
+) -> tuple[str, ...]:
+    if contract_version < STRICT_CONTRACT_VERSION:
+        return ()
     if profile == "research":
         return _RESEARCH_REQUIRED_FALSIFY_FIELDS
     if profile == "engineer":
@@ -160,7 +164,9 @@ def get_task_plan_contract(
             )
         ),
         "required_falsify_fields": list(
-            _required_falsify_fields_for_profile(normalized_profile)
+            _required_falsify_fields_for_profile(
+                normalized_profile, normalized_contract_version
+            )
         ),
         "falsify_keywords": list(_FALSIFY_KEYWORDS),
     }
@@ -245,6 +251,51 @@ def _load_project_contract_version(project_dir: Path | None) -> int:
         if isinstance(value, int) and value in {DEFAULT_CONTRACT_VERSION, STRICT_CONTRACT_VERSION}:
             return value
     return DEFAULT_CONTRACT_VERSION
+
+
+def _is_repairable_contract_issue(issue: str) -> bool:
+    return (
+        "completed experiment missing results/conclusion" in issue
+        or "profile missing required fields" in issue
+        or "hypothesis rejection requires fields" in issue
+        or ": evidence_refs" in issue
+    )
+
+
+def _build_guard_result(
+    *,
+    ok: bool | None = None,
+    exists: bool,
+    fixed: bool,
+    issues: list[str],
+    contract_version: int = DEFAULT_CONTRACT_VERSION,
+) -> dict[str, Any]:
+    repairable_issues = [
+        issue for issue in issues if _is_repairable_contract_issue(issue)
+    ]
+    fatal_issues = [
+        issue for issue in issues if not _is_repairable_contract_issue(issue)
+    ]
+    if ok is None:
+        blocking_issues = (
+            issues
+            if contract_version >= STRICT_CONTRACT_VERSION
+            else fatal_issues
+        )
+        ok = len(blocking_issues) == 0
+    else:
+        blocking_issues = issues if not ok else []
+
+    return {
+        "ok": ok,
+        "exists": exists,
+        "fixed": fixed,
+        "blocking": len(blocking_issues) > 0,
+        "issues": issues,
+        "repairable_issues": repairable_issues,
+        "fatal_issues": fatal_issues,
+        "blocking_issues": blocking_issues,
+    }
 
 
 def _is_nonempty(value: object) -> bool:
@@ -352,7 +403,7 @@ def _validate_profile_falsify_fields(
 ) -> list[str]:
     if not _looks_like_hypothesis_rejection(exp.get("conclusion")):
         return []
-    required = _required_falsify_fields_for_profile(profile)
+    required = _required_falsify_fields_for_profile(profile, contract_version)
     missing = _missing_required_fields(
         exp,
         required,
@@ -902,33 +953,33 @@ def guard_task_plan_file(
     """Validate (and optionally auto-fix) task_plan.json under a project directory."""
     plan_path = project_dir / PLAN_FILENAME
     if not plan_path.is_file():
-        return {
-            "ok": True,
-            "exists": False,
-            "fixed": False,
-            "blocking": False,
-            "issues": [],
-        }
+        return _build_guard_result(
+            ok=True,
+            exists=False,
+            fixed=False,
+            issues=[],
+            contract_version=_load_project_contract_version(project_dir),
+        )
 
     try:
         data = json.loads(plan_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        return {
-            "ok": False,
-            "exists": True,
-            "fixed": False,
-            "blocking": True,
-            "issues": [f"failed to parse task_plan.json: {exc}"],
-        }
+        return _build_guard_result(
+            ok=False,
+            exists=True,
+            fixed=False,
+            issues=[f"failed to parse task_plan.json: {exc}"],
+            contract_version=_load_project_contract_version(project_dir),
+        )
 
     if not _is_mapping(data):
-        return {
-            "ok": False,
-            "exists": True,
-            "fixed": False,
-            "blocking": True,
-            "issues": ["task_plan root must be a JSON object"],
-        }
+        return _build_guard_result(
+            ok=False,
+            exists=True,
+            fixed=False,
+            issues=["task_plan root must be a JSON object"],
+            contract_version=_load_project_contract_version(project_dir),
+        )
 
     fixed = False
     if auto_fix:
@@ -942,19 +993,18 @@ def guard_task_plan_file(
                 data = normalized
                 fixed = True
             except OSError as exc:
-                return {
-                    "ok": False,
-                    "exists": True,
-                    "fixed": False,
-                    "blocking": True,
-                    "issues": [f"failed to write normalized task_plan.json: {exc}"],
-                }
+                return _build_guard_result(
+                    ok=False,
+                    exists=True,
+                    fixed=False,
+                    issues=[f"failed to write normalized task_plan.json: {exc}"],
+                    contract_version=_load_project_contract_version(project_dir),
+                )
 
     issues = lint_task_plan_data(data, project_dir=project_dir, profile=profile)
-    return {
-        "ok": len(issues) == 0,
-        "exists": True,
-        "fixed": fixed,
-        "blocking": len(issues) > 0,
-        "issues": issues,
-    }
+    return _build_guard_result(
+        exists=True,
+        fixed=fixed,
+        issues=issues,
+        contract_version=_load_project_contract_version(project_dir),
+    )

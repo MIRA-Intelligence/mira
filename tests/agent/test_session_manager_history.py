@@ -194,6 +194,66 @@ def test_get_history_preserves_reasoning_content():
     ]
 
 
+def test_get_history_preserves_reasoning_when_stripping_incomplete_tool_calls() -> None:
+    session = Session(key="test:reasoning-incomplete-tool")
+    session.messages.append({"role": "user", "content": "hi"})
+    session.messages.append({
+        "role": "assistant",
+        "content": "done",
+        "reasoning_content": "hidden chain of thought",
+        "thinking_blocks": [{"type": "thinking", "signature": "sig"}],
+        "tool_calls": [
+            {"id": "missing", "type": "function", "function": {"name": "x", "arguments": "{}"}},
+        ],
+    })
+    session.messages.append({"role": "user", "content": "next"})
+
+    history = session.get_history(max_messages=500)
+
+    assert history == [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "done",
+            "reasoning_content": "hidden chain of thought",
+            "thinking_blocks": [{"type": "thinking", "signature": "sig"}],
+        },
+        {"role": "user", "content": "next"},
+    ]
+
+
+def test_get_history_merges_reasoning_when_collapsing_consecutive_assistants() -> None:
+    session = Session(key="test:reasoning-collapse")
+    session.messages.append({"role": "user", "content": "hi"})
+    session.messages.append({
+        "role": "assistant",
+        "content": "first",
+        "reasoning_content": "r1",
+        "thinking_blocks": [{"type": "thinking", "signature": "sig1"}],
+    })
+    session.messages.append({
+        "role": "assistant",
+        "content": "second",
+        "reasoning_content": "r2",
+        "thinking_blocks": [{"type": "thinking", "signature": "sig2"}],
+    })
+
+    history = session.get_history(max_messages=500)
+
+    assert history == [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "first\n\nsecond",
+            "reasoning_content": "r1\n\nr2",
+            "thinking_blocks": [
+                {"type": "thinking", "signature": "sig1"},
+                {"type": "thinking", "signature": "sig2"},
+            ],
+        },
+    ]
+
+
 # --- Window cuts mid-group: assistant present but some tool results orphaned ---
 
 def test_window_cuts_mid_tool_group():

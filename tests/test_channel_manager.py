@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 from mira_engine.bus.events import OutboundMessage
@@ -153,20 +152,36 @@ async def test_dispatch_outbound_filters_progress_messages() -> None:
     cfg.channels.send_tool_hints = False
     bus = MessageBus()
     mgr = ChannelManager(cfg, bus)
-    ch = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
-    mgr.channels = {"ui": ch}
+    ui_ch = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
+    matrix_ch = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
+    mgr.channels = {"ui": ui_ch, "matrix": matrix_ch}
 
     task = asyncio.create_task(mgr._dispatch_outbound())
     await bus.publish_outbound(OutboundMessage("ui", "x", "normal"))
     await bus.publish_outbound(OutboundMessage("ui", "x", "progress", metadata={"_progress": True}))
     await bus.publish_outbound(
+        OutboundMessage("ui", "x", "activity", metadata={"_progress": True, "_activity_ping": True})
+    )
+    await bus.publish_outbound(
         OutboundMessage("ui", "x", "hint", metadata={"_progress": True, "_tool_hint": True})
+    )
+    await bus.publish_outbound(
+        OutboundMessage("matrix", "x", "hint", metadata={"_progress": True, "_tool_hint": True})
+    )
+    await bus.publish_outbound(
+        OutboundMessage(
+            "matrix",
+            "x",
+            "activity",
+            metadata={"_progress": True, "_activity_ping": True},
+        )
     )
     await asyncio.sleep(0.1)
     task.cancel()
     await task
 
-    assert [m.content for m in ch.sent] == ["normal"]
+    assert [m.content for m in ui_ch.sent] == ["normal", "activity"]
+    assert matrix_ch.sent == []
 
 
 async def test_dispatch_outbound_handles_unknown_channel_and_send_errors() -> None:
