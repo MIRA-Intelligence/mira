@@ -29,6 +29,7 @@ from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
+from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.config import loader as config_loader
 from mira_engine.config.paths import get_runtime_subdir
 from mira_engine.config.schema import Config, UiChannelConfig
@@ -50,7 +51,7 @@ PROJECT_META_DIRNAME = ".mira"
 PROJECT_META_FILENAME = "project.json"
 PROJECT_META_SCHEMA_VERSION = 1
 PROJECT_META_DEFAULT_RUN_MODE = "auto"
-PROJECT_META_DEFAULT_AGENT_PROFILE = "default"
+PROJECT_META_DEFAULT_AGENT_PROFILE = "research"
 PROJECT_META_DEFAULT_CONTRACT_VERSION = 1
 PROJECT_META_STRICT_CONTRACT_VERSION = 2
 _ASSETS_DIR = Path(__file__).parent / "ui_assets"
@@ -108,13 +109,22 @@ def _normalize_run_mode(value: Any) -> str:
     return "manual"
 
 
+def _normalize_loop_mode(value: Any) -> str:
+    """Normalize the UI's high-level app mode."""
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode in {"normal", "project"}:
+            return mode
+    return "project"
+
+
 def _normalize_agent_profile(value: Any) -> str:
     """Normalize UI agent profile with a conservative fallback."""
     if isinstance(value, str):
         profile = value.strip().lower()
-        if profile in {"engineer", "default", "research"}:
+        if profile in {"engineer", "research"}:
             return profile
-    return "default"
+    return "research"
 
 
 def _normalize_contract_version(value: Any) -> int:
@@ -519,6 +529,13 @@ class UiChannel(BaseChannel):
         self._project_dirs: dict[str, Path] = {}
         self._known_project_roots: set[Path] = {self.projects_root}
         self._boot_ts: float = time.monotonic()
+        # Snapshot the engine identity at boot so the desktop UI can detect
+        # an in-place binary swap (DMG re-install) even before our process
+        # exits. ``_current_engine_identity`` reads the on-disk manifest,
+        # which the new bundle overwrites in place — re-reading it on every
+        # ``/version`` would make the old, still-running engine appear to
+        # match the new bundled identity and skip the reinstall flow.
+        self._engine_identity: dict[str, Any] = _current_engine_identity()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
         self._client_project_dirs: dict[str, Path | None] = {}
@@ -926,13 +943,14 @@ class UiChannel(BaseChannel):
         if project_dir is None:
             project_dir = self._resolve_project_dir(msg.chat_id) if msg.chat_id else None
         is_progress = metadata.get("_progress", False)
+        is_activity_ping = bool(metadata.get("_activity_ping", False))
         msg_type = "progress" if is_progress else "response"
         common_details = {
             "type": msg_type,
             "tool_hint": bool(metadata.get("_tool_hint", False)),
             "content_preview": self._preview(msg.content),
         }
-        if project_dir and project_dir.is_dir():
+        if project_dir and project_dir.is_dir() and not is_activity_ping:
             SessionManager(project_dir).append_ui_event(
                 key=f"ui:{msg.chat_id}",
                 role="assistant",
@@ -1191,6 +1209,7 @@ class UiChannel(BaseChannel):
                 user_id = data.get("user_id", session_id or "anonymous")
                 content = data.get("content", "")
                 media = data.get("media", [])
+                loop_mode = _normalize_loop_mode(data.get("loop_mode"))
                 run_mode = _normalize_run_mode(data.get("mode"))
                 agent_profile = _normalize_agent_profile(data.get("agent_profile"))
                 contract_version = (
@@ -1207,30 +1226,41 @@ class UiChannel(BaseChannel):
                     )
                     continue
 
-                project_dir_path = self._resolve_project_dir(
-                    session_id, create=True
-                )
-                if project_dir_path is None:
-                    await ws.send_json(
-                        {"type": "error", "content": "project_dir resolution failed"}
+                project_dir_path: Path | None = None
+                project_dir: str | None = None
+                meta: dict[str, Any] = {
+                    "contract_version": PROJECT_META_DEFAULT_CONTRACT_VERSION,
+                    "automation_policy": None,
+                }
+                if loop_mode == "project":
+                    project_dir_path = self._resolve_project_dir(
+                        session_id, create=True
                     )
-                    continue
+                    if project_dir_path is None:
+                        await ws.send_json(
+                            {"type": "error", "content": "project_dir resolution failed"}
+                        )
+                        continue
+                    project_dir = str(project_dir_path)
+                    meta = self._persist_project_runtime_preferences(
+                        project_dir_path,
+                        run_mode=run_mode,
+                        agent_profile=agent_profile,
+                        contract_version=contract_version,
+                        automation_policy=incoming_policy,
+                    )
                 self._clients[session_id] = ws
                 self._client_project_dirs[session_id] = project_dir_path
-                project_dir = str(project_dir_path)
-                meta = self._persist_project_runtime_preferences(
-                    project_dir_path,
-                    run_mode=run_mode,
-                    agent_profile=agent_profile,
-                    contract_version=contract_version,
-                    automation_policy=incoming_policy,
-                )
                 effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
-                plan_ids_before = _extract_plan_experiment_ids(project_dir_path)
-                guard = guard_task_plan_file(project_dir_path, auto_fix=True)
+                plan_ids_before = _extract_plan_experiment_ids(project_dir_path) if project_dir_path else []
+                guard = (
+                    guard_task_plan_file(project_dir_path, auto_fix=True)
+                    if project_dir_path
+                    else {"fixed": False, "blocking": False}
+                )
                 guard_notice: str | None = None
                 if guard.get("fixed"):
-                    plan_ids_after = _extract_plan_experiment_ids(project_dir_path)
+                    plan_ids_after = _extract_plan_experiment_ids(project_dir_path) if project_dir_path else []
                     reassignments = _detect_guard_id_reassignments(plan_ids_before, plan_ids_after)
                     guard_notice = _build_task_plan_guard_notice(reassignments)
                 if guard.get("fixed"):
@@ -1264,6 +1294,7 @@ class UiChannel(BaseChannel):
                     project_dir=project_dir_path,
                     details={
                         "user_id": user_id,
+                        "loop_mode": loop_mode,
                         "run_mode": run_mode,
                         "agent_profile": agent_profile,
                         "contract_version": _normalize_contract_version(
@@ -1276,16 +1307,17 @@ class UiChannel(BaseChannel):
                         "media_count": len(media) if isinstance(media, list) else 0,
                     },
                 )
-                SessionManager(project_dir_path).append_ui_event(
-                    key=f"ui:{session_id}",
-                    role="user",
-                    content=content,
-                    msg_type="response",
-                    metadata={"_user": True},
-                )
+                if project_dir_path:
+                    SessionManager(project_dir_path).append_ui_event(
+                        key=f"ui:{session_id}",
+                        role="user",
+                        content=content,
+                        msg_type="response",
+                        metadata={"_user": True},
+                    )
                 metadata: dict[str, Any] = {
                     "source": "ui",
-                    "project_dir": project_dir,
+                    "loop_mode": loop_mode,
                     "run_mode": run_mode,
                     "agent_profile": agent_profile,
                     "contract_version": _normalize_contract_version(
@@ -1293,9 +1325,11 @@ class UiChannel(BaseChannel):
                     ),
                     "_allow_result_write": allow_result_write,
                 }
+                if project_dir is not None:
+                    metadata["project_dir"] = project_dir
                 if effective_policy:
                     metadata["automation_policy"] = effective_policy
-                if self._ui_instructions:
+                if loop_mode == "project" and self._ui_instructions:
                     metadata["_ui_system_instructions"] = self._ui_instructions
                 if guard_notice:
                     metadata["_task_plan_guard_notice"] = guard_notice
@@ -1392,11 +1426,28 @@ class UiChannel(BaseChannel):
         })
 
     async def _handle_version(self, _request: web.Request) -> web.Response:
+        # Return the identity snapshot captured at boot — see __init__. Using
+        # a live ``_current_engine_identity()`` here would let an in-place
+        # binary swap masquerade as "already matching" and the desktop UI
+        # would skip the reinstall.
+        #
+        # ``engine_sha256_at_boot`` is the authoritative identity field for
+        # the desktop UI's fast path: it is *only* exposed by engines that
+        # cache the manifest at startup, so its presence proves to the UI
+        # that ``engine_sha256`` is a real boot snapshot rather than a stale
+        # disk re-read. Older engines that pre-date this change still set
+        # ``engine_sha256`` but lack ``engine_sha256_at_boot``, and the UI
+        # treats those as untrusted and forces a one-time reinstall.
+        identity = self._engine_identity
         return web.json_response({
             "service": "mira-gateway",
             "agent_version": __version__,
             "api_contract": _API_CONTRACT_VERSION,
             "uptime_seconds": int(max(time.monotonic() - self._boot_ts, 0)),
+            "engine_sha256": identity.get("engine_sha256"),
+            "engine_sha256_at_boot": identity.get("engine_sha256"),
+            "engine_manifest": identity.get("engine_manifest"),
+            "engine_executable": identity.get("engine_executable"),
         })
 
     async def _handle_status(self, _request: web.Request) -> web.Response:

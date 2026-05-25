@@ -25,6 +25,7 @@ from mira_engine.channels.ui import (
     _load_ui_instructions,
     _normalize_agent_profile,
     _normalize_contract_version,
+    _normalize_loop_mode,
     _normalize_run_mode,
     _safe_upload_name,
     _stringify_history_content,
@@ -114,13 +115,12 @@ def test_load_ui_instructions_skips_missing_files(monkeypatch: pytest.MonkeyPatc
 
 def test_normalize_agent_profile_accepts_known_values() -> None:
     assert _normalize_agent_profile("engineer") == "engineer"
-    assert _normalize_agent_profile("default") == "default"
     assert _normalize_agent_profile("research") == "research"
 
 
 def test_normalize_agent_profile_falls_back_to_default() -> None:
-    assert _normalize_agent_profile("unknown") == "default"
-    assert _normalize_agent_profile(None) == "default"
+    assert _normalize_agent_profile("unknown") == "research"
+    assert _normalize_agent_profile(None) == "research"
 
 
 def test_normalize_contract_version_accepts_known_values() -> None:
@@ -190,6 +190,52 @@ async def test_handle_version_returns_contract_payload(ui_channel: UiChannel) ->
     assert body["api_contract"] == _API_CONTRACT_VERSION
     assert isinstance(body["uptime_seconds"], int)
     assert body["uptime_seconds"] >= 0
+    # Engine identity is surfaced so the desktop UI's fast-path health
+    # probe can verify the live engine matches the bundled manifest
+    # without invoking the slower `mira-engine status` CLI.
+    assert "engine_sha256" in body
+    assert "engine_manifest" in body
+    assert "engine_executable" in body
+    # `engine_sha256_at_boot` proves the engine snapshots its identity at
+    # startup. The desktop UI uses its presence as a guarantee that
+    # `engine_sha256` is a real boot snapshot (rather than a stale disk
+    # re-read produced by an in-place DMG swap of the manifest file).
+    assert "engine_sha256_at_boot" in body
+
+
+async def test_handle_version_snapshots_identity_at_boot(
+    monkeypatch, ui_channel: UiChannel
+) -> None:
+    """A DMG re-install overwrites the on-disk manifest in place. The
+    running engine must keep reporting the identity it had *at boot* via
+    /version, not whatever the new manifest now claims, otherwise the
+    desktop UI would falsely believe the live engine already matches."""
+    import mira_engine.channels.ui as ui_module
+
+    captured_at_boot = ui_channel._engine_identity
+
+    # Simulate the manifest being swapped out under the running engine
+    # — a fresh `_current_engine_identity()` call would now return the
+    # *new* SHA. The snapshot stored on the channel must shield us.
+    monkeypatch.setattr(
+        ui_module,
+        "_current_engine_identity",
+        lambda: {
+            "engine_executable": "/opt/mira/mira-engine",
+            "engine_manifest_path": "/opt/mira/mira-engine.manifest.json",
+            "engine_manifest": {"sha256": "new-sha-after-dmg-swap"},
+            "engine_sha256": "new-sha-after-dmg-swap",
+        },
+    )
+    req = MagicMock(spec=web.Request)
+    resp = await ui_channel._handle_version(req)
+    body = json.loads(resp.text)
+
+    # Boot-snapshot fields are stable across an in-place manifest swap.
+    assert body["engine_sha256"] == captured_at_boot.get("engine_sha256")
+    assert body["engine_sha256_at_boot"] == captured_at_boot.get("engine_sha256")
+    assert body["engine_manifest"] == captured_at_boot.get("engine_manifest")
+    assert body["engine_executable"] == captured_at_boot.get("engine_executable")
 
 
 def test_audit_writes_global_and_project_logs(ui_channel: UiChannel) -> None:
@@ -702,7 +748,7 @@ async def test_handle_history_uses_bound_project_dir_after_projects_root_change(
     ui_channel._persist_project_runtime_preferences(
         project_dir,
         run_mode="auto",
-        agent_profile="default",
+        agent_profile="research",
         contract_version=1,
         automation_policy=None,
     )
@@ -804,7 +850,7 @@ async def test_project_dir_index_survives_channel_restart_after_root_change(
     ui_channel._persist_project_runtime_preferences(
         project_dir,
         run_mode="auto",
-        agent_profile="default",
+        agent_profile="research",
         contract_version=1,
         automation_policy=None,
     )
@@ -1240,14 +1286,14 @@ async def test_handle_project_meta_updates_display_name(ui_channel: UiChannel) -
     body = json.loads(resp.text)
     assert body["display_name"] == "Lung CT baseline"
     assert body["run_mode"] == "auto"
-    assert body["agent_profile"] == "default"
+    assert body["agent_profile"] == "research"
     assert body["contract_version"] == 1
 
     meta_file = project_dir / ".mira" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["display_name"] == "Lung CT baseline"
     assert meta["run_mode"] == "auto"
-    assert meta["agent_profile"] == "default"
+    assert meta["agent_profile"] == "research"
     assert meta["contract_version"] == 1
 
 
@@ -1632,6 +1678,26 @@ async def test_send_progress_type(ui_channel: UiChannel) -> None:
     assert ws.send_json.await_args.args[0]["type"] == "progress"
 
 
+async def test_send_activity_ping_does_not_persist_history(ui_channel: UiChannel) -> None:
+    session_id = "sid-activity"
+    project_dir = ui_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+
+    ws = MagicMock()
+    ws.closed = False
+    ws.send_json = AsyncMock()
+    ui_channel._clients[session_id] = ws
+    msg = OutboundMessage(
+        channel="ui",
+        chat_id=session_id,
+        content="Mira is working...",
+        metadata={"_progress": True, "_activity_ping": True},
+    )
+    await ui_channel.send(msg)
+    assert ws.send_json.await_args.args[0]["type"] == "progress"
+    assert SessionManager(project_dir).get_ui_history(f"ui:{session_id}") == []
+
+
 async def test_send_writes_project_audit_entry(ui_channel: UiChannel) -> None:
     session_id = "sid-log"
     project_dir = ui_channel.projects_root / session_id
@@ -1714,8 +1780,10 @@ async def test_send_send_json_failure_swallowed(ui_channel: UiChannel) -> None:
 def test_web_helpers_cover_normalization_and_formatting() -> None:
     assert _normalize_run_mode(" AUTO ") == "auto"
     assert _normalize_run_mode("unknown") == "manual"
+    assert _normalize_loop_mode(" NORMAL ") == "normal"
+    assert _normalize_loop_mode("unknown") == "project"
     assert _normalize_agent_profile(" ENGINEER ") == "engineer"
-    assert _normalize_agent_profile("bad") == "default"
+    assert _normalize_agent_profile("bad") == "research"
     assert _normalize_contract_version(2) == 2
     assert _normalize_contract_version(None) == 1
     assert _safe_upload_name("../x.txt") == "x.txt"
@@ -1854,6 +1922,45 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
 
 
+async def test_ws_handler_normal_message_skips_project_runtime_state(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "__normal__"
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps(
+                {
+                    "type": "message",
+                    "session_id": session_id,
+                    "user_id": "u1",
+                    "loop_mode": "normal",
+                    "mode": "auto",
+                    "agent_profile": "research",
+                    "content": "general question",
+                    "media": [],
+                }
+            ),
+        ),
+    ])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    ui_channel._ui_instructions = "UI instruction"
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    req = MagicMock(spec=web.Request)
+    await ui_channel._ws_handler(req)
+
+    assert captured["chat_id"] == session_id
+    assert captured["metadata"]["loop_mode"] == "normal"
+    assert "project_dir" not in captured["metadata"]
+    assert "_ui_system_instructions" not in captured["metadata"]
+    assert not (ui_channel.projects_root / session_id).exists()
+
+
 async def test_ws_handler_injects_guard_notice_on_id_reassignment(
     ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1883,7 +1990,7 @@ async def test_ws_handler_injects_guard_notice_on_id_reassignment(
                     "session_id": session_id,
                     "user_id": "u1",
                     "mode": "auto",
-                    "agent_profile": "default",
+                    "agent_profile": "research",
                     "content": "check latest exp ids",
                     "media": [],
                 }

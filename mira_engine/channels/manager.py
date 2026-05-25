@@ -14,7 +14,10 @@ from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.config.schema import Config
-from mira_engine.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
+from mira_engine.utils.restart import (
+    consume_restart_notice_from_env,
+    format_restart_completed_message,
+)
 
 
 class ChannelManager:
@@ -37,8 +40,9 @@ class ChannelManager:
 
     @staticmethod
     def _to_ns(value: Any) -> Any:
-        from pydantic import BaseModel
         import re
+
+        from pydantic import BaseModel
 
         def to_snake(name: str) -> str:
             name = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
@@ -256,9 +260,12 @@ class ChannelManager:
                 msg = pending.pop(0) if pending else await asyncio.wait_for(self.bus.consume_outbound(), timeout=1.0)
 
                 if msg.metadata.get("_progress"):
-                    if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
+                    if msg.metadata.get("_activity_ping"):
+                        if msg.channel != "ui":
+                            continue
+                    elif msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
                         continue
-                    if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                    elif not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
                         continue
 
                 if msg.metadata.get("_stream_delta") and not msg.metadata.get("_stream_end"):

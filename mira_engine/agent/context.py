@@ -206,14 +206,26 @@ class ContextBuilder:
                     result.append(msg)
                     result.extend(tool_msgs)
                 else:
-                    content = msg.get("content")
-                    if content:
-                        result.append({"role": "assistant", "content": content})
+                    fallback = ContextBuilder._assistant_without_tool_calls(msg)
+                    if fallback is not None:
+                        result.append(fallback)
                 i = j if j > i + 1 else i + 1
             else:
                 result.append(msg)
                 i += 1
         return result
+
+    @staticmethod
+    def _assistant_without_tool_calls(msg: dict[str, Any]) -> dict[str, Any] | None:
+        """Keep provider reasoning metadata when invalid tool calls are stripped."""
+        content = msg.get("content")
+        if not content:
+            return None
+        fallback: dict[str, Any] = {"role": "assistant", "content": content}
+        for key in ("reasoning_content", "thinking_blocks"):
+            if key in msg:
+                fallback[key] = msg[key]
+        return fallback
 
     def build_messages(
         self,

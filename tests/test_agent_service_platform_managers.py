@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import mock_open
 
 from mira_engine.cli.agent_service import (
+    EXIT_ERROR,
     EXIT_OK,
     LAUNCHD_LABEL,
     SYSTEMD_UNIT_NAME,
@@ -107,6 +108,8 @@ def test_launchd_manager_writes_bundle_environment(monkeypatch, tmp_path):
     assert status_payload["engine_manifest"] == manifest
     assert status_payload["engine_sha256"] == "abc123"
     assert status_payload["launchd_program"] == str(engine)
+    assert ["launchctl", "bootout", "gui/501/com.projectmira.engine"] in calls
+    assert ["launchctl", "remove", LAUNCHD_LABEL] in calls
     assert ["launchctl", "bootstrap", "gui/501", str(manager.paths.launchd_plist)] in calls
 
 
@@ -210,3 +213,185 @@ def test_windows_service_manager_installs_winsw_service(monkeypatch, tmp_path):
     assert payload["windows_service"] == WINDOWS_SERVICE_NAME
     assert any(cmd[-1] == "install" for cmd in calls)
     assert any(cmd[-1] == "start" for cmd in calls)
+
+
+def test_windows_service_manager_requires_winsw_service_by_default(monkeypatch, tmp_path):
+    import mira_engine.cli.agent_service as agent_service
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("MIRA_ENGINE_WINDOWS_BACKGROUND_FALLBACK", raising=False)
+    engine = tmp_path / "app" / "mira-engine.exe"
+    engine.parent.mkdir(parents=True)
+    engine.write_text("engine", encoding="utf-8")
+    monkeypatch.setattr(agent_service.sys, "executable", str(engine))
+    monkeypatch.setattr(agent_service.sys, "frozen", True, raising=False)
+    manager = WindowsServiceManager(AgentPaths.default())
+
+    code, message = manager.install_service(
+        host="127.0.0.1",
+        port=18790,
+        home=str(tmp_path),
+    )
+
+    assert code == EXIT_ERROR
+    assert "MiraEngineService.exe not found" in message
+    assert "requires a real Windows service" in message
+
+
+def test_windows_service_manager_background_fallback_is_explicit_opt_in(monkeypatch, tmp_path):
+    import mira_engine.cli.agent_service as agent_service
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("MIRA_ENGINE_WINDOWS_BACKGROUND_FALLBACK", "1")
+    engine = tmp_path / "app" / "mira-engine.exe"
+    engine.parent.mkdir(parents=True)
+    engine.write_text("engine", encoding="utf-8")
+    monkeypatch.setattr(agent_service.sys, "executable", str(engine))
+    monkeypatch.setattr(agent_service.sys, "frozen", True, raising=False)
+    manager = WindowsServiceManager(AgentPaths.default())
+
+    code, message = manager.install_service(
+        host="127.0.0.1",
+        port=18790,
+        home=str(tmp_path),
+    )
+
+    assert code == EXIT_OK
+    assert "fallback" in message
+    status_code, payload = manager.status()
+    assert status_code == EXIT_OK
+    assert payload["service_mode"] == "windows-background"
+
+
+def test_windows_service_manager_stops_existing_wrapper_before_restaging(monkeypatch, tmp_path):
+    import mira_engine.cli.agent_service as agent_service
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    engine = tmp_path / "app" / "mira-engine.exe"
+    wrapper = engine.with_name("MiraEngineService.exe")
+    staged_wrapper = tmp_path / ".mira" / "runtime" / "MiraEngineService.exe"
+    wrapper.parent.mkdir(parents=True)
+    staged_wrapper.parent.mkdir(parents=True)
+    engine.write_text("engine", encoding="utf-8")
+    wrapper.write_text("new winsw", encoding="utf-8")
+    staged_wrapper.write_text("old winsw", encoding="utf-8")
+    monkeypatch.setattr(agent_service.sys, "executable", str(engine))
+    monkeypatch.setattr(agent_service.sys, "frozen", True, raising=False)
+
+    events = []
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
+        events.append(cmd[-1])
+        return _cp(returncode=0)
+
+    def fake_copy2(source, target, *_args, **_kwargs):  # noqa: ANN001
+        events.append("copy")
+        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
+    monkeypatch.setattr(agent_service.shutil, "copy2", fake_copy2)
+    manager = WindowsServiceManager(AgentPaths.default())
+
+    code, message = manager.install_service(
+        host="127.0.0.1",
+        port=18790,
+        home=str(tmp_path),
+    )
+
+    assert code == EXIT_OK
+    assert "Windows service installed" in message
+    assert events.index("stop") < events.index("copy")
+    assert events.index("uninstall") < events.index("copy")
+    assert events.index("copy") < events.index("install")
+    assert staged_wrapper.read_text(encoding="utf-8") == "new winsw"
+
+
+def test_windows_service_manager_retries_locked_wrapper_stage(monkeypatch, tmp_path):
+    import mira_engine.cli.agent_service as agent_service
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    engine = tmp_path / "app" / "mira-engine.exe"
+    wrapper = engine.with_name("MiraEngineService.exe")
+    staged_wrapper = tmp_path / ".mira" / "runtime" / "MiraEngineService.exe"
+    wrapper.parent.mkdir(parents=True)
+    staged_wrapper.parent.mkdir(parents=True)
+    engine.write_text("engine", encoding="utf-8")
+    wrapper.write_text("new winsw", encoding="utf-8")
+    staged_wrapper.write_text("old winsw", encoding="utf-8")
+    monkeypatch.setattr(agent_service.sys, "executable", str(engine))
+    monkeypatch.setattr(agent_service.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(agent_service.time, "sleep", lambda *_args, **_kwargs: None)
+
+    events = []
+    copy_attempts = 0
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
+        events.append(cmd[-1])
+        return _cp(returncode=0)
+
+    def fake_copy2(source, target, *_args, **_kwargs):  # noqa: ANN001
+        nonlocal copy_attempts
+        copy_attempts += 1
+        events.append(f"copy-{copy_attempts}")
+        if copy_attempts == 1:
+            raise PermissionError("wrapper is locked")
+        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
+    monkeypatch.setattr(agent_service.shutil, "copy2", fake_copy2)
+    manager = WindowsServiceManager(AgentPaths.default())
+
+    code, message = manager.install_service(
+        host="127.0.0.1",
+        port=18790,
+        home=str(tmp_path),
+    )
+
+    assert code == EXIT_OK
+    assert "Windows service installed" in message
+    assert copy_attempts == 2
+    assert events.index("copy-1") < events.index("copy-2")
+    assert events.index("uninstall") < events.index("copy-2")
+    assert staged_wrapper.read_text(encoding="utf-8") == "new winsw"
+
+
+def test_windows_service_manager_reports_locked_wrapper_stage_failure(monkeypatch, tmp_path):
+    import mira_engine.cli.agent_service as agent_service
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    engine = tmp_path / "app" / "mira-engine.exe"
+    wrapper = engine.with_name("MiraEngineService.exe")
+    staged_wrapper = tmp_path / ".mira" / "runtime" / "MiraEngineService.exe"
+    wrapper.parent.mkdir(parents=True)
+    staged_wrapper.parent.mkdir(parents=True)
+    engine.write_text("engine", encoding="utf-8")
+    wrapper.write_text("new winsw", encoding="utf-8")
+    staged_wrapper.write_text("old winsw", encoding="utf-8")
+    monkeypatch.setattr(agent_service.sys, "executable", str(engine))
+    monkeypatch.setattr(agent_service.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(agent_service.time, "sleep", lambda *_args, **_kwargs: None)
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
+        return _cp(returncode=0)
+
+    def fake_copy2(source, target, *_args, **_kwargs):  # noqa: ANN001, ARG001
+        raise PermissionError("wrapper is locked")
+
+    monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
+    monkeypatch.setattr(agent_service.shutil, "copy2", fake_copy2)
+    manager = WindowsServiceManager(AgentPaths.default())
+
+    code, message = manager.install_service(
+        host="127.0.0.1",
+        port=18790,
+        home=str(tmp_path),
+    )
+
+    assert code == EXIT_ERROR
+    assert "failed to stage MiraEngineService.exe" in message
+    assert "wrapper is locked" in message

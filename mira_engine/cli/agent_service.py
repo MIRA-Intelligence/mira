@@ -589,7 +589,7 @@ class WindowsServiceManager(LocalServiceManager):
         self._fallback = WindowsBackgroundProcessManager(paths)
 
     def _background_fallback_enabled(self) -> bool:
-        value = os.environ.get("MIRA_ENGINE_WINDOWS_BACKGROUND_FALLBACK", "1").strip().lower()
+        value = os.environ.get("MIRA_ENGINE_WINDOWS_BACKGROUND_FALLBACK", "0").strip().lower()
         return value not in {"0", "false", "no", "off"}
 
     def _run_windows_tool(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -634,11 +634,29 @@ class WindowsServiceManager(LocalServiceManager):
     def _service_xml_path(self, wrapper_path: Path) -> Path:
         return wrapper_path.with_name(WINDOWS_SERVICE_CONFIG_NAME)
 
+    def _release_staged_wrapper_for_update(self, source: Path) -> None:
+        target = self._staged_wrapper_path()
+        if source.resolve(strict=False) == target.resolve(strict=False):
+            return
+        if not target.is_file():
+            return
+        self._append_log("windows_service_prepare_wrapper_update", wrapper=str(target))
+        self._run_wrapper("stop")
+        self._run_wrapper("uninstall")
+
     def _stage_wrapper(self, source: Path) -> Path:
         self.paths.ensure()
         target = self._staged_wrapper_path()
         if source.resolve(strict=False) != target.resolve(strict=False):
-            shutil.copy2(source, target)
+            for attempt in range(1, 4):
+                try:
+                    shutil.copy2(source, target)
+                    break
+                except PermissionError:
+                    if attempt >= 3:
+                        raise
+                    self._release_staged_wrapper_for_update(source)
+                    time.sleep(0.5)
         return target
 
     def _write_service_xml(
@@ -724,7 +742,12 @@ class WindowsServiceManager(LocalServiceManager):
         reason: str,
     ) -> tuple[int, str]:
         if not self._background_fallback_enabled():
-            return EXIT_ERROR, reason
+            return (
+                EXIT_ERROR,
+                f"{reason}; Windows background fallback is disabled because "
+                "Mira requires a real Windows service. Approve the administrator "
+                "prompt and retry.",
+            )
         code, message = self._fallback.install_service(host, port, home, config_path)
         state = self.load_state()
         state["fallback_reason"] = reason
@@ -752,7 +775,23 @@ class WindowsServiceManager(LocalServiceManager):
             )
 
         self._stop_legacy_background_if_needed()
-        wrapper_path = self._stage_wrapper(source)
+        self._release_staged_wrapper_for_update(source)
+        try:
+            wrapper_path = self._stage_wrapper(source)
+        except OSError as exc:
+            message = (
+                f"failed to stage {WINDOWS_SERVICE_WRAPPER_NAME}; "
+                "the existing service wrapper may still be locked. "
+                "Stop the Mira Engine service or restart Windows, then retry. "
+                f"{exc}"
+            )
+            self._append_log(
+                "windows_service_stage_wrapper_failed",
+                source=str(source),
+                target=str(self._staged_wrapper_path()),
+                error=str(exc),
+            )
+            return EXIT_ERROR, message
         home_path, config_file = self._write_service_xml(
             wrapper_path,
             host=service_host,
@@ -774,6 +813,12 @@ class WindowsServiceManager(LocalServiceManager):
                 reason=message,
             )
 
+        start = self._run_wrapper("start")
+        service_started = start.returncode == 0
+        if not service_started:
+            message = start.stderr.strip() or start.stdout.strip() or "failed to start Windows service"
+            self._append_log("windows_service_start_after_install_failed", error=message)
+
         code, _ = super().install_service(
             service_host,
             service_port,
@@ -786,7 +831,7 @@ class WindowsServiceManager(LocalServiceManager):
         state["windows_service_wrapper"] = str(wrapper_path)
         state["windows_service_config"] = str(self._service_xml_path(wrapper_path))
         state["engine_executable"] = _gateway_service_args(service_host, service_port)[0]
-        state["running"] = False
+        state["running"] = service_started
         state["pid"] = None
         self.save_state(state)
         self._append_log(
@@ -795,7 +840,10 @@ class WindowsServiceManager(LocalServiceManager):
             config=str(self._service_xml_path(wrapper_path)),
             home=str(home_path),
             config_path=str(config_file),
+            running=service_started,
         )
+        if service_started:
+            return code, f"Windows service installed and started ({WINDOWS_SERVICE_NAME})"
         return code, f"Windows service installed ({WINDOWS_SERVICE_NAME})"
 
     def uninstall_service(self) -> tuple[int, str]:
@@ -943,6 +991,41 @@ class LaunchdServiceManager(LocalServiceManager):
         with self.paths.launchd_plist.open("wb") as fp:
             plistlib.dump(payload, fp)
 
+    def _wait_for_service_unloaded(self, timeout_s: float = 15.0) -> bool:
+        """Poll until the LaunchAgent is no longer registered in our domain.
+
+        ``launchctl bootout`` returns as soon as it has signalled the service;
+        the underlying process can take several seconds to actually exit
+        (especially when it has active aiohttp / WebSocket clients to drain).
+        If we ``bootstrap`` the replacement plist before launchd has fully
+        torn down the previous instance we get the opaque
+        ``Bootstrap failed: 5: Input/output error``. Polling ``launchctl
+        print`` lets us wait for the label to leave the domain before
+        attempting to bootstrap again.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            result = self._run_launchctl("print", self._service_target)
+            # Non-zero return means launchd no longer has the label in this
+            # domain — exactly the precondition `bootstrap` needs.
+            if result.returncode != 0:
+                return True
+            time.sleep(0.25)
+        return False
+
+    def _teardown_existing_job(self) -> None:
+        """Best-effort cleanup of any already-loaded LaunchAgent with our label.
+
+        `launchctl bootstrap` returns the opaque "Bootstrap failed: 5: Input/
+        output error" whenever the label is already registered in the target
+        domain. Booting it out, removing the cached label, and then waiting
+        until the label has actually left the domain makes the install
+        idempotent even when the previous engine is busy draining clients.
+        """
+        self._run_launchctl("bootout", self._service_target)
+        self._run_launchctl("remove", LAUNCHD_LABEL)
+        self._wait_for_service_unloaded()
+
     def install_service(
         self,
         host: str | None = None,
@@ -950,36 +1033,75 @@ class LaunchdServiceManager(LocalServiceManager):
         home: str | None = None,
         config_path: str | None = None,
     ) -> tuple[int, str]:
-        code, msg = super().install_service(host, port, home, config_path)
-        if code != EXIT_OK:
-            return code, msg
-        state = self.load_state()
-        service_home = state.get("home") if isinstance(state.get("home"), str) else home
+        previous_state = self.load_state()
+        self.paths.ensure()
+        service_host = str(host if host is not None else previous_state.get("host", "127.0.0.1"))
+        service_port = int(port if port is not None else previous_state.get("port", DEFAULT_PORT))
+        service_home = (
+            previous_state.get("home") if isinstance(previous_state.get("home"), str) else home
+        )
         service_config_path = (
-            state.get("config_path")
-            if isinstance(state.get("config_path"), str)
+            previous_state.get("config_path")
+            if isinstance(previous_state.get("config_path"), str)
             else config_path
         )
+
+        # Remember whether a plist already exists so we can restore it if the
+        # bootstrap below fails (rollback for the transactional install).
+        plist_path = self.paths.launchd_plist
+        previous_plist: bytes | None = None
+        if plist_path.is_file():
+            try:
+                previous_plist = plist_path.read_bytes()
+            except OSError:
+                previous_plist = None
+
+        self._teardown_existing_job()
         self._write_plist(
-            str(state.get("host", "127.0.0.1")),
-            int(state.get("port", DEFAULT_PORT)),
+            service_host,
+            service_port,
             home=service_home,
             config_path=service_config_path,
         )
-        bootstrap = self._run_launchctl("bootstrap", self._domain, str(self.paths.launchd_plist))
-        # launchd returns non-zero when already loaded; try cleanup then retry once.
+        bootstrap = self._run_launchctl("bootstrap", self._domain, str(plist_path))
+        # Retry once after another cleanup pass — launchctl occasionally races
+        # with its own shutdown when the previous job exits during bootout.
         if bootstrap.returncode != 0:
-            self._run_launchctl("bootout", self._service_target)
-            bootstrap = self._run_launchctl("bootstrap", self._domain, str(self.paths.launchd_plist))
+            self._teardown_existing_job()
+            bootstrap = self._run_launchctl("bootstrap", self._domain, str(plist_path))
             if bootstrap.returncode != 0:
+                # Roll back the plist so a partial install does not leave
+                # disk state pointing at an executable that never loaded.
+                if previous_plist is not None:
+                    try:
+                        plist_path.write_bytes(previous_plist)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        plist_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 return EXIT_ERROR, bootstrap.stderr.strip() or "failed to bootstrap launchd service"
+
+        # Bootstrap succeeded — persist the new identity. If the base class
+        # state write somehow fails, undo the launchd job so the on-disk
+        # state stays consistent with what is actually running.
+        code, msg = super().install_service(host, port, home, config_path)
+        if code != EXIT_OK:
+            self._teardown_existing_job()
+            return code, msg
+        state = self.load_state()
         state["service_mode"] = "launchd"
         self.save_state(state)
-        self._append_log("launchd_install_service", plist=str(self.paths.launchd_plist))
-        return EXIT_OK, f"launchd service installed ({self.paths.launchd_plist})"
+        self._append_log("launchd_install_service", plist=str(plist_path))
+        return EXIT_OK, f"launchd service installed ({plist_path})"
 
     def uninstall_service(self) -> tuple[int, str]:
-        self._run_launchctl("bootout", self._service_target)
+        # Symmetric with install_service: bootout + remove drops the label
+        # from launchd's cache so a subsequent reinstall starts from a
+        # clean slate.
+        self._teardown_existing_job()
         try:
             self.paths.launchd_plist.unlink(missing_ok=True)
         except OSError as exc:

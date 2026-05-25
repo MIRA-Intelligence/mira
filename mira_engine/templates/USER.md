@@ -1,56 +1,45 @@
 # User Profile
 
-Information about the user to help personalize interactions.
+Optional information that helps MIRA personalize responses. This template is intentionally general and should not contain private identity, employer, project, credential, or sensitive research details by default.
 
 ## Basic Information
 
-- **Name**: LoveMachine
-- **Timezone**: CST (UTC+8)
-- **Language**: Chinese (中文), English
+- **Name**: MIRA User
+- **Timezone**: Not specified
+- **Preferred language(s)**: Not specified
 
 ## Preferences
 
 ### Communication Style
 
-- [x] Technical
-- Comfortable switching between Chinese and English
-- Prefers code-oriented, practical help
+- Clear, practical, and respectful
+- Ask clarifying questions when requirements are ambiguous
+- Avoid assuming private context that is not stated in the current conversation
 
 ### Response Length
 
-- [x] Adaptive based on question
-- Brief for simple questions; detailed for experiment design and analysis
+- Keep simple answers concise
+- Provide more detail for complex planning, debugging, or research tasks
 
 ### Technical Level
 
-- [x] Expert
-- Deep knowledge in MRI/MRS physics, deep learning, signal processing
-- Proficient in Python, PyTorch, scientific computing stack
-
-## Work Context
-
-- **Primary Role**: Medical imaging researcher
-- **Research Focus**: MR Spectroscopy (31P-MRS) quantification, deep learning for spectral fitting
-- **Main Projects**: Physics-informed self-supervised spectral fitting, medical image analysis pipelines
-- **Tools**: Python, PyTorch, NumPy/SciPy, matplotlib, Git, macOS (Apple Silicon)
-- **Computing**: Local macOS arm64 development, GPU clusters for heavy training
+- Adapt explanations to the user's question and visible context
+- Define specialized terms when they may be unclear
 
 ## Topics of Interest
 
-- MR Spectroscopy quantification and fitting algorithms
-- Self-supervised / unsupervised learning for inverse problems
-- Physics-informed neural networks and optimization
-- Medical image segmentation and classification
-- Radiomics and survival analysis
+- General research assistance
+- Software engineering and debugging
+- Data analysis and scientific workflows
+- Writing, planning, and documentation
 
 ## Special Instructions
 
-- Always use **git commits** for every experiment — no exceptions
-- Prefer **unsupervised/self-supervised** methods; supervised only as baseline or sanity check
-- Every experiment must produce **visual outputs** (figures) for qualitative inspection
-- Record experiments systematically: hypothesis → method → results → conclusion
-- When in doubt, ask — don't assume the research direction
+- Do not include or infer sensitive personal information unless the user explicitly provides it for the current task
+- Prefer reproducible, auditable workflows for experiments and code changes
+- Record assumptions clearly when making recommendations
+- When in doubt, ask before proceeding
 
 ---
 
-*Edit this file to customize mira's behavior for your needs.*
+*Edit this file to customize MIRA's behavior for your needs.*
