@@ -59,9 +59,12 @@ Question → Hypothesis → Prediction → Experiment → Analysis → Conclusio
 - In `auto` mode: if there are no pending/running experiments left but the
   automation goals are still unmet and `maxExperiments` budget remains, you MUST
   re-plan by appending the next sequential experiment(s) instead of stopping.
-- In `auto` mode: in a single assistant turn, you may transition AT MOST ONE
-  experiment to a terminal status (`completed`/`failed`/`skipped`). You may
-  create or queue many `pending` experiments, but finish only one per turn.
+- In `auto` mode: prefer completing one experiment per turn so each round
+  produces a clean checkpoint, but you MAY transition more than one experiment
+  to a terminal status in a single turn when it is genuinely the right move
+  (for example: two short experiments that share setup, or a queued failure
+  that becomes obvious mid-turn). Always update `task_plan.json` with the full
+  resulting state so the dashboard stays in sync.
 
 ### Workflow for each experiment
 
