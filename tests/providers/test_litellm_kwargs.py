@@ -741,6 +741,60 @@ def test_deepseek_preserves_existing_reasoning_content() -> None:
     assert kw["messages"][1]["reasoning_content"] == "Thinking carefully…"
 
 
+def test_resolve_timeout_returns_generous_defaults(monkeypatch) -> None:
+    """Default timeouts match LiteLLM's ballpark so reasoning-heavy providers don't 5s-out."""
+    monkeypatch.delenv("MIRA_LLM_CONNECT_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("MIRA_LLM_READ_TIMEOUT_S", raising=False)
+
+    from mira_engine.providers.openai_compat_provider import _resolve_timeout
+
+    timeout = _resolve_timeout()
+    assert timeout.connect == 30.0
+    assert timeout.read == 6000.0
+    assert timeout.write == 6000.0
+
+
+def test_resolve_timeout_honors_env_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("MIRA_LLM_CONNECT_TIMEOUT_S", "60")
+    monkeypatch.setenv("MIRA_LLM_READ_TIMEOUT_S", "180")
+
+    from mira_engine.providers.openai_compat_provider import _resolve_timeout
+
+    timeout = _resolve_timeout()
+    assert timeout.connect == 60.0
+    assert timeout.read == 180.0
+
+
+def test_resolve_timeout_ignores_garbage_env_values(monkeypatch) -> None:
+    """Garbled env values fall back to defaults instead of crashing the provider."""
+    monkeypatch.setenv("MIRA_LLM_CONNECT_TIMEOUT_S", "not-a-number")
+    monkeypatch.setenv("MIRA_LLM_READ_TIMEOUT_S", "")
+
+    from mira_engine.providers.openai_compat_provider import _resolve_timeout
+
+    timeout = _resolve_timeout()
+    assert timeout.connect == 30.0
+    assert timeout.read == 6000.0
+
+
+def test_openai_compat_passes_timeout_to_async_openai(monkeypatch) -> None:
+    """The resolved timeout must reach the AsyncOpenAI constructor."""
+    monkeypatch.setenv("MIRA_LLM_CONNECT_TIMEOUT_S", "45")
+    monkeypatch.setenv("MIRA_LLM_READ_TIMEOUT_S", "1234")
+
+    spec = find_by_name("deepseek")
+    with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+        OpenAICompatProvider(
+            api_key="sk-deepseek",
+            default_model="deepseek-v4-pro",
+            spec=spec,
+        )
+
+    timeout = MockClient.call_args.kwargs["timeout"]
+    assert timeout.connect == 45.0
+    assert timeout.read == 1234.0
+
+
 def test_deepseek_does_not_backfill_non_tool_call_assistant_messages() -> None:
     """Plain assistant turns without tool_calls are left untouched."""
     spec = find_by_name("deepseek")
