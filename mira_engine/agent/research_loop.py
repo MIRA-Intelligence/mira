@@ -333,6 +333,28 @@ class ResearchAgentLoop(BaseAgentLoop):
         lowered = text.lower()
         return "error calling llm" in lowered or "all candidate models failed" in lowered
 
+    @staticmethod
+    def _format_stop_reason_detail(
+        reason: str, final_content: str | None, *, max_len: int = 240
+    ) -> str:
+        """Render an inline detail suffix for a stop-reason progress event.
+
+        For ``provider error`` stops the actual error text lives in
+        ``final_content`` and is also returned as the assistant response. UI
+        clients show progress events above the assistant reply, which makes the
+        bare ``auto-run stop reason: provider error`` line look like the cause
+        is missing. Including a truncated snippet here keeps the cause visible
+        right next to the stop reason without duplicating the full payload.
+        """
+        if reason != "provider error" or not final_content:
+            return ""
+        snippet = " ".join(final_content.split()).strip()
+        if not snippet:
+            return ""
+        if len(snippet) > max_len:
+            snippet = snippet[: max_len - 1].rstrip() + "…"
+        return f" — {snippet}"
+
     # ------------------------------------------------------------------
     # task_plan loaders / inspectors
     # ------------------------------------------------------------------
@@ -1344,11 +1366,6 @@ class ResearchAgentLoop(BaseAgentLoop):
             automation_policy = self._resolve_session_automation_policy(key, None)
             if current_mode == "auto":
                 crossed = self._experiments_crossed_boundary(round_plan_before, round_plan_after)
-                if len(crossed) > 1:
-                    await progress_cb(
-                        "auto-run guard warning: multiple experiments advanced in one round "
-                        f"({', '.join(crossed[:3])})"
-                    )
                 if crossed and project_dir:
                     code_guard = self._guard_task_plan_structure(
                         project_dir,
@@ -1498,8 +1515,11 @@ class ResearchAgentLoop(BaseAgentLoop):
                             )
                     continue
                 if current_mode == "auto" and continuation_reason:
+                    detail = self._format_stop_reason_detail(
+                        continuation_reason, final_content
+                    )
                     await progress_cb(
-                        f"auto-run stop reason: {continuation_reason}"
+                        f"auto-run stop reason: {continuation_reason}{detail}"
                     )
                 break
             await self._emit_auto_round_response(
