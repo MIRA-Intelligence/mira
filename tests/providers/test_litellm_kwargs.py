@@ -629,3 +629,138 @@ def test_openai_no_thinking_extra_body() -> None:
     """Non-thinking providers should never get extra_body for thinking."""
     kw = _build_kwargs_for("openai", "gpt-4o", reasoning_effort="medium")
     assert "extra_body" not in kw
+
+
+def test_deepseek_thinking_enabled_with_reasoning_effort() -> None:
+    kw = _build_kwargs_for("deepseek", "deepseek-v4-pro", reasoning_effort="high")
+    assert kw["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
+def test_deepseek_thinking_disabled_for_minimal() -> None:
+    kw = _build_kwargs_for("deepseek", "deepseek-v4-pro", reasoning_effort="minimal")
+    assert kw["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_deepseek_no_extra_body_when_reasoning_effort_none() -> None:
+    kw = _build_kwargs_for("deepseek", "deepseek-chat", reasoning_effort=None)
+    assert "extra_body" not in kw
+
+
+def test_deepseek_strips_litellm_prefix_in_built_model_name() -> None:
+    """Mira's `deepseek/deepseek-chat` convention is stripped before hitting DeepSeek's API."""
+    spec = find_by_name("deepseek")
+    with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="sk-deepseek",
+            default_model="deepseek/deepseek-v4-pro",
+            spec=spec,
+        )
+    kw = provider._build_kwargs(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        model="deepseek/deepseek-v4-pro",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+    assert kw["model"] == "deepseek-v4-pro"
+
+
+def test_deepseek_backfills_reasoning_content_on_assistant_tool_calls() -> None:
+    """Legacy assistant tool-call turns get an empty reasoning_content so DeepSeek won't 400."""
+    spec = find_by_name("deepseek")
+    with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="sk-deepseek",
+            default_model="deepseek-v4-pro",
+            spec=spec,
+        )
+    kw = provider._build_kwargs(
+        messages=[
+            {"role": "user", "content": "start"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "abc123abc",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "abc123abc", "name": "read_file", "content": "ok"},
+            {"role": "user", "content": "next"},
+        ],
+        tools=None,
+        model="deepseek-v4-pro",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+    assistant_msg = kw["messages"][1]
+    assert assistant_msg["role"] == "assistant"
+    assert assistant_msg["reasoning_content"] == ""
+
+
+def test_deepseek_preserves_existing_reasoning_content() -> None:
+    """Real reasoning_content from the model survives the backfill pass."""
+    spec = find_by_name("deepseek")
+    with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="sk-deepseek",
+            default_model="deepseek-v4-pro",
+            spec=spec,
+        )
+    kw = provider._build_kwargs(
+        messages=[
+            {"role": "user", "content": "start"},
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "Thinking carefully…",
+                "tool_calls": [
+                    {
+                        "id": "abc123abc",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "abc123abc", "name": "read_file", "content": "ok"},
+        ],
+        tools=None,
+        model="deepseek-v4-pro",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+    assert kw["messages"][1]["reasoning_content"] == "Thinking carefully…"
+
+
+def test_deepseek_does_not_backfill_non_tool_call_assistant_messages() -> None:
+    """Plain assistant turns without tool_calls are left untouched."""
+    spec = find_by_name("deepseek")
+    with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="sk-deepseek",
+            default_model="deepseek-v4-pro",
+            spec=spec,
+        )
+    kw = provider._build_kwargs(
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello!"},
+            {"role": "user", "content": "again"},
+        ],
+        tools=None,
+        model="deepseek-v4-pro",
+        max_tokens=1024,
+        temperature=0.7,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+    assert "reasoning_content" not in kw["messages"][1]

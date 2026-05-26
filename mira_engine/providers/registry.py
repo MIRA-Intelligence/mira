@@ -283,7 +283,11 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
         is_oauth=True,  # OAuth-based authentication
     ),
-    # DeepSeek: needs "deepseek/" prefix for LiteLLM routing.
+    # DeepSeek: routed natively through OpenAICompatProvider to sidestep
+    # LiteLLM's buggy reasoning_content round-trip for thinking-mode models
+    # (https://github.com/BerriAI/litellm/issues/26395). LiteLLM metadata is
+    # kept around as a safety net for anyone who still wires the LiteLLM
+    # provider manually with a `deepseek/` model.
     ProviderSpec(
         name="deepseek",
         keywords=("deepseek",),
@@ -296,8 +300,8 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_local=False,
         detect_by_key_prefix="",
         detect_by_base_keyword="",
-        default_api_base="",
-        strip_model_prefix=False,
+        default_api_base="https://api.deepseek.com/v1",
+        strip_model_prefix=True,  # deepseek/deepseek-chat → deepseek-chat on the wire
         model_overrides=(),
     ),
     # Gemini: needs "gemini/" prefix for LiteLLM.

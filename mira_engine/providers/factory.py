@@ -107,6 +107,24 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
             f"No API key configured for model '{resolved_model}'. Set it under providers in config.json."
         )
 
+    # Native DeepSeek path — bypass LiteLLM to avoid the thinking-mode
+    # reasoning_content round-trip bug (litellm#26395). OpenAICompatProvider
+    # already preserves reasoning_content across turns; the spec carries the
+    # default api_base and model-name stripping so the OpenAI SDK can hit
+    # DeepSeek's OpenAI-compatible endpoint directly.
+    if provider_name == "deepseek" or resolved_model.startswith("deepseek/"):
+        deepseek_spec = spec or find_by_name("deepseek")
+        api_base = config.get_api_base(resolved_model)
+        if not api_base and deepseek_spec:
+            api_base = deepseek_spec.default_api_base or None
+        return OpenAICompatProvider(
+            api_key=provider_config.api_key if provider_config else None,
+            api_base=api_base,
+            default_model=resolved_model,
+            extra_headers=provider_config.extra_headers if provider_config else None,
+            spec=deepseek_spec,
+        )
+
     return LiteLLMProvider(
         api_key=provider_config.api_key if provider_config else None,
         api_base=config.get_api_base(resolved_model),
