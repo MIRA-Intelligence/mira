@@ -94,3 +94,49 @@ def test_make_provider_falls_back_to_web_proxy_for_openai_codex() -> None:
 
     assert provider.__class__.__name__ == "OpenAICodexProvider"
     assert provider.proxy == "http://127.0.0.1:7890"
+
+
+def test_make_provider_routes_deepseek_through_openai_compat() -> None:
+    """DeepSeek bypasses LiteLLM to dodge the thinking-mode reasoning_content bug."""
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "deepseek",
+                    "model": "deepseek/deepseek-v4-pro",
+                }
+            },
+            "providers": {"deepseek": {"apiKey": "sk-deepseek-test"}},
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "OpenAICompatProvider"
+    assert provider.get_default_model() == "deepseek/deepseek-v4-pro"
+    assert provider._effective_base == "https://api.deepseek.com/v1"
+
+
+def test_make_provider_routes_deepseek_with_custom_api_base() -> None:
+    """User-provided api_base wins over the registry default."""
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "deepseek",
+                    "model": "deepseek/deepseek-chat",
+                }
+            },
+            "providers": {
+                "deepseek": {
+                    "apiKey": "sk-deepseek-test",
+                    "apiBase": "https://deepseek.proxy.example/v1",
+                }
+            },
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "OpenAICompatProvider"
+    assert provider._effective_base == "https://deepseek.proxy.example/v1"

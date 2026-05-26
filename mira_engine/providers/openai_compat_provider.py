@@ -51,6 +51,33 @@ _DEFAULT_OPENROUTER_HEADERS = {
 }
 _DEFAULT_ACCEPT_ENCODING = "identity"
 
+# Generous default HTTP timeouts. The OpenAI SDK defaults to
+# Timeout(connect=5s, read=600s), which is tight for reasoning-heavy or
+# China-region providers (DeepSeek V4-Pro thinking mode, etc.) and trips
+# `APITimeoutError("Request timed out.")` on slow networks. LiteLLM's own
+# default sits at 6000s, so we match that ballpark and let users tune via env.
+_DEFAULT_CONNECT_TIMEOUT_S = 30.0
+_DEFAULT_READ_TIMEOUT_S = 6000.0
+
+
+def _resolve_timeout() -> "Any":
+    """Build an httpx.Timeout from env overrides, falling back to generous defaults."""
+    import httpx
+
+    try:
+        connect_s = float(
+            os.environ.get("MIRA_LLM_CONNECT_TIMEOUT_S", _DEFAULT_CONNECT_TIMEOUT_S)
+        )
+    except (TypeError, ValueError):
+        connect_s = _DEFAULT_CONNECT_TIMEOUT_S
+    try:
+        read_s = float(
+            os.environ.get("MIRA_LLM_READ_TIMEOUT_S", _DEFAULT_READ_TIMEOUT_S)
+        )
+    except (TypeError, ValueError):
+        read_s = _DEFAULT_READ_TIMEOUT_S
+    return httpx.Timeout(connect=connect_s, read=read_s, write=read_s, pool=connect_s)
+
 
 def _short_tool_id() -> str:
     """9-char alphanumeric ID compatible with all providers (incl. Mistral)."""
@@ -170,6 +197,7 @@ class OpenAICompatProvider(LLMProvider):
             base_url=effective_base,
             default_headers=default_headers,
             max_retries=0,
+            timeout=_resolve_timeout(),
         )
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
@@ -331,18 +359,57 @@ class OpenAICompatProvider(LLMProvider):
             elif spec.name in (
                 "volcengine", "volcengine_coding_plan",
                 "byteplus", "byteplus_coding_plan",
+                "deepseek",
             ):
+                # DeepSeek V4 uses the same wire format as Volcengine/BytePlus
+                # ({"thinking": {"type": "enabled" | "disabled"}}).
                 extra = {
                     "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
                 }
             if extra:
                 kwargs.setdefault("extra_body", {}).update(extra)
 
+        # DeepSeek thinking-mode requires every assistant tool-call turn in
+        # the history to carry reasoning_content (api-docs.deepseek.com/guides/
+        # thinking_mode#tool-calls). New responses already preserve the field
+        # via the message round-trip; this backfill repairs legacy/in-memory
+        # turns that lost it (older sessions, route_model handoffs, etc.).
+        if spec and spec.name == "deepseek":
+            kwargs["messages"] = self._backfill_deepseek_reasoning_content(
+                kwargs["messages"]
+            )
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
         return kwargs
+
+    @staticmethod
+    def _backfill_deepseek_reasoning_content(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Ensure assistant tool-call messages have a reasoning_content field.
+
+        DeepSeek thinking mode rejects subsequent requests when an assistant
+        turn with tool_calls is missing reasoning_content. Real reasoning text
+        is preserved when present; only messages lacking the field receive an
+        empty placeholder to satisfy DeepSeek's validation.
+        """
+        patched: list[dict[str, Any]] = []
+        for msg in messages:
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and not msg.get("reasoning_content")
+            ):
+                repaired = dict(msg)
+                repaired["reasoning_content"] = ""
+                patched.append(repaired)
+            else:
+                patched.append(msg)
+        return patched
 
     def _should_use_responses_api(
         self,

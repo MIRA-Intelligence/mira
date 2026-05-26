@@ -257,50 +257,6 @@ class LiteLLMProvider(LLMProvider):
                 return nested_map.get(key)
         return None
 
-    @staticmethod
-    def _is_deepseek_model(*models: str | None) -> bool:
-        return any(
-            isinstance(model, str) and "deepseek" in model.lower()
-            for model in models
-        )
-
-    @staticmethod
-    def _is_deepseek_reasoning_roundtrip_error(error: Exception) -> bool:
-        text = str(error).lower()
-        return (
-            "deepseek" in text
-            and "reasoning_content" in text
-            and "thinking mode" in text
-            and "must be passed back" in text
-        )
-
-    @staticmethod
-    def _backfill_missing_reasoning_content(
-        messages: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], int]:
-        """Add minimal reasoning_content to legacy assistant tool-call messages.
-
-        DeepSeek thinking mode validates assistant tool-call turns and rejects
-        follow-up requests when those turns are missing ``reasoning_content``.
-        New responses should preserve the real field; this fallback only repairs
-        older/in-memory turns that already lost it.
-        """
-        patched: list[dict[str, Any]] = []
-        count = 0
-        for msg in messages:
-            if (
-                msg.get("role") == "assistant"
-                and msg.get("tool_calls")
-                and not msg.get("reasoning_content")
-            ):
-                repaired = dict(msg)
-                repaired["reasoning_content"] = " "
-                patched.append(repaired)
-                count += 1
-            else:
-                patched.append(msg)
-        return patched, count
-
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -369,26 +325,6 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            if (
-                self._is_deepseek_model(original_model, model)
-                and self._is_deepseek_reasoning_roundtrip_error(e)
-            ):
-                repaired_messages, repaired_count = (
-                    self._backfill_missing_reasoning_content(kwargs["messages"])
-                )
-                if repaired_count:
-                    logger.warning(
-                        "Retrying DeepSeek request after backfilling missing reasoning_content "
-                        "on {} assistant tool-call message(s)",
-                        repaired_count,
-                    )
-                    retry_kwargs = dict(kwargs)
-                    retry_kwargs["messages"] = repaired_messages
-                    try:
-                        response = await acompletion(**retry_kwargs)
-                        return self._parse_response(response)
-                    except Exception as retry_error:
-                        e = retry_error
             # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",

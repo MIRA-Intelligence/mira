@@ -533,6 +533,40 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert persisted.get("status") == "in_progress"
 
 
+def test_format_stop_reason_detail_inlines_provider_error_snippet() -> None:
+    """Provider-error stops should surface the underlying error inline.
+
+    Progress events render above the assistant reply in the UI; without the
+    snippet the user only sees ``auto-run stop reason: provider error`` and the
+    actual cause appears as a separate message that looks like it happened
+    *after* the stop. The detail suffix collapses that ambiguity.
+    """
+    err = (
+        "All candidate models failed for this turn. Last error from "
+        "'deepseek/deepseek-v4-pro': Error calling LLM: Connection error."
+    )
+    detail = ResearchAgentLoop._format_stop_reason_detail("provider error", err)
+    assert detail.startswith(" — ")
+    assert "Connection error" in detail
+    assert "All candidate models failed" in detail
+
+    long_err = "Error calling LLM: " + ("x" * 5000)
+    truncated = ResearchAgentLoop._format_stop_reason_detail(
+        "provider error", long_err, max_len=200
+    )
+    assert truncated.endswith("…")
+    assert len(truncated) <= 3 + 200
+
+    assert (
+        ResearchAgentLoop._format_stop_reason_detail(
+            "max rounds reached (20)", err
+        )
+        == ""
+    )
+    assert ResearchAgentLoop._format_stop_reason_detail("provider error", None) == ""
+    assert ResearchAgentLoop._format_stop_reason_detail("provider error", "   ") == ""
+
+
 async def test_normal_loop_mode_uses_base_loop_without_project_metadata(
     monkeypatch, tmp_path: Path
 ) -> None:
