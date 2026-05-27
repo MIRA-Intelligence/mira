@@ -325,11 +325,40 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
+            # Some providers (notably Moonshot's Kimi K2 / thinking models)
+            # enforce temperature=1 and reject any other value with a 400.
+            # Retry once with temperature=1.0 instead of bubbling the error up,
+            # so newly released models we haven't registered overrides for
+            # still succeed.
+            if self._is_temperature_one_required(e) and kwargs.get("temperature") != 1.0:
+                logger.warning(
+                    "Provider rejected temperature={}; retrying with temperature=1.0 (model={})",
+                    kwargs.get("temperature"), kwargs.get("model"),
+                )
+                kwargs["temperature"] = 1.0
+                try:
+                    response = await acompletion(**kwargs)
+                    return self._parse_response(response)
+                except Exception as retry_err:
+                    e = retry_err
+
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+
+    @staticmethod
+    def _is_temperature_one_required(err: Exception) -> bool:
+        """Detect provider errors that demand temperature=1 (e.g. Moonshot Kimi K2)."""
+        msg = str(err).lower()
+        if "temperature" not in msg:
+            return False
+        return (
+            "only 1 is allowed" in msg
+            or "only 1.0 is allowed" in msg
+            or "must be 1" in msg
+            or "temperature=1" in msg
+        )
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
