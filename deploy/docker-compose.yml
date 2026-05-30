@@ -1,0 +1,99 @@
+x-common-config: &common-config
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  volumes:
+    - ~/.mira:/home/mira/.mira
+  cap_drop:
+    - ALL
+  cap_add:
+    - SYS_ADMIN
+  security_opt:
+    - apparmor=unconfined
+    - seccomp=unconfined
+
+services:
+  # Local build/run stack (uses repository Dockerfile)
+  mira-gateway:
+    container_name: mira-gateway
+    <<: *common-config
+    command: ["gateway"]
+    restart: unless-stopped
+    ports:
+      - 18790:18790
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  mira-api:
+    container_name: mira-api
+    <<: *common-config
+    command:
+      ["serve", "--host", "0.0.0.0", "-w", "/home/mira/.mira/api-workspace"]
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:8900:8900
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  mira-cli:
+    <<: *common-config
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        BUILD_BRIDGE: "0"
+    user: "479001138:479001138"
+    environment:
+      - MIRA_CONFIG_PATH=/home/mira/.mira/config.json
+      - XDG_CONFIG_HOME=/home/mira/.mira/.config
+      - XDG_DATA_HOME=/home/mira/.mira/.local/share
+      - XDG_CACHE_HOME=/home/mira/.mira/.cache
+    profiles:
+      - cli
+    command: ["status"]
+    stdin_open: true
+    tty: true
+
+  # Optional self-hosted release stack
+  mira-engine:
+    image: ghcr.io/mira-intelligence/mira-engine:${MIRA_AGENT_TAG:-latest}
+    container_name: mira-engine
+    profiles:
+      - self-hosted
+    restart: unless-stopped
+    command: ["mira", "gateway", "--port", "18790"]
+    ports:
+      - "${MIRA_AGENT_PORT:-18790}:18790"
+    volumes:
+      - mira_data:/root/.mira
+    environment:
+      - MIRA_CONFIG_PATH=/root/.mira/config.json
+
+  mira-ui:
+    image: ghcr.io/mira-intelligence/mira-ui:${MIRA_UI_TAG:-latest}
+    container_name: mira-ui
+    profiles:
+      - self-hosted
+    restart: unless-stopped
+    depends_on:
+      - mira-engine
+    ports:
+      - "${MIRA_UI_PORT:-8080}:80"
+    environment:
+      - VITE_API_URL=${MIRA_API_URL:-http://localhost:18790/api}
+      - VITE_WS_URL=${MIRA_WS_URL:-ws://localhost:18790/ws}
+
+volumes:
+  mira_data:

@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 import pytest
 
-from medpilot.utils import helpers
-from medpilot.utils.helpers import (
+from mira_engine.utils import helpers
+from mira_engine.utils.helpers import (
     detect_image_mime,
     ensure_dir,
     safe_filename,
@@ -131,6 +131,12 @@ def test_sync_workspace_templates_skips_bootstrap_md(tmp_path: Path) -> None:
     sync_workspace_templates(tmp_path, silent=True)
     for name in helpers._RUNTIME_BOOTSTRAP:
         assert not (tmp_path / name).exists()
+
+
+def test_sync_workspace_templates_skips_profile_agents_templates(tmp_path: Path) -> None:
+    sync_workspace_templates(tmp_path, silent=True)
+    assert not (tmp_path / "AGENTS_EG.md").exists()
+    assert not (tmp_path / "AGENTS_RS.md").exists()
 
 
 def test_sync_workspace_templates_does_not_overwrite_existing(tmp_path: Path) -> None:

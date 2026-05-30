@@ -8,12 +8,12 @@ from unittest.mock import patch
 
 import pytest
 
-from medpilot.session.manager import Session, SessionManager
+from mira_engine.session.manager import Session, SessionManager
 
 
 @pytest.fixture
 def manager(tmp_path: Path) -> SessionManager:
-    with patch("medpilot.session.manager.get_legacy_sessions_dir", return_value=tmp_path / "legacy"):
+    with patch("mira_engine.session.manager.get_legacy_sessions_dir", return_value=tmp_path / "legacy"):
         return SessionManager(tmp_path)
 
 
@@ -83,6 +83,47 @@ def test_save_preserves_tool_calls(manager: SessionManager) -> None:
     assert loaded.messages[2]["tool_call_id"] == "tc_1"
 
 
+def test_save_appends_events_without_rewriting(manager: SessionManager) -> None:
+    s = manager.get_or_create("cli:append")
+    s.add_message("user", "first")
+    manager.save(s)
+    path = manager._get_session_path("cli:append")
+    first_save_lines = len(path.read_text(encoding="utf-8").splitlines())
+
+    s.add_message("assistant", "second")
+    manager.save(s)
+    second_save_lines = len(path.read_text(encoding="utf-8").splitlines())
+
+    assert second_save_lines > first_save_lines
+
+    manager.invalidate("cli:append")
+    loaded = manager.get_or_create("cli:append")
+    assert [m["content"] for m in loaded.messages] == ["first", "second"]
+
+
+def test_append_ui_event_round_trip(manager: SessionManager) -> None:
+    manager.append_ui_event(
+        key="ui:PRJ-0001",
+        role="user",
+        content="hello ui",
+        msg_type="response",
+        metadata={"_user": True},
+        timestamp="2026-03-24T12:00:00",
+    )
+    manager.append_ui_event(
+        key="ui:PRJ-0001",
+        role="assistant",
+        content="hello back",
+        msg_type="response",
+        metadata={},
+        timestamp="2026-03-24T12:00:01",
+    )
+
+    entries = manager.get_ui_history("ui:PRJ-0001")
+    assert entries[0]["content"] == "hello ui"
+    assert entries[0]["metadata"]["_user"] is True
+    assert entries[1]["content"] == "hello back"
+
 def test_load_corrupt_file_returns_new_session(manager: SessionManager) -> None:
     path = manager._get_session_path("cli:corrupt")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,7 +148,7 @@ def test_legacy_session_migrated(tmp_path: Path) -> None:
     legacy_dir = tmp_path / "legacy"
     legacy_dir.mkdir()
 
-    with patch("medpilot.session.manager.get_legacy_sessions_dir", return_value=legacy_dir):
+    with patch("mira_engine.session.manager.get_legacy_sessions_dir", return_value=legacy_dir):
         mgr = SessionManager(tmp_path)
 
     safe_key = "cli_migrate"

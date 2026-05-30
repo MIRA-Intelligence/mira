@@ -1,8 +1,8 @@
 from typing import Any
 
-from medpilot.agent.routing import ModelRouter, RoutedModel, RoutedProviderManager
-from medpilot.config.schema import AgentDefaults, Config
-from medpilot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.agent.routing import ModelRouter, RoutedModel, RoutedProviderManager
+from mira_engine.config.schema import AgentDefaults, Config
+from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
 def _defaults(**overrides) -> AgentDefaults:

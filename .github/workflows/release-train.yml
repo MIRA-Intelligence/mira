@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       agent_tag:
-        description: "Agent tag in MedPilot (e.g. v0.2.0)"
+        description: "Agent tag in Mira (e.g. v0.2.0)"
         required: true
         type: string
       ui_tag:
-        description: "UI tag in MedPilotUI (e.g. v0.2.0)"
+        description: "UI tag in MiraUI (e.g. v0.2.0)"
         required: true
         type: string
 
@@ -21,21 +21,21 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.RELEASE_TRAIN_GH_TOKEN || github.token }}
     steps:
-      - name: Ensure cross-repo token can access MedPilotUI
+      - name: Ensure cross-repo token can access MiraUI
         run: |
-          if ! gh api repos/Project-MedPilot/MedPilotUI >/dev/null 2>&1; then
-            echo "::error::Current GH token cannot access Project-MedPilot/MedPilotUI."
-            echo "Configure RELEASE_TRAIN_GH_TOKEN with access to both repos: classic PATs need repo (or public_repo for public-only repos), and fine-grained PATs need repository Contents: Read, then rerun."
+          if ! gh api repos/MIRA-Intelligence/mira-ui >/dev/null 2>&1; then
+            echo "::error::Current GH token cannot access MIRA-Intelligence/mira-ui."
+            echo "Configure RELEASE_TRAIN_GH_TOKEN with repo:read access to both repos, then rerun."
             exit 1
           fi
 
       - name: Verify agent tag exists
         run: |
-          gh api repos/Project-MedPilot/MedPilot/git/ref/tags/${{ inputs.agent_tag }} >/dev/null
+          gh api repos/MIRA-Intelligence/mira/git/ref/tags/${{ inputs.agent_tag }} >/dev/null
 
       - name: Verify UI tag exists
         run: |
-          gh api repos/Project-MedPilot/MedPilotUI/git/ref/tags/${{ inputs.ui_tag }} >/dev/null
+          gh api repos/MIRA-Intelligence/mira-ui/git/ref/tags/${{ inputs.ui_tag }} >/dev/null
 
   smoke:
     needs: verify-tags
@@ -51,7 +51,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install MedPilot
+      - name: Install Mira
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
@@ -61,7 +61,7 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
-          from medpilot.config.schema import Config
+          from mira_engine.config.schema import Config
 
           cfg = Config()
           cfg.agents.defaults.model = "custom/default"
@@ -69,7 +69,6 @@ jobs:
           cfg.providers.custom.api_key = "no-key"
           cfg.providers.custom.api_base = "http://127.0.0.1:8000/v1"
           cfg.channels.web.enabled = True
-          cfg.channels.web.host = "127.0.0.1"
           cfg.channels.web.port = 18790
           cfg.channels.web.allow_from = ["*"]
           cfg.channels.web.cors_origins = ["*"]
@@ -81,7 +80,7 @@ jobs:
 
       - name: Start gateway
         run: |
-          nohup medpilot gateway --config release-train-config.json > gateway.log 2>&1 &
+          nohup mira gateway --config release-train-config.json > gateway.log 2>&1 &
 
       - name: Wait for gateway health
         run: |

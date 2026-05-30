@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import asyncio
+import sys
+import types
+from types import SimpleNamespace
+
+from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.base import BaseChannel
+from mira_engine.channels.manager import ChannelManager
+from mira_engine.config.schema import Config
+
+
+class _DummyChannel(BaseChannel):
+    def __init__(self, config, bus, **kwargs):
+        super().__init__(config, bus)
+        self.init_kwargs = kwargs
+        self.started = False
+        self.stopped = False
+        self.sent = []
+        self.fail_on_stop = False
+
+    async def start(self) -> None:
+        self.started = True
+        self._running = True
+
+    async def stop(self) -> None:
+        if self.fail_on_stop:
+            raise RuntimeError("stop failed")
+        self.stopped = True
+        self._running = False
+
+    async def send(self, msg: OutboundMessage) -> None:
+        self.sent.append(msg)
+
+
+def _install_channel_module(monkeypatch, module_name: str, cls_name: str) -> None:
+    mod = types.ModuleType(module_name)
+    setattr(mod, cls_name, _DummyChannel)
+    monkeypatch.setitem(sys.modules, module_name, mod)
+
+
+def _enable_all_channels(cfg: Config) -> None:
+    for name in (
+        "telegram",
+        "whatsapp",
+        "discord",
+        "feishu",
+        "mochat",
+        "dingtalk",
+        "email",
+        "slack",
+        "qq",
+        "matrix",
+        "ui",
+    ):
+        ch = getattr(cfg.channels, name)
+        ch.enabled = True
+        if hasattr(ch, "allow_from"):
+            ch.allow_from = ["*"]
+
+
+def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
+    for module_name, cls_name in (
+        ("mira_engine.channels.telegram", "TelegramChannel"),
+        ("mira_engine.channels.whatsapp", "WhatsAppChannel"),
+        ("mira_engine.channels.discord", "DiscordChannel"),
+        ("mira_engine.channels.feishu", "FeishuChannel"),
+        ("mira_engine.channels.mochat", "MochatChannel"),
+        ("mira_engine.channels.dingtalk", "DingTalkChannel"),
+        ("mira_engine.channels.email", "EmailChannel"),
+        ("mira_engine.channels.slack", "SlackChannel"),
+        ("mira_engine.channels.qq", "QQChannel"),
+        ("mira_engine.channels.matrix", "MatrixChannel"),
+        ("mira_engine.channels.ui", "UiChannel"),
+    ):
+        _install_channel_module(monkeypatch, module_name, cls_name)
+
+    cfg = Config()
+    _enable_all_channels(cfg)
+    mgr = ChannelManager(cfg, MessageBus())
+    assert set(mgr.enabled_channels) == {
+        "telegram",
+        "whatsapp",
+        "discord",
+        "feishu",
+        "mochat",
+        "dingtalk",
+        "email",
+        "slack",
+        "qq",
+        "matrix",
+        "ui",
+    }
+
+
+def test_validate_allow_from_rejects_empty_lists() -> None:
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.channels = {"telegram": SimpleNamespace(config=SimpleNamespace(allow_from=[]))}
+    try:
+        mgr._validate_allow_from()
+        assert False, "Expected SystemExit"
+    except SystemExit as exc:
+        assert "empty allowFrom" in str(exc)
+
+
+def test_ui_channel_receives_gateway_bind_host_port(monkeypatch) -> None:
+    _install_channel_module(monkeypatch, "mira_engine.channels.ui", "UiChannel")
+    cfg = Config()
+    cfg.channels.ui.enabled = True
+    cfg.channels.ui.allow_from = ["*"]
+    cfg.gateway.host = "127.0.0.2"
+    cfg.gateway.port = 19991
+
+    mgr = ChannelManager(cfg, MessageBus())
+    ui = mgr.get_channel("ui")
+    assert isinstance(ui, _DummyChannel)
+    assert ui.init_kwargs["workspace"] == cfg.workspace_path
+    assert ui.init_kwargs["bind_host"] == "127.0.0.2"
+    assert ui.init_kwargs["bind_port"] == 19991
+
+
+async def test_start_all_and_stop_all_with_channels(monkeypatch) -> None:
+    _install_channel_module(monkeypatch, "mira_engine.channels.telegram", "TelegramChannel")
+    cfg = Config()
+    cfg.channels.telegram.enabled = True
+    cfg.channels.telegram.allow_from = ["*"]
+    bus = MessageBus()
+    mgr = ChannelManager(cfg, bus)
+
+    await mgr.start_all()
+    assert mgr.get_channel("telegram").started is True
+    assert mgr._dispatch_task is not None
+
+    await mgr.stop_all()
+    assert mgr.get_channel("telegram").stopped is True
+
+
+async def test_start_all_without_channels_returns_early() -> None:
+    cfg = Config()
+    bus = MessageBus()
+    mgr = ChannelManager(cfg, bus)
+    mgr.channels = {}
+    await mgr.start_all()
+    assert mgr._dispatch_task is None
+
+
+async def test_dispatch_outbound_filters_progress_messages() -> None:
+    cfg = Config()
+    cfg.channels.send_progress = False
+    cfg.channels.send_tool_hints = False
+    bus = MessageBus()
+    mgr = ChannelManager(cfg, bus)
+    ui_ch = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
+    matrix_ch = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
+    mgr.channels = {"ui": ui_ch, "matrix": matrix_ch}
+
+    task = asyncio.create_task(mgr._dispatch_outbound())
+    await bus.publish_outbound(OutboundMessage("ui", "x", "normal"))
+    await bus.publish_outbound(OutboundMessage("ui", "x", "progress", metadata={"_progress": True}))
+    await bus.publish_outbound(
+        OutboundMessage("ui", "x", "activity", metadata={"_progress": True, "_activity_ping": True})
+    )
+    await bus.publish_outbound(
+        OutboundMessage("ui", "x", "hint", metadata={"_progress": True, "_tool_hint": True})
+    )
+    await bus.publish_outbound(
+        OutboundMessage("matrix", "x", "hint", metadata={"_progress": True, "_tool_hint": True})
+    )
+    await bus.publish_outbound(
+        OutboundMessage(
+            "matrix",
+            "x",
+            "activity",
+            metadata={"_progress": True, "_activity_ping": True},
+        )
+    )
+    await asyncio.sleep(0.1)
+    task.cancel()
+    await task
+
+    assert [m.content for m in ui_ch.sent] == ["normal", "activity"]
+    assert matrix_ch.sent == []
+
+
+async def test_dispatch_outbound_handles_unknown_channel_and_send_errors() -> None:
+    cfg = Config()
+    bus = MessageBus()
+    mgr = ChannelManager(cfg, bus)
+    bad = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
+
+    async def _boom(_msg):
+        raise RuntimeError("send fail")
+
+    bad.send = _boom
+    mgr.channels = {"ui": bad}
+
+    task = asyncio.create_task(mgr._dispatch_outbound())
+    await bus.publish_outbound(OutboundMessage("ui", "x", "one"))
+    await bus.publish_outbound(OutboundMessage("missing", "x", "two"))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    await task
+
+
+async def test_stop_all_continues_when_channel_stop_fails() -> None:
+    cfg = Config()
+    bus = MessageBus()
+    mgr = ChannelManager(cfg, bus)
+    bad = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
+    bad.fail_on_stop = True
+    mgr.channels = {"ui": bad}
+    mgr._dispatch_task = asyncio.create_task(asyncio.sleep(5))
+    await mgr.stop_all()
+
+
+def test_status_and_get_channel_helpers() -> None:
+    cfg = Config()
+    bus = MessageBus()
+    mgr = ChannelManager(cfg, bus)
+    ch = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
+    ch._running = True
+    mgr.channels = {"ui": ch}
+
+    assert mgr.get_channel("ui") is ch
+    assert mgr.get_channel("missing") is None
+    assert mgr.get_status() == {"ui": {"enabled": True, "running": True}}

@@ -2,9 +2,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from medpilot.agent.memory import MemoryStore
-from medpilot.providers.base import LLMResponse, ToolCallRequest
-from medpilot.session.manager import Session
+from mira_engine.agent.memory import MemoryStore
+from mira_engine.providers.base import LLMResponse, ToolCallRequest
+from mira_engine.session.manager import Session
 
 
 def test_read_long_term_missing_and_present(tmp_path) -> None:

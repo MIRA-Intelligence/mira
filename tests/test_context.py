@@ -8,10 +8,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from medpilot.agent.context import ContextBuilder
-from medpilot.agent.skill_plugins import SkillPluginManager
-from medpilot.agent.skills import SkillsLoader
-from medpilot.agent import skill_plugins as skill_plugins_mod
+from mira_engine.agent.context import ContextBuilder
+from mira_engine.agent.skill_plugins import SkillPluginManager
+from mira_engine.agent.skills import SkillsLoader
+from mira_engine.agent import skill_plugins as skill_plugins_mod
 
 TAG = ContextBuilder._RUNTIME_CONTEXT_TAG
 
@@ -55,6 +55,28 @@ class TestSanitizeToolPairs:
         ]
         assert ContextBuilder._sanitize_tool_pairs(msgs) == [
             {"role": "assistant", "content": "keep me"},
+            {"role": "user", "content": "hi"},
+        ]
+
+    def test_strips_missing_result_preserves_reasoning_metadata(self) -> None:
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "keep me",
+                "reasoning_content": "hidden reasoning",
+                "thinking_blocks": [{"type": "thinking", "signature": "sig"}],
+                "tool_calls": [_tc("a")],
+            },
+            {"role": "user", "content": "hi"},
+        ]
+
+        assert ContextBuilder._sanitize_tool_pairs(msgs) == [
+            {
+                "role": "assistant",
+                "content": "keep me",
+                "reasoning_content": "hidden reasoning",
+                "thinking_blocks": [{"type": "thinking", "signature": "sig"}],
+            },
             {"role": "user", "content": "hi"},
         ]
 
@@ -168,8 +190,8 @@ class TestSanitizeToolPairs:
 class TestBuildRuntimeContext:
     def test_channel_and_chat_id(self) -> None:
         with (
-            patch("medpilot.agent.context.datetime") as m_dt,
-            patch("medpilot.agent.context.time.strftime", return_value="TZ"),
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="TZ"),
         ):
             m_dt.now.return_value.strftime.return_value = "T"
             s = ContextBuilder._build_runtime_context("discord", "c1", None)
@@ -181,26 +203,26 @@ class TestBuildRuntimeContext:
 
     def test_project_dir(self) -> None:
         with (
-            patch("medpilot.agent.context.datetime") as m_dt,
-            patch("medpilot.agent.context.time.strftime", return_value="UTC"),
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
         ):
             m_dt.now.return_value.strftime.return_value = "T"
             s = ContextBuilder._build_runtime_context("x", "y", "/abs/proj")
         assert "Project Directory: /abs/proj" in s
 
-    def test_web_default_project_dir(self) -> None:
+    def test_ui_default_project_dir(self) -> None:
         with (
-            patch("medpilot.agent.context.datetime") as m_dt,
-            patch("medpilot.agent.context.time.strftime", return_value="UTC"),
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
         ):
             m_dt.now.return_value.strftime.return_value = "T"
-            s = ContextBuilder._build_runtime_context("web", "abc123", None)
+            s = ContextBuilder._build_runtime_context("ui", "abc123", None)
         assert "Project Directory: projects/abc123" in s
 
     def test_no_channel_or_chat_id_time_only(self) -> None:
         with (
-            patch("medpilot.agent.context.datetime") as m_dt,
-            patch("medpilot.agent.context.time.strftime", return_value="UTC"),
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
         ):
             m_dt.now.return_value.strftime.return_value = "T"
             s = ContextBuilder._build_runtime_context(None, None, None)
@@ -208,15 +230,15 @@ class TestBuildRuntimeContext:
 
     def test_partial_channel_missing_chat_id(self) -> None:
         with (
-            patch("medpilot.agent.context.datetime") as m_dt,
-            patch("medpilot.agent.context.time.strftime", return_value="UTC"),
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
         ):
             m_dt.now.return_value.strftime.return_value = "T"
-            s = ContextBuilder._build_runtime_context("web", None, None)
+            s = ContextBuilder._build_runtime_context("ui", None, None)
         assert s == TAG + "\nCurrent Time: T (UTC)"
 
 
-@patch("medpilot.agent.context.ContextBuilder._load_builtin_template")
+@patch("mira_engine.agent.context.ContextBuilder._load_builtin_template")
 class TestLoadBootstrapFiles:
     def test_workspace_override(self, mock_builtin: MagicMock, tmp_path: Path) -> None:
         mock_builtin.return_value = None
@@ -252,17 +274,27 @@ class TestLoadBootstrapFiles:
         cb = ContextBuilder(tmp_path)
         assert cb._load_bootstrap_files() == ""
 
+    def test_switches_agents_template_file(
+        self, mock_builtin: MagicMock, tmp_path: Path,
+    ) -> None:
+        mock_builtin.side_effect = lambda fn: f"BUILTIN-{fn}"
+        cb = ContextBuilder(tmp_path)
+        out = cb._load_bootstrap_files(agents_filename="AGENTS_EG.md")
+        assert "## AGENTS_EG.md" in out
+        assert "BUILTIN-AGENTS_EG.md" in out
+        assert "## AGENTS.md" not in out
 
-@patch("medpilot.agent.context.SkillsLoader")
-@patch("medpilot.agent.context.MemoryStore")
+
+@patch("mira_engine.agent.context.SkillsLoader")
+@patch("mira_engine.agent.context.MemoryStore")
 class TestBuildMessages:
     def test_text_merged_with_runtime_context(
         self, _mock_mem: MagicMock, _mock_skills: MagicMock, tmp_path: Path,
     ) -> None:
         with (
             patch.object(ContextBuilder, "build_system_prompt", return_value="SYS"),
-            patch("medpilot.agent.context.datetime") as m_dt,
-            patch("medpilot.agent.context.time.strftime", return_value="UTC"),
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
         ):
             m_dt.now.return_value.strftime.return_value = "T"
             cb = ContextBuilder(tmp_path)
@@ -280,8 +312,8 @@ class TestBuildMessages:
     ) -> None:
         with (
             patch.object(ContextBuilder, "build_system_prompt", return_value="SYS"),
-            patch("medpilot.agent.context.datetime") as m_dt,
-            patch("medpilot.agent.context.time.strftime", return_value="UTC"),
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
         ):
             m_dt.now.return_value.strftime.return_value = "T"
             cb = ContextBuilder(tmp_path)
@@ -293,8 +325,8 @@ class TestBuildMessages:
     ) -> None:
         with (
             patch.object(ContextBuilder, "build_system_prompt", return_value="SYS"),
-            patch("medpilot.agent.context.datetime") as m_dt,
-            patch("medpilot.agent.context.time.strftime", return_value="UTC"),
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
         ):
             m_dt.now.return_value.strftime.return_value = "T"
             cb = ContextBuilder(tmp_path)
@@ -304,9 +336,23 @@ class TestBuildMessages:
             out = cb.build_messages(history, "q")
         assert out[1] == {"role": "assistant", "content": "k"}
 
+    def test_agents_filename_forwarded_to_system_prompt(
+        self, _mock_mem: MagicMock, _mock_skills: MagicMock, tmp_path: Path,
+    ) -> None:
+        with (
+            patch.object(ContextBuilder, "build_system_prompt", return_value="SYS") as mock_sp,
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
+        ):
+            m_dt.now.return_value.strftime.return_value = "T"
+            cb = ContextBuilder(tmp_path)
+            cb.build_messages([], "hello", agents_filename="AGENTS_RS.md")
+        _, kwargs = mock_sp.call_args
+        assert kwargs["agents_filename"] == "AGENTS_RS.md"
 
-@patch("medpilot.agent.context.SkillsLoader")
-@patch("medpilot.agent.context.MemoryStore")
+
+@patch("mira_engine.agent.context.SkillsLoader")
+@patch("mira_engine.agent.context.MemoryStore")
 class TestAddToolResultAndAssistant:
     def test_add_tool_result(
         self, _mock_mem: MagicMock, _mock_skills: MagicMock, tmp_path: Path,
@@ -346,8 +392,8 @@ class TestAddToolResultAndAssistant:
         }
 
 
-@patch("medpilot.agent.context.SkillsLoader")
-@patch("medpilot.agent.context.MemoryStore")
+@patch("mira_engine.agent.context.SkillsLoader")
+@patch("mira_engine.agent.context.MemoryStore")
 class TestBuildUserContent:
     def test_no_media_plain_text(
         self, _mock_mem: MagicMock, _mock_skills: MagicMock, tmp_path: Path,

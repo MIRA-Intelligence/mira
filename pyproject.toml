@@ -1,17 +1,18 @@
 [project]
-name = "medpilot-ai"
-version = "0.1"
+name = "mira-engine"
+dynamic = ["version"]
 description = "A lightweight personal AI assistant framework"
+readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = {text = "GPL-3.0-or-later"}
 authors = [
-    {name = "medpilot contributors"}
+    {name = "mira contributors"}
 ]
 keywords = ["ai", "agent", "chatbot"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
@@ -44,6 +45,8 @@ dependencies = [
     "json-repair>=0.57.0,<1.0.0",
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
+    "ddgs>=9.0.0,<10.0.0",
+    "psutil>=6.0.0",
 ]
 
 [project.optional-dependencies]
@@ -64,30 +67,39 @@ dev = [
 ]
 
 [project.scripts]
-medpilot = "medpilot.cli.commands:app"
+mira = "mira_engine.cli.commands:app"
+mira-engine = "mira_engine.cli.agent_service:app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+(?:rc\\d+)?)$"
+fallback_version = "0.0.0"
+local_scheme = "no-local-version"
+
 [tool.hatch.build.targets.wheel]
-packages = ["medpilot"]
+packages = ["mira_engine"]
 
 [tool.hatch.build.targets.wheel.sources]
-"medpilot" = "medpilot"
+"mira_engine" = "mira_engine"
 
 # Include non-Python files in skills and templates
 [tool.hatch.build]
 include = [
-    "medpilot/**/*.py",
-    "medpilot/templates/**/*.md",
-    "medpilot/skills/**/*.md",
-    "medpilot/skills/**/*.sh",
+    "mira_engine/**/*.py",
+    "mira_engine/templates/**/*.md",
+    "mira_engine/skills/**/*.md",
+    "mira_engine/skills/**/*.sh",
 ]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "medpilot/",
+    "mira_engine/",
     "bridge/",
     "README.md",
     "LICENSE",
@@ -97,6 +109,7 @@ include = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["mira_engine/skills"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
@@ -107,10 +120,10 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["medpilot"]
+source = ["mira_engine"]
 omit = [
-    "medpilot/skills/*",
-    "medpilot/cli/*",
+    "mira_engine/skills/*",
+    "mira_engine/cli/*",
 ]
 
 [tool.coverage.report]
