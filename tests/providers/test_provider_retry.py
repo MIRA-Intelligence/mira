@@ -94,6 +94,50 @@ async def test_chat_with_retry_preserves_cancelled_error() -> None:
         await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
 
 
+def _has_image_block(messages: list[dict]) -> bool:
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    return True
+    return False
+
+
+@pytest.mark.asyncio
+async def test_chat_with_retry_strips_images_for_text_only_model() -> None:
+    provider = ScriptedProvider([LLMResponse(content="ok")])
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}, "_meta": {"path": "/p.png"}},
+            {"type": "text", "text": "what is this"},
+        ],
+    }]
+
+    response = await provider.chat_with_retry(messages=messages, model="moonshot/kimi-k2.6")
+
+    assert response.content == "ok"
+    assert provider.calls == 1  # no failed round-trip / reactive retry needed
+    assert not _has_image_block(provider.last_kwargs["messages"])
+
+
+@pytest.mark.asyncio
+async def test_chat_with_retry_preserves_images_for_vision_model() -> None:
+    provider = ScriptedProvider([LLMResponse(content="ok")])
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "text", "text": "what is this"},
+        ],
+    }]
+
+    await provider.chat_with_retry(messages=messages, model="gpt-4o")
+
+    assert _has_image_block(provider.last_kwargs["messages"])
+
+
 @pytest.mark.asyncio
 async def test_chat_with_retry_uses_provider_generation_defaults() -> None:
     """When callers omit generation params, provider.generation defaults are used."""
@@ -152,7 +196,9 @@ async def test_non_transient_error_with_images_retries_without_images() -> None:
         LLMResponse(content="ok, no image"),
     ])
 
-    response = await provider.chat_with_retry(messages=_IMAGE_MSG)
+    # Use a vision-capable model so proactive stripping is skipped and the
+    # reactive (post-error) fallback path is the one under test.
+    response = await provider.chat_with_retry(messages=_IMAGE_MSG, model="gpt-4o")
 
     assert response.content == "ok, no image"
     assert provider.calls == 2
@@ -187,7 +233,7 @@ async def test_image_fallback_returns_error_on_second_failure() -> None:
         LLMResponse(content="still failing", finish_reason="error"),
     ])
 
-    response = await provider.chat_with_retry(messages=_IMAGE_MSG)
+    response = await provider.chat_with_retry(messages=_IMAGE_MSG, model="gpt-4o")
 
     assert provider.calls == 2
     assert response.content == "still failing"
@@ -202,7 +248,7 @@ async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
         LLMResponse(content="ok"),
     ])
 
-    response = await provider.chat_with_retry(messages=_IMAGE_MSG_NO_META)
+    response = await provider.chat_with_retry(messages=_IMAGE_MSG_NO_META, model="gpt-4o")
 
     assert response.content == "ok"
     assert provider.calls == 2

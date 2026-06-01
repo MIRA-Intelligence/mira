@@ -31,7 +31,7 @@ from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.config import loader as config_loader
-from mira_engine.config.paths import get_runtime_subdir
+from mira_engine.config.paths import get_runtime_subdir, get_workspace_path
 from mira_engine.config.schema import Config, UiChannelConfig
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
@@ -49,6 +49,9 @@ PLAN_FILENAME = "task_plan.json"
 PROJECT_DIR_PREFIX = "PRJ"
 PROJECT_META_DIRNAME = ".mira"
 PROJECT_META_FILENAME = "project.json"
+# Sentinel session id used by the UI to manage globally-scoped skill plugins
+# without a selected project. Mirrors GLOBAL_SKILLS_SESSION_ID in the frontend.
+_GLOBAL_SKILLS_SESSION_ID = "__global__"
 PROJECT_META_SCHEMA_VERSION = 1
 PROJECT_META_DEFAULT_RUN_MODE = "auto"
 PROJECT_META_DEFAULT_AGENT_PROFILE = "research"
@@ -539,6 +542,9 @@ class UiChannel(BaseChannel):
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
         self._client_project_dirs: dict[str, Path | None] = {}
+        # Accumulates streamed assistant text per session so the final turn can
+        # be persisted to the UI history log on stream end.
+        self._stream_buffers: dict[str, str] = {}
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -918,6 +924,20 @@ class UiChannel(BaseChannel):
         self._clients.clear()
         self._client_project_dirs.clear()
 
+    def _stream_history_dir(
+        self, chat_id: str, metadata: dict[str, Any]
+    ) -> Path | None:
+        """Resolve the session-log directory for a streamed turn (project dir
+        when available, else the workspace-level log for Quick Chat)."""
+        project_dir = self._project_dir_from_metadata(chat_id, metadata)
+        if project_dir is None:
+            project_dir = self._resolve_project_dir(chat_id)
+        if project_dir is not None and project_dir.is_dir():
+            return project_dir
+        if self.workspace is not None:
+            return self.workspace
+        return None
+
     async def send(self, msg: OutboundMessage) -> None:
         metadata = msg.metadata or {}
         if metadata.get("_audit_only"):
@@ -935,6 +955,53 @@ class UiChannel(BaseChannel):
             return
 
         metadata = msg.metadata or {}
+
+        # Streaming token deltas: forward to the client live and accumulate so
+        # the completed turn can be persisted on stream end. Deltas/end markers
+        # are never written to the history log individually.
+        if metadata.get("_stream_delta"):
+            if msg.chat_id and msg.content:
+                self._stream_buffers[msg.chat_id] = (
+                    self._stream_buffers.get(msg.chat_id, "") + msg.content
+                )
+                ws = self._clients.get(msg.chat_id)
+                if ws is not None and not ws.closed:
+                    try:
+                        await ws.send_json({
+                            "type": "stream_delta",
+                            "session_id": msg.chat_id,
+                            "content": msg.content,
+                            "metadata": metadata,
+                        })
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Failed to stream delta to {}: {}", msg.chat_id, e)
+            return
+
+        if metadata.get("_stream_end"):
+            joined = self._stream_buffers.pop(msg.chat_id, "") if msg.chat_id else ""
+            if joined and msg.chat_id:
+                history_dir = self._stream_history_dir(msg.chat_id, metadata)
+                if history_dir is not None:
+                    SessionManager(history_dir).append_ui_event(
+                        key=f"ui:{msg.chat_id}",
+                        role="assistant",
+                        content=joined,
+                        msg_type="response",
+                        metadata={k: v for k, v in metadata.items() if not k.startswith("_stream")},
+                    )
+            ws = self._clients.get(msg.chat_id)
+            if ws is not None and not ws.closed:
+                try:
+                    await ws.send_json({
+                        "type": "stream_end",
+                        "session_id": msg.chat_id,
+                        "content": "",
+                        "metadata": metadata,
+                    })
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to send stream end to {}: {}", msg.chat_id, e)
+            return
+
         project_dir = (
             self._project_dir_from_metadata(msg.chat_id, metadata)
             if msg.chat_id
@@ -950,8 +1017,15 @@ class UiChannel(BaseChannel):
             "tool_hint": bool(metadata.get("_tool_hint", False)),
             "content_preview": self._preview(msg.content),
         }
-        if project_dir and project_dir.is_dir() and not is_activity_ping:
-            SessionManager(project_dir).append_ui_event(
+        history_dir: Path | None = (
+            project_dir if (project_dir and project_dir.is_dir()) else None
+        )
+        if history_dir is None and self.workspace is not None and msg.chat_id:
+            # Quick-chat (no project): persist assistant turns under the
+            # workspace-level session log so the chat history reloads.
+            history_dir = self.workspace
+        if history_dir is not None and not is_activity_ping:
+            SessionManager(history_dir).append_ui_event(
                 key=f"ui:{msg.chat_id}",
                 role="assistant",
                 content=msg.content,
@@ -1219,6 +1293,10 @@ class UiChannel(BaseChannel):
                 )
                 incoming_policy = _normalize_automation_policy(data.get("automation_policy"))
                 allow_result_write = bool(data.get("allow_result_write"))
+                # Token streaming is opt-in per message. Default on so clients
+                # that omit the flag still get a responsive experience.
+                stream_pref = data.get("stream")
+                wants_stream = True if stream_pref is None else bool(stream_pref)
 
                 if session_id is None:
                     await ws.send_json(
@@ -1315,6 +1393,16 @@ class UiChannel(BaseChannel):
                         msg_type="response",
                         metadata={"_user": True},
                     )
+                elif loop_mode == "normal" and self.workspace is not None:
+                    # Quick-chat sessions have no project dir; persist the user
+                    # turn under the workspace-level session log so history loads.
+                    SessionManager(self.workspace).append_ui_event(
+                        key=f"ui:{session_id}",
+                        role="user",
+                        content=content,
+                        msg_type="response",
+                        metadata={"_user": True},
+                    )
                 metadata: dict[str, Any] = {
                     "source": "ui",
                     "loop_mode": loop_mode,
@@ -1325,6 +1413,8 @@ class UiChannel(BaseChannel):
                     ),
                     "_allow_result_write": allow_result_write,
                 }
+                if wants_stream:
+                    metadata["_wants_stream"] = True
                 if project_dir is not None:
                     metadata["project_dir"] = project_dir
                 if effective_policy:
@@ -1531,10 +1621,13 @@ class UiChannel(BaseChannel):
 
     def _load_history_entries(self, session_id: str) -> list[dict[str, Any]]:
         project_dir = self._resolve_project_dir(session_id)
-        if project_dir is None or not project_dir.is_dir():
+        if project_dir is not None and project_dir.is_dir():
+            manager = SessionManager(project_dir)
+        elif self.workspace is not None:
+            # Quick-chat (no project): read from the workspace-level session log.
+            manager = SessionManager(self.workspace)
+        else:
             return []
-
-        manager = SessionManager(project_dir)
         session_key = f"ui:{session_id}"
         session = manager.get_or_create(session_key)
         ui_entries = manager.get_ui_history(session_key)
@@ -2314,6 +2407,12 @@ class UiChannel(BaseChannel):
         return web.FileResponse(candidate)
 
     def _skill_plugin_manager(self, session_id: str) -> SkillPluginManager:
+        # Skills are managed at a single global scope. The UI sends a sentinel
+        # session id so plugins can be listed/installed without first selecting
+        # a project; route it to the global workspace (plugins + global state
+        # already live there regardless of the manager's workspace argument).
+        if session_id == _GLOBAL_SKILLS_SESSION_ID:
+            return SkillPluginManager(get_workspace_path(None))
         project_dir = self._resolve_project_dir(session_id, create=True)
         if project_dir is None:
             raise SkillPluginError(f"project not found: {session_id}")

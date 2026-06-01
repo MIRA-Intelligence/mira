@@ -62,6 +62,54 @@ def test_save_turn_keeps_image_placeholder_without_meta() -> None:
     assert session.messages[0]["content"] == [{"type": "text", "text": "[image]"}]
 
 
+def test_save_turn_strips_image_url_from_tool_results() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:tool-image")
+
+    loop._save_turn(
+        session,
+        [{
+            "role": "tool",
+            "tool_call_id": "call_img",
+            "name": "read_file",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}, "_meta": {"path": "/data/chart.png"}},
+                {"type": "text", "text": "(Image file: chart.png)"},
+            ],
+        }],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == [
+        {"type": "text", "text": "[image: /data/chart.png]"},
+        {"type": "text", "text": "(Image file: chart.png)"},
+    ]
+    # No base64 may survive into the persisted session log.
+    assert "base64" not in str(session.messages[0]["content"])
+
+
+def test_save_turn_strips_image_url_from_assistant_messages() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:assistant-image")
+
+    loop._save_turn(
+        session,
+        [{
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Here is the figure"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,xyz"}},
+            ],
+        }],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == [
+        {"type": "text", "text": "Here is the figure"},
+        {"type": "text", "text": "[image]"},
+    ]
+
+
 def test_save_turn_keeps_tool_results_under_16k() -> None:
     loop = _mk_loop()
     session = Session(key="test:tool-result")
