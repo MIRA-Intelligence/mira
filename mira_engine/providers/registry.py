@@ -61,6 +61,11 @@ class ProviderSpec:
     # Provider supports cache_control on content blocks (e.g. Anthropic prompt caching)
     supports_prompt_caching: bool = False
 
+    # Every model served by this provider accepts image (multimodal) input.
+    # Only set on specs whose entire model line-up is vision-capable; per-model
+    # detection (see ``model_supports_vision``) covers the common mixed case.
+    supports_vision: bool = False
+
     @property
     def label(self) -> str:
         return self.display_name or self.name.title()
@@ -596,3 +601,44 @@ def find_by_name(name: str) -> ProviderSpec | None:
         if spec.name == key:
             return spec
     return None
+
+
+# Substrings that identify vision-capable (multimodal) chat models. Matched on
+# the lowercased model name (with and without the provider prefix). Models not
+# listed are treated as text-only so the agent never sends them base64 image
+# blocks, which text-only backends reject with errors like
+# "unknown variant `image_url`, expected `text`".
+_VISION_MODEL_MARKERS: tuple[str, ...] = (
+    # OpenAI
+    "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "gpt-5", "chatgpt-4o",
+    "o1", "o3", "o4",
+    # Anthropic (Claude 3 and newer are all multimodal)
+    "claude-3", "claude-4", "claude-opus-4", "claude-sonnet-4", "claude-haiku-4",
+    # Google
+    "gemini",
+    # Generic vision markers / open models
+    "vision", "-vl", "vl-", "llava", "qwen-vl", "qwen2-vl", "qwen2.5-vl",
+    "qwen3-vl", "internvl", "minicpm-v", "pixtral", "llama-3.2", "llama3.2",
+    "llama-4", "phi-3-vision", "phi-3.5-vision", "phi-4-multimodal",
+    "glm-4v", "glm-4.1v", "step-1v", "step-1o", "grok-2-vision", "grok-4",
+    "kimi-vl", "kimi-latest", "doubao-vision", "yi-vision", "mistral-small-3.1",
+)
+
+
+def model_supports_vision(model: str | None) -> bool:
+    """Best-effort check whether a model accepts image (multimodal) input.
+
+    Conservative by design: unknown models are treated as text-only so the
+    agent never sends base64 image blocks to a backend that would reject them.
+    Providers keep a reactive image-stripping retry as a final safety net.
+    """
+    if not model:
+        return False
+    name = model.lower()
+    short = name.split("/", 1)[-1]
+    if any(marker in name or marker in short for marker in _VISION_MODEL_MARKERS):
+        return True
+    spec = find_by_model(model)
+    if spec is not None and spec.supports_vision:
+        return True
+    return False

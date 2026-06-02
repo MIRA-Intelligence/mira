@@ -407,13 +407,18 @@ def apply_ui_runtime_update(
     changed = False
     projects_root = current_projects_root.expanduser().resolve()
 
+    # Only flag ``changed`` when a value actually differs from the live config.
+    # A no-op save (e.g. the UI re-posting the runtime block while the user only
+    # toggled a frontend-only preference) must not trigger an expensive agent
+    # ``reconfigure_runtime`` or a config rewrite.
     raw_projects_root = payload.get("projects_root")
     if raw_projects_root is not None:
         if not isinstance(raw_projects_root, str):
             raise ValueError("projects_root must be a string")
         projects_root = Path(raw_projects_root).expanduser().resolve()
-        config.agents.defaults.workspace = raw_projects_root
-        changed = True
+        if config.agents.defaults.workspace != raw_projects_root:
+            config.agents.defaults.workspace = raw_projects_root
+            changed = True
 
     runtime_payload = payload.get("runtime")
     if runtime_payload is not None:
@@ -425,46 +430,55 @@ def apply_ui_runtime_update(
             if not isinstance(raw_workspace, str):
                 raise ValueError("runtime.workspace must be a string")
             projects_root = Path(raw_workspace).expanduser().resolve()
-            config.agents.defaults.workspace = raw_workspace
-            changed = True
+            if config.agents.defaults.workspace != raw_workspace:
+                config.agents.defaults.workspace = raw_workspace
+                changed = True
 
         if "provider" in runtime_payload:
             provider = runtime_payload["provider"]
             if not isinstance(provider, str) or not provider.strip():
                 raise ValueError("runtime.provider must be a non-empty string")
-            config.agents.defaults.provider = provider.strip()
-            changed = True
+            provider = provider.strip()
+            if config.agents.defaults.provider != provider:
+                config.agents.defaults.provider = provider
+                changed = True
 
         if "model" in runtime_payload:
             model = runtime_payload["model"]
             if not isinstance(model, str) or not model.strip():
                 raise ValueError("runtime.model must be a non-empty string")
-            config.agents.defaults.model = model.strip()
-            changed = True
+            model = model.strip()
+            if config.agents.defaults.model != model:
+                config.agents.defaults.model = model
+                changed = True
 
         if "reasoning_effort" in runtime_payload:
             reasoning_effort = runtime_payload["reasoning_effort"]
             if reasoning_effort is None or reasoning_effort == "":
-                config.agents.defaults.reasoning_effort = None
+                next_effort = None
             elif isinstance(reasoning_effort, str) and reasoning_effort in _ALLOWED_REASONING_EFFORTS:
-                config.agents.defaults.reasoning_effort = reasoning_effort
+                next_effort = reasoning_effort
             else:
                 raise ValueError("runtime.reasoning_effort must be one of: low, medium, high, adaptive")
-            changed = True
+            if config.agents.defaults.reasoning_effort != next_effort:
+                config.agents.defaults.reasoning_effort = next_effort
+                changed = True
 
         if "max_tool_iterations" in runtime_payload:
             max_tool_iterations = runtime_payload["max_tool_iterations"]
             if not isinstance(max_tool_iterations, int) or max_tool_iterations < 1:
                 raise ValueError("runtime.max_tool_iterations must be a positive integer")
-            config.agents.defaults.max_tool_iterations = max_tool_iterations
-            changed = True
+            if config.agents.defaults.max_tool_iterations != max_tool_iterations:
+                config.agents.defaults.max_tool_iterations = max_tool_iterations
+                changed = True
 
         if "restrict_to_workspace" in runtime_payload:
             restrict_to_workspace = runtime_payload["restrict_to_workspace"]
             if not isinstance(restrict_to_workspace, bool):
                 raise ValueError("runtime.restrict_to_workspace must be a boolean")
-            config.tools.restrict_to_workspace = restrict_to_workspace
-            changed = True
+            if config.tools.restrict_to_workspace != restrict_to_workspace:
+                config.tools.restrict_to_workspace = restrict_to_workspace
+                changed = True
 
     providers_payload = payload.get("providers")
     if providers_payload is not None:
@@ -473,12 +487,14 @@ def apply_ui_runtime_update(
         for provider_name, provider_update in providers_payload.items():
             if provider_name == "proxy":
                 if provider_update is None or provider_update == "":
-                    config.providers.proxy = None
+                    next_proxy = None
                 elif isinstance(provider_update, str):
-                    config.providers.proxy = provider_update.strip()
+                    next_proxy = provider_update.strip()
                 else:
                     raise ValueError("providers.proxy must be a string or null")
-                changed = True
+                if config.providers.proxy != next_proxy:
+                    config.providers.proxy = next_proxy
+                    changed = True
                 continue
 
             if provider_name not in _provider_field_names():
@@ -491,17 +507,21 @@ def apply_ui_runtime_update(
                 api_key = provider_update["api_key"]
                 if not isinstance(api_key, str):
                     raise ValueError(f"providers.{provider_name}.api_key must be a string")
-                provider_cfg.api_key = api_key.strip()
-                changed = True
+                api_key = api_key.strip()
+                if provider_cfg.api_key != api_key:
+                    provider_cfg.api_key = api_key
+                    changed = True
 
             if "api_base" in provider_update:
                 api_base = provider_update["api_base"]
                 if api_base is None or api_base == "":
-                    provider_cfg.api_base = None
+                    next_api_base = None
                 elif isinstance(api_base, str):
-                    provider_cfg.api_base = api_base.strip()
+                    next_api_base = api_base.strip()
                 else:
                     raise ValueError(f"providers.{provider_name}.api_base must be a string or null")
-                changed = True
+                if provider_cfg.api_base != next_api_base:
+                    provider_cfg.api_base = next_api_base
+                    changed = True
 
     return projects_root, changed

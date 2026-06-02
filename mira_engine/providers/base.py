@@ -159,6 +159,16 @@ class LLMProvider(ABC):
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
 
+    def supports_vision(self, model: str | None = None) -> bool:
+        """Return True when the (resolved) model accepts image input.
+
+        Defaults to the provider's own default model when ``model`` is omitted.
+        """
+        from mira_engine.providers.registry import model_supports_vision
+
+        resolved = model or getattr(self, "default_model", None)
+        return model_supports_vision(resolved)
+
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Sanitize message content: fix empty blocks, strip internal _meta fields."""
@@ -301,6 +311,23 @@ class LLMProvider(ABC):
 
             merged.append(dict(current))
         return merged
+
+    def _strip_images_if_text_only(
+        self, messages: list[dict[str, Any]], model: str | None
+    ) -> list[dict[str, Any]]:
+        """Proactively drop image blocks when the target model has no vision.
+
+        Avoids a guaranteed round-trip failure (and the noisy reactive retry)
+        for text-only models such as ``moonshot/kimi-k2.6``. Returns the input
+        unchanged when the model is vision-capable or has no image content.
+        """
+        if self.supports_vision(model):
+            return messages
+        stripped = self._strip_image_content(messages)
+        if stripped is None:
+            return messages
+        logger.debug("Stripping image content for text-only model {}", model or "(default)")
+        return stripped
 
     @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
@@ -578,6 +605,7 @@ class LLMProvider(ABC):
         if reasoning_effort is self._SENTINEL:
             reasoning_effort = self.generation.reasoning_effort
 
+        messages = self._strip_images_if_text_only(messages, model)
         kw: dict[str, Any] = dict(
             messages=messages,
             tools=tools,
@@ -615,6 +643,7 @@ class LLMProvider(ABC):
         if reasoning_effort is self._SENTINEL:
             reasoning_effort = self.generation.reasoning_effort
 
+        messages = self._strip_images_if_text_only(messages, model)
         kw: dict[str, Any] = dict(
             messages=messages,
             tools=tools,

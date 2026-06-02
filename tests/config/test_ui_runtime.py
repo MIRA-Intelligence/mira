@@ -116,6 +116,31 @@ def test_apply_ui_runtime_update_accepts_new_provider_names() -> None:
     assert cfg.providers.deepseek.api_key == "sk-new-key"
 
 
+def test_apply_ui_runtime_update_noop_does_not_flag_changed() -> None:
+    cfg = Config()
+    defaults = cfg.agents.defaults
+
+    # Re-post the runtime block with the values already in config (the shape the
+    # UI sends when only a frontend-only preference was toggled).
+    next_root, changed = apply_ui_runtime_update(
+        cfg,
+        {
+            "runtime": {
+                "workspace": defaults.workspace,
+                "provider": defaults.provider,
+                "model": defaults.model,
+                "reasoning_effort": defaults.reasoning_effort,
+                "max_tool_iterations": defaults.max_tool_iterations,
+                "restrict_to_workspace": cfg.tools.restrict_to_workspace,
+            },
+            "providers": {},
+        },
+        current_projects_root=Path(defaults.workspace).expanduser(),
+    )
+
+    assert changed is False
+
+
 def test_apply_ui_runtime_update_accepts_global_provider_proxy() -> None:
     cfg = Config()
 
