@@ -221,12 +221,22 @@ class MatrixConfig(ChannelConfig):
     streaming: bool = False
 
 
+class UiFeedbackConfig(Base):
+    """Optional backend relay configuration for in-app feedback."""
+
+    feishu_webhook_url: str = ""
+    feishu_secret: str = ""
+    feishu_invite_url: str = ""
+    feishu_mention_open_id: str = ""
+    feishu_mention_name: str = ""
+
 class UiChannelConfig(Base):
     """UI channel runtime configuration (WebSocket + HTTP for desktop/browser clients)."""
 
     enabled: bool = False
     allow_from: list[str] = Field(default_factory=list)
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    feedback: UiFeedbackConfig = Field(default_factory=UiFeedbackConfig)
 
 
 # Legacy alias kept for downstream imports that reference the previous name.

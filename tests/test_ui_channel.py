@@ -18,6 +18,7 @@ from mira_engine.channels.ui import (
     _API_CONTRACT_VERSION,
     PLAN_FILENAME,
     UiChannel,
+    _build_feedback_agent_text,
     _build_task_plan_guard_notice,
     _detect_guard_id_reassignments,
     _extract_plan_experiment_ids,
@@ -1036,6 +1037,157 @@ async def test_handle_get_config_returns_runtime_payload(
     assert body["runtime"]["restrict_to_workspace"] is True
     assert body["providers"]["openrouter"]["api_key_configured"] is True
     assert body["providers"]["openrouter"]["api_key_preview"] == "sk-t...ey"
+
+
+async def test_handle_feedback_config_exposes_only_public_state(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MIRA_FEISHU_WEBHOOK_URL", "https://open.feishu.cn/webhook/test")
+    monkeypatch.setenv("MIRA_FEISHU_WEBHOOK_SECRET", "super-secret")
+    monkeypatch.setenv("MIRA_FEISHU_GROUP_INVITE_URL", "https://applink.feishu.cn/client/chat/test")
+
+    resp = await ui_channel._handle_feedback_config(MagicMock(spec=web.Request))
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body == {
+        "configured": True,
+        "invite_url": "https://applink.feishu.cn/client/chat/test",
+    }
+    assert "super-secret" not in resp.text
+    assert "webhook" not in resp.text
+
+
+async def test_handle_feedback_requires_backend_config(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={
+        "type": "bug",
+        "title": "Cannot save",
+        "body": "Save button does nothing.",
+    })
+
+    resp = await ui_channel._handle_feedback(req)
+
+    assert resp.status == 503
+    assert json.loads(resp.text) == {"error": "not_configured"}
+
+
+async def test_handle_feedback_submits_to_feishu_relay(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MIRA_FEISHU_WEBHOOK_URL", "https://open.feishu.cn/webhook/test")
+    monkeypatch.setenv("MIRA_FEISHU_WEBHOOK_SECRET", "super-secret")
+    monkeypatch.setenv("MIRA_FEISHU_GROUP_INVITE_URL", "https://applink.feishu.cn/client/chat/test")
+    monkeypatch.setenv("MIRA_FEISHU_MENTION_OPEN_ID", "ou_hermes")
+    monkeypatch.setenv("MIRA_FEISHU_MENTION_NAME", "Hermes")
+    submitted: list[tuple[ui_channel_mod._FeedbackRelayConfig, dict[str, Any]]] = []
+
+    async def _fake_submit(relay: ui_channel_mod._FeedbackRelayConfig, payload: dict[str, Any]) -> None:
+        submitted.append((relay, payload))
+
+    monkeypatch.setattr(ui_channel, "_submit_feishu_feedback", _fake_submit)
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={
+        "id": "fb_test",
+        "clientHandle": "MIRA-1234",
+        "type": "bug",
+        "severity": "critical",
+        "title": "Cannot save",
+        "body": "Save button does nothing.",
+        "contact": {"kind": "email", "value": "user@example.com"},
+        "appVersion": "0.4.0",
+        "os": "darwin",
+        "route": "/",
+        "locale": "en",
+        "createdAt": "2026-06-02T00:00:00Z",
+    })
+
+    resp = await ui_channel._handle_feedback(req)
+
+    assert resp.status == 200
+    assert json.loads(resp.text) == {
+        "ok": True,
+        "channel": "feishu",
+        "invite_url": "https://applink.feishu.cn/client/chat/test",
+    }
+    assert len(submitted) == 1
+    relay, payload = submitted[0]
+    assert relay.feishu_webhook_url == "https://open.feishu.cn/webhook/test"
+    assert relay.feishu_secret == "super-secret"
+    assert relay.feishu_mention_open_id == "ou_hermes"
+    assert relay.feishu_mention_name == "Hermes"
+    assert payload["title"] == "Cannot save"
+    assert payload["contact"] == {"kind": "email", "value": "user@example.com"}
+
+
+def test_build_feedback_agent_text_includes_full_feedback_payload() -> None:
+    text = _build_feedback_agent_text(
+        {
+            "id": "fb_test",
+            "clientHandle": "anon_abcd",
+            "type": "feature",
+            "severity": None,
+            "title": "Add file manager",
+            "body": "Show workspace files as a tree.",
+            "contact": {"kind": "email", "value": "user@example.com"},
+            "appVersion": "0.4.0",
+            "os": "darwin",
+            "route": "/",
+            "locale": "zh",
+            "createdAt": "2026-06-02T00:00:00Z",
+        },
+        mention_open_id="ou_hermes",
+        mention_name="Hermes",
+    )
+
+    assert '<at user_id="ou_hermes">Hermes</at>' in text
+    assert "【MIRA Feedback】Feature" in text
+    assert "mira_feedback  tag=feature  feedback_id=fb_test" in text
+    assert "标题：Add file manager" in text
+    assert "内容：\nShow workspace files as a tree." in text
+    assert "- 联系：email · user@example.com" in text
+
+
+async def test_submit_feedback_sends_single_text_message(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay = ui_channel_mod._FeedbackRelayConfig(
+        feishu_webhook_url="https://open.feishu.cn/webhook/test",
+        feishu_secret="super-secret",
+        feishu_mention_open_id="ou_hermes",
+        feishu_mention_name="Hermes",
+    )
+    payload = {
+        "id": "fb_test",
+        "clientHandle": "anon_abcd",
+        "type": "feature",
+        "severity": None,
+        "title": "Add file manager",
+        "body": "Show workspace files as a tree.",
+        "contact": None,
+        "appVersion": "0.4.0",
+        "os": "darwin",
+        "route": "/",
+        "locale": "zh",
+        "createdAt": "2026-06-02T00:00:00Z",
+    }
+    posted: list[dict[str, Any]] = []
+
+    async def _fake_post(
+        _relay: ui_channel_mod._FeedbackRelayConfig,
+        body: dict[str, Any],
+    ) -> None:
+        posted.append(body)
+
+    monkeypatch.setattr(ui_channel, "_post_feishu_webhook", _fake_post)
+
+    await ui_channel._submit_feishu_feedback(relay, payload)
+
+    assert len(posted) == 1
+    assert posted[0]["msg_type"] == "text"
+    assert "card" not in posted[0]
+    assert "mira_feedback" in posted[0]["content"]["text"]
+    assert "Show workspace files as a tree." in posted[0]["content"]["text"]
 
 
 async def test_handle_config_updates_runtime_fields_and_provider_secrets(
