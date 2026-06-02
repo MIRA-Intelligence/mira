@@ -60,10 +60,15 @@ class _FsTool(Tool):
         workspace: Path | None = None,
         allowed_dir: Path | None = None,
         extra_allowed_dirs: list[Path] | None = None,
+        supports_vision: bool = True,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._extra_allowed_dirs = extra_allowed_dirs
+        # Whether the active model can accept image input. When False, image
+        # reads degrade to a text placeholder instead of emitting base64 the
+        # backend would reject.
+        self._supports_vision = supports_vision
 
     def _resolve(self, path: str) -> Path:
         return _resolve_path(
@@ -133,6 +138,13 @@ class ReadFileTool(_FsTool):
 
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if mime and mime.startswith("image/"):
+                if not self._supports_vision:
+                    return (
+                        f"(Image file: {path} — {len(raw):,} bytes, {mime}. "
+                        "The current model has no vision support, so the image "
+                        "cannot be shown. Switch to a vision-capable model to "
+                        "view it.)"
+                    )
                 return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
 
             try:

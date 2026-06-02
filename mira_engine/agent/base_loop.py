@@ -327,7 +327,8 @@ class BaseAgentLoop:
                 if parent != skill_path.parent:
                     _add_skill_dir(parent)
 
-        self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs))
+        supports_vision = self.provider.supports_vision(self.model)
+        self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs, supports_vision=supports_vision))
         self.tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs))
@@ -837,10 +838,13 @@ class BaseAgentLoop:
 
         if bool((msg.metadata or {}).get("_wants_stream")):
             stream_meta = dict(msg.metadata or {})
+            streamed_any = False
 
             async def _on_stream(delta: str) -> None:
+                nonlocal streamed_any
                 if not delta:
                     return
+                streamed_any = True
                 meta = dict(stream_meta)
                 meta["_stream_delta"] = True
                 await self.bus.publish_outbound(
@@ -867,7 +871,15 @@ class BaseAgentLoop:
                 )
 
             try:
-                await self._process_message(msg, on_stream=_on_stream, on_stream_end=_on_stream_end)
+                response = await self._process_message(
+                    msg, on_stream=_on_stream, on_stream_end=_on_stream_end
+                )
+                # Fallback: if the runtime never streamed (e.g. routed provider
+                # without token streaming), the deltas/end markers carry no
+                # content, so publish the final response normally so the client
+                # still receives the answer.
+                if not streamed_any and response is not None:
+                    await self.bus.publish_outbound(response)
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
@@ -1216,24 +1228,57 @@ class BaseAgentLoop:
                     and self._AUTO_CONTINUE_MARKER in entry["content"]
                 ):
                     continue
-                if isinstance(content, list):
-                    filtered = []
-                    for c in content:
-                        if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                            continue  # Strip runtime context from multimodal messages
-                        if (c.get("type") == "image_url"
-                                and c.get("image_url", {}).get("url", "").startswith("data:image/")):
-                            ctx_meta = c.get("_meta")
-                            path = ctx_meta.get("path") if isinstance(ctx_meta, dict) else None
-                            filtered.append({"type": "text", "text": f"[image: {path}]" if path else "[image]"})
-                        else:
-                            filtered.append(c)
-                    if not filtered:
-                        continue
-                    entry["content"] = filtered
+
+            # Replace base64 image blocks with text placeholders for ANY role
+            # (tool/assistant/user) so they never persist in the session log:
+            # text-only providers reject `image_url` content blocks (e.g.
+            # Moonshot's "unknown variant image_url, expected text"), and the
+            # UI cannot render base64. The live turn keeps the real image; it is
+            # re-read on demand if the model needs it again.
+            cur = entry.get("content")
+            if isinstance(cur, list):
+                if role == "user":
+                    # Drop runtime-context text blocks from multimodal messages.
+                    cur = [
+                        c
+                        for c in cur
+                        if not (
+                            isinstance(c, dict)
+                            and c.get("type") == "text"
+                            and isinstance(c.get("text"), str)
+                            and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                        )
+                    ]
+                filtered = self._strip_image_blocks(cur)
+                if not filtered:
+                    continue
+                entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+
+    @staticmethod
+    def _strip_image_blocks(content: list[Any]) -> list[Any]:
+        """Replace base64 ``image_url`` blocks with short text placeholders.
+
+        Non-image blocks pass through untouched. Used by ``_save_turn`` so a
+        multimodal message (e.g. a ``read_file`` image result) is never written
+        to the session log as raw base64.
+        """
+        filtered: list[Any] = []
+        for c in content:
+            if not isinstance(c, dict):
+                filtered.append(c)
+                continue
+            image_url = c.get("image_url")
+            url = image_url.get("url", "") if isinstance(image_url, dict) else ""
+            if c.get("type") == "image_url" and isinstance(url, str) and url.startswith("data:image/"):
+                ctx_meta = c.get("_meta")
+                path = ctx_meta.get("path") if isinstance(ctx_meta, dict) else None
+                filtered.append({"type": "text", "text": f"[image: {path}]" if path else "[image]"})
+            else:
+                filtered.append(c)
+        return filtered
 
     def _restore_runtime_checkpoint(self, session: Session) -> bool:
         checkpoint = (session.metadata or {}).get(self._RUNTIME_CHECKPOINT_KEY)

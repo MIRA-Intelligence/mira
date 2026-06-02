@@ -72,6 +72,18 @@ class TestReadFileTool:
         assert result[1] == {"type": "text", "text": f"(Image file: {f})"}
 
     @pytest.mark.asyncio
+    async def test_image_file_degrades_to_text_for_non_vision_model(self, tmp_path):
+        tool = ReadFileTool(workspace=tmp_path, supports_vision=False)
+        f = tmp_path / "pixel.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-data")
+
+        result = await tool.execute(path=str(f))
+
+        assert isinstance(result, str)
+        assert "no vision support" in result
+        assert "base64" not in result
+
+    @pytest.mark.asyncio
     async def test_file_not_found(self, tool, tmp_path):
         result = await tool.execute(path=str(tmp_path / "nope.txt"))
         assert "Error" in result
