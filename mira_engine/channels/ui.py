@@ -11,17 +11,23 @@ session-key fallback in :class:`UiChannel`.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from aiohttp import web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from loguru import logger
 
 from mira_engine import __version__
@@ -64,6 +70,226 @@ _PROJECT_EXPERIMENT_SNAPSHOT_REL_DIR = Path(".mira") / "snapshots" / "experiment
 _PROJECT_DIR_INDEX_FILENAME = "project-dirs.json"
 _RECOVERED_CONCLUSION_PLACEHOLDER = "Recovered completed experiment artifacts from workspace."
 _API_CONTRACT_VERSION = "v1"
+_FEEDBACK_CONFIG_FILENAME = "mira-engine.feedback.json"
+_FEEDBACK_TIMEOUT_SECONDS = 8
+
+
+@dataclass(frozen=True)
+class _FeedbackRelayConfig:
+    feishu_webhook_url: str = ""
+    feishu_secret: str = ""
+    feishu_invite_url: str = ""
+    feishu_mention_open_id: str = ""
+    feishu_mention_name: str = ""
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.feishu_webhook_url.strip())
+
+
+def _string_value(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _first_present(*values: Any) -> str:
+    for value in values:
+        text = _string_value(value)
+        if text:
+            return text
+    return ""
+
+
+def _feedback_sidecar_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    configured = os.environ.get("MIRA_FEEDBACK_CONFIG_PATH")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    try:
+        candidates.append(Path(sys.executable).resolve().with_name(_FEEDBACK_CONFIG_FILENAME))
+    except (OSError, ValueError):
+        pass
+    meipass = getattr(sys, "_MEIPASS", None)
+    if isinstance(meipass, str) and meipass:
+        candidates.append(Path(meipass) / _FEEDBACK_CONFIG_FILENAME)
+    return candidates
+
+
+def _load_feedback_sidecar() -> dict[str, Any]:
+    for path in _feedback_sidecar_candidates():
+        if not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Ignoring invalid feedback relay config at {}", path)
+            continue
+        return raw if isinstance(raw, dict) else {}
+    return {}
+
+
+def _feedback_sidecar_sha256() -> str | None:
+    for path in _feedback_sidecar_candidates():
+        if not path.is_file():
+            continue
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return None
+
+
+def _nested_value(data: dict[str, Any], *keys: str) -> Any:
+    current: Any = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _resolve_feedback_config(config: UiChannelConfig) -> _FeedbackRelayConfig:
+    configured = getattr(config, "feedback", None)
+    sidecar = _load_feedback_sidecar()
+    feishu = sidecar.get("feishu") if isinstance(sidecar.get("feishu"), dict) else {}
+    return _FeedbackRelayConfig(
+        feishu_webhook_url=_first_present(
+            os.environ.get("MIRA_FEISHU_WEBHOOK_URL"),
+            getattr(configured, "feishu_webhook_url", None),
+            _nested_value(feishu, "webhookUrl"),
+            _nested_value(feishu, "webhook_url"),
+        ),
+        feishu_secret=_first_present(
+            os.environ.get("MIRA_FEISHU_WEBHOOK_SECRET"),
+            getattr(configured, "feishu_secret", None),
+            _nested_value(feishu, "secret"),
+        ),
+        feishu_invite_url=_first_present(
+            os.environ.get("MIRA_FEISHU_GROUP_INVITE_URL"),
+            getattr(configured, "feishu_invite_url", None),
+            _nested_value(feishu, "inviteUrl"),
+            _nested_value(feishu, "invite_url"),
+        ),
+        feishu_mention_open_id=_first_present(
+            os.environ.get("MIRA_FEISHU_MENTION_OPEN_ID"),
+            getattr(configured, "feishu_mention_open_id", None),
+            _nested_value(feishu, "mentionOpenId"),
+            _nested_value(feishu, "mention_open_id"),
+        ),
+        feishu_mention_name=_first_present(
+            os.environ.get("MIRA_FEISHU_MENTION_NAME"),
+            getattr(configured, "feishu_mention_name", None),
+            _nested_value(feishu, "mentionName"),
+            _nested_value(feishu, "mention_name"),
+        ),
+    )
+
+
+def _escape_feishu_text(input_text: str) -> str:
+    return input_text.replace("<", "＜").replace(">", "＞")
+
+
+def _feedback_text(payload: dict[str, Any], key: str, max_len: int, default: str = "") -> str:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        return default
+    return value.strip()[:max_len]
+
+
+def _sanitize_feedback_payload(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("feedback payload must be an object")
+    title = _feedback_text(raw, "title", 120)
+    body = _feedback_text(raw, "body", 4000)
+    if not title or not body:
+        raise ValueError("title and body are required")
+
+    feedback_type = _feedback_text(raw, "type", 24, "other")
+    if feedback_type not in {"bug", "feature", "question", "other"}:
+        feedback_type = "other"
+    severity = _feedback_text(raw, "severity", 24)
+    if severity not in {"blocker", "critical", "normal", "minor"}:
+        severity = ""
+
+    contact_raw = raw.get("contact")
+    contact = None
+    if isinstance(contact_raw, dict):
+        kind = _feedback_text(contact_raw, "kind", 24)
+        value = _feedback_text(contact_raw, "value", 120)
+        if kind in {"wechat", "phone", "email"} and value:
+            contact = {"kind": kind, "value": value}
+
+    return {
+        "id": _feedback_text(raw, "id", 80, f"fb_{int(time.time())}"),
+        "clientHandle": _feedback_text(raw, "clientHandle", 80, "anonymous"),
+        "type": feedback_type,
+        "severity": severity or None,
+        "title": title,
+        "body": body,
+        "contact": contact,
+        "appVersion": _feedback_text(raw, "appVersion", 80, __version__),
+        "os": _feedback_text(raw, "os", 80, "unknown"),
+        "route": _feedback_text(raw, "route", 200, "/"),
+        "locale": _feedback_text(raw, "locale", 20, "unknown"),
+        "createdAt": _feedback_text(raw, "createdAt", 80, datetime.utcnow().isoformat() + "Z"),
+    }
+
+
+def _build_feedback_agent_text(
+    payload: dict[str, Any],
+    mention_open_id: str = "",
+    mention_name: str = "",
+) -> str:
+    type_label = {
+        "bug": "Bug",
+        "feature": "Feature",
+        "question": "Question",
+        "other": "Other",
+    }
+    severity_label = {
+        "blocker": "阻塞",
+        "critical": "严重",
+        "normal": "一般",
+        "minor": "轻微",
+    }
+    lines: list[str] = []
+    if mention_open_id:
+        display_name = mention_name or "Hermes"
+        lines.append(
+            f'<at user_id="{mention_open_id}">{_escape_feishu_text(display_name)}</at> 请处理这条 MIRA feedback。'
+        )
+        lines.append("")
+
+    lines.extend([
+        f"【MIRA Feedback】{type_label[payload['type']]}",
+        f"mira_feedback  tag={_escape_feishu_text(payload['type'])}  feedback_id={_escape_feishu_text(payload['id'])}",
+        "",
+        f"标题：{_escape_feishu_text(payload['title'])}",
+        "",
+        "内容：",
+        _escape_feishu_text(payload["body"]),
+        "",
+        "元信息：",
+        f"- 用户：{_escape_feishu_text(payload['clientHandle'])}",
+        f"- 版本：{_escape_feishu_text(payload['appVersion'])}",
+        f"- OS：{_escape_feishu_text(payload['os'])}",
+        f"- 页面：{_escape_feishu_text(payload['route'])}",
+        f"- 语言：{_escape_feishu_text(payload['locale'])}",
+        f"- 时间：{_escape_feishu_text(payload['createdAt'])}",
+    ])
+    if payload.get("severity"):
+        lines.insert(3, f"严重度：{severity_label[payload['severity']]}")
+    contact = payload.get("contact")
+    if isinstance(contact, dict):
+        lines.append(
+            f"- 联系：{_escape_feishu_text(contact['kind'])} · {_escape_feishu_text(contact['value'])}"
+        )
+    return "\n".join(lines)
+
+
+def _feishu_sign(timestamp_sec: str, secret: str) -> str:
+    key = f"{timestamp_sec}\n{secret}".encode("utf-8")
+    digest = hmac.new(key, b"", hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("ascii")
 
 
 def _resolve_project_dir_index_path() -> Path:
@@ -872,6 +1098,8 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/plan/lint", self._handle_plan_lint)
         self._app.router.add_get("/api/config", self._handle_get_config)
         self._app.router.add_post("/api/config", self._handle_config)
+        self._app.router.add_get("/api/feedback/config", self._handle_feedback_config)
+        self._app.router.add_post("/api/feedback", self._handle_feedback)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
         self._app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
@@ -1538,6 +1766,7 @@ class UiChannel(BaseChannel):
             "engine_sha256_at_boot": identity.get("engine_sha256"),
             "engine_manifest": identity.get("engine_manifest"),
             "engine_executable": identity.get("engine_executable"),
+            "feedback_config_sha256": _feedback_sidecar_sha256(),
         })
 
     async def _handle_status(self, _request: web.Request) -> web.Response:
@@ -1813,6 +2042,86 @@ class UiChannel(BaseChannel):
                 persisted=persisted,
             )
         )
+
+    async def _handle_feedback_config(self, _request: web.Request) -> web.Response:
+        relay = _resolve_feedback_config(self.config)
+        return web.json_response({
+            "configured": relay.configured,
+            "invite_url": relay.feishu_invite_url or None,
+        })
+
+    async def _submit_feishu_feedback(
+        self,
+        relay: _FeedbackRelayConfig,
+        payload: dict[str, Any],
+    ) -> None:
+        await self._post_feishu_webhook(relay, {
+            "msg_type": "text",
+            "content": {
+                "text": _build_feedback_agent_text(
+                    payload,
+                    mention_open_id=relay.feishu_mention_open_id,
+                    mention_name=relay.feishu_mention_name,
+                ),
+            },
+        })
+
+    async def _post_feishu_webhook(
+        self,
+        relay: _FeedbackRelayConfig,
+        body: dict[str, Any],
+    ) -> None:
+        timestamp_sec = str(int(time.time()))
+        body = dict(body)
+        if relay.feishu_secret:
+            body["timestamp"] = timestamp_sec
+            body["sign"] = _feishu_sign(timestamp_sec, relay.feishu_secret)
+
+        timeout = ClientTimeout(total=_FEEDBACK_TIMEOUT_SECONDS)
+        try:
+            async with ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    relay.feishu_webhook_url,
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                ) as resp:
+                    text = await resp.text()
+                    if not 200 <= resp.status < 300:
+                        raise RuntimeError(f"feishu webhook returned {resp.status}")
+                    if text:
+                        try:
+                            parsed = json.loads(text)
+                        except json.JSONDecodeError:
+                            parsed = None
+                        if isinstance(parsed, dict) and parsed.get("code") not in {None, 0}:
+                            raise RuntimeError(
+                                f"feishu webhook error {parsed.get('code')}: {parsed.get('msg') or 'unknown'}"
+                            )
+        except (ClientError, asyncio.TimeoutError) as exc:
+            raise RuntimeError(f"feishu webhook request failed: {exc}") from exc
+
+    async def _handle_feedback(self, request: web.Request) -> web.Response:
+        relay = _resolve_feedback_config(self.config)
+        if not relay.configured:
+            return web.json_response({"error": "not_configured"}, status=503)
+
+        try:
+            body = await request.json()
+            payload = _sanitize_feedback_payload(body)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        try:
+            await self._submit_feishu_feedback(relay, payload)
+        except RuntimeError as exc:
+            logger.warning("Failed to submit UI feedback to Feishu: {}", exc)
+            return web.json_response({"error": str(exc)}, status=502)
+
+        return web.json_response({
+            "ok": True,
+            "channel": "feishu",
+            "invite_url": relay.feishu_invite_url or None,
+        })
 
     def _workspace_root_for_access(self) -> Path:
         """Return the root path used for workspace access checks."""
