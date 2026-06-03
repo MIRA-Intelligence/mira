@@ -1189,13 +1189,11 @@ def test_build_feedback_agent_text_includes_full_feedback_payload() -> None:
             "locale": "zh",
             "createdAt": "2026-06-02T00:00:00Z",
         },
-        mention_open_id="ou_hermes",
-        mention_name="Hermes",
+        mention_open_id="ou_mirai",
+        mention_name="MIRAI",
     )
 
-    assert text.startswith("@MIRAI 请处理这条 MIRA feedback。")
-    assert "<at user_id=" not in text
-    assert "Hermes" not in text
+    assert text.startswith('<at user_id="ou_mirai">MIRAI</at> 请处理这条 MIRA feedback。')
     assert "【MIRA Feedback】Feature" in text
     assert "mira_feedback  tag=feature  feedback_id=fb_test" in text
     assert "标题：Add file manager" in text
@@ -1232,8 +1230,8 @@ async def test_submit_feedback_sends_single_text_message(
     relay = ui_channel_mod._FeedbackRelayConfig(
         feishu_webhook_url="https://open.feishu.cn/webhook/test",
         feishu_secret="super-secret",
-        feishu_mention_open_id="ou_hermes",
-        feishu_mention_name="Hermes",
+        feishu_mention_open_id="ou_mirai",
+        feishu_mention_name="MIRAI",
     )
     payload = {
         "id": "fb_test",
@@ -1264,8 +1262,9 @@ async def test_submit_feedback_sends_single_text_message(
     assert len(posted) == 1
     assert posted[0]["msg_type"] == "text"
     assert "card" not in posted[0]
-    assert posted[0]["content"]["text"].startswith("@MIRAI 请处理这条 MIRA feedback。")
-    assert "<at user_id=" not in posted[0]["content"]["text"]
+    assert posted[0]["content"]["text"].startswith(
+        '<at user_id="ou_mirai">MIRAI</at> 请处理这条 MIRA feedback。'
+    )
     assert "mira_feedback" in posted[0]["content"]["text"]
     assert "Show workspace files as a tree." in posted[0]["content"]["text"]
 
