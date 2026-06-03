@@ -72,6 +72,8 @@ _RECOVERED_CONCLUSION_PLACEHOLDER = "Recovered completed experiment artifacts fr
 _API_CONTRACT_VERSION = "v1"
 _FEEDBACK_CONFIG_FILENAME = "mira-engine.feedback.json"
 _FEEDBACK_TIMEOUT_SECONDS = 8
+_FEEDBACK_AGENT_HANDLE = "@MIRAI"
+_FEEDBACK_AGENT_DISPLAY_NAME = "MIRAI"
 
 
 @dataclass(frozen=True)
@@ -253,10 +255,14 @@ def _build_feedback_agent_text(
     }
     lines: list[str] = []
     if mention_open_id:
-        display_name = mention_name or "Hermes"
+        display_name = mention_name or _FEEDBACK_AGENT_DISPLAY_NAME
         lines.append(
-            f'<at user_id="{mention_open_id}">{_escape_feishu_text(display_name)}</at> 请处理这条 MIRA feedback。'
+            f'<at user_id="{mention_open_id}">{_escape_feishu_text(display_name)}</at> '
+            f"{_FEEDBACK_AGENT_HANDLE} 请处理这条 MIRA feedback。"
         )
+        lines.append("")
+    else:
+        lines.append(f"{_FEEDBACK_AGENT_HANDLE} 请处理这条 MIRA feedback。")
         lines.append("")
 
     lines.extend([

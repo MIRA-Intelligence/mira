@@ -1141,11 +1141,35 @@ def test_build_feedback_agent_text_includes_full_feedback_payload() -> None:
     )
 
     assert '<at user_id="ou_hermes">Hermes</at>' in text
+    assert "@MIRAI 请处理这条 MIRA feedback。" in text
     assert "【MIRA Feedback】Feature" in text
     assert "mira_feedback  tag=feature  feedback_id=fb_test" in text
     assert "标题：Add file manager" in text
     assert "内容：\nShow workspace files as a tree." in text
     assert "- 联系：email · user@example.com" in text
+
+
+def test_build_feedback_agent_text_mentions_mirai_without_open_id() -> None:
+    text = _build_feedback_agent_text(
+        {
+            "id": "fb_test",
+            "clientHandle": "anon_abcd",
+            "type": "question",
+            "severity": None,
+            "title": "How to export?",
+            "body": "Where is the export button?",
+            "contact": None,
+            "appVersion": "0.4.0",
+            "os": "darwin",
+            "route": "/",
+            "locale": "zh",
+            "createdAt": "2026-06-02T00:00:00Z",
+        }
+    )
+
+    assert text.startswith("@MIRAI 请处理这条 MIRA feedback。")
+    assert "<at user_id=" not in text
+    assert "mira_feedback  tag=question  feedback_id=fb_test" in text
 
 
 async def test_submit_feedback_sends_single_text_message(
@@ -1186,6 +1210,7 @@ async def test_submit_feedback_sends_single_text_message(
     assert len(posted) == 1
     assert posted[0]["msg_type"] == "text"
     assert "card" not in posted[0]
+    assert "@MIRAI" in posted[0]["content"]["text"]
     assert "mira_feedback" in posted[0]["content"]["text"]
     assert "Show workspace files as a tree." in posted[0]["content"]["text"]
 
