@@ -1347,24 +1347,9 @@ def _run_cli_agent_session(
         cli_channel, cli_chat_id = "cli", session_id
 
     # Double-Ctrl+C to exit: first interrupt, second quits.
-    _sigint_state = {"last": 0.0, "count": 0}
+    _sigint_last = [0.0]
 
-    def _handle_signal(signum, frame):
-        now = time.monotonic()
-        if _sigint_state["last"] and now - _sigint_state["last"] < 2.0:
-            _sigint_state["count"] += 1
-        else:
-            _sigint_state["count"] = 1
-        _sigint_state["last"] = now
-
-        if _sigint_state["count"] >= 2:
-            _restore_terminal()
-            console.print("\nGoodbye!")
-            sys.exit(0)
-        else:
-            console.print("\n[yellow]Interrupt — press Ctrl+C again to quit[/yellow]")
-
-    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     signal.signal(signal.SIGTERM, _handle_signal)
     if hasattr(signal, 'SIGHUP'):
         signal.signal(signal.SIGHUP, _handle_signal)
@@ -1457,8 +1442,13 @@ def _run_cli_agent_session(
                         used = ", ".join(sorted(turn_skills)) if turn_skills else "none"
                         console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
                 except KeyboardInterrupt:
-                    # First Ctrl+C: interrupted by signal handler, continue loop
-                    # Second Ctrl+C: signal handler already called sys.exit()
+                    now = time.monotonic()
+                    if _sigint_last[0] and now - _sigint_last[0] < 2.0:
+                        _restore_terminal()
+                        console.print("\nGoodbye!")
+                        break
+                    _sigint_last[0] = now
+                    console.print("\n[yellow]Interrupt — press Ctrl+C again to quit[/yellow]")
                     continue
                 except EOFError:
                     _restore_terminal()
