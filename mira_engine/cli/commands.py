@@ -7,6 +7,7 @@ import select
 import signal
 import socket
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1336,7 +1337,7 @@ def _run_cli_agent_session(
     from mira_engine.bus.events import InboundMessage
     _init_prompt_session()
     banner = interactive_banner or (
-        f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+        f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C x2[/bold] to quit)\n"
     )
     console.print(banner)
 
@@ -1345,11 +1346,23 @@ def _run_cli_agent_session(
     else:
         cli_channel, cli_chat_id = "cli", session_id
 
+    # Double-Ctrl+C to exit: first interrupt, second quits.
+    _sigint_state = {"last": 0.0, "count": 0}
+
     def _handle_signal(signum, frame):
-        sig_name = signal.Signals(signum).name
-        _restore_terminal()
-        console.print(f"\nReceived {sig_name}, goodbye!")
-        sys.exit(0)
+        now = time.monotonic()
+        if _sigint_state["last"] and now - _sigint_state["last"] < 2.0:
+            _sigint_state["count"] += 1
+        else:
+            _sigint_state["count"] = 1
+        _sigint_state["last"] = now
+
+        if _sigint_state["count"] >= 2:
+            _restore_terminal()
+            console.print("\nGoodbye!")
+            sys.exit(0)
+        else:
+            console.print("\n[yellow]Interrupt — press Ctrl+C again to quit[/yellow]")
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -1444,9 +1457,9 @@ def _run_cli_agent_session(
                         used = ", ".join(sorted(turn_skills)) if turn_skills else "none"
                         console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
                 except KeyboardInterrupt:
-                    _restore_terminal()
-                    console.print("\nGoodbye!")
-                    break
+                    # First Ctrl+C: interrupted by signal handler, continue loop
+                    # Second Ctrl+C: signal handler already called sys.exit()
+                    continue
                 except EOFError:
                     _restore_terminal()
                     console.print("\nGoodbye!")
@@ -1656,7 +1669,7 @@ def research(
     banner = (
         f"{__logo__} Research mode "
         f"(mode=[bold]{mode_value}[/bold], profile=[bold]{profile_value}[/bold]) "
-        "(type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+        "(type [bold]exit[/bold] or [bold]Ctrl+C x2[/bold] to quit)\n"
     )
     _run_cli_agent_session(
         agent_loop=agent_loop,
