@@ -268,17 +268,10 @@ def _build_feedback_agent_text(
         "normal": "一般",
         "minor": "轻微",
     }
-    lines: list[str] = []
-    if mention_open_id:
-        display_name = mention_name or _FEEDBACK_AGENT_DISPLAY_NAME
-        lines.append(
-            f'<at user_id="{mention_open_id}">{_escape_feishu_text(display_name)}</at> '
-            f"{_FEEDBACK_AGENT_HANDLE} 请处理这条 MIRA feedback。"
-        )
-        lines.append("")
-    else:
-        lines.append(f"{_FEEDBACK_AGENT_HANDLE} 请处理这条 MIRA feedback。")
-        lines.append("")
+    lines: list[str] = [
+        f"{_FEEDBACK_AGENT_HANDLE} 请处理这条 MIRA feedback。",
+        "",
+    ]
 
     lines.extend([
         f"【MIRA Feedback】{type_label[payload['type']]}",

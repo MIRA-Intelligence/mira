@@ -1193,8 +1193,9 @@ def test_build_feedback_agent_text_includes_full_feedback_payload() -> None:
         mention_name="Hermes",
     )
 
-    assert '<at user_id="ou_hermes">Hermes</at>' in text
-    assert "@MIRAI 请处理这条 MIRA feedback。" in text
+    assert text.startswith("@MIRAI 请处理这条 MIRA feedback。")
+    assert "<at user_id=" not in text
+    assert "Hermes" not in text
     assert "【MIRA Feedback】Feature" in text
     assert "mira_feedback  tag=feature  feedback_id=fb_test" in text
     assert "标题：Add file manager" in text
@@ -1263,7 +1264,8 @@ async def test_submit_feedback_sends_single_text_message(
     assert len(posted) == 1
     assert posted[0]["msg_type"] == "text"
     assert "card" not in posted[0]
-    assert "@MIRAI" in posted[0]["content"]["text"]
+    assert posted[0]["content"]["text"].startswith("@MIRAI 请处理这条 MIRA feedback。")
+    assert "<at user_id=" not in posted[0]["content"]["text"]
     assert "mira_feedback" in posted[0]["content"]["text"]
     assert "Show workspace files as a tree." in posted[0]["content"]["text"]
 
