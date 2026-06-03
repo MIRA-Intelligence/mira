@@ -2,6 +2,7 @@ import json
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1120,6 +1121,58 @@ async def test_handle_feedback_submits_to_feishu_relay(
     assert payload["contact"] == {"kind": "email", "value": "user@example.com"}
 
 
+def test_resolve_feedback_config_accepts_raw_dict_channel_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in (
+        "MIRA_FEISHU_WEBHOOK_URL",
+        "MIRA_FEISHU_WEBHOOK_SECRET",
+        "MIRA_FEISHU_GROUP_INVITE_URL",
+        "MIRA_FEISHU_MENTION_OPEN_ID",
+        "MIRA_FEISHU_MENTION_NAME",
+        "MIRA_FEEDBACK_CONFIG_PATH",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    relay = ui_channel_mod._resolve_feedback_config({
+        "feedback": {
+            "feishuWebhookUrl": "https://open.feishu.cn/webhook/test",
+            "feishuSecret": "super-secret",
+            "feishuInviteUrl": "https://applink.feishu.cn/client/chat/test",
+            "feishuMentionOpenId": "ou_mirai",
+            "feishuMentionName": "MIRAI",
+        }
+    })
+
+    assert relay.configured is True
+    assert relay.feishu_webhook_url == "https://open.feishu.cn/webhook/test"
+    assert relay.feishu_secret == "super-secret"
+    assert relay.feishu_invite_url == "https://applink.feishu.cn/client/chat/test"
+    assert relay.feishu_mention_open_id == "ou_mirai"
+    assert relay.feishu_mention_name == "MIRAI"
+
+
+def test_resolve_feedback_config_accepts_namespace_with_nested_dict(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in (
+        "MIRA_FEISHU_WEBHOOK_URL",
+        "MIRA_FEISHU_WEBHOOK_SECRET",
+        "MIRA_FEISHU_GROUP_INVITE_URL",
+        "MIRA_FEISHU_MENTION_OPEN_ID",
+        "MIRA_FEISHU_MENTION_NAME",
+        "MIRA_FEEDBACK_CONFIG_PATH",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    relay = ui_channel_mod._resolve_feedback_config(SimpleNamespace(
+        feedback={
+            "feishuWebhookUrl": "https://open.feishu.cn/webhook/test",
+            "feishuSecret": "super-secret",
+        }
+    ))
+
+    assert relay.configured is True
+    assert relay.feishu_webhook_url == "https://open.feishu.cn/webhook/test"
+    assert relay.feishu_secret == "super-secret"
+
+
 def test_build_feedback_agent_text_includes_full_feedback_payload() -> None:
     text = _build_feedback_agent_text(
         {
@@ -1213,6 +1266,54 @@ async def test_submit_feedback_sends_single_text_message(
     assert "@MIRAI" in posted[0]["content"]["text"]
     assert "mira_feedback" in posted[0]["content"]["text"]
     assert "Show workspace files as a tree." in posted[0]["content"]["text"]
+
+
+async def test_post_feishu_webhook_retries_ssl_verification_failure(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay = ui_channel_mod._FeedbackRelayConfig(
+        feishu_webhook_url="https://open.feishu.cn/webhook/test",
+        feishu_secret="super-secret",
+    )
+    calls: list[bool | None] = []
+
+    async def _fake_post_once(
+        _relay: ui_channel_mod._FeedbackRelayConfig,
+        _body: dict[str, Any],
+        *,
+        ssl: bool | None = None,
+    ) -> None:
+        calls.append(ssl)
+        if ssl is None:
+            raise ui_channel_mod.ClientError("CERTIFICATE_VERIFY_FAILED")
+
+    monkeypatch.setattr(ui_channel, "_post_feishu_webhook_once", _fake_post_once)
+
+    await ui_channel._post_feishu_webhook(relay, {"msg_type": "text", "content": {"text": "hello"}})
+
+    assert calls == [None, False]
+
+
+async def test_post_feishu_webhook_wraps_non_certificate_network_error(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay = ui_channel_mod._FeedbackRelayConfig(
+        feishu_webhook_url="https://open.feishu.cn/webhook/test",
+        feishu_secret="super-secret",
+    )
+
+    async def _fake_post_once(
+        _relay: ui_channel_mod._FeedbackRelayConfig,
+        _body: dict[str, Any],
+        *,
+        ssl: bool | None = None,
+    ) -> None:
+        raise ui_channel_mod.ClientError("connection refused")
+
+    monkeypatch.setattr(ui_channel, "_post_feishu_webhook_once", _fake_post_once)
+
+    with pytest.raises(RuntimeError, match="feishu webhook request failed: connection refused"):
+        await ui_channel._post_feishu_webhook(relay, {"msg_type": "text", "content": {"text": "hello"}})
 
 
 async def test_handle_config_updates_runtime_fields_and_provider_secrets(

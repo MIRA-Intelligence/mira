@@ -149,37 +149,52 @@ def _nested_value(data: dict[str, Any], *keys: str) -> Any:
     return current
 
 
-def _resolve_feedback_config(config: UiChannelConfig) -> _FeedbackRelayConfig:
-    configured = getattr(config, "feedback", None)
+def _camel_key(key: str) -> str:
+    parts = key.split("_")
+    return parts[0] + "".join(part.capitalize() for part in parts[1:])
+
+
+def _config_value(config: Any, key: str) -> Any:
+    camel_key = _camel_key(key)
+    if isinstance(config, dict):
+        for candidate in (key, camel_key):
+            if candidate in config:
+                return config[candidate]
+        return None
+    return getattr(config, key, getattr(config, camel_key, None))
+
+
+def _resolve_feedback_config(config: UiChannelConfig | Any) -> _FeedbackRelayConfig:
+    configured = _config_value(config, "feedback")
     sidecar = _load_feedback_sidecar()
     feishu = sidecar.get("feishu") if isinstance(sidecar.get("feishu"), dict) else {}
     return _FeedbackRelayConfig(
         feishu_webhook_url=_first_present(
             os.environ.get("MIRA_FEISHU_WEBHOOK_URL"),
-            getattr(configured, "feishu_webhook_url", None),
+            _config_value(configured, "feishu_webhook_url"),
             _nested_value(feishu, "webhookUrl"),
             _nested_value(feishu, "webhook_url"),
         ),
         feishu_secret=_first_present(
             os.environ.get("MIRA_FEISHU_WEBHOOK_SECRET"),
-            getattr(configured, "feishu_secret", None),
+            _config_value(configured, "feishu_secret"),
             _nested_value(feishu, "secret"),
         ),
         feishu_invite_url=_first_present(
             os.environ.get("MIRA_FEISHU_GROUP_INVITE_URL"),
-            getattr(configured, "feishu_invite_url", None),
+            _config_value(configured, "feishu_invite_url"),
             _nested_value(feishu, "inviteUrl"),
             _nested_value(feishu, "invite_url"),
         ),
         feishu_mention_open_id=_first_present(
             os.environ.get("MIRA_FEISHU_MENTION_OPEN_ID"),
-            getattr(configured, "feishu_mention_open_id", None),
+            _config_value(configured, "feishu_mention_open_id"),
             _nested_value(feishu, "mentionOpenId"),
             _nested_value(feishu, "mention_open_id"),
         ),
         feishu_mention_name=_first_present(
             os.environ.get("MIRA_FEISHU_MENTION_NAME"),
-            getattr(configured, "feishu_mention_name", None),
+            _config_value(configured, "feishu_mention_name"),
             _nested_value(feishu, "mentionName"),
             _nested_value(feishu, "mention_name"),
         ),
@@ -2083,28 +2098,50 @@ class UiChannel(BaseChannel):
             body["timestamp"] = timestamp_sec
             body["sign"] = _feishu_sign(timestamp_sec, relay.feishu_secret)
 
-        timeout = ClientTimeout(total=_FEEDBACK_TIMEOUT_SECONDS)
         try:
-            async with ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    relay.feishu_webhook_url,
-                    json=body,
-                    headers={"Content-Type": "application/json"},
-                ) as resp:
-                    text = await resp.text()
-                    if not 200 <= resp.status < 300:
-                        raise RuntimeError(f"feishu webhook returned {resp.status}")
-                    if text:
-                        try:
-                            parsed = json.loads(text)
-                        except json.JSONDecodeError:
-                            parsed = None
-                        if isinstance(parsed, dict) and parsed.get("code") not in {None, 0}:
-                            raise RuntimeError(
-                                f"feishu webhook error {parsed.get('code')}: {parsed.get('msg') or 'unknown'}"
-                            )
-        except (ClientError, asyncio.TimeoutError) as exc:
+            await self._post_feishu_webhook_once(relay, body)
+        except ClientError as exc:
+            if "CERTIFICATE_VERIFY_FAILED" not in str(exc) and "certificate verify failed" not in str(exc):
+                raise RuntimeError(f"feishu webhook request failed: {exc}") from exc
+            logger.warning("SSL certificate verification failed for Feishu feedback webhook; retrying with ssl=False")
+            try:
+                await self._post_feishu_webhook_once(relay, body, ssl=False)
+            except (ClientError, asyncio.TimeoutError) as retry_exc:
+                raise RuntimeError(f"feishu webhook request failed: {retry_exc}") from retry_exc
+        except asyncio.TimeoutError as exc:
             raise RuntimeError(f"feishu webhook request failed: {exc}") from exc
+
+    async def _post_feishu_webhook_once(
+        self,
+        relay: _FeedbackRelayConfig,
+        body: dict[str, Any],
+        *,
+        ssl: bool | None = None,
+    ) -> None:
+        timeout = ClientTimeout(total=_FEEDBACK_TIMEOUT_SECONDS)
+        request_kwargs: dict[str, Any] = {
+            "json": body,
+            "headers": {"Content-Type": "application/json"},
+        }
+        if ssl is not None:
+            request_kwargs["ssl"] = ssl
+        async with ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.post(
+                relay.feishu_webhook_url,
+                **request_kwargs,
+            ) as resp:
+                text = await resp.text()
+                if not 200 <= resp.status < 300:
+                    raise RuntimeError(f"feishu webhook returned {resp.status}")
+                if text:
+                    try:
+                        parsed = json.loads(text)
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if isinstance(parsed, dict) and parsed.get("code") not in {None, 0}:
+                        raise RuntimeError(
+                            f"feishu webhook error {parsed.get('code')}: {parsed.get('msg') or 'unknown'}"
+                        )
 
     async def _handle_feedback(self, request: web.Request) -> web.Response:
         relay = _resolve_feedback_config(self.config)
