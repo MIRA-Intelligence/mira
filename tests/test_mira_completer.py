@@ -22,6 +22,13 @@ def _completions(ws: Path, text: str) -> list[str]:
     return [comp.text for comp in c.get_completions(doc, None)]
 
 
+def _completions_with_meta(ws: Path, text: str) -> list[tuple[str, int]]:
+    """Return (text, start_position) pairs for a given input string."""
+    c = MiraCompleter(ws)
+    doc = Document(text=text, cursor_position=len(text))
+    return [(comp.text, comp.start_position) for comp in c.get_completions(doc, None)]
+
+
 # ---------------------------------------------------------------------------
 # Basic behaviour
 # ---------------------------------------------------------------------------
@@ -62,6 +69,37 @@ class TestBasicBehaviour:
         _build_workspace(tmp_path, files)
         results = _completions(tmp_path, "@")
         assert len(results) == 50
+
+    def test_pycache_excluded(self, tmp_path):
+        ws = _build_workspace(tmp_path, ["__pycache__/mod.cpython-311.pyc", "mod.py"])
+        results = _completions(ws, "@")
+        assert "mod.py" in results
+        assert all("__pycache__" not in r for r in results)
+
+    def test_node_modules_excluded(self, tmp_path):
+        ws = _build_workspace(tmp_path, ["node_modules/pkg/index.js", "app.js"])
+        results = _completions(ws, "@")
+        assert "app.js" in results
+        assert all("node_modules" not in r for r in results)
+
+    def test_venv_excluded(self, tmp_path):
+        ws = _build_workspace(tmp_path, [".venv/lib/foo.so", "script.py"])
+        results = _completions(ws, "@")
+        assert "script.py" in results
+        assert all(".venv" not in r for r in results)
+
+    def test_results_sorted(self, tmp_path):
+        ws = _build_workspace(tmp_path, ["zebra.py", "alpha.py", "middle.py"])
+        results = _completions(ws, "@")
+        assert results == ["alpha.py", "middle.py", "zebra.py"]
+
+    def test_cache_returns_same_result(self, tmp_path):
+        """Scanning twice should return identical results (cached)."""
+        ws = _build_workspace(tmp_path, ["a.txt", "b.txt"])
+        c = MiraCompleter(ws)
+        first = c._scan_files()
+        second = c._scan_files()
+        assert first == second
 
 
 # ---------------------------------------------------------------------------
@@ -143,28 +181,39 @@ class TestAtPosition:
 class TestCompletionMetadata:
     def test_start_position_replaces_at_and_partial(self, tmp_path):
         ws = _build_workspace(tmp_path, ["commands.py"])
-        c = MiraCompleter(ws)
-        doc = Document(text="@com", cursor_position=4)
-        comps = list(c.get_completions(doc, None))
-        assert len(comps) == 1
-        # start_position=-4 means "@com" (4 chars) is replaced with the path
-        assert comps[0].start_position == -4
-        assert comps[0].text == "commands.py"
+        results = _completions_with_meta(ws, "@com")
+        assert len(results) == 1
+        # "@com" is 4 chars, so start_position=-4 replaces "@com" with path
+        assert results[0] == ("commands.py", -4)
 
     def test_start_position_with_at_only(self, tmp_path):
         ws = _build_workspace(tmp_path, ["x.txt"])
-        c = MiraCompleter(ws)
-        doc = Document(text="@", cursor_position=1)
-        comps = list(c.get_completions(doc, None))
-        assert len(comps) == 1
-        # partial is "", len+1 = 1, replaces "@" only
-        assert comps[0].start_position == -1
+        results = _completions_with_meta(ws, "@")
+        assert len(results) == 1
+        # raw_partial is "" (0 chars) + 1 for "@" = -1
+        assert results[0] == ("x.txt", -1)
 
     def test_start_position_with_text_before_at(self, tmp_path):
         ws = _build_workspace(tmp_path, ["hello.py"])
+        results = _completions_with_meta(ws, "run @hello")
+        assert len(results) == 1
+        # raw_partial "hello" (5 chars) + 1 for "@" = -6
+        assert results[0] == ("hello.py", -6)
+
+    def test_start_position_with_whitespace_after_at(self, tmp_path):
+        """Whitespace after @ should be included in the replaced span."""
+        ws = _build_workspace(tmp_path, ["foo.txt"])
+        results = _completions_with_meta(ws, "@ foo")
+        assert len(results) == 1
+        # raw_partial is " foo" (4 chars) + 1 for "@" = -5
+        assert results[0] == ("foo.txt", -5)
+
+    def test_return_type_is_iterable(self, tmp_path):
+        """get_completions returns an iterable of Completion objects."""
+        ws = _build_workspace(tmp_path, ["a.txt"])
         c = MiraCompleter(ws)
-        doc = Document(text="run @hello", cursor_position=10)
-        comps = list(c.get_completions(doc, None))
-        assert len(comps) == 1
-        # partial is "hello" (5 chars) + 1 for @ = -6
-        assert comps[0].start_position == -6
+        doc = Document(text="@", cursor_position=1)
+        result = list(c.get_completions(doc, None))
+        assert len(result) == 1
+        from prompt_toolkit.completion import Completion
+        assert isinstance(result[0], Completion)

@@ -276,32 +276,67 @@ def _restore_terminal() -> None:
         pass
 
 
+# Directories never suggested in file-path completions.
+_COMPLETER_IGNORE_DIRS = {
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".coverage",
+    "htmlcov",
+}
+
+
 class MiraCompleter(Completer):
     """File-path completer triggered by @ in the CLI prompt."""
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
+        self._file_cache: list[tuple[str, Path]] | None = None
 
-    def get_completions(self, document: PtDocument, complete_event):
-        text = document.text_before_cursor
-        at_pos = text.rfind("@")
-        if at_pos == -1:
-            return
-        partial = text[at_pos + 1:].strip()
-        yielded = 0
+    def _scan_files(self) -> list[str]:
+        """Scan workspace once and return sorted relative paths as strings."""
+        if self._file_cache is not None:
+            return [p for p, _ in self._file_cache]
+        entries: list[tuple[str, Path]] = []
         for f in self.workspace.rglob("*"):
             if not f.is_file() or f.name.startswith("."):
                 continue
-            # Skip files inside hidden directories
             rel = f.relative_to(self.workspace)
-            if any(part.startswith(".") for part in rel.parts):
+            if any(
+                part.startswith(".") or part in _COMPLETER_IGNORE_DIRS
+                for part in rel.parts
+            ):
                 continue
-            rel_str = str(rel)
-            if not partial or partial in rel_str:
-                yield Completion(rel_str, -(len(partial) + 1))
-                yielded += 1
-                if yielded >= 50:
-                    break
+            entries.append((str(rel), f))
+        entries.sort(key=lambda e: e[0])
+        self._file_cache = entries
+        return [p for p, _ in entries]
+
+    def get_completions(
+        self, document: PtDocument, complete_event: object | None
+    ) -> list[Completion]:
+        text = document.text_before_cursor
+        at_pos = text.rfind("@")
+        if at_pos == -1:
+            return []
+        raw_partial = text[at_pos + 1:]
+        filtered_partial = raw_partial.strip()
+        yielded = 0
+        for rel_str in self._scan_files():
+            if filtered_partial and filtered_partial not in rel_str:
+                continue
+            yield Completion(rel_str, -(len(raw_partial) + 1))
+            yielded += 1
+            if yielded >= 50:
+                break
 
 
 def _init_prompt_session(workspace: Path | None = None) -> None:
