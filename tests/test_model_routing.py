@@ -54,9 +54,12 @@ def test_config_accepts_model_candidate_lists() -> None:
 
 
 class _FakeProvider(LLMProvider):
-    def __init__(self, route_tier: str | None = None):
+    def __init__(self, route_tier: str | None = None, stream_deltas: list[str] | None = None):
         super().__init__()
         self.route_tier = route_tier
+        self.stream_deltas = list(stream_deltas or [])
+        self.chat_calls = 0
+        self.stream_calls = 0
 
     async def chat(
         self,
@@ -67,6 +70,7 @@ class _FakeProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
     ) -> LLMResponse:
+        self.chat_calls += 1
         if self.route_tier and tools:
             return LLMResponse(
                 content=None,
@@ -79,6 +83,23 @@ class _FakeProvider(LLMProvider):
                 ],
             )
         return LLMResponse(content="ok")
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_content_delta=None,
+    ) -> LLMResponse:
+        self.stream_calls += 1
+        for delta in self.stream_deltas:
+            if on_content_delta is not None:
+                await on_content_delta(delta)
+        return LLMResponse(content="".join(self.stream_deltas) or "ok")
 
     def get_default_model(self) -> str:
         return "anthropic/claude-opus-4-5"
@@ -117,6 +138,36 @@ async def test_instinct_router_uses_route_model_when_configured() -> None:
     assert route.tier == "medium"
     assert route.model == defaults.primary_model_for_tier("medium")
     assert route.source == "instinct"
+
+
+async def test_routed_provider_manager_streams_selected_model() -> None:
+    provider = _FakeProvider(stream_deltas=["Hel", "lo"])
+    route = RoutedModel(
+        tier="default",
+        model="anthropic/claude-opus-4-5",
+        candidates=("anthropic/claude-opus-4-5",),
+        source="default",
+    )
+    manager = RoutedProviderManager(
+        default_provider=provider,
+        default_model="anthropic/claude-opus-4-5",
+    )
+    deltas: list[str] = []
+
+    async def _on_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    response, selected = await manager.chat_stream_with_retry(
+        route,
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=_on_delta,
+    )
+
+    assert response.content == "Hello"
+    assert selected.model == "anthropic/claude-opus-4-5"
+    assert deltas == ["Hel", "lo"]
+    assert provider.stream_calls == 1
+    assert provider.chat_calls == 0
 
 
 class _BrokenProvider(LLMProvider):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -310,6 +310,92 @@ class RoutedProviderManager:
             if index < len(candidates) - 1:
                 logger.warning(
                     "Model '{}' failed with retryable error; trying fallback model '{}': {}",
+                    model,
+                    candidates[index + 1],
+                    (response.content or "")[:200],
+                )
+
+        if last_response is not None:
+            return LLMResponse(
+                content=(
+                    f"All candidate models failed for this turn. "
+                    f"Last error from '{candidates[-1]}': {last_response.content or 'unknown error'}"
+                ),
+                finish_reason="error",
+                usage=last_response.usage,
+                reasoning_content=last_response.reasoning_content,
+                thinking_blocks=last_response.thinking_blocks,
+            ), RoutedModel(
+                route.tier,
+                candidates[-1],
+                candidates,
+                route.score,
+                route.source,
+                route.reason,
+            )
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No candidate models available for chat completion")
+
+    async def chat_stream_with_retry(
+        self,
+        route: RoutedModel,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> tuple[LLMResponse, RoutedModel]:
+        """Call the routed model with token streaming when the client requests it."""
+        candidates = self._ordered_candidate_models(tuple(route.candidates) or (route.model,))
+        last_response: LLMResponse | None = None
+        last_error: Exception | None = None
+
+        for index, model in enumerate(candidates):
+            provider = self._provider_for_model(model)
+            try:
+                response = await provider.chat_stream_with_retry(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    on_content_delta=on_content_delta,
+                )
+            except Exception as exc:
+                last_error = exc
+                self._mark_model_failed(model)
+                if index < len(candidates) - 1:
+                    logger.warning(
+                        "Model '{}' raised '{}' while streaming; trying fallback model '{}'",
+                        model,
+                        exc,
+                        candidates[index + 1],
+                    )
+                    continue
+                raise
+
+            if response.finish_reason != "error" or not self._should_retry_with_fallback(response.content):
+                if response.finish_reason == "error":
+                    self._mark_model_failed(model)
+                else:
+                    self._mark_model_success(model)
+                return response, RoutedModel(
+                    route.tier,
+                    model,
+                    candidates,
+                    route.score,
+                    route.source,
+                    route.reason,
+                )
+
+            last_response = response
+            self._mark_model_failed(model)
+            if index < len(candidates) - 1:
+                logger.warning(
+                    "Model '{}' failed with retryable streaming error; trying fallback model '{}': {}",
                     model,
                     candidates[index + 1],
                     (response.content or "")[:200],

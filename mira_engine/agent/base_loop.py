@@ -622,16 +622,53 @@ class BaseAgentLoop:
                         reasoning_effort=self.reasoning_effort,
                     )
             else:
+                assert model_runtime is not None
                 if active_provider is None or active_route is None:
                     active_provider, active_route = await model_runtime.resolve(messages, iteration)
-                response, active_route = await model_runtime.chat(
-                    active_route,
-                    messages=messages,
-                    tools=self.tools.get_definitions(),
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    reasoning_effort=self.reasoning_effort,
-                )
+                if on_stream is not None:
+                    streamed_raw = ""
+                    streamed_clean = ""
+
+                    async def _stream_delta(delta: str) -> None:
+                        nonlocal streamed_raw, streamed_clean
+                        if not delta:
+                            return
+                        streamed_raw += delta
+                        new_clean = self._strip_think(streamed_raw) or ""
+                        if not new_clean:
+                            streamed_clean = ""
+                            return
+                        if new_clean.startswith(streamed_clean):
+                            out = new_clean[len(streamed_clean):]
+                        else:
+                            out = new_clean
+                        streamed_clean = new_clean
+                        if out and on_stream:
+                            await on_stream(out)
+
+                    response, active_route = await model_runtime.chat_stream_with_retry(
+                        active_route,
+                        messages=messages,
+                        tools=self.tools.get_definitions(),
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        reasoning_effort=self.reasoning_effort,
+                        on_content_delta=_stream_delta,
+                    )
+                    clean_streamed = self._strip_think(streamed_raw)
+                    if response.content and clean_streamed:
+                        response.content = clean_streamed
+                    if on_stream_end:
+                        await on_stream_end(resuming=False)
+                else:
+                    response, active_route = await model_runtime.chat(
+                        active_route,
+                        messages=messages,
+                        tools=self.tools.get_definitions(),
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        reasoning_effort=self.reasoning_effort,
+                    )
             if isinstance(response.usage, dict):
                 self._last_usage = {
                     "prompt_tokens": int(response.usage.get("prompt_tokens", 0) or 0),
