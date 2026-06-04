@@ -11,10 +11,43 @@ from mira_engine.cli.commands import (
     PROMPT_CTRL_C_EXIT,
     PROMPT_CTRL_C_IGNORE,
     PROMPT_CTRL_C_SHOW_HINT,
+    handle_cli_loop_sigint,
     interrupt_cli_agent_turn,
     resolve_prompt_ctrl_c_action,
     should_cancel_turn_on_sigint,
+    wait_cli_turn_or_interrupt,
 )
+
+
+def test_handle_cli_loop_sigint_during_turn():
+    turn_done = asyncio.Event()
+    interrupt_evt = asyncio.Event()
+    exit_armed = [99.0]
+    assert (
+        handle_cli_loop_sigint(
+            turn_done=turn_done,
+            interrupt_evt=interrupt_evt,
+            exit_armed_until=exit_armed,
+        )
+        == "turn_interrupt"
+    )
+    assert interrupt_evt.is_set()
+    assert exit_armed[0] == 0.0
+
+
+def test_handle_cli_loop_sigint_at_prompt():
+    turn_done = asyncio.Event()
+    turn_done.set()
+    interrupt_evt = asyncio.Event()
+    assert (
+        handle_cli_loop_sigint(
+            turn_done=turn_done,
+            interrupt_evt=interrupt_evt,
+            exit_armed_until=[0.0],
+        )
+        == "prompt"
+    )
+    assert not interrupt_evt.is_set()
 
 
 def test_should_cancel_turn_on_sigint_when_agent_busy():
@@ -109,3 +142,54 @@ async def test_interrupt_cli_agent_turn_is_idempotent_when_already_done():
 
     assert turn_response == ["keep"]
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_interrupt_cli_agent_turn_user_interrupted_when_turn_done():
+    turn_done = asyncio.Event()
+    turn_done.set()
+    interrupted: list[str] = []
+
+    await interrupt_cli_agent_turn(
+        turn_done=turn_done,
+        turn_response=["partial"],
+        turn_skills=set(),
+        dispatch_tasks=[],
+        user_interrupted=True,
+        on_interrupted=lambda: interrupted.append("ok"),
+    )
+
+    assert interrupted == ["ok"]
+    assert turn_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_wait_cli_turn_or_interrupt_on_signal():
+    turn_done = asyncio.Event()
+    interrupt_evt = asyncio.Event()
+
+    async def wait_turn():
+        return await wait_cli_turn_or_interrupt(
+            turn_done=turn_done,
+            interrupt_evt=interrupt_evt,
+        )
+
+    waiter = asyncio.create_task(wait_turn())
+    await asyncio.sleep(0)
+    interrupt_evt.set()
+    assert await waiter is True
+
+
+@pytest.mark.asyncio
+async def test_wait_cli_turn_or_interrupt_on_turn_complete():
+    turn_done = asyncio.Event()
+    interrupt_evt = asyncio.Event()
+    turn_done.set()
+
+    assert (
+        await wait_cli_turn_or_interrupt(
+            turn_done=turn_done,
+            interrupt_evt=interrupt_evt,
+        )
+        is False
+    )
