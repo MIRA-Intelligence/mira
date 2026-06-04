@@ -25,8 +25,12 @@ if sys.platform == "win32":
 
 import typer
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document as PtDocument
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
@@ -405,7 +409,70 @@ def _restore_terminal() -> None:
         pass
 
 
-def _init_prompt_session() -> None:
+# Directories never suggested in file-path completions.
+_COMPLETER_IGNORE_DIRS = {
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".coverage",
+    "htmlcov",
+}
+
+
+class MiraCompleter(Completer):
+    """File-path completer triggered by @ in the CLI prompt."""
+
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+        self._file_cache: list[tuple[str, Path]] | None = None
+
+    def _scan_files(self) -> list[str]:
+        """Scan workspace once and return sorted relative paths as strings."""
+        if self._file_cache is not None:
+            return [p for p, _ in self._file_cache]
+        entries: list[tuple[str, Path]] = []
+        for f in self.workspace.rglob("*"):
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            rel = f.relative_to(self.workspace)
+            if any(
+                part.startswith(".") or part in _COMPLETER_IGNORE_DIRS
+                for part in rel.parts
+            ):
+                continue
+            entries.append((str(rel), f))
+        entries.sort(key=lambda e: e[0])
+        self._file_cache = entries
+        return [p for p, _ in entries]
+
+    def get_completions(
+        self, document: PtDocument, complete_event: object | None
+    ) -> list[Completion]:
+        text = document.text_before_cursor
+        at_pos = text.rfind("@")
+        if at_pos == -1:
+            return []
+        raw_partial = text[at_pos + 1:]
+        filtered_partial = raw_partial.strip()
+        yielded = 0
+        for rel_str in self._scan_files():
+            if filtered_partial and filtered_partial not in rel_str:
+                continue
+            yield Completion(rel_str, -(len(raw_partial) + 1))
+            yielded += 1
+            if yielded >= 50:
+                break
+
+
+def _init_prompt_session(workspace: Path | None = None) -> None:
     """Create the prompt_toolkit session with persistent file history."""
     global _PROMPT_SESSION, _SAVED_TERM_ATTRS
 
@@ -421,11 +488,55 @@ def _init_prompt_session() -> None:
     history_file = get_cli_history_path()
     history_file.parent.mkdir(parents=True, exist_ok=True)
 
+    ws = workspace or Path.cwd()
+    completer = MiraCompleter(ws)
+
+    # Custom key bindings
+    kb = KeyBindings()
+
+    @kb.add("@")
+    def _(event):
+        """Insert @ then show file completion menu immediately."""
+        b = event.current_buffer
+        b.insert_text("@")
+        b.start_completion(insert_common_part=False)
+
+    @kb.add(Keys.Enter)
+    def _(event):
+        b = event.current_buffer
+        cs = b.complete_state
+        if cs is not None and len(cs.completions) > 0:
+            # Select first completion if none selected yet
+            completion = cs.current_completion
+            if completion is None:
+                b.complete_next()
+                completion = cs.current_completion
+            if completion is not None:
+                b.apply_completion(completion)
+            return
+        # Default behavior: submit
+        b.validate_and_handle()
+
+    def _refresh_completion(buffer):
+        """Buffer text changed — refresh completion if after @."""
+        text = buffer.text
+        at_pos = text.rfind("@")
+        if at_pos == -1:
+            return
+        # Cancel existing completion menu and restart so list updates
+        if buffer.complete_state:
+            buffer.cancel_completion()
+        buffer.start_completion(insert_common_part=False)
+
     _PROMPT_SESSION = PromptSession(
         history=SafeFileHistory(str(history_file)),
         enable_open_in_editor=False,
         multiline=False,   # Enter submits (single line mode)
+        complete_while_typing=False,
+        completer=completer,
+        key_bindings=kb,
     )
+    _PROMPT_SESSION.default_buffer.on_text_changed += _refresh_completion
 
 
 def _is_llm_error(text: str) -> bool:
@@ -1383,6 +1494,7 @@ def _run_cli_agent_session(
     interactive_banner: str | None = None,
     model_name: str | None = None,
     provider_name: str | None = None,
+    workspace: Path | None = None,
 ) -> None:
     """Drive a single message or REPL session against ``agent_loop``.
 
@@ -1467,7 +1579,7 @@ def _run_cli_agent_session(
 
     # Interactive mode — route through bus like other channels
     from mira_engine.bus.events import InboundMessage
-    _init_prompt_session()
+    _init_prompt_session(workspace)
     banner = interactive_banner or (
         f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to interrupt, "
         "[bold]Ctrl+C x2[/bold] at prompt to quit)\n"
@@ -1899,6 +2011,7 @@ def agent(
         inbound_metadata=None,
         model_name=config.agents.defaults.primary_model,
         provider_name=config.agents.defaults.provider,
+        workspace=config.workspace_path,
     )
 
 
@@ -2021,6 +2134,7 @@ def research(
         interactive_banner=banner,
         model_name=config.agents.defaults.primary_model,
         provider_name=config.agents.defaults.provider,
+        workspace=config.workspace_path,
     )
 
 
