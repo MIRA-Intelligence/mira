@@ -242,14 +242,18 @@ PROMPT_CTRL_C_EXIT = "exit"
 def resolve_prompt_ctrl_c_action(
     *,
     turn_done_set: bool,
-    sigint_last: float,
+    exit_armed_until: float,
     now: float,
-    window_sec: float = CLI_DOUBLE_CTRL_C_WINDOW_SEC,
 ) -> str:
-    """Classify Ctrl+C at the ``You:`` prompt (ignore / hint / exit)."""
+    """Classify Ctrl+C at the ``You:`` prompt (ignore / hint / exit).
+
+    ``exit_armed_until`` is set only after the user sees the quit hint at the
+    prompt, so a Ctrl+C that interrupted an agent turn cannot be mistaken for
+    a double-press exit.
+    """
     if not turn_done_set:
         return PROMPT_CTRL_C_IGNORE
-    if sigint_last and now - sigint_last < window_sec:
+    if exit_armed_until and now < exit_armed_until:
         return PROMPT_CTRL_C_EXIT
     return PROMPT_CTRL_C_SHOW_HINT
 
@@ -1413,7 +1417,7 @@ def _run_cli_agent_session(
     # Double-Ctrl+C to exit.
     # First Ctrl+C: cancels the current agent turn (interrupts the request).
     # Second Ctrl+C within 2 s: exits the session entirely.
-    _sigint_last = [0.0]
+    _exit_armed_until = [0.0]
     _cli_session_key = f"{cli_channel}:{cli_chat_id}"
     _turn_done_ref: list[asyncio.Event | None] = [None]
     _loop_ref: list[asyncio.AbstractEventLoop | None] = [None]
@@ -1430,12 +1434,11 @@ def _run_cli_agent_session(
         loop.call_soon_threadsafe(lambda: loop.create_task(coro_factory()))
 
     def _handle_sigint(signum, frame):
-        now = time.monotonic()
         evt = _turn_done_ref[0]
         at_prompt = evt is None or evt.is_set()
         cancel_turn = _cancel_turn_ref[0]
         if should_cancel_turn_on_sigint(turn_done_set=not at_prompt) and cancel_turn is not None:
-            _sigint_last[0] = now
+            _exit_armed_until[0] = 0.0
             # Agent turn in progress — cancel on the event loop; never sys.exit here.
             _schedule_on_loop(cancel_turn)
             return
@@ -1509,7 +1512,7 @@ def _run_cli_agent_session(
                 cancel_subagents=_cancel_subagents,
                 on_interrupted=lambda: console.print("\n\n[dim]Interrupted[/dim]"),
             )
-            _sigint_last[0] = 0.0
+            _exit_armed_until[0] = 0.0
 
         _cancel_turn_ref[0] = _cancel_current_turn
 
@@ -1566,18 +1569,20 @@ def _run_cli_agent_session(
                     user_input = await _read_interactive_input_async()
                 except KeyboardInterrupt:
                     evt = _turn_done_ref[0]
+                    now = time.monotonic()
                     action = resolve_prompt_ctrl_c_action(
                         turn_done_set=evt.is_set() if evt is not None else True,
-                        sigint_last=_sigint_last[0],
-                        now=time.monotonic(),
+                        exit_armed_until=_exit_armed_until[0],
+                        now=now,
                     )
                     if action == PROMPT_CTRL_C_IGNORE:
                         continue
                     if action == PROMPT_CTRL_C_EXIT:
+                        _exit_armed_until[0] = 0.0
                         _restore_terminal()
                         console.print("\nGoodbye!")
                         return
-                    _sigint_last[0] = time.monotonic()
+                    _exit_armed_until[0] = now + CLI_DOUBLE_CTRL_C_WINDOW_SEC
                     console.print(f"\n[dim]{CLI_CTRL_C_EXIT_HINT}[/dim]")
                     continue
 
@@ -1593,7 +1598,7 @@ def _run_cli_agent_session(
                 turn_done.clear()
                 turn_response.clear()
                 turn_skills.clear()
-                _sigint_last[0] = 0.0
+                _exit_armed_until[0] = 0.0
 
                 turn_metadata = dict(inbound_metadata)
                 if verbose_mode:

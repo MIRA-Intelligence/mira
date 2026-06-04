@@ -23,23 +23,36 @@ def test_should_cancel_turn_on_sigint_when_agent_busy():
 
 
 @pytest.mark.parametrize(
-    ("turn_done_set", "sigint_last", "now", "expected"),
+    ("turn_done_set", "exit_armed_until", "now", "expected"),
     [
         (False, 0.0, 10.0, PROMPT_CTRL_C_IGNORE),
         (True, 0.0, 10.0, PROMPT_CTRL_C_SHOW_HINT),
-        (True, 8.0, 9.0, PROMPT_CTRL_C_EXIT),
-        (True, 8.0, 11.0, PROMPT_CTRL_C_SHOW_HINT),
+        (True, 12.0, 11.0, PROMPT_CTRL_C_EXIT),
+        (True, 12.0, 13.0, PROMPT_CTRL_C_SHOW_HINT),
     ],
 )
-def test_resolve_prompt_ctrl_c_action(turn_done_set, sigint_last, now, expected):
+def test_resolve_prompt_ctrl_c_action(turn_done_set, exit_armed_until, now, expected):
     assert (
         resolve_prompt_ctrl_c_action(
             turn_done_set=turn_done_set,
-            sigint_last=sigint_last,
+            exit_armed_until=exit_armed_until,
             now=now,
-            window_sec=2.0,
         )
         == expected
+    )
+
+
+def test_recent_turn_sigint_does_not_arm_prompt_exit():
+    """After interrupting a turn, the first Ctrl+C at the prompt must show a hint."""
+    now = 100.0
+    # Simulates old bug: turn interrupt stamped monotonic time recently.
+    assert (
+        resolve_prompt_ctrl_c_action(
+            turn_done_set=True,
+            exit_armed_until=0.0,
+            now=now,
+        )
+        == PROMPT_CTRL_C_SHOW_HINT
     )
 
 
