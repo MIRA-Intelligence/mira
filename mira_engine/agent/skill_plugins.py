@@ -23,6 +23,7 @@ _GLOBAL_STATE_FILENAME = "plugin_state.json"
 _PROJECT_OVERRIDES_FILENAME = "plugin_overrides.json"
 _BUILTIN_PLUGIN_ID = "builtin-skills"
 _BUILTIN_PLUGIN_NAME = "Built-in Skills"
+_BUILTIN_MANIFEST_UNCACHED = object()
 # Directories skipped when scanning built-in skills (keeps startup/interrupt responsive).
 _BUILTIN_SCAN_SKIP_DIRS = frozenset({
     ".git",
@@ -95,11 +96,11 @@ class SkillPluginManager:
         self.global_state_path = self.global_skills_dir / _GLOBAL_STATE_FILENAME
         self.project_overrides_path = self.project_skills_dir / _PROJECT_OVERRIDES_FILENAME
         self.builtin_skills_dir = Path(__file__).parent.parent / "skills"
-        self._builtin_manifest_cache: dict[str, Any] | None | object = object()
+        self._builtin_manifest_cache: dict[str, Any] | None | object = _BUILTIN_MANIFEST_UNCACHED
 
     def warm_builtin_manifest_cache(self) -> None:
         """Build and cache the built-in skill manifest (safe to call from a worker thread)."""
-        if self._builtin_manifest_cache is object():
+        if self._builtin_manifest_cache is _BUILTIN_MANIFEST_UNCACHED:
             self._builtin_manifest_cache = self._build_builtin_manifest()
 
     def _read_json(self, path: Path) -> dict[str, Any]:
@@ -165,13 +166,12 @@ class SkillPluginManager:
         )
 
     def _build_builtin_manifest(self) -> dict[str, Any] | None:
-        if self._builtin_manifest_cache is not object():
-            cached = self._builtin_manifest_cache
-            return cached if isinstance(cached, dict) else None
+        if isinstance(self._builtin_manifest_cache, dict):
+            return self._builtin_manifest_cache
 
         root = self.builtin_skills_dir
         if not root.is_dir():
-            self._builtin_manifest_cache = None
+            self._builtin_manifest_cache = _BUILTIN_MANIFEST_UNCACHED
             return None
 
         skills: list[dict[str, Any]] = []
@@ -207,7 +207,7 @@ class SkillPluginManager:
             })
 
         if not skills:
-            self._builtin_manifest_cache = None
+            self._builtin_manifest_cache = _BUILTIN_MANIFEST_UNCACHED
             return None
 
         groups = [

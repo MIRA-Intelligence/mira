@@ -470,7 +470,7 @@ async def _read_interactive_input_async() -> str:
                 HTML("<b fg='ansiblue'>You:</b> "),
             )
     except EOFError:
-        raise
+        raise KeyboardInterrupt
 
 
 
