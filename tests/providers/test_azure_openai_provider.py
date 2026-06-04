@@ -299,6 +299,20 @@ async def test_chat_reasoning_param_format():
     assert "reasoning_effort" not in call_kwargs
 
 
+def test_build_body_maps_adaptive_reasoning_effort_to_high():
+    """OpenAI-family Responses APIs do not accept Anthropic's adaptive enum."""
+    provider = AzureOpenAIProvider(
+        api_key="k", api_base="https://test.openai.azure.com", default_model="gpt-5-chat",
+    )
+
+    body = provider._build_body(
+        [{"role": "user", "content": "think"}], reasoning_effort="adaptive",
+    )
+
+    assert body["reasoning"] == {"effort": "high"}
+    assert "reasoning_effort" not in body
+
+
 # ---------------------------------------------------------------------------
 # chat_stream()
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from oauth_cli_kit import get_token as get_codex_token
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
+from mira_engine.providers.openai_responses import normalize_openai_reasoning_effort
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "mira"
@@ -79,8 +80,9 @@ class OpenAICodexProvider(LLMProvider):
                 "parallel_tool_calls": True,
             }
 
-            if reasoning_effort:
-                body["reasoning"] = {"effort": reasoning_effort}
+            normalized_reasoning_effort = normalize_openai_reasoning_effort(reasoning_effort)
+            if normalized_reasoning_effort:
+                body["reasoning"] = {"effort": normalized_reasoning_effort}
 
             if tools:
                 body["tools"] = _convert_tools(tools)

@@ -13,6 +13,7 @@ from mira_engine.providers.openai_responses import (
     consume_sdk_stream,
     convert_messages,
     convert_tools,
+    normalize_openai_reasoning_effort,
     parse_response_output,
 )
 
@@ -80,6 +81,7 @@ class AzureOpenAIProvider(LLMProvider):
             _AZURE_MSG_KEYS,
         )
         system_prompt, input_items = convert_messages(prepared)
+        normalized_reasoning_effort = normalize_openai_reasoning_effort(reasoning_effort)
 
         body: dict[str, Any] = {
             "model": deployment_name,
@@ -90,10 +92,10 @@ class AzureOpenAIProvider(LLMProvider):
         if system_prompt:
             body["instructions"] = system_prompt
 
-        if self._supports_temperature(deployment_name, reasoning_effort):
+        if self._supports_temperature(deployment_name, normalized_reasoning_effort):
             body["temperature"] = temperature
-        if reasoning_effort:
-            body["reasoning"] = {"effort": reasoning_effort}
+        if normalized_reasoning_effort:
+            body["reasoning"] = {"effort": normalized_reasoning_effort}
             body["include"] = ["reasoning.encrypted_content"]
         if tools:
             body["tools"] = convert_tools(tools)

@@ -112,3 +112,31 @@ async def test_openai_codex_chat_prepares_oauth_state_before_getting_token(monke
 
     assert response.content == "ok"
     assert calls == ["prepare"]
+
+
+@pytest.mark.asyncio
+async def test_openai_codex_chat_maps_adaptive_reasoning_effort(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_request_codex(_url, _headers, body, **_kwargs):
+        captured["body"] = body
+        return "ok", [], "stop"
+
+    monkeypatch.setattr(codex_provider, "ensure_oauth_state_dirs_for_runtime", lambda: None)
+    monkeypatch.setattr(
+        codex_provider,
+        "get_codex_token",
+        lambda: SimpleNamespace(access="access-token", account_id="account-id"),
+    )
+    monkeypatch.setattr(codex_provider, "_request_codex", fake_request_codex)
+
+    provider = OpenAICodexProvider()
+    response = await provider.chat(
+        [{"role": "user", "content": "hi"}],
+        reasoning_effort="adaptive",
+    )
+
+    assert response.content == "ok"
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["reasoning"] == {"effort": "high"}
