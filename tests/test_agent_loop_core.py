@@ -68,8 +68,11 @@ class _SlowEchoTool(_EchoTool):
 
 
 class _RuntimeStub:
-    def __init__(self, responses: list[LLMResponse]):
+    def __init__(self, responses: list[LLMResponse], stream_deltas: list[str] | None = None):
         self._responses = list(responses)
+        self.stream_deltas = list(stream_deltas or [])
+        self.chat_calls = 0
+        self.stream_calls = 0
         self.route = RoutedModel(
             tier="small",
             model="dummy/default",
@@ -83,10 +86,23 @@ class _RuntimeStub:
         return object(), self.route
 
     async def chat(self, route: RoutedModel, **kwargs: Any):
+        self.chat_calls += 1
         if self._responses:
             response = self._responses.pop(0)
         else:
             response = LLMResponse(content="done")
+        return response, route
+
+    async def chat_stream_with_retry(self, route: RoutedModel, **kwargs: Any):
+        self.stream_calls += 1
+        on_content_delta = kwargs.get("on_content_delta")
+        if on_content_delta is not None:
+            for delta in self.stream_deltas:
+                await on_content_delta(delta)
+        if self._responses:
+            response = self._responses.pop(0)
+        else:
+            response = LLMResponse(content="".join(self.stream_deltas) or "done")
         return response, route
 
 
@@ -298,6 +314,32 @@ async def test_run_agent_loop_tool_call_and_finish(tmp_path: Path) -> None:
     assert any(item[0] == "working" for item in progress)
     assert any(item[1] for item in progress)
     assert any(m.get("role") == "tool" for m in messages)
+
+
+async def test_run_agent_loop_streams_when_routed_runtime_is_active(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    runtime = _RuntimeStub([LLMResponse(content="Hello world")], stream_deltas=["Hel", "lo", " world"])
+    deltas: list[str] = []
+    stream_end_calls: list[bool] = []
+
+    async def _on_stream(delta: str) -> None:
+        deltas.append(delta)
+
+    async def _on_stream_end(*, resuming: bool = False) -> None:
+        stream_end_calls.append(resuming)
+
+    final, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=runtime,  # type: ignore[arg-type]
+        on_stream=_on_stream,
+        on_stream_end=_on_stream_end,
+    )
+
+    assert final == "Hello world"
+    assert deltas == ["Hel", "lo", " world"]
+    assert stream_end_calls == [False]
+    assert runtime.stream_calls == 1
+    assert runtime.chat_calls == 0
 
 
 async def test_run_agent_loop_keeps_long_tool_visibly_active(
