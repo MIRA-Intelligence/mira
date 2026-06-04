@@ -767,6 +767,7 @@ class BaseAgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        await self._warm_skill_scan_cache()
         logger.info("Agent loop started")
 
         while self._running:
@@ -883,6 +884,10 @@ class BaseAgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
+            except KeyboardInterrupt:
+                raise asyncio.CancelledError() from None
+            except SystemExit:
+                raise asyncio.CancelledError() from None
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
                 err_text = "Sorry, I encountered an error."
@@ -907,6 +912,10 @@ class BaseAgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
+            except KeyboardInterrupt:
+                raise asyncio.CancelledError() from None
+            except SystemExit:
+                raise asyncio.CancelledError() from None
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
                 err_text = "Sorry, I encountered an error."
@@ -917,6 +926,17 @@ class BaseAgentLoop:
                     content=err_text,
                     metadata=dict(msg.metadata or {}),
                 ))
+
+    async def _warm_skill_scan_cache(self) -> None:
+        """Pre-scan built-in skills off the event loop so Ctrl+C stays responsive."""
+        skills = getattr(getattr(self, "context", None), "skills", None)
+        plugin_manager = getattr(skills, "plugin_manager", None) if skills else None
+        if plugin_manager is None:
+            return
+        try:
+            await asyncio.to_thread(plugin_manager.warm_builtin_manifest_cache)
+        except Exception:
+            logger.debug("Skill manifest warmup failed", exc_info=True)
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""

@@ -231,6 +231,69 @@ def _coerce_model_for_provider(model: str, provider_name: str) -> str:
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
 
+CLI_CTRL_C_EXIT_HINT = "Press Ctrl+C again to quit"
+CLI_DOUBLE_CTRL_C_WINDOW_SEC = 2.0
+
+PROMPT_CTRL_C_IGNORE = "ignore"
+PROMPT_CTRL_C_SHOW_HINT = "show_hint"
+PROMPT_CTRL_C_EXIT = "exit"
+
+
+def resolve_prompt_ctrl_c_action(
+    *,
+    turn_done_set: bool,
+    sigint_last: float,
+    now: float,
+    window_sec: float = CLI_DOUBLE_CTRL_C_WINDOW_SEC,
+) -> str:
+    """Classify Ctrl+C at the ``You:`` prompt (ignore / hint / exit)."""
+    if not turn_done_set:
+        return PROMPT_CTRL_C_IGNORE
+    if sigint_last and now - sigint_last < window_sec:
+        return PROMPT_CTRL_C_EXIT
+    return PROMPT_CTRL_C_SHOW_HINT
+
+
+def should_cancel_turn_on_sigint(*, turn_done_set: bool) -> bool:
+    """Return True when SIGINT should cancel the in-flight agent turn."""
+    return not turn_done_set
+
+
+async def interrupt_cli_agent_turn(
+    *,
+    turn_done: asyncio.Event,
+    turn_response: list[str],
+    turn_skills: set[str],
+    dispatch_tasks: list[asyncio.Task],
+    cancel_subagents: object | None = None,
+    on_interrupted: object | None = None,
+    cancel_timeout: float = 1.0,
+) -> None:
+    """Stop the current CLI turn: unblock the prompt and cancel dispatch tasks."""
+    if not turn_done.is_set():
+        turn_response.clear()
+        turn_skills.clear()
+        turn_done.set()
+        if on_interrupted is not None:
+            on_interrupted()
+    for task in dispatch_tasks:
+        if not task.done():
+            task.cancel()
+    if dispatch_tasks:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*dispatch_tasks, return_exceptions=True),
+                timeout=cancel_timeout,
+            )
+        except asyncio.TimeoutError:
+            pass
+    if cancel_subagents is not None:
+        try:
+            await cancel_subagents()  # type: ignore[misc]
+        except Exception:
+            pass
+
+
 _PROMPT_SESSION: PromptSession | None = None
 _SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
 
@@ -406,8 +469,8 @@ async def _read_interactive_input_async() -> str:
             return await _PROMPT_SESSION.prompt_async(
                 HTML("<b fg='ansiblue'>You:</b> "),
             )
-    except EOFError as exc:
-        raise KeyboardInterrupt from exc
+    except EOFError:
+        raise
 
 
 
@@ -1337,7 +1400,8 @@ def _run_cli_agent_session(
     from mira_engine.bus.events import InboundMessage
     _init_prompt_session()
     banner = interactive_banner or (
-        f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C x2[/bold] to quit)\n"
+        f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to interrupt, "
+        "[bold]Ctrl+C x2[/bold] at prompt to quit)\n"
     )
     console.print(banner)
 
@@ -1346,13 +1410,52 @@ def _run_cli_agent_session(
     else:
         cli_channel, cli_chat_id = "cli", session_id
 
-    # Double-Ctrl+C to exit: first interrupt, second quits.
+    # Double-Ctrl+C to exit.
+    # First Ctrl+C: cancels the current agent turn (interrupts the request).
+    # Second Ctrl+C within 2 s: exits the session entirely.
     _sigint_last = [0.0]
+    _cli_session_key = f"{cli_channel}:{cli_chat_id}"
+    _turn_done_ref: list[asyncio.Event | None] = [None]
+    _loop_ref: list[asyncio.AbstractEventLoop | None] = [None]
+    _cancel_turn_ref: list = [None]
+    _shutdown_ref: list = [None]
 
-    signal.signal(signal.SIGINT, signal.default_int_handler)
-    signal.signal(signal.SIGTERM, _handle_signal)
+    class _CliSessionExit(Exception):
+        """Raised to end the interactive loop without sys.exit() in a signal handler."""
+
+    def _schedule_on_loop(coro_factory) -> None:
+        loop = _loop_ref[0]
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(lambda: loop.create_task(coro_factory()))
+
+    def _handle_sigint(signum, frame):
+        now = time.monotonic()
+        evt = _turn_done_ref[0]
+        at_prompt = evt is None or evt.is_set()
+        cancel_turn = _cancel_turn_ref[0]
+        if should_cancel_turn_on_sigint(turn_done_set=not at_prompt) and cancel_turn is not None:
+            _sigint_last[0] = now
+            # Agent turn in progress — cancel on the event loop; never sys.exit here.
+            _schedule_on_loop(cancel_turn)
+            return
+        # At the prompt — first/second press handled in the KeyboardInterrupt handler below.
+        raise KeyboardInterrupt
+
+    def _handle_term(signum, frame):
+        shutdown = _shutdown_ref[0]
+        if shutdown is not None:
+            _schedule_on_loop(shutdown)
+            return
+        _restore_terminal()
+        sig_name = signal.Signals(signum).name
+        console.print(f"\nReceived {sig_name}, goodbye!")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    signal.signal(signal.SIGTERM, _handle_term)
     if hasattr(signal, 'SIGHUP'):
-        signal.signal(signal.SIGHUP, _handle_signal)
+        signal.signal(signal.SIGHUP, _handle_term)
     if hasattr(signal, 'SIGPIPE'):
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     if hasattr(signal, 'SIGTTOU'):
@@ -1361,11 +1464,62 @@ def _run_cli_agent_session(
         signal.signal(signal.SIGTTIN, signal.SIG_IGN)
 
     async def run_interactive():
+        _loop_ref[0] = asyncio.get_running_loop()
         bus_task = asyncio.create_task(agent_loop.run())
         turn_done = asyncio.Event()
+        _turn_done_ref[0] = turn_done
         turn_done.set()
         turn_response: list[str] = []
         turn_skills: set[str] = set()
+
+        async def _collect_dispatch_tasks() -> list[asyncio.Task]:
+            tasks = list(agent_loop._active_tasks.get(_cli_session_key, []))
+            if not tasks:
+                tasks = [
+                    t
+                    for task_list in agent_loop._active_tasks.values()
+                    for t in task_list
+                    if not t.done()
+                ]
+            return tasks
+
+        _cancel_turn_in_flight = [False]
+
+        async def _cancel_current_turn() -> None:
+            """Cancel in-flight agent work for this CLI session (like /stop)."""
+            if _cancel_turn_in_flight[0]:
+                return
+            _cancel_turn_in_flight[0] = True
+            try:
+                await _cancel_current_turn_body()
+            finally:
+                _cancel_turn_in_flight[0] = False
+
+        async def _cancel_current_turn_body() -> None:
+            tasks = await _collect_dispatch_tasks()
+
+            async def _cancel_subagents() -> None:
+                await agent_loop.subagents.cancel_by_session(_cli_session_key)
+
+            await interrupt_cli_agent_turn(
+                turn_done=turn_done,
+                turn_response=turn_response,
+                turn_skills=turn_skills,
+                dispatch_tasks=tasks,
+                cancel_subagents=_cancel_subagents,
+                on_interrupted=lambda: console.print("\n\n[dim]Interrupted[/dim]"),
+            )
+            _sigint_last[0] = 0.0
+
+        _cancel_turn_ref[0] = _cancel_current_turn
+
+        async def _shutdown_cli_session() -> None:
+            await _cancel_current_turn()
+            _restore_terminal()
+            console.print("\nGoodbye!")
+            raise _CliSessionExit()
+
+        _shutdown_ref[0] = _shutdown_cli_session
 
         async def _consume_outbound():
             while True:
@@ -1381,6 +1535,8 @@ def _run_cli_agent_session(
                                     console.print(f"  [cyan]↳ skill:[/cyan] {skill_name}")
                         continue
                     if msg.metadata.get("_progress"):
+                        if turn_done.is_set():
+                            continue
                         is_tool_hint = msg.metadata.get("_tool_hint", False)
                         ch = agent_loop.channels_config
                         if ch and is_tool_hint and not ch.send_tool_hints:
@@ -1405,60 +1561,69 @@ def _run_cli_agent_session(
 
         try:
             while True:
+                _flush_pending_tty_input()
                 try:
-                    _flush_pending_tty_input()
                     user_input = await _read_interactive_input_async()
-                    command = user_input.strip()
-                    if not command:
-                        continue
-
-                    if _is_exit_command(command):
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
-
-                    turn_done.clear()
-                    turn_response.clear()
-                    turn_skills.clear()
-
-                    turn_metadata = dict(inbound_metadata)
-                    if verbose_mode:
-                        turn_metadata["_emit_skill_audit"] = True
-
-                    await bus.publish_inbound(InboundMessage(
-                        channel=cli_channel,
-                        sender_id="user",
-                        chat_id=cli_chat_id,
-                        content=user_input,
-                        metadata=turn_metadata,
-                    ))
-
-                    with _thinking_ctx():
-                        await turn_done.wait()
-
-                    if turn_response:
-                        _print_agent_response(turn_response[0], render_markdown=markdown)
-                    if verbose_mode:
-                        used = ", ".join(sorted(turn_skills)) if turn_skills else "none"
-                        console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
                 except KeyboardInterrupt:
-                    now = time.monotonic()
-                    if _sigint_last[0] and now - _sigint_last[0] < 2.0:
+                    evt = _turn_done_ref[0]
+                    action = resolve_prompt_ctrl_c_action(
+                        turn_done_set=evt.is_set() if evt is not None else True,
+                        sigint_last=_sigint_last[0],
+                        now=time.monotonic(),
+                    )
+                    if action == PROMPT_CTRL_C_IGNORE:
+                        continue
+                    if action == PROMPT_CTRL_C_EXIT:
                         _restore_terminal()
                         console.print("\nGoodbye!")
-                        break
-                    _sigint_last[0] = now
-                    console.print("\n[yellow]Interrupt — press Ctrl+C again to quit[/yellow]")
+                        return
+                    _sigint_last[0] = time.monotonic()
+                    console.print(f"\n[dim]{CLI_CTRL_C_EXIT_HINT}[/dim]")
                     continue
-                except EOFError:
+
+                command = user_input.strip()
+                if not command:
+                    continue
+
+                if _is_exit_command(command):
                     _restore_terminal()
                     console.print("\nGoodbye!")
-                    break
+                    return
+
+                turn_done.clear()
+                turn_response.clear()
+                turn_skills.clear()
+                _sigint_last[0] = 0.0
+
+                turn_metadata = dict(inbound_metadata)
+                if verbose_mode:
+                    turn_metadata["_emit_skill_audit"] = True
+
+                await bus.publish_inbound(InboundMessage(
+                    channel=cli_channel,
+                    sender_id="user",
+                    chat_id=cli_chat_id,
+                    content=user_input,
+                    metadata=turn_metadata,
+                ))
+
+                with _thinking_ctx():
+                    await turn_done.wait()
+
+                if turn_response:
+                    _print_agent_response(turn_response[0], render_markdown=markdown)
+                if verbose_mode:
+                    used = ", ".join(sorted(turn_skills)) if turn_skills else "none"
+                    console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
+        except _CliSessionExit:
+            pass
+        except EOFError:
+            _restore_terminal()
+            console.print("\nGoodbye!")
         finally:
-            agent_loop.stop()
             outbound_task.cancel()
+            bus_task.cancel()
             await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-            await agent_loop.close_mcp()
 
     asyncio.run(run_interactive())
 
@@ -1659,7 +1824,7 @@ def research(
     banner = (
         f"{__logo__} Research mode "
         f"(mode=[bold]{mode_value}[/bold], profile=[bold]{profile_value}[/bold]) "
-        "(type [bold]exit[/bold] or [bold]Ctrl+C x2[/bold] to quit)\n"
+        "(type [bold]exit[/bold], [bold]Ctrl+C[/bold] to interrupt, [bold]Ctrl+C x2[/bold] at prompt to quit)\n"
     )
     _run_cli_agent_session(
         agent_loop=agent_loop,

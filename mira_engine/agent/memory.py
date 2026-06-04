@@ -739,7 +739,9 @@ class Consolidator:
                 self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
             )
             target = budget // 2
-            estimated, source = self.estimate_session_prompt_tokens(session)
+            estimated, source = await asyncio.to_thread(
+                self.estimate_session_prompt_tokens, session
+            )
             if estimated <= 0 or estimated < budget:
                 return
 
@@ -771,7 +773,9 @@ class Consolidator:
                     return
                 session.last_consolidated = end_idx
                 self.sessions.save(session)
-                estimated, source = self.estimate_session_prompt_tokens(session)
+                estimated, source = await asyncio.to_thread(
+                    self.estimate_session_prompt_tokens, session
+                )
                 if estimated <= 0:
                     return
 
