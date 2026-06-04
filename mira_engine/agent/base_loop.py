@@ -804,6 +804,7 @@ class BaseAgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        await self._warm_skill_scan_cache()
         logger.info("Agent loop started")
 
         while self._running:
@@ -840,7 +841,48 @@ class BaseAgentLoop:
                 )
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(effective_key, []).append(task)
-                task.add_done_callback(lambda t, k=effective_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                task.add_done_callback(self._make_dispatch_done_callback(msg, effective_key))
+
+    def _make_dispatch_done_callback(
+        self, msg: InboundMessage, effective_key: str
+    ):
+        """Drop finished tasks and publish a CLI-facing error if dispatch crashed."""
+
+        def _callback(task: asyncio.Task) -> None:
+            active = self._active_tasks.get(effective_key, [])
+            if task in active:
+                active.remove(task)
+            if task.cancelled():
+                return
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is None:
+                return
+            logger.exception(
+                "Unhandled error in dispatch for session {}", msg.session_key
+            )
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            loop.create_task(self._publish_dispatch_failure(msg))
+
+        return _callback
+
+    async def _publish_dispatch_failure(self, msg: InboundMessage) -> None:
+        err_text = "Sorry, I encountered an error."
+        if msg.channel == "cli":
+            err_text += " Run `mira agent --logs` to view details."
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=err_text,
+                metadata=dict(msg.metadata or {}),
+            )
+        )
 
     async def _handle_control(self, msg: InboundMessage, control: str) -> bool:
         """Hook for subclasses to handle ``_control`` metadata messages.
@@ -920,6 +962,10 @@ class BaseAgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
+            except KeyboardInterrupt:
+                raise asyncio.CancelledError() from None
+            except SystemExit:
+                raise asyncio.CancelledError() from None
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
                 err_text = "Sorry, I encountered an error."
@@ -944,6 +990,10 @@ class BaseAgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
+            except KeyboardInterrupt:
+                raise asyncio.CancelledError() from None
+            except SystemExit:
+                raise asyncio.CancelledError() from None
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
                 err_text = "Sorry, I encountered an error."
@@ -954,6 +1004,17 @@ class BaseAgentLoop:
                     content=err_text,
                     metadata=dict(msg.metadata or {}),
                 ))
+
+    async def _warm_skill_scan_cache(self) -> None:
+        """Pre-scan built-in skills off the event loop so Ctrl+C stays responsive."""
+        skills = getattr(getattr(self, "context", None), "skills", None)
+        plugin_manager = getattr(skills, "plugin_manager", None) if skills else None
+        if plugin_manager is None:
+            return
+        try:
+            await asyncio.to_thread(plugin_manager.warm_builtin_manifest_cache)
+        except Exception:
+            logger.debug("Skill manifest warmup failed", exc_info=True)
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
