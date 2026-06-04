@@ -1713,6 +1713,59 @@ async def test_handle_upload_project_files_writes_data_files(ui_channel: UiChann
     assert (data_dir / "sample_1.csv").read_bytes() == b"c,d\n"
 
 
+async def test_handle_upload_project_files_preserves_data_directory_paths(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0002"}
+    req.query = {}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="dataset/tables/a.csv", chunks=[b"a,b\n"]),
+        _FakePart(name="files", filename="dataset/tables/a.csv", chunks=[b"c,d\n"]),
+        _FakePart(name="files", filename="dataset/notes/readme.txt", chunks=[b"ok"]),
+    ]))
+
+    resp = await ui_channel._handle_upload_project_files(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["uploaded"] == [
+        {"name": "a.csv", "path": "data/dataset/tables/a.csv", "size": 4},
+        {"name": "a_1.csv", "path": "data/dataset/tables/a_1.csv", "size": 4},
+        {"name": "readme.txt", "path": "data/dataset/notes/readme.txt", "size": 2},
+    ]
+
+    data_dir = ui_channel.projects_root / "PRJ-0002" / "data"
+    assert (data_dir / "dataset" / "tables" / "a.csv").read_bytes() == b"a,b\n"
+    assert (data_dir / "dataset" / "tables" / "a_1.csv").read_bytes() == b"c,d\n"
+    assert (data_dir / "dataset" / "notes" / "readme.txt").read_bytes() == b"ok"
+
+
+async def test_handle_upload_project_files_rejects_data_path_traversal(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0003"}
+    req.query = {}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="../escape.csv", chunks=[b"bad"]),
+    ]))
+
+    resp = await ui_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "unsafe upload path: ../escape.csv"}
+    assert not (ui_channel.projects_root / "escape.csv").exists()
+
+
+async def test_handle_upload_project_files_rejects_absolute_data_paths(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0004"}
+    req.query = {}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="/tmp/escape.csv", chunks=[b"bad"]),
+    ]))
+
+    resp = await ui_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "unsafe upload path: /tmp/escape.csv"}
+    assert not (ui_channel.projects_root / "PRJ-0004" / "data" / "tmp").exists()
+
+
 async def test_handle_upload_project_files_references_extracts_zip(
     ui_channel: UiChannel,
 ) -> None:
