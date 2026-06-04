@@ -630,6 +630,28 @@ def _safe_upload_name(filename: str) -> str:
     return Path(filename).name.strip().replace("\x00", "")
 
 
+def _safe_upload_relative_parts(filename: str) -> list[str] | None:
+    """Normalize a browser-provided upload path without allowing traversal."""
+    normalized = filename.replace("\\", "/").replace("\x00", "")
+    if len(normalized) >= 3 and normalized[1] == ":" and normalized[2] == "/":
+        return None
+    raw = Path(normalized)
+    if raw.is_absolute():
+        return None
+
+    safe_parts: list[str] = []
+    for part in raw.parts:
+        clean = part.strip()
+        if clean in {"", "."}:
+            continue
+        if clean == "..":
+            return None
+        safe_parts.append(clean)
+    if not safe_parts:
+        return None
+    return safe_parts
+
+
 def _next_available_path(base_dir: Path, filename: str) -> Path:
     """Return a non-colliding destination path inside *base_dir*."""
     candidate = base_dir / filename
@@ -644,6 +666,32 @@ def _next_available_path(base_dir: Path, filename: str) -> Path:
         if not alt.exists():
             return alt
         idx += 1
+
+
+def _resolve_upload_destination(
+    upload_dir: Path,
+    filename: str,
+    *,
+    preserve_relative_path: bool,
+) -> Path | None:
+    """Return a safe destination for a multipart upload part."""
+    if not preserve_relative_path:
+        safe_name = _safe_upload_name(filename)
+        return _next_available_path(upload_dir, safe_name) if safe_name else None
+
+    safe_parts = _safe_upload_relative_parts(filename)
+    if not safe_parts:
+        return None
+
+    parent = upload_dir.joinpath(*safe_parts[:-1])
+    root_resolved = upload_dir.resolve()
+    try:
+        parent_resolved = parent.resolve(strict=False)
+        parent_resolved.relative_to(root_resolved)
+    except (OSError, ValueError):
+        return None
+
+    return _next_available_path(parent, safe_parts[-1])
 
 
 def _next_available_dir(base_dir: Path, dirname: str) -> Path:
@@ -2660,12 +2708,22 @@ class UiChannel(BaseChannel):
                 await part.release()
                 continue
 
-            safe_name = _safe_upload_name(part.filename)
-            if not safe_name:
+            preserve_relative_path = target == "data"
+            destination = _resolve_upload_destination(
+                upload_dir,
+                part.filename,
+                preserve_relative_path=preserve_relative_path,
+            )
+            if destination is None:
                 await part.release()
+                if preserve_relative_path:
+                    return web.json_response(
+                        {"error": f"unsafe upload path: {part.filename}"},
+                        status=400,
+                    )
                 continue
             if target == "references":
-                suffix = Path(safe_name).suffix.lower()
+                suffix = destination.suffix.lower()
                 if suffix not in {".pdf", ".zip"}:
                     return web.json_response(
                         {
@@ -2676,9 +2734,9 @@ class UiChannel(BaseChannel):
                         status=400,
                     )
 
-            destination = _next_available_path(upload_dir, safe_name)
             size = 0
             try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 with destination.open("wb") as f:
                     while True:
                         chunk = await part.read_chunk()
