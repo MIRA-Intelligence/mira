@@ -338,6 +338,39 @@ async def test_direct_openai_reasoning_prefers_responses_api() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_openai_adaptive_reasoning_maps_to_high() -> None:
+    mock_chat = AsyncMock(return_value=_fake_chat_response())
+    mock_responses = AsyncMock(return_value=_fake_responses_response("reasoned"))
+    spec = find_by_name("openai")
+
+    with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+        client_instance = MockClient.return_value
+        client_instance.chat.completions.create = mock_chat
+        client_instance.responses.create = mock_responses
+
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            default_model="gpt-4o",
+            spec=spec,
+        )
+        await provider.chat(
+            messages=[{"role": "user", "content": "hello"}],
+            model="gpt-4o",
+            reasoning_effort="adaptive",
+        )
+
+    mock_responses.assert_awaited_once()
+    mock_chat.assert_not_awaited()
+    call_kwargs = mock_responses.call_args.kwargs
+    assert call_kwargs["reasoning"] == {"effort": "high"}
+
+
+def test_openrouter_adaptive_reasoning_maps_to_high_for_chat_completions() -> None:
+    kw = _build_kwargs_for("openrouter", "openai/gpt-5", reasoning_effort="adaptive")
+    assert kw["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
 async def test_direct_openai_gpt4o_stays_on_chat_completions() -> None:
     mock_chat = AsyncMock(return_value=_fake_chat_response())
     mock_responses = AsyncMock(return_value=_fake_responses_response())

@@ -30,6 +30,7 @@ from mira_engine.providers.openai_responses import (
     consume_sdk_stream,
     convert_messages,
     convert_tools,
+    normalize_openai_reasoning_effort,
     parse_response_output,
 )
 
@@ -312,6 +313,7 @@ class OpenAICompatProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None,
     ) -> dict[str, Any]:
         model_name = model or self.default_model
+        reasoning_effort = normalize_openai_reasoning_effort(reasoning_effort)
         spec = self._spec
 
         if spec and spec.supports_prompt_caching:
@@ -468,6 +470,7 @@ class OpenAICompatProvider(LLMProvider):
     ) -> dict[str, Any]:
         """Build a Responses API body for direct OpenAI requests."""
         model_name = model or self.default_model
+        reasoning_effort = normalize_openai_reasoning_effort(reasoning_effort)
         sanitized_messages = self._sanitize_messages(self._sanitize_empty_content(messages))
         instructions, input_items = convert_messages(sanitized_messages)
 
@@ -904,6 +907,7 @@ class OpenAICompatProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         try:
+            reasoning_effort = normalize_openai_reasoning_effort(reasoning_effort)
             if self._should_use_responses_api(model, reasoning_effort):
                 try:
                     body = self._build_responses_body(
@@ -936,6 +940,7 @@ class OpenAICompatProvider(LLMProvider):
     ) -> LLMResponse:
         idle_timeout_s = int(os.environ.get("MIRA_STREAM_IDLE_TIMEOUT_S", "90"))
         try:
+            reasoning_effort = normalize_openai_reasoning_effort(reasoning_effort)
             if self._should_use_responses_api(model, reasoning_effort):
                 try:
                     body = self._build_responses_body(

@@ -16,6 +16,26 @@ from mira_engine.providers.openai_responses.parsing import (
     map_finish_reason,
     parse_response_output,
 )
+from mira_engine.providers.openai_responses.reasoning import normalize_openai_reasoning_effort
+
+
+# ======================================================================
+# reasoning effort normalization
+# ======================================================================
+
+
+@pytest.mark.parametrize("raw", [None, "", " ", "none", "NoNe"])
+def test_normalize_openai_reasoning_effort_disables_empty_values(raw) -> None:
+    assert normalize_openai_reasoning_effort(raw) is None
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "max", "xhigh"])
+def test_normalize_openai_reasoning_effort_preserves_openai_values(effort: str) -> None:
+    assert normalize_openai_reasoning_effort(effort) == effort
+
+
+def test_normalize_openai_reasoning_effort_maps_adaptive_to_high() -> None:
+    assert normalize_openai_reasoning_effort("adaptive") == "high"
 
 
 # ======================================================================
