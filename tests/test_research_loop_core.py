@@ -21,6 +21,7 @@ from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.config.schema import ChannelsConfig, ExecToolConfig
+from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider, LLMResponse
 from mira_engine.session.manager import SessionManager
 
@@ -197,7 +198,8 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     project = tmp_path / "PRJ-1"
     project.mkdir()
     (project / "task_plan.json").write_text(
-        json.dumps({"experiments": [{"status": "pending"}]}), encoding="utf-8"
+        json.dumps({"plan": {"phase": "approved"}, "experiments": [{"status": "pending"}]}),
+        encoding="utf-8",
     )
     loaded = ResearchAgentLoop._load_task_plan(str(project))
     assert loaded is not None
@@ -210,6 +212,37 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         final_content="all good",
         auto_round=0,
     ) is True
+    missing_plan_project = tmp_path / "PRJ-missing-plan"
+    missing_plan_project.mkdir()
+    (missing_plan_project / "task_plan.json").write_text(
+        json.dumps({"experiments": [{"status": "pending"}]}),
+        encoding="utf-8",
+    )
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(missing_plan_project),
+        final_content="all good",
+        auto_round=0,
+    )
+    assert decision is False
+    assert reason == "awaiting plan approval"
+    (missing_plan_project / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "plan": {"phase": "draft"},
+                "experiments": [{"status": "pending"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(missing_plan_project),
+        final_content="all good",
+        auto_round=0,
+    )
+    assert decision is False
+    assert reason == "awaiting plan approval"
     # PR 2 follow-up: research auto mode no longer filters on channel — any
     # channel reaching ResearchAgentLoop is by definition the research surface.
     assert loop._should_continue_auto_ui(
@@ -265,6 +298,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (compat_project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {
                         "id": "Exp001",
@@ -318,6 +352,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {"status": "completed", "results": {"metrics": {"Dice": 0.78}}}
                     for _ in range(7)
@@ -337,6 +372,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {"status": "completed", "results": {"metrics": {"Dice": 0.78}}}
                     for _ in range(8)
@@ -366,6 +402,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {"status": "completed", "results": {"metrics": {"Dice": 0.78}}}
                 ]
@@ -385,6 +422,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {
                         "status": "completed",
@@ -452,7 +490,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert decision is False
     assert reason == "failure heuristic matched"
     (project / "task_plan.json").write_text(
-        json.dumps({"experiments": [{"status": "pending"}]}),
+        json.dumps({"plan": {"phase": "approved"}, "experiments": [{"status": "pending"}]}),
         encoding="utf-8",
     )
     decision, reason = loop._evaluate_continuation(
@@ -967,6 +1005,36 @@ async def test_run_main_loop_dispatches_set_mode_control(monkeypatch, tmp_path: 
     assert loop._running is False
     assert len(set_mode_calls) == 1
     assert set_mode_calls[0].metadata.get("run_mode") == "auto"
+
+
+async def test_set_mode_control_uses_project_scoped_key(tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+    project_dir = tmp_path / "projects" / "alpha"
+    project_dir.mkdir(parents=True)
+
+    await loop._handle_set_mode(
+        InboundMessage(
+            channel="ui",
+            sender_id="u",
+            chat_id="PRJ-X",
+            content="",
+            metadata={
+                "_control": "set_mode",
+                "run_mode": "auto",
+                "project_id": "alpha",
+                "project_dir": str(project_dir),
+            },
+        )
+    )
+
+    scoped_key = loop._scoped_session_key(
+        ProjectRef(project_id="alpha", project_dir=project_dir.resolve(), metadata={}),
+        "ui:PRJ-X",
+    )
+    assert loop._session_run_modes == {scoped_key: "auto"}
+    ack = await loop.bus.consume_outbound()
+    assert ack.metadata["project_id"] == "alpha"
+    assert ack.metadata["project_dir"] == str(project_dir.resolve())
 
 
 async def test_session_reset_drops_research_state(tmp_path: Path) -> None:

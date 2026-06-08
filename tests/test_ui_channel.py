@@ -1552,6 +1552,71 @@ async def test_handle_list_projects_only_returns_prj_with_meta(ui_channel: UiCha
     assert meta["contract_version"] == 1
 
 
+async def test_handle_create_project_registers_custom_parent(ui_channel: UiChannel, tmp_path: Path) -> None:
+    parent = tmp_path / "chosen-parent"
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={
+        "project_id": "lung-ct-baseline",
+        "display_name": "Lung CT Baseline",
+        "project_parent_dir": str(parent),
+        "run_mode": "manual",
+        "agent_profile": "research",
+        "contract_version": 2,
+    })
+
+    resp = await ui_channel._handle_create_project(req)
+    body = json.loads(resp.text)
+
+    assert resp.status == 201
+    assert body["id"] == "lung-ct-baseline"
+    assert body["display_name"] == "Lung CT Baseline"
+    assert body["project_dir"] == str((parent / "lung-ct-baseline").resolve())
+    assert body["run_mode"] == "manual"
+    assert body["agent_profile"] == "research"
+    assert body["contract_version"] == 2
+
+    workspace_file = ui_channel._project_workspace_path
+    registry = json.loads(workspace_file.read_text(encoding="utf-8"))
+    assert registry["projects"][0]["id"] == "lung-ct-baseline"
+
+    list_resp = await ui_channel._handle_list_projects(MagicMock(spec=web.Request))
+    list_body = json.loads(list_resp.text)
+    assert [item["id"] for item in list_body["projects"]] == ["lung-ct-baseline"]
+
+
+async def test_handle_create_project_managed_mode_ignores_client_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = MagicMock(spec=UiChannelConfig)
+    config.project_storage = "managed"
+    config.managed_project_root = str(tmp_path / "managed")
+    bus = MagicMock(spec=MessageBus)
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setattr(
+        ui_channel_mod,
+        "get_runtime_subdir",
+        lambda name: (runtime_root / name).mkdir(parents=True, exist_ok=True) or (runtime_root / name),
+    )
+    with patch.object(BaseChannel, "__init__", _minimal_base_init):
+        with patch.object(ui_channel_mod, "_load_ui_instructions", return_value=""):
+            ch = UiChannel(config, bus, workspace=tmp_path / "local")
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={
+        "project_id": "cloud-project",
+        "display_name": "Cloud Project",
+        "project_parent_dir": str(tmp_path / "client-choice"),
+    })
+
+    resp = await ch._handle_create_project(req)
+    body = json.loads(resp.text)
+
+    assert resp.status == 201
+    assert body["project_dir"] == str((tmp_path / "managed" / "cloud-project").resolve())
+    assert ch._project_location_payload()["custom_dir_allowed"] is False
+
+
 async def test_handle_project_meta_updates_display_name(ui_channel: UiChannel) -> None:
     project_dir = ui_channel.projects_root / "PRJ-0001"
     project_dir.mkdir(parents=True)

@@ -237,6 +237,8 @@ class UiChannelConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     feedback: UiFeedbackConfig = Field(default_factory=UiFeedbackConfig)
+    project_storage: Literal["user_selectable", "managed"] = "user_selectable"
+    managed_project_root: str | None = None
 
 
 # Legacy alias kept for downstream imports that reference the previous name.

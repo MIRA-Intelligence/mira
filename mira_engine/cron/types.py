@@ -37,6 +37,8 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    project_id: str | None = None
+    project_dir: str | None = None
 
 
 @dataclass

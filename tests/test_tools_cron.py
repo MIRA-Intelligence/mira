@@ -26,6 +26,8 @@ class _FakeCronService:
                 deliver=kwargs["deliver"],
                 channel=kwargs["channel"],
                 to=kwargs["to"],
+                project_id=kwargs.get("project_id"),
+                project_dir=kwargs.get("project_dir"),
             ),
             state=CronJobState(),
             delete_after_run=kwargs.get("delete_after_run", False),
@@ -75,6 +77,34 @@ async def test_cron_add_valid_every_and_list_and_remove() -> None:
     assert removed == "Removed job job-1"
     missing = await tool.execute(action="remove", job_id="job-1")
     assert missing == "Job job-1 not found"
+
+
+async def test_cron_add_persists_project_context(tmp_path) -> None:
+    svc = _FakeCronService()
+    tool = CronTool(svc)
+    project_dir = tmp_path / "alpha"
+
+    tool.set_context("ui", "PRJ-1")
+    tool.set_project_context("alpha", str(project_dir))
+    await tool.execute(action="add", message="ping", every_seconds=3)
+
+    payload = svc.added[0].payload
+    assert payload.project_id == "alpha"
+    assert payload.project_dir == str(project_dir)
+
+
+async def test_cron_add_can_clear_project_context(tmp_path) -> None:
+    svc = _FakeCronService()
+    tool = CronTool(svc)
+
+    tool.set_context("ui", "PRJ-1")
+    tool.set_project_context("alpha", str(tmp_path / "alpha"))
+    tool.clear_project_context()
+    await tool.execute(action="add", message="ping", every_seconds=3)
+
+    payload = svc.added[0].payload
+    assert payload.project_id is None
+    assert payload.project_dir is None
 
 
 async def test_cron_add_rejects_invalid_tz_and_at() -> None:

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import time
 
 import pytest
 
@@ -32,6 +31,31 @@ def test_add_job_accepts_valid_timezone(tmp_path) -> None:
 
     assert job.schedule.tz == "America/Vancouver"
     assert job.state.next_run_at_ms is not None
+
+
+def test_add_job_persists_project_context(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    project_dir = tmp_path / "projects" / "alpha"
+    service = CronService(store_path)
+
+    job = service.add_job(
+        name="project scoped",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        project_id="alpha",
+        project_dir=str(project_dir),
+    )
+
+    raw = json.loads(store_path.read_text())
+    payload = raw["jobs"][0]["payload"]
+    assert payload["projectId"] == "alpha"
+    assert payload["projectDir"] == str(project_dir)
+
+    fresh = CronService(store_path)
+    loaded = fresh.get_job(job.id)
+    assert loaded is not None
+    assert loaded.payload.project_id == "alpha"
+    assert loaded.payload.project_dir == str(project_dir)
 
 
 @pytest.mark.asyncio

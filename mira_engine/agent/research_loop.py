@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from mira_engine.agent.base_loop import BaseAgentLoop
+from mira_engine.agent.base_loop import UNIFIED_SESSION_KEY, BaseAgentLoop
 from mira_engine.agent.context import ContextBuilder
 from mira_engine.agent.tools.message import MessageTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
@@ -372,6 +372,19 @@ class ResearchAgentLoop(BaseAgentLoop):
         except (OSError, json.JSONDecodeError):
             return None
         return payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def _plan_phase(cls, project_dir: str | None) -> str | None:
+        """Return the interactive plan-mode phase from task_plan.json, if any."""
+        plan = cls._load_task_plan(project_dir)
+        if not isinstance(plan, dict):
+            return None
+        block = plan.get("plan")
+        if isinstance(block, dict):
+            phase = block.get("phase")
+            if isinstance(phase, str) and phase.strip():
+                return phase.strip()
+        return None
 
     @staticmethod
     def _plan_has_pending_work(plan: dict | None) -> bool:
@@ -835,6 +848,73 @@ class ResearchAgentLoop(BaseAgentLoop):
             f"{contract_hint}"
         )
 
+    def _build_plan_event_message(
+        self,
+        event: str,
+        *,
+        channel: str,
+        chat_id: str,
+        project_dir: str | None,
+        run_mode: str,
+        agent_profile: str | None = None,
+        decision: str | None = None,
+        feedback: str | None = None,
+    ) -> str:
+        """Build the internal instruction for an interactive plan-mode event.
+
+        ``event`` is one of ``start`` (user invoked /plan or research finished),
+        ``answer`` (user answered the clarifying questions), or ``decision``
+        (user approved or requested changes to the draft plan).
+        """
+        runtime_ctx = ContextBuilder._build_runtime_context(
+            channel,
+            chat_id,
+            project_dir,
+            run_mode=run_mode,
+        )
+        header = f"{runtime_ctx}\n\n[PLAN MODE]\n"
+        if event == "start":
+            body = (
+                "Enter plan mode. Review the literature you have gathered so far for "
+                "this project, then call the set_plan tool with phase='questions' and "
+                "3-6 concise, high-value clarifying questions you must resolve before "
+                "designing experiments. Use kind 'single'/'multi' with an options list "
+                "when the answer is a choice, otherwise kind 'text'. Do NOT create or "
+                "run experiments yet. After calling set_plan, stop and wait for the "
+                "user's answers."
+            )
+        elif event == "answer":
+            body = (
+                "The user has answered your planning questions; their answers are saved "
+                "in task_plan.json under plan.answers. Read them, then call set_plan "
+                "with phase='draft' proposing a concise experiment plan (a short summary "
+                "plus a list of experiments, each with title, hypothesis and method). Do "
+                "NOT start experiments yet. After calling set_plan, stop and wait for the "
+                "user to approve or request changes."
+            )
+        elif event == "decision" and (decision or "").strip().lower() == "approve":
+            body = (
+                "The user APPROVED your draft plan (saved in task_plan.json under "
+                "plan.draft). Call set_plan with phase='approved', then turn the draft "
+                "experiments into pending entries in task_plan.json's 'experiments' "
+                "array (give each a stable id such as Exp001) and begin executing them "
+                "according to the current run mode."
+            )
+        elif event == "decision":
+            cleaned = (feedback or "").strip()
+            feedback_line = f"\nUser feedback: {cleaned}" if cleaned else ""
+            body = (
+                "The user requested CHANGES to your draft plan. Revise it and call "
+                "set_plan again with phase='draft'. Do NOT start experiments; wait for "
+                "approval." + feedback_line
+            )
+        else:
+            body = (
+                "Continue interactive plan mode using the set_plan tool. Do not start "
+                "experiments until the plan is approved."
+            )
+        return header + body
+
     def _build_auto_guardrail_repair_message(
         self,
         *,
@@ -921,6 +1001,11 @@ class ResearchAgentLoop(BaseAgentLoop):
         """
         if run_mode != "auto":
             return False, None
+        # Interactive plan mode gate: project auto-mode must not advance into
+        # experiments until the user has approved the plan. Treat a missing
+        # plan block as unapproved so prompt drift cannot bypass the gate.
+        if project_dir and self._plan_phase(project_dir) != "approved":
+            return False, "awaiting plan approval"
         if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
             return False, "task_plan guardrail blocking"
         if auto_round >= self._AUTO_MAX_ROUNDS:
@@ -1026,17 +1111,28 @@ class ResearchAgentLoop(BaseAgentLoop):
 
     async def _handle_set_mode(self, msg: InboundMessage) -> None:
         """Update session run mode immediately without entering normal dispatch."""
-        mode = self._normalize_run_mode((msg.metadata or {}).get("run_mode"))
-        self._session_run_modes[msg.session_key] = mode
+        meta = msg.metadata or {}
+        mode = self._normalize_run_mode(meta.get("run_mode"))
+        project_ref = self._project_ref_from_metadata(meta)
+        raw_key = (
+            UNIFIED_SESSION_KEY
+            if getattr(self, "_unified_session", False) and not msg.session_key_override
+            else msg.session_key
+        )
+        self._session_run_modes[self._scoped_session_key(project_ref, raw_key)] = mode
+        response_metadata = {
+            **dict(meta),
+            "_control": "set_mode_ack",
+            "run_mode": mode,
+        }
+        if project_ref is not None:
+            response_metadata["project_id"] = project_ref.project_id
+            response_metadata["project_dir"] = str(project_ref.project_dir)
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=f"Run mode switched to {mode}.",
-            metadata={
-                **dict(msg.metadata or {}),
-                "_control": "set_mode_ack",
-                "run_mode": mode,
-            },
+            metadata=response_metadata,
         ))
 
     async def _emit_auto_round_response(
@@ -1069,7 +1165,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         ))
 
     def _on_session_reset(self, session_key: str) -> None:
-        """Drop research-specific per-session caches on /new."""
+        """Drop volatile research state on /new while retaining UI selections."""
         super()._on_session_reset(session_key)
         self._session_automation_policies.pop(session_key, None)
         self._session_tokens_used.pop(session_key, None)
@@ -1093,18 +1189,30 @@ class ResearchAgentLoop(BaseAgentLoop):
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
                                 else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
-            key = f"{channel}:{chat_id}"
-            session = self.sessions.get_or_create(key)
+            meta = msg.metadata or {}
+            project_ref = self._project_ref_from_metadata(meta)
+            raw_key = f"{channel}:{chat_id}"
+            key = self._scoped_session_key(project_ref, raw_key)
+            sessions_mgr = self._get_project_sessions(project_ref) if project_ref else self.sessions
+            session = sessions_mgr.get_or_create(raw_key)
             model_runtime = self._get_model_runtime(key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(
+                channel,
+                chat_id,
+                meta.get("message_id"),
+                project_ref=project_ref,
+                session_key=key,
+            )
             history = session.get_history(max_messages=self.memory_window)
-            messages = self.context.build_messages(
+            ctx = self._get_project_context(project_ref)
+            messages = ctx.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
+                project_dir=str(project_ref.project_dir) if project_ref else None,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages, model_runtime=model_runtime)
             self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
+            sessions_mgr.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -1136,8 +1244,10 @@ class ResearchAgentLoop(BaseAgentLoop):
                 audit_hook=audit_hook,
             )
 
-        project_dir = meta.get("project_dir")
-        key = session_key or msg.session_key
+        project_ref = self._project_ref_from_metadata(meta)
+        project_dir = str(project_ref.project_dir) if project_ref else None
+        raw_key = session_key or msg.session_key
+        key = self._scoped_session_key(project_ref, raw_key)
         run_mode = self._resolve_session_run_mode(key, meta.get("run_mode"))
         agent_profile = self._resolve_session_agent_profile(key, meta.get("agent_profile"))
         automation_policy = self._resolve_session_automation_policy(
@@ -1145,13 +1255,40 @@ class ResearchAgentLoop(BaseAgentLoop):
             meta.get("automation_policy"),
         )
         agents_filename = self._agent_profile_to_agents_filename(agent_profile)
-        if project_dir:
-            sessions_mgr = self._get_project_sessions(project_dir)
-        else:
-            sessions_mgr = self.sessions
 
-        session = sessions_mgr.get_or_create(key)
-        memory_workspace = Path(project_dir) if project_dir else self.workspace
+        # Interactive plan-mode events (from /plan or the UI plan GUI) are
+        # delivered as ordinary inbound messages carrying ``_plan_event`` in
+        # metadata. Rewrite the content into a concrete instruction so the agent
+        # drives the set_plan tool correctly.
+        plan_event = meta.get("_plan_event")
+        if isinstance(plan_event, str) and plan_event.strip():
+            synthesized = self._build_plan_event_message(
+                plan_event.strip(),
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                project_dir=project_dir,
+                run_mode=run_mode,
+                agent_profile=agent_profile,
+                decision=meta.get("_plan_decision"),
+                feedback=meta.get("_plan_feedback"),
+            )
+            msg = InboundMessage(
+                channel=msg.channel,
+                sender_id=msg.sender_id,
+                chat_id=msg.chat_id,
+                content=synthesized,
+                timestamp=msg.timestamp,
+                media=list(msg.media),
+                metadata=meta,
+                session_key_override=msg.session_key_override,
+            )
+
+        sessions_mgr = self._get_project_sessions(project_ref) if project_ref else self.sessions
+
+        session = sessions_mgr.get_or_create(raw_key)
+        memory_workspace = project_ref.project_dir if project_ref else self.workspace
+        ctx = self._get_project_context(project_ref)
+        project_consolidator = self._get_project_consolidator(project_ref, sessions_mgr, ctx)
         recent_skill_names: list[str] = []
         if isinstance(session.metadata, dict):
             raw_recent = session.metadata.get("_recent_skills")
@@ -1166,9 +1303,9 @@ class ResearchAgentLoop(BaseAgentLoop):
                 session.clear()
                 sessions_mgr.save(session)
                 sessions_mgr.invalidate(session.key)
-                self._on_session_reset(session.key)
+                self._on_session_reset(key)
                 if snapshot:
-                    self._schedule_background(self.consolidator.archive(snapshot))
+                    self._schedule_background(project_consolidator.archive(snapshot))
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                       content="New session started.")
             ok = await self._consolidate_memory(session, archive_all=True, workspace_override=memory_workspace)
@@ -1178,7 +1315,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             session.clear()
             sessions_mgr.save(session)
             sessions_mgr.invalidate(session.key)
-            self._on_session_reset(session.key)
+            self._on_session_reset(key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -1206,9 +1343,9 @@ class ResearchAgentLoop(BaseAgentLoop):
                 return handled
 
         unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
+        if (unconsolidated >= self.memory_window and key not in self._consolidating):
+            self._consolidating.add(key)
+            lock = self._consolidation_locks.setdefault(key, asyncio.Lock())
             _mw = memory_workspace
 
             async def _consolidate_and_unlock():
@@ -1216,7 +1353,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                     async with lock:
                         await self._consolidate_memory(session, workspace_override=_mw)
                 finally:
-                    self._consolidating.discard(session.key)
+                    self._consolidating.discard(key)
                     _task = asyncio.current_task()
                     if _task is not None:
                         self._consolidation_tasks.discard(_task)
@@ -1224,12 +1361,21 @@ class ResearchAgentLoop(BaseAgentLoop):
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            meta.get("message_id"),
+            project_ref=project_ref,
+            session_key=key,
+        )
+        if plan_tool := self.tools.get("set_plan"):
+            if hasattr(plan_tool, "set_project_dir"):
+                plan_tool.set_project_dir(project_dir)
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        await self.consolidator.maybe_consolidate_by_tokens(session)
+        await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
         model_runtime = self._get_model_runtime(key)
         extra_system = self._compose_extra_system(
@@ -1237,7 +1383,6 @@ class ResearchAgentLoop(BaseAgentLoop):
             meta.get("_task_plan_guard_notice"),
         )
 
-        ctx = ContextBuilder(memory_workspace) if project_dir else self.context
         suggested_skills = ctx.skills.suggest_skills(
             msg.content,
             recent=recent_skill_names,
@@ -1592,10 +1737,18 @@ class ResearchAgentLoop(BaseAgentLoop):
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         response_metadata = dict(msg.metadata or {})
+        # Internal plan-event routing flags must not leak to the client.
+        for _internal_key in ("_plan_event", "_plan_decision", "_plan_feedback"):
+            response_metadata.pop(_internal_key, None)
         response_metadata["tokens_used_session"] = self._session_tokens_used.get(key, 0)
         max_tokens = self._max_tokens_from_policy(automation_policy)
         if max_tokens is not None:
             response_metadata["max_tokens"] = max_tokens
+        # Surface the current interactive plan phase so the UI can switch to the
+        # plan stage immediately instead of waiting for the next poll.
+        current_plan_phase = self._plan_phase(project_dir)
+        if current_plan_phase:
+            response_metadata["_plan_phase"] = current_plan_phase
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=response_metadata,

@@ -8,6 +8,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from mira_engine.agent.routing import ModelRouter, RoutedProviderManager
+from mira_engine.agent.runner import AgentRunner, AgentRunSpec
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
@@ -22,7 +23,6 @@ from mira_engine.bus.events import InboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.config.schema import ExecToolConfig
 from mira_engine.providers.base import LLMProvider
-from mira_engine.agent.runner import AgentRunSpec, AgentRunner
 
 
 class SubagentManager:
@@ -85,15 +85,26 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        workspace: Path | None = None,
+        project_id: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
+        run_workspace = workspace or self.workspace
 
         runtime_key = session_key or f"subagent:{task_id}"
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, self._get_runtime(runtime_key))
+            self._run_subagent(
+                task_id,
+                task,
+                display_label,
+                origin,
+                self._get_runtime(runtime_key),
+                workspace=run_workspace,
+                project_id=project_id,
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -118,24 +129,27 @@ class SubagentManager:
         label: str,
         origin: dict[str, str],
         provider_runtime: RoutedProviderManager | None = None,
+        workspace: Path | None = None,
+        project_id: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        run_workspace = workspace or self.workspace
 
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
-            allowed_dir = self.workspace if self.restrict_to_workspace else None
+            allowed_dir = run_workspace if self.restrict_to_workspace else None
             supports_vision = self.provider.supports_vision(self.model)
-            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, supports_vision=supports_vision))
-            tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            tools.register(ReadFileTool(workspace=run_workspace, allowed_dir=allowed_dir, supports_vision=supports_vision))
+            tools.register(WriteFileTool(workspace=run_workspace, allowed_dir=allowed_dir))
+            tools.register(EditFileTool(workspace=run_workspace, allowed_dir=allowed_dir))
+            tools.register(ListDirTool(workspace=run_workspace, allowed_dir=allowed_dir))
+            tools.register(GrepTool(workspace=run_workspace, allowed_dir=allowed_dir))
+            tools.register(GlobTool(workspace=run_workspace, allowed_dir=allowed_dir))
             if self.exec_config.enable:
                 tools.register(ExecTool(
-                    working_dir=str(self.workspace),
+                    working_dir=str(run_workspace),
                     timeout=self.exec_config.timeout,
                     restrict_to_workspace=self.restrict_to_workspace,
                     path_append=self.exec_config.path_append,
@@ -144,7 +158,7 @@ class SubagentManager:
             tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
 
-            system_prompt = self._build_subagent_prompt()
+            system_prompt = self._build_subagent_prompt(run_workspace)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -187,12 +201,30 @@ class SubagentManager:
                 status = "error"
 
             logger.info("Subagent [{}] completed successfully", task_id)
-            await self._announce_result(task_id, label, task, final_result, origin, status)
+            await self._announce_result(
+                task_id,
+                label,
+                task,
+                final_result,
+                origin,
+                status,
+                run_workspace,
+                project_id,
+            )
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
-            await self._announce_result(task_id, label, task, error_msg, origin, "error")
+            await self._announce_result(
+                task_id,
+                label,
+                task,
+                error_msg,
+                origin,
+                "error",
+                run_workspace,
+                project_id,
+            )
 
     async def _announce_result(
         self,
@@ -202,6 +234,8 @@ class SubagentManager:
         result: str,
         origin: dict[str, str],
         status: str,
+        workspace: Path | None = None,
+        project_id: str | None = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
@@ -221,16 +255,25 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
+            metadata={
+                key: value
+                for key, value in {
+                    "project_id": project_id,
+                    "project_dir": str(workspace) if workspace else None,
+                }.items()
+                if value
+            },
         )
 
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
 
-    def _build_subagent_prompt(self) -> str:
+    def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
         """Build a focused system prompt for the subagent."""
         from mira_engine.agent.context import ContextBuilder
 
-        context = ContextBuilder(self.workspace)
+        run_workspace = workspace or self.workspace
+        context = ContextBuilder(run_workspace)
         time_ctx = ContextBuilder._build_runtime_context(None, None)
         parts = [context.build_system_prompt(), f"""# Subagent
 
@@ -240,7 +283,7 @@ You are a subagent spawned by the main agent to complete a specific task.
 Stay focused on the assigned task. Your final response will be reported back to the main agent.
 
 ## Workspace
-{self.workspace}"""]
+{run_workspace}"""]
 
         return "\n\n".join(parts)
 

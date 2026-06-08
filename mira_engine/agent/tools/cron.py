@@ -16,6 +16,12 @@ class CronTool(Tool):
         self._cron = cron_service
         self._channel = ""
         self._chat_id = ""
+        self._project_id: str | None = None
+        self._project_dir: str | None = None
+        self._runtime_channel: ContextVar[str | None] = ContextVar("cron_channel", default=None)
+        self._runtime_chat_id: ContextVar[str | None] = ContextVar("cron_chat_id", default=None)
+        self._runtime_project_id: ContextVar[str | None] = ContextVar("cron_project_id", default=None)
+        self._runtime_project_dir: ContextVar[str | None] = ContextVar("cron_project_dir", default=None)
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
         self._default_timezone = default_timezone
 
@@ -23,6 +29,24 @@ class CronTool(Tool):
         """Set the current session context for delivery."""
         self._channel = channel
         self._chat_id = chat_id
+        self._runtime_channel.set(channel)
+        self._runtime_chat_id.set(chat_id)
+
+    def set_project_context(self, project_id: str, project_dir: str) -> None:
+        """Set the current project context for scheduled jobs."""
+
+        self._project_id = project_id
+        self._project_dir = project_dir
+        self._runtime_project_id.set(project_id)
+        self._runtime_project_dir.set(project_dir)
+
+    def clear_project_context(self) -> None:
+        """Clear the current project context for scheduled jobs."""
+
+        self._project_id = None
+        self._project_dir = None
+        self._runtime_project_id.set(None)
+        self._runtime_project_dir.set(None)
 
     def set_cron_context(self, active: bool):
         """Mark whether the tool is executing inside a cron job callback."""
@@ -107,7 +131,11 @@ class CronTool(Tool):
     ) -> str:
         if not message:
             return "Error: message is required for add"
-        if not self._channel or not self._chat_id:
+        channel = self._runtime_channel.get() or self._channel
+        chat_id = self._runtime_chat_id.get() or self._chat_id
+        project_id = self._runtime_project_id.get() or self._project_id
+        project_dir = self._runtime_project_dir.get() or self._project_dir
+        if not channel or not chat_id:
             return "Error: no session context (channel/chat_id)"
         if tz and not cron_expr:
             return "Error: tz can only be used with cron_expr"
@@ -146,8 +174,10 @@ class CronTool(Tool):
             schedule=schedule,
             message=message,
             deliver=deliver,
-            channel=self._channel,
-            to=self._chat_id,
+            channel=channel,
+            to=chat_id,
+            project_id=project_id,
+            project_dir=project_dir,
             delete_after_run=delete_after,
         )
         return f"Created job '{job.name}' (id: {job.id})"

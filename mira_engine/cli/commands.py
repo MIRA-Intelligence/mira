@@ -231,6 +231,64 @@ def _coerce_model_for_provider(model: str, provider_name: str) -> str:
         return value
     return examples[0]
 
+
+def _load_models_command_config(config: str | None) -> tuple[Config, Path]:
+    """Load config for model cache commands and return config plus path."""
+    from mira_engine.config.loader import get_config_path, load_config, set_config_path
+
+    config_path = Path(config).expanduser().resolve() if config else get_config_path()
+    if config:
+        set_config_path(config_path)
+    return load_config(config_path), config_path
+
+
+def _resolve_models_provider(config: Config, provider: str | None) -> str:
+    """Resolve provider argument for model cache commands."""
+    from mira_engine.providers.model_fetch import current_provider_name
+    from mira_engine.providers.registry import find_by_name
+
+    value = (provider or "").strip().replace("-", "_")
+    if not value:
+        value = current_provider_name(config) or ""
+    spec = find_by_name(value) if value else None
+    if not spec:
+        raise typer.BadParameter(
+            "Provider is not configured. Pass a provider name, or set agents.defaults.provider."
+        )
+    return spec.name
+
+
+def _model_cache_table(caches) -> Table:
+    """Render model caches as a compact table."""
+    from mira_engine.providers.model_fetch import is_cache_stale
+
+    table = Table(title="Cached Models")
+    table.add_column("Provider")
+    table.add_column("Models", justify="right")
+    table.add_column("Fetched")
+    table.add_column("Status")
+    table.add_column("API Base")
+    for cache in caches:
+        status = "stale" if is_cache_stale(cache) else "fresh"
+        table.add_row(
+            cache.provider,
+            str(len(cache.models)),
+            cache.fetched_at or "-",
+            status,
+            cache.api_base or "-",
+        )
+    return table
+
+
+def _find_cached_model(cache, model: str):
+    """Find a model by native or config model id."""
+    target = model.strip()
+    for item in cache.models:
+        if target in {item.id, item.config_model}:
+            return item
+    return None
+
+
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
@@ -1198,11 +1256,20 @@ def gateway(
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
+            metadata = {
+                key: value
+                for key, value in {
+                    "project_id": job.payload.project_id,
+                    "project_dir": job.payload.project_dir,
+                }.items()
+                if value
+            }
             response = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                metadata=metadata,
             )
             response = _as_text_response(response)
         finally:
@@ -1230,7 +1297,8 @@ def gateway(
             await bus.publish_outbound(OutboundMessage(
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to,
-                content=response
+                content=response,
+                metadata=metadata,
             ))
         return response
     cron.on_job = on_cron_job
@@ -2139,6 +2207,162 @@ def research(
 
 
 # ============================================================================
+# Model Cache Commands
+# ============================================================================
+
+
+models_app = typer.Typer(help="Fetch and manage provider model lists")
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("fetch")
+def models_fetch(
+    provider: str | None = typer.Argument(None, help="Provider name (defaults to configured provider)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    select_model: bool = typer.Option(False, "--select", help="Select a model after fetching"),
+):
+    """Fetch provider models and cache them locally."""
+    from mira_engine.config.loader import save_config
+    from mira_engine.providers.model_fetch import fetch_models_to_cache
+
+    cfg, config_path = _load_models_command_config(config)
+    provider_name = _resolve_models_provider(cfg, provider)
+    try:
+        cache, cache_path = asyncio.run(fetch_models_to_cache(cfg, provider_name, config_path))
+    except Exception as e:
+        console.print(f"[red]Model fetch failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]✓[/green] Fetched {len(cache.models)} models for {cache.provider} "
+        f"-> {cache_path}"
+    )
+
+    if select_model and cache.models:
+        selected = _prompt_cached_model(cache)
+        if selected is None:
+            return
+        cfg.agents.defaults.provider = cache.provider
+        cfg.agents.defaults.model = selected.config_model
+        save_config(cfg, config_path)
+        console.print(f"[green]✓[/green] Set default model to {selected.config_model}")
+
+
+@models_app.command("list")
+def models_list(
+    provider: str | None = typer.Argument(None, help="Provider name (omit to list all caches)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    refresh: bool = typer.Option(False, "--refresh", help="Fetch before listing"),
+):
+    """List cached provider models."""
+    from mira_engine.providers.model_fetch import fetch_models_to_cache, read_all_model_caches, read_model_cache
+
+    cfg, config_path = _load_models_command_config(config)
+    caches = []
+    if refresh:
+        provider_name = _resolve_models_provider(cfg, provider)
+        try:
+            cache, _ = asyncio.run(fetch_models_to_cache(cfg, provider_name, config_path))
+        except Exception as e:
+            console.print(f"[red]Model fetch failed:[/red] {e}")
+            raise typer.Exit(1)
+        caches = [cache]
+    elif provider:
+        cache = read_model_cache(provider, config_path)
+        caches = [cache] if cache else []
+    else:
+        caches = read_all_model_caches(config_path)
+
+    if not caches:
+        console.print("[yellow]No cached models found. Run `mira models fetch` first.[/yellow]")
+        return
+
+    console.print(_model_cache_table(caches))
+    for cache in caches:
+        table = Table(title=f"{cache.provider} models")
+        table.add_column("Model")
+        table.add_column("Config Value")
+        table.add_column("Context", justify="right")
+        for model in cache.models:
+            context = str(model.context_window_tokens) if model.context_window_tokens else "-"
+            table.add_row(model.display_name or model.id, model.config_model, context)
+        console.print(table)
+
+
+@models_app.command("select")
+def models_select(
+    provider: str | None = typer.Argument(None, help="Provider name (defaults to configured provider)"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model id or config model to select"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    refresh: bool = typer.Option(False, "--refresh", help="Fetch before selecting"),
+):
+    """Select a cached model and write it to config.json."""
+    from mira_engine.config.loader import save_config
+    from mira_engine.providers.model_fetch import fetch_models_to_cache, read_model_cache
+
+    cfg, config_path = _load_models_command_config(config)
+    provider_name = _resolve_models_provider(cfg, provider)
+    if refresh:
+        try:
+            cache, _ = asyncio.run(fetch_models_to_cache(cfg, provider_name, config_path))
+        except Exception as e:
+            console.print(f"[red]Model fetch failed:[/red] {e}")
+            raise typer.Exit(1)
+    else:
+        cache = read_model_cache(provider_name, config_path)
+        if cache is None:
+            console.print("[yellow]No cached models found. Run `mira models fetch` first.[/yellow]")
+            raise typer.Exit(1)
+
+    selected = _find_cached_model(cache, model) if model else _prompt_cached_model(cache)
+    if selected is None:
+        console.print("[red]Model not found in cache.[/red]" if model else "[yellow]No model selected.[/yellow]")
+        raise typer.Exit(1)
+
+    cfg.agents.defaults.provider = cache.provider
+    cfg.agents.defaults.model = selected.config_model
+    save_config(cfg, config_path)
+    console.print(f"[green]✓[/green] Set default model to {selected.config_model}")
+
+
+@models_app.command("clear")
+def models_clear(
+    provider: str | None = typer.Argument(None, help="Provider name (omit to clear all model caches)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Clear cached model lists."""
+    from mira_engine.providers.model_fetch import clear_model_cache
+
+    _cfg, config_path = _load_models_command_config(config)
+    removed = clear_model_cache(provider, config_path)
+    if not removed:
+        console.print("[yellow]No model cache files removed.[/yellow]")
+        return
+    console.print(f"[green]✓[/green] Removed {len(removed)} model cache file(s).")
+
+
+def _prompt_cached_model(cache):
+    """Prompt for a model from a cache in interactive terminals."""
+    if not cache.models:
+        return None
+    if not sys.stdin.isatty():
+        return None
+
+    console.print(f"\nModels for {cache.provider}:")
+    for idx, item in enumerate(cache.models, 1):
+        console.print(f"  {idx}. {item.config_model}")
+    raw = typer.prompt("Select model number", default="", show_default=False).strip()
+    if not raw:
+        return None
+    if not raw.isdigit():
+        return None
+    idx = int(raw)
+    if not 1 <= idx <= len(cache.models):
+        return None
+    return cache.models[idx - 1]
+
+
+# ============================================================================
 # Runtime Commands (Python environment management)
 # ============================================================================
 
@@ -2556,6 +2780,29 @@ def channels_login(
 # ============================================================================
 
 
+def _oauth_login_status(provider_name: str) -> tuple[bool, str | None]:
+    """Return local OAuth login state without doing any network calls."""
+    try:
+        if provider_name == "openai_codex":
+            ensure_oauth_state_dirs_for_runtime()
+            from oauth_cli_kit import get_token
+
+            token = get_token()
+        elif provider_name == "github_copilot":
+            from mira_engine.providers.github_copilot_provider import get_github_copilot_login_status
+
+            token = get_github_copilot_login_status()
+        else:
+            return False, None
+    except Exception:
+        return False, None
+
+    if not (token and getattr(token, "access", None)):
+        return False, None
+    account_id = getattr(token, "account_id", None)
+    return True, str(account_id) if account_id else None
+
+
 @app.command()
 def status():
     """Show mira status."""
@@ -2572,8 +2819,12 @@ def status():
 
     if config_path.exists():
         from mira_engine.providers.registry import PROVIDERS
+        from mira_engine.providers.model_fetch import is_cache_stale, read_model_cache
 
         console.print(f"Model: {_format_model_selection(config.agents.defaults.model)}")
+        active_provider = (
+            config.get_provider_name(config.agents.defaults.model) or config.agents.defaults.provider
+        ).replace("-", "_")
         if config.agents.defaults.route_by_complexity:
             console.print("Routing: [green]enabled[/green]")
             console.print(f"  small: {_format_model_selection(config.agents.defaults.small_model)}")
@@ -2588,7 +2839,12 @@ def status():
             if p is None:
                 continue
             if spec.is_oauth:
-                console.print(f"{spec.label}: [green]✓ (OAuth)[/green]")
+                authenticated, account_id = _oauth_login_status(spec.name)
+                if authenticated:
+                    account_part = f" [dim]{account_id}[/dim]" if account_id else ""
+                    console.print(f"{spec.label}: [green]✓ OAuth[/green]{account_part}")
+                else:
+                    console.print(f"{spec.label}: [dim]not logged in[/dim]")
             elif spec.is_local:
                 # Local deployments show api_base instead of api_key
                 if p.api_base:
@@ -2598,6 +2854,20 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+            if spec.name == active_provider:
+                cache = read_model_cache(spec.name, config_path)
+                if cache:
+                    state = "stale" if is_cache_stale(cache) else "fresh"
+                    console.print(
+                        f"  Models: [green]{len(cache.models)} cached[/green] "
+                        f"({state}, fetched {cache.fetched_at})"
+                    )
+                    cached_models = {model.config_model for model in cache.models}
+                    if config.agents.defaults.model not in cached_models:
+                        console.print(
+                            "  [yellow]! Current model is not in the cached model list. "
+                            "Run `mira models fetch` to refresh.[/yellow]"
+                        )
 
 
 # ============================================================================
