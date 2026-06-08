@@ -12,6 +12,7 @@ user's response (delivered on a later turn).
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -132,17 +133,23 @@ class SetPlanTool(Tool):
             plan_block = {}
 
         plan_block["phase"] = phase
+        plan_block["updated_at"] = datetime.now(UTC).isoformat()
         if phase == "questions":
             normalized = self._normalize_questions(questions)
             if not normalized:
                 return "Error: phase='questions' requires a non-empty 'questions' list"
             plan_block["questions"] = normalized
-            # Re-asking invalidates any previous draft.
+            # Re-asking starts a new planning round; prior answers/drafts belong
+            # to the previous round and would otherwise make the UI look approved
+            # or pre-answered.
+            plan_block.pop("answers", None)
             plan_block.pop("draft", None)
+            plan_block.pop("feedback", None)
         elif phase == "draft":
             if not isinstance(draft, dict) or not str(draft.get("summary", "")).strip():
                 return "Error: phase='draft' requires a 'draft' object with a non-empty summary"
             plan_block["draft"] = self._normalize_draft(draft)
+            plan_block.pop("feedback", None)
 
         data["plan"] = plan_block
         if not isinstance(data.get("schema_version"), int):
