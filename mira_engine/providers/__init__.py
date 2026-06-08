@@ -12,6 +12,7 @@ __all__ = [
     "OpenAICodexProvider",
     "GitHubCopilotProvider",
     "AzureOpenAIProvider",
+    "NvidiaProvider",
 ]
 
 
@@ -36,4 +37,8 @@ def __getattr__(name: str):
         from mira_engine.providers.azure_openai_provider import AzureOpenAIProvider
 
         return AzureOpenAIProvider
+    if name == "NvidiaProvider":
+        from mira_engine.providers.nvidia_provider import NvidiaProvider
+
+        return NvidiaProvider
     raise AttributeError(f"module 'mira_engine.providers' has no attribute {name!r}")

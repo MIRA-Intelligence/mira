@@ -12,7 +12,11 @@
     }
   },
   "providers": {
-    "proxy": null
+    "proxy": null,
+    "nvidia": {
+      "apiKey": "",
+      "apiBase": "https://inference-api.nvidia.com/v1"
+    }
   },
   "tools": {
     "restrictToWorkspace": false,

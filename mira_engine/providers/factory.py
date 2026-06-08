@@ -47,8 +47,9 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
     from mira_engine.providers.azure_openai_provider import AzureOpenAIProvider
     from mira_engine.providers.github_copilot_provider import GitHubCopilotProvider
     from mira_engine.providers.litellm_provider import LiteLLMProvider
-    from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
+    from mira_engine.providers.nvidia_provider import NvidiaProvider
     from mira_engine.providers.openai_codex_provider import OpenAICodexProvider
+    from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
     from mira_engine.providers.registry import find_by_name
 
     resolved_model = primary_model_candidate(model, config.agents.defaults.primary_model)
@@ -105,6 +106,18 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
     if not resolved_model.startswith("bedrock/") and not (provider_config and provider_config.api_key) and not (spec and spec.is_oauth):
         raise ValueError(
             f"No API key configured for model '{resolved_model}'. Set it under providers in config.json."
+        )
+
+    if provider_name == "nvidia":
+        nvidia_spec = spec or find_by_name("nvidia")
+        api_base = config.get_api_base(resolved_model)
+        if not api_base and nvidia_spec:
+            api_base = nvidia_spec.default_api_base or None
+        return NvidiaProvider(
+            api_key=provider_config.api_key if provider_config else None,
+            api_base=api_base,
+            default_model=resolved_model,
+            extra_headers=provider_config.extra_headers if provider_config else None,
         )
 
     # Native DeepSeek path — bypass LiteLLM to avoid the thinking-mode
