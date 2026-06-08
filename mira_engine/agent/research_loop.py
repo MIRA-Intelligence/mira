@@ -373,6 +373,19 @@ class ResearchAgentLoop(BaseAgentLoop):
             return None
         return payload if isinstance(payload, dict) else None
 
+    @classmethod
+    def _plan_phase(cls, project_dir: str | None) -> str | None:
+        """Return the interactive plan-mode phase from task_plan.json, if any."""
+        plan = cls._load_task_plan(project_dir)
+        if not isinstance(plan, dict):
+            return None
+        block = plan.get("plan")
+        if isinstance(block, dict):
+            phase = block.get("phase")
+            if isinstance(phase, str) and phase.strip():
+                return phase.strip()
+        return None
+
     @staticmethod
     def _plan_has_pending_work(plan: dict | None) -> bool:
         """Return whether task_plan still has pending/running experiments."""
@@ -835,6 +848,73 @@ class ResearchAgentLoop(BaseAgentLoop):
             f"{contract_hint}"
         )
 
+    def _build_plan_event_message(
+        self,
+        event: str,
+        *,
+        channel: str,
+        chat_id: str,
+        project_dir: str | None,
+        run_mode: str,
+        agent_profile: str | None = None,
+        decision: str | None = None,
+        feedback: str | None = None,
+    ) -> str:
+        """Build the internal instruction for an interactive plan-mode event.
+
+        ``event`` is one of ``start`` (user invoked /plan or research finished),
+        ``answer`` (user answered the clarifying questions), or ``decision``
+        (user approved or requested changes to the draft plan).
+        """
+        runtime_ctx = ContextBuilder._build_runtime_context(
+            channel,
+            chat_id,
+            project_dir,
+            run_mode=run_mode,
+        )
+        header = f"{runtime_ctx}\n\n[PLAN MODE]\n"
+        if event == "start":
+            body = (
+                "Enter plan mode. Review the literature you have gathered so far for "
+                "this project, then call the set_plan tool with phase='questions' and "
+                "3-6 concise, high-value clarifying questions you must resolve before "
+                "designing experiments. Use kind 'single'/'multi' with an options list "
+                "when the answer is a choice, otherwise kind 'text'. Do NOT create or "
+                "run experiments yet. After calling set_plan, stop and wait for the "
+                "user's answers."
+            )
+        elif event == "answer":
+            body = (
+                "The user has answered your planning questions; their answers are saved "
+                "in task_plan.json under plan.answers. Read them, then call set_plan "
+                "with phase='draft' proposing a concise experiment plan (a short summary "
+                "plus a list of experiments, each with title, hypothesis and method). Do "
+                "NOT start experiments yet. After calling set_plan, stop and wait for the "
+                "user to approve or request changes."
+            )
+        elif event == "decision" and (decision or "").strip().lower() == "approve":
+            body = (
+                "The user APPROVED your draft plan (saved in task_plan.json under "
+                "plan.draft). Call set_plan with phase='approved', then turn the draft "
+                "experiments into pending entries in task_plan.json's 'experiments' "
+                "array (give each a stable id such as Exp001) and begin executing them "
+                "according to the current run mode."
+            )
+        elif event == "decision":
+            cleaned = (feedback or "").strip()
+            feedback_line = f"\nUser feedback: {cleaned}" if cleaned else ""
+            body = (
+                "The user requested CHANGES to your draft plan. Revise it and call "
+                "set_plan again with phase='draft'. Do NOT start experiments; wait for "
+                "approval." + feedback_line
+            )
+        else:
+            body = (
+                "Continue interactive plan mode using the set_plan tool. Do not start "
+                "experiments until the plan is approved."
+            )
+        return header + body
+
     def _build_auto_guardrail_repair_message(
         self,
         *,
@@ -921,6 +1001,11 @@ class ResearchAgentLoop(BaseAgentLoop):
         """
         if run_mode != "auto":
             return False, None
+        # Interactive plan mode gate: project auto-mode must not advance into
+        # experiments until the user has approved the plan. Treat a missing
+        # plan block as unapproved so prompt drift cannot bypass the gate.
+        if project_dir and self._plan_phase(project_dir) != "approved":
+            return False, "awaiting plan approval"
         if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
             return False, "task_plan guardrail blocking"
         if auto_round >= self._AUTO_MAX_ROUNDS:
@@ -1170,6 +1255,34 @@ class ResearchAgentLoop(BaseAgentLoop):
             meta.get("automation_policy"),
         )
         agents_filename = self._agent_profile_to_agents_filename(agent_profile)
+
+        # Interactive plan-mode events (from /plan or the UI plan GUI) are
+        # delivered as ordinary inbound messages carrying ``_plan_event`` in
+        # metadata. Rewrite the content into a concrete instruction so the agent
+        # drives the set_plan tool correctly.
+        plan_event = meta.get("_plan_event")
+        if isinstance(plan_event, str) and plan_event.strip():
+            synthesized = self._build_plan_event_message(
+                plan_event.strip(),
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                project_dir=project_dir,
+                run_mode=run_mode,
+                agent_profile=agent_profile,
+                decision=meta.get("_plan_decision"),
+                feedback=meta.get("_plan_feedback"),
+            )
+            msg = InboundMessage(
+                channel=msg.channel,
+                sender_id=msg.sender_id,
+                chat_id=msg.chat_id,
+                content=synthesized,
+                timestamp=msg.timestamp,
+                media=list(msg.media),
+                metadata=meta,
+                session_key_override=msg.session_key_override,
+            )
+
         sessions_mgr = self._get_project_sessions(project_ref) if project_ref else self.sessions
 
         session = sessions_mgr.get_or_create(raw_key)
@@ -1255,6 +1368,9 @@ class ResearchAgentLoop(BaseAgentLoop):
             project_ref=project_ref,
             session_key=key,
         )
+        if plan_tool := self.tools.get("set_plan"):
+            if hasattr(plan_tool, "set_project_dir"):
+                plan_tool.set_project_dir(project_dir)
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -1621,10 +1737,18 @@ class ResearchAgentLoop(BaseAgentLoop):
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         response_metadata = dict(msg.metadata or {})
+        # Internal plan-event routing flags must not leak to the client.
+        for _internal_key in ("_plan_event", "_plan_decision", "_plan_feedback"):
+            response_metadata.pop(_internal_key, None)
         response_metadata["tokens_used_session"] = self._session_tokens_used.get(key, 0)
         max_tokens = self._max_tokens_from_policy(automation_policy)
         if max_tokens is not None:
             response_metadata["max_tokens"] = max_tokens
+        # Surface the current interactive plan phase so the UI can switch to the
+        # plan stage immediately instead of waiting for the next poll.
+        current_plan_phase = self._plan_phase(project_dir)
+        if current_plan_phase:
+            response_metadata["_plan_phase"] = current_plan_phase
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=response_metadata,

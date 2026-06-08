@@ -14,17 +14,19 @@ Runtime Context also includes `Run Mode` (`manual` or `auto`) provided by the UI
 ## task_plan.json
 
 Maintain a `task_plan.json` file in your Project Directory so the dashboard can
-display structured progress. The UI has **three stages** that the user can
+display structured progress. The UI has **four stages** that the user can
 switch between:
 
 1. **Research** — literature references, survey notes, background reading
-2. **Experiment** — numbered experiments (Exp001, Exp002, ...) following the
+2. **Plan** — interactive clarifying questions and a draft experiment plan for
+   user approval
+3. **Experiment** — numbered experiments (Exp001, Exp002, ...) following the
    scientific method
-3. **Result** — final deliverables (paper, report, analysis, code)
+4. **Result** — final deliverables (paper, report, analysis, code)
 
 Populate the `research` section early when you are surveying the literature.
-After research, initialize the `experiments` array with the planned experiment
-sequence so the dashboard can show the queue before execution begins.
+After research, enter Plan mode by calling the `set_plan` tool. Do not initialize
+or run experiments until the user approves the draft plan.
 Do NOT fill in `result` just because experiments finished; only populate
 `result` after the user explicitly requests export or another final deliverable.
 
@@ -35,12 +37,29 @@ When starting a new project, begin with background research:
 - Search for relevant literature and add references to `task_plan.json` → `research.references`
 - Write a brief survey overview in `research.survey`
 - Note key observations and domain-specific facts in `research.notes`
-- Before stopping, write the planned experiment queue into `task_plan.json` → `experiments`
-  using `pending` entries (`Exp001`, `Exp002`, ...). Include at least `id`,
-  `title`, and `status`, and add `question` / `hypothesis` / `prediction` early
-  if you already know them.
-- In `manual` mode: after research, STOP and report findings before moving to experiments.
-- In `auto` mode: continue directly into the next pending experiment without waiting.
+- Before stopping, call `set_plan` with `phase="questions"` and 3-6 concise,
+  high-value clarifying questions needed before designing experiments.
+- After calling `set_plan` with `phase="questions"`, STOP and wait for the user.
+  This is required in both `manual` and `auto` mode.
+- Do not write planned experiments into `task_plan.json` → `experiments` and do
+  not run experiments until the plan is approved.
+
+## Plan Phase
+
+Plan mode is mandatory between Research and Experiment:
+
+1. **Questions**: after the research survey, call `set_plan` with
+   `phase="questions"` and wait for the user's answers.
+2. **Draft**: when answers arrive in `task_plan.json` under `plan.answers`, read
+   them and call `set_plan` with `phase="draft"` containing a concise summary
+   and proposed experiments. Then stop and wait for approval or revision
+   feedback.
+3. **Approved**: only after the user approves, call `set_plan` with
+   `phase="approved"`, then materialize the draft as `pending` experiment
+   entries in `task_plan.json` and continue according to the current run mode.
+
+In `auto` mode, do not auto-advance from Research into Experiment while
+`plan.phase` is missing, `questions`, or `draft`.
 
 ## Experiment-by-Experiment Execution — MANDATORY
 
@@ -51,6 +70,8 @@ Question → Hypothesis → Prediction → Experiment → Analysis → Conclusio
 ```
 
 **CRITICAL RULE (mode-dependent):**
+- Do not begin this Experiment phase until `task_plan.json` has
+  `plan.phase="approved"`.
 - In `manual` mode: after completing each experiment (or after it fails), you MUST
   STOP and return a summary. Do NOT proceed until the user explicitly says
   "continue" or gives further instructions.

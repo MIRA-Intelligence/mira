@@ -1,7 +1,7 @@
-# Task Plan — Mira 3-Stage Schema (Research → Experiment → Result)
+# Task Plan — Mira 4-Stage Schema (Research → Plan → Experiment → Result)
 
 Maintain a `task_plan.json` in your **Project Directory** (from Runtime Context).
-The dashboard reads this file to display structured progress across three stages.
+The dashboard reads this file to display structured progress across four stages.
 
 Write the file using:
 ```
@@ -37,6 +37,29 @@ Always write the **full** JSON (not a patch).
       "Existing methods assume Gaussian noise — may break for low SNR"
     ],
     "survey": "A brief literature overview paragraph..."
+  },
+  "plan": {
+    "phase": "questions",
+    "questions": [
+      {
+        "id": "q1",
+        "prompt": "Which constraint matters most for this benchmark?",
+        "kind": "single",
+        "options": ["lowest CV MAE", "fewest features", "fastest inference"],
+        "rationale": "This determines which experiment branch should be prioritized."
+      }
+    ],
+    "answers": {},
+    "draft": {
+      "summary": "Short approved-or-pending experiment plan.",
+      "experiments": [
+        {
+          "title": "Baseline model comparison",
+          "hypothesis": "A regularized linear/SVR baseline will set the leakage-safe reference.",
+          "method": "Run 5-fold CV with fixed preprocessing and compare MAE."
+        }
+      ]
+    }
   },
   "experiments": [
     {
@@ -105,6 +128,7 @@ Always write the **full** JSON (not a patch).
 | `started_at` | `string` (ISO 8601) | YES | — |
 | `current_experiment` | `string` (id of active experiment) | NO | Experiment |
 | `research` | `object` | NO | Research |
+| `plan` | `object` | NO | Plan |
 | `experiments` | `array` | YES | Experiment |
 | `knowledge` | `string[]` (accumulated discoveries) | NO | Experiment |
 | `result` | `object` | NO | Result |
@@ -116,6 +140,26 @@ Always write the **full** JSON (not a patch).
 | `references` | `array` of reference objects | NO |
 | `notes` | `string[]` | NO |
 | `survey` | `string` (literature overview) | NO |
+
+## Plan fields
+
+| Field | Type | Required |
+|-------|------|----------|
+| `phase` | `string` (`questions` / `draft` / `approved`) | YES once Plan starts |
+| `questions` | `array` of question objects | YES when `phase="questions"` |
+| `answers` | `object` keyed by question id | NO |
+| `draft` | `object` (`summary`, `experiments`) | YES when `phase="draft"` or `approved` |
+| `feedback` | `string` | NO |
+
+### Plan question object
+
+| Field | Type |
+|-------|------|
+| `id` | `string` (e.g. `q1`) |
+| `prompt` | `string` |
+| `kind` | `string` (`single` / `multi` / `text`) |
+| `options` | `string[]` for `single` / `multi` |
+| `rationale` | `string` |
 
 ### Reference object
 
@@ -160,8 +204,12 @@ Always write the **full** JSON (not a patch).
 ## Rules
 
 - Populate `research` early — add references and notes during the research phase
-- After research, pre-populate `experiments` with the planned queue using
-  `pending` entries so the UI can show upcoming experiments before execution
+- After research, enter Plan mode by calling the `set_plan` tool with
+  `phase="questions"` and stop for user answers
+- After user answers, call `set_plan` with `phase="draft"` and stop for approval
+- Only after approval, call `set_plan` with `phase="approved"` and then
+  pre-populate `experiments` with the approved planned queue using `pending`
+  entries
 - Only **one experiment** should be `running` at a time
 - Each experiment follows: question → hypothesis → prediction → experiment → analysis
 - Status semantics:
@@ -175,7 +223,7 @@ Always write the **full** JSON (not a patch).
 - Update `current_experiment` when starting a new experiment
 - Add to `knowledge[]` when you discover something broadly applicable
 - Populate `result` when generating final deliverables
-- The UI shows 3 clickable stages: **Research → Experiment → Result**
+- The UI shows 4 clickable stages: **Research → Plan → Experiment → Result**
 - If proposing a new experiment batch after prior experiments completed, keep
   old entries, append new sequential IDs, and set top-level `status` to
   `in_progress`

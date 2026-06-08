@@ -1579,6 +1579,10 @@ async def test_handle_create_project_registers_custom_parent(ui_channel: UiChann
     registry = json.loads(workspace_file.read_text(encoding="utf-8"))
     assert registry["projects"][0]["id"] == "lung-ct-baseline"
 
+    list_resp = await ui_channel._handle_list_projects(MagicMock(spec=web.Request))
+    list_body = json.loads(list_resp.text)
+    assert [item["id"] for item in list_body["projects"]] == ["lung-ct-baseline"]
+
 
 async def test_handle_create_project_managed_mode_ignores_client_path(
     tmp_path: Path,

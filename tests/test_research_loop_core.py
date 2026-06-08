@@ -198,7 +198,8 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     project = tmp_path / "PRJ-1"
     project.mkdir()
     (project / "task_plan.json").write_text(
-        json.dumps({"experiments": [{"status": "pending"}]}), encoding="utf-8"
+        json.dumps({"plan": {"phase": "approved"}, "experiments": [{"status": "pending"}]}),
+        encoding="utf-8",
     )
     loaded = ResearchAgentLoop._load_task_plan(str(project))
     assert loaded is not None
@@ -211,6 +212,37 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
         final_content="all good",
         auto_round=0,
     ) is True
+    missing_plan_project = tmp_path / "PRJ-missing-plan"
+    missing_plan_project.mkdir()
+    (missing_plan_project / "task_plan.json").write_text(
+        json.dumps({"experiments": [{"status": "pending"}]}),
+        encoding="utf-8",
+    )
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(missing_plan_project),
+        final_content="all good",
+        auto_round=0,
+    )
+    assert decision is False
+    assert reason == "awaiting plan approval"
+    (missing_plan_project / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "plan": {"phase": "draft"},
+                "experiments": [{"status": "pending"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(missing_plan_project),
+        final_content="all good",
+        auto_round=0,
+    )
+    assert decision is False
+    assert reason == "awaiting plan approval"
     # PR 2 follow-up: research auto mode no longer filters on channel — any
     # channel reaching ResearchAgentLoop is by definition the research surface.
     assert loop._should_continue_auto_ui(
@@ -266,6 +298,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (compat_project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {
                         "id": "Exp001",
@@ -319,6 +352,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {"status": "completed", "results": {"metrics": {"Dice": 0.78}}}
                     for _ in range(7)
@@ -338,6 +372,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {"status": "completed", "results": {"metrics": {"Dice": 0.78}}}
                     for _ in range(8)
@@ -367,6 +402,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {"status": "completed", "results": {"metrics": {"Dice": 0.78}}}
                 ]
@@ -386,6 +422,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     (project / "task_plan.json").write_text(
         json.dumps(
             {
+                "plan": {"phase": "approved"},
                 "experiments": [
                     {
                         "status": "completed",
@@ -453,7 +490,7 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert decision is False
     assert reason == "failure heuristic matched"
     (project / "task_plan.json").write_text(
-        json.dumps({"experiments": [{"status": "pending"}]}),
+        json.dumps({"plan": {"phase": "approved"}, "experiments": [{"status": "pending"}]}),
         encoding="utf-8",
     )
     decision, reason = loop._evaluate_continuation(

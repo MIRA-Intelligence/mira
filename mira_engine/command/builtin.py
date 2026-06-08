@@ -7,7 +7,7 @@ import os
 import sys
 
 from mira_engine import __version__
-from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.command.router import CommandContext, CommandRouter
 from mira_engine.utils.helpers import build_status_content
 from mira_engine.utils.restart import set_restart_notice_to_env
@@ -60,7 +60,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         pass
     if ctx_est <= 0:
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
-    
+
     # Fetch web search provider usage (best-effort, never blocks the response)
     search_usage_text: str | None = None
     try:
@@ -303,6 +303,46 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_plan(ctx: CommandContext) -> OutboundMessage:
+    """Enter interactive plan mode for the current project.
+
+    Plan mode is a project-only feature: the agent asks structured clarifying
+    questions, proposes a draft experiment plan, and only runs experiments once
+    the user approves. This command re-triggers that flow by publishing an
+    internal plan-start event back onto the bus so the agent generates a fresh
+    set of clarifying questions.
+    """
+    msg = ctx.msg
+    meta = dict(msg.metadata or {})
+    project_dir = meta.get("project_dir")
+    if not project_dir or meta.get("loop_mode") == "normal":
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="Plan mode is only available inside a project.",
+            metadata={**meta, "render_as": "text"},
+        )
+
+    event_meta = {**meta, "_plan_event": "start"}
+    event_meta.pop("render_as", None)
+    plan_event = InboundMessage(
+        channel=msg.channel,
+        sender_id=msg.sender_id,
+        chat_id=msg.chat_id,
+        content="__plan_start__",
+        media=list(msg.media),
+        metadata=event_meta,
+        session_key_override=msg.session_key_override,
+    )
+    await ctx.loop.bus.publish_inbound(plan_event)
+    return OutboundMessage(
+        channel=msg.channel,
+        chat_id=msg.chat_id,
+        content="Entering plan mode — preparing clarifying questions...",
+        metadata={**meta, "render_as": "text"},
+    )
+
+
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands."""
     return OutboundMessage(
@@ -321,6 +361,7 @@ def build_help_text() -> str:
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/plan — Enter interactive plan mode (project only)",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -336,6 +377,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
+    router.exact("/plan", cmd_plan)
     router.exact("/dream", cmd_dream)
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)

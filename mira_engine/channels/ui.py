@@ -1450,6 +1450,39 @@ class UiChannel(BaseChannel):
         self._attach_experiment_snapshots(project_dir, data)
         return data
 
+    def _persist_plan_patch(self, project_dir: Path, patch: dict[str, Any]) -> None:
+        """Merge ``patch`` into the task_plan.json ``plan`` block, creating it if needed.
+
+        Used to record interactive plan answers / revision feedback coming from
+        the UI before the agent is re-triggered to act on them.
+        """
+        plan_path = project_dir / PLAN_FILENAME
+        try:
+            if plan_path.is_file():
+                data = json.loads(plan_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    data = {}
+            else:
+                data = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read {} for plan patch: {}", plan_path, exc)
+            return
+        block = data.get("plan")
+        if not isinstance(block, dict):
+            block = {}
+        block.update(patch)
+        data["plan"] = block
+        if not isinstance(data.get("schema_version"), int):
+            data["schema_version"] = 1
+        try:
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("Failed to write plan patch to {}: {}", plan_path, exc)
+
     # ── CORS middleware ──────────────────────────────────────────────
 
     @web.middleware
@@ -1622,8 +1655,6 @@ class UiChannel(BaseChannel):
                 metadata: dict[str, Any] = {
                     "source": "ui",
                     "loop_mode": loop_mode,
-                    "project_id": session_id,
-                    "project_dir": project_dir,
                     "run_mode": run_mode,
                     "agent_profile": agent_profile,
                     "contract_version": _normalize_contract_version(
@@ -1634,6 +1665,7 @@ class UiChannel(BaseChannel):
                 if wants_stream:
                     metadata["_wants_stream"] = True
                 if project_dir is not None:
+                    metadata["project_id"] = session_id
                     metadata["project_dir"] = project_dir
                 if effective_policy:
                     metadata["automation_policy"] = effective_policy
@@ -1692,6 +1724,144 @@ class UiChannel(BaseChannel):
                     sender_id=user_id,
                     chat_id=session_id,
                     content="__set_mode__",
+                    media=[],
+                    metadata=metadata,
+                    session_key=f"ui:{session_id}",
+                )
+            elif msg_type == "plan_answer":
+                session_id = data.get("session_id", session_id)
+                user_id = data.get("user_id", session_id or "anonymous")
+                answers = data.get("answers")
+                if not isinstance(answers, dict):
+                    answers = {}
+                if session_id is None:
+                    await ws.send_json(
+                        {"type": "error", "content": "session_id required"}
+                    )
+                    continue
+                project_dir_path = self._resolve_project_dir(session_id, create=True)
+                if project_dir_path is None:
+                    await ws.send_json(
+                        {"type": "error", "content": "project_dir resolution failed"}
+                    )
+                    continue
+                self._clients[session_id] = ws
+                self._client_project_dirs[session_id] = project_dir_path
+                project_dir = str(project_dir_path)
+                run_mode = _normalize_run_mode(data.get("mode"))
+                agent_profile = _normalize_agent_profile(data.get("agent_profile"))
+                meta = self._persist_project_runtime_preferences(
+                    project_dir_path,
+                    run_mode=run_mode,
+                    agent_profile=agent_profile,
+                    contract_version=None,
+                    automation_policy=_normalize_automation_policy(
+                        data.get("automation_policy")
+                    ),
+                )
+                effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
+                self._persist_plan_patch(project_dir_path, {"answers": answers})
+                self._audit(
+                    source="ui",
+                    action="ws_plan_answer_received",
+                    session_id=session_id,
+                    project_dir=project_dir_path,
+                    details={"user_id": user_id, "answer_count": len(answers)},
+                )
+                metadata = {
+                    "source": "ui",
+                    "loop_mode": "project",
+                    "run_mode": run_mode,
+                    "agent_profile": agent_profile,
+                    "contract_version": _normalize_contract_version(
+                        meta.get("contract_version")
+                    ),
+                    "project_dir": project_dir,
+                    "_wants_stream": True,
+                    "_plan_event": "answer",
+                }
+                if effective_policy:
+                    metadata["automation_policy"] = effective_policy
+                if self._ui_instructions:
+                    metadata["_ui_system_instructions"] = self._ui_instructions
+                await self._handle_message(
+                    sender_id=user_id,
+                    chat_id=session_id,
+                    content="__plan_answer__",
+                    media=[],
+                    metadata=metadata,
+                    session_key=f"ui:{session_id}",
+                )
+            elif msg_type == "plan_decision":
+                session_id = data.get("session_id", session_id)
+                user_id = data.get("user_id", session_id or "anonymous")
+                raw_decision = data.get("decision")
+                decision = raw_decision.strip().lower() if isinstance(raw_decision, str) else ""
+                if decision not in {"approve", "revise"}:
+                    await ws.send_json(
+                        {"type": "error", "content": "decision must be 'approve' or 'revise'"}
+                    )
+                    continue
+                raw_feedback = data.get("feedback")
+                feedback = raw_feedback.strip() if isinstance(raw_feedback, str) else ""
+                if session_id is None:
+                    await ws.send_json(
+                        {"type": "error", "content": "session_id required"}
+                    )
+                    continue
+                project_dir_path = self._resolve_project_dir(session_id, create=True)
+                if project_dir_path is None:
+                    await ws.send_json(
+                        {"type": "error", "content": "project_dir resolution failed"}
+                    )
+                    continue
+                self._clients[session_id] = ws
+                self._client_project_dirs[session_id] = project_dir_path
+                project_dir = str(project_dir_path)
+                run_mode = _normalize_run_mode(data.get("mode"))
+                agent_profile = _normalize_agent_profile(data.get("agent_profile"))
+                meta = self._persist_project_runtime_preferences(
+                    project_dir_path,
+                    run_mode=run_mode,
+                    agent_profile=agent_profile,
+                    contract_version=None,
+                    automation_policy=_normalize_automation_policy(
+                        data.get("automation_policy")
+                    ),
+                )
+                effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
+                if decision == "revise":
+                    self._persist_plan_patch(project_dir_path, {"feedback": feedback})
+                self._audit(
+                    source="ui",
+                    action="ws_plan_decision_received",
+                    session_id=session_id,
+                    project_dir=project_dir_path,
+                    details={"user_id": user_id, "decision": decision},
+                )
+                metadata = {
+                    "source": "ui",
+                    "loop_mode": "project",
+                    "run_mode": run_mode,
+                    "agent_profile": agent_profile,
+                    "contract_version": _normalize_contract_version(
+                        meta.get("contract_version")
+                    ),
+                    "project_dir": project_dir,
+                    "_wants_stream": True,
+                    "_plan_event": "decision",
+                    "_plan_decision": decision,
+                }
+                if feedback:
+                    metadata["_plan_feedback"] = feedback
+                if effective_policy:
+                    metadata["automation_policy"] = effective_policy
+                if self._ui_instructions:
+                    metadata["_ui_system_instructions"] = self._ui_instructions
+                await self._handle_message(
+                    sender_id=user_id,
+                    chat_id=session_id,
+                    content="__plan_decision__",
                     media=[],
                     metadata=metadata,
                     session_key=f"ui:{session_id}",

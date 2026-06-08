@@ -17,6 +17,9 @@ STRICT_CONTRACT_VERSION = 2
 
 _VALID_PLAN_STATUS = {"in_progress", "completed", "failed"}
 _VALID_EXPERIMENT_STATUS = {"pending", "running", "completed", "failed", "skipped"}
+# Interactive plan-mode (the ``plan`` block inside task_plan.json).
+_VALID_PLAN_PHASES = {"questions", "draft", "approved"}
+_VALID_PLAN_QUESTION_KINDS = {"single", "multi", "text"}
 _EXP_ID_PATTERN = re.compile(r"(?i)^exp[-_ ]?(\d{1,4})$")
 _RESEARCH_REQUIRED_COMPLETED_FIELDS = (
     "theoretical_proof",
@@ -727,6 +730,59 @@ def _auto_fill_contract_fields(
     return False
 
 
+def lint_plan_block(plan: object) -> list[str]:
+    """Validate the interactive plan-mode ``plan`` block, if present.
+
+    The ``plan`` block is written by the ``set_plan`` tool and read by the UI
+    to render the interactive planning stage. It is optional; absence yields no
+    issues. Unknown keys are tolerated so the schema can evolve.
+    """
+    issues: list[str] = []
+    if plan is None:
+        return issues
+    if not _is_mapping(plan):
+        return ["plan must be a JSON object"]
+
+    phase = plan.get("phase")
+    if phase is not None and phase not in _VALID_PLAN_PHASES:
+        issues.append(f"plan.phase invalid: {phase!r}")
+
+    questions = plan.get("questions")
+    if questions is not None:
+        if not isinstance(questions, list):
+            issues.append("plan.questions must be a list")
+        else:
+            seen_ids: set[str] = set()
+            for idx, question in enumerate(questions, start=1):
+                if not _is_mapping(question):
+                    issues.append(f"plan question #{idx} is not an object")
+                    continue
+                qid = question.get("id")
+                if not isinstance(qid, str) or not qid.strip():
+                    issues.append(f"plan question #{idx} missing id")
+                elif qid in seen_ids:
+                    issues.append(f"duplicate plan question id: {qid}")
+                else:
+                    seen_ids.add(qid)
+                prompt = question.get("prompt")
+                if not isinstance(prompt, str) or not prompt.strip():
+                    issues.append(f"plan question {qid or idx} missing prompt")
+                kind = question.get("kind")
+                if kind not in _VALID_PLAN_QUESTION_KINDS:
+                    issues.append(f"plan question {qid or idx} invalid kind: {kind!r}")
+                elif kind in {"single", "multi"}:
+                    options = question.get("options")
+                    if not isinstance(options, list) or not options:
+                        issues.append(
+                            f"plan question {qid or idx} requires options for kind '{kind}'"
+                        )
+
+    draft = plan.get("draft")
+    if draft is not None and not _is_mapping(draft):
+        issues.append("plan.draft must be a JSON object")
+    return issues
+
+
 def lint_task_plan_data(
     data: object,
     project_dir: Path | None = None,
@@ -744,6 +800,8 @@ def lint_task_plan_data(
         effective_contract_version = _normalize_contract_version(
             _load_project_contract_version(project_dir)
         )
+
+    issues.extend(lint_plan_block(data.get("plan")))
 
     experiments = data.get("experiments")
     if not isinstance(experiments, list):
