@@ -64,3 +64,25 @@ def test_provider_helpers_return_expected_fields() -> None:
     cfg.providers.deepseek.api_key = "k-deepseek"
     assert cfg.get_provider_name("deepseek-chat") == "deepseek"
     assert cfg.get_api_key("deepseek-chat") == "k-deepseek"
+
+
+def test_match_provider_by_nvidia_model_prefix_with_api_key() -> None:
+    cfg = Config()
+    cfg.agents.defaults.provider = "auto"
+    cfg.providers.nvidia.api_key = "nvapi-test-key"
+
+    provider, name = cfg._match_provider("nvidia/deepseek-ai/deepseek-v4-pro")
+
+    assert name == "nvidia"
+    assert provider is cfg.providers.nvidia
+
+
+def test_match_provider_does_not_route_nvidia_prefix_without_nvidia_key() -> None:
+    cfg = Config()
+    cfg.agents.defaults.provider = "auto"
+    cfg.providers.deepseek.api_key = "k-deepseek"
+
+    provider, name = cfg._match_provider("nvidia/deepseek-ai/deepseek-v4-pro")
+
+    assert name == "deepseek"
+    assert provider is cfg.providers.deepseek

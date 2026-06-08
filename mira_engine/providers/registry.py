@@ -309,6 +309,26 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=True,  # deepseek/deepseek-chat → deepseek-chat on the wire
         model_overrides=(),
     ),
+    # NVIDIA NIM public inference API.  This path is intentionally direct
+    # rather than LiteLLM/OpenAI-SDK based because NVIDIA's endpoint is
+    # OpenAI-shaped but has proven more reliable with a plain HTTP POST.
+    ProviderSpec(
+        name="nvidia",
+        keywords=("nvidia", "nemotron", "nvidia/"),
+        env_key="NVIDIA_API_KEY",
+        display_name="NVIDIA",
+        litellm_prefix="",
+        skip_prefixes=("nvidia/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="inference-api.nvidia.com",
+        default_api_base="https://inference-api.nvidia.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+        is_direct=True,
+    ),
     # Gemini: needs "gemini/" prefix for LiteLLM.
     ProviderSpec(
         name="gemini",

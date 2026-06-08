@@ -34,6 +34,26 @@ def test_build_ui_runtime_payload_includes_dynamic_provider_metadata() -> None:
     assert payload["provider_proxy"] == "http://127.0.0.1:7890"
 
 
+def test_build_ui_runtime_payload_includes_nvidia_provider_metadata() -> None:
+    cfg = Config()
+    cfg.agents.defaults.provider = "nvidia"
+    cfg.agents.defaults.model = "nvidia/deepseek-ai/deepseek-v4-pro"
+    cfg.providers.nvidia.api_key = "nvapi-test-key"
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=True,
+    )
+
+    assert payload["runtime"]["setup_required"] is False
+    assert payload["providers"]["nvidia"]["display_name"] == "NVIDIA"
+    assert payload["providers"]["nvidia"]["api_key_required"] is True
+    assert payload["providers"]["nvidia"]["api_base_required"] is False
+    assert payload["providers"]["nvidia"]["default_api_base"] == "https://inference-api.nvidia.com/v1"
+
+
 def test_build_ui_runtime_payload_returns_raw_and_resolved_workspace(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
