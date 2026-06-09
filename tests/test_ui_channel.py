@@ -2514,7 +2514,7 @@ async def test_handle_delete_project_paths(ui_channel: UiChannel, monkeypatch: p
     req_ok = MagicMock(spec=web.Request)
     req_ok.query = {"session_id": "PRJ-DEL"}
     ok = await ui_channel._handle_delete_project(req_ok)
-    assert json.loads(ok.text) == {"deleted": True}
+    assert json.loads(ok.text) == {"deleted": True, "removed": True}
 
     project2 = ui_channel.projects_root / "PRJ-ERR"
     project2.mkdir(parents=True)
@@ -2528,3 +2528,20 @@ async def test_handle_delete_project_paths(ui_channel: UiChannel, monkeypatch: p
     err = await ui_channel._handle_delete_project(req_err)
     assert err.status == 500
     assert "cannot delete" in json.loads(err.text)["error"]
+
+
+async def test_handle_remove_project_keeps_files_hidden_from_list(ui_channel: UiChannel) -> None:
+    project = ui_channel.projects_root / "PRJ-KEEP"
+    project.mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-KEEP"}
+    resp = await ui_channel._handle_remove_project(req)
+
+    assert resp.status == 200
+    assert json.loads(resp.text) == {"deleted": False, "removed": True}
+    assert project.is_dir()
+
+    list_resp = await ui_channel._handle_list_projects(MagicMock(spec=web.Request))
+    list_body = json.loads(list_resp.text)
+    assert [item["id"] for item in list_body["projects"]] == []
