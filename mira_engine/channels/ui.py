@@ -942,9 +942,13 @@ class UiChannel(BaseChannel):
         ).project_dir
 
     def _drop_project_dir_registration(
-        self, session_id: str, *, persist: bool = True
+        self, session_id: str, *, persist: bool = True, hide: bool = False
     ) -> None:
-        self.project_registry.drop_project_dir_registration(session_id, persist=persist)
+        self.project_registry.drop_project_dir_registration(
+            session_id,
+            persist=persist,
+            hide=hide,
+        )
 
     def _register_projects_under_root(self, root: Path) -> None:
         self.project_registry.register_projects_under_root(root)
@@ -1139,6 +1143,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/projects", self._handle_create_project)
         self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
         self._app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
+        self._app.router.add_post("/api/projects/{session_id}/remove", self._handle_remove_project)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
         self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
         self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
@@ -2846,7 +2851,7 @@ class UiChannel(BaseChannel):
                 session_id=session_id,
                 details={"reason": "not found"},
             )
-            return web.json_response({"deleted": False, "reason": "not found"})
+            return web.json_response({"deleted": False, "removed": False, "reason": "not found"})
 
         try:
             self._audit(
@@ -2857,13 +2862,14 @@ class UiChannel(BaseChannel):
             )
             shutil.rmtree(project_dir)
             self._drop_project_dir_registration(session_id)
+            self._client_project_dirs.pop(session_id, None)
             self._audit(
                 source="ui",
                 action="api_delete_project_completed",
                 session_id=session_id,
             )
             logger.info("Deleted project directory: {}", project_dir)
-            return web.json_response({"deleted": True})
+            return web.json_response({"deleted": True, "removed": True})
         except OSError as exc:
             self._audit(
                 source="ui",
@@ -2873,6 +2879,38 @@ class UiChannel(BaseChannel):
             )
             logger.warning("Failed to delete {}: {}", project_dir, exc)
             return web.json_response({"error": str(exc)}, status=500)
+
+    async def _handle_remove_project(self, request: web.Request) -> web.Response:
+        """Remove a project from the UI registry without deleting local files."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        try:
+            session_id = validate_project_id(session_id)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        project_dir = self._resolve_project_dir(session_id)
+        self._audit(
+            source="ui",
+            action="api_remove_project_requested",
+            session_id=session_id,
+            project_dir=project_dir,
+        )
+        try:
+            self._drop_project_dir_registration(session_id, hide=True)
+            self._client_project_dirs.pop(session_id, None)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        self._audit(
+            source="ui",
+            action="api_remove_project_completed",
+            session_id=session_id,
+            project_dir=project_dir,
+            details={"files_preserved": True},
+        )
+        return web.json_response({"deleted": False, "removed": True})
 
     async def _handle_upload_project_files(self, request: web.Request) -> web.Response:
         """Upload files into projects_root/<session_id>/data for web clients."""

@@ -142,6 +142,7 @@ class ProjectRegistry:
         self.legacy_index_path = legacy_index_path or resolve_project_dir_index_path()
         self._project_dirs: dict[str, Path] = {}
         self._project_display_names: dict[str, str] = {}
+        self._hidden_project_ids: set[str] = set()
         self._known_project_roots: set[Path] = {self.projects_root}
         self._load_workspace_file()
         self._load_legacy_project_dir_index()
@@ -171,6 +172,15 @@ class ProjectRegistry:
         projects = payload.get("projects") if isinstance(payload, dict) else None
         if not isinstance(projects, list):
             return
+        hidden_projects = payload.get("hidden_projects")
+        if isinstance(hidden_projects, list):
+            for raw_id in hidden_projects:
+                if not isinstance(raw_id, str):
+                    continue
+                try:
+                    self._hidden_project_ids.add(validate_project_id(raw_id))
+                except ValueError:
+                    continue
         for item in projects:
             if not isinstance(item, dict):
                 continue
@@ -237,6 +247,7 @@ class ProjectRegistry:
             "schema_version": 1,
             "default_project_parent": str(self.projects_root),
             "projects": projects,
+            "hidden_projects": sorted(self._hidden_project_ids),
         }
         try:
             self.workspace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -377,6 +388,7 @@ class ProjectRegistry:
         if existing is not None and existing.resolve(strict=False) != normalized_dir:
             raise ValueError(f"project_id {normalized_id!r} is already bound to {existing}")
         self._project_dirs[normalized_id] = normalized_dir
+        self._hidden_project_ids.discard(normalized_id)
         self.remember_projects_root(normalized_dir.parent)
         meta = self.ensure_project_meta(
             normalized_id,
@@ -388,8 +400,22 @@ class ProjectRegistry:
             self.save_legacy_index()
         return ProjectRef(normalized_id, normalized_dir, meta)
 
-    def drop_project_dir_registration(self, project_id: str, *, persist: bool = True) -> None:
-        if self._project_dirs.pop(project_id, None) is not None and persist:
+    def drop_project_dir_registration(
+        self,
+        project_id: str,
+        *,
+        persist: bool = True,
+        hide: bool = False,
+    ) -> None:
+        normalized_id = validate_project_id(project_id)
+        changed = self._project_dirs.pop(normalized_id, None) is not None
+        if hide and normalized_id not in self._hidden_project_ids:
+            self._hidden_project_ids.add(normalized_id)
+            changed = True
+        elif not hide and normalized_id in self._hidden_project_ids:
+            self._hidden_project_ids.discard(normalized_id)
+            changed = True
+        if changed and persist:
             self.save()
             self.save_legacy_index()
 
@@ -402,6 +428,8 @@ class ProjectRegistry:
             if not self.is_legacy_project_dir(candidate):
                 continue
             project_id = candidate.name
+            if project_id in self._hidden_project_ids:
+                continue
             if project_id in self._project_dirs:
                 continue
             self._project_dirs[project_id] = candidate.expanduser().resolve()
