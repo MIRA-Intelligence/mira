@@ -42,6 +42,12 @@ Configure these in the CNB key repository or repository variables:
 
 - `GH_SYNC_TOKEN`: GitHub fine-grained token for `MIRA-Intelligence/mira`
 
+The repository imports this token from:
+
+```text
+https://cnb.cool/mira-intelligence/mira-secrets/-/blob/main/env.yml
+```
+
 The CNB-to-GitHub Git push uses `x-access-token` as the HTTPS username, so no
 separate GitHub username or email variable is required. The same `GH_SYNC_TOKEN`
 name is used in GitHub repository secrets and in CNB key-repository imports to

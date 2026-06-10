@@ -1,4 +1,5 @@
 .github_branch_mirror: &github_branch_mirror
+  imports: https://cnb.cool/mira-intelligence/mira-secrets/-/blob/main/env.yml
   stages:
     - name: verify github sync token
       image: alpine:3.20
@@ -18,6 +19,7 @@
         force: false
 
 .cnb_issue_to_github: &cnb_issue_to_github
+  imports: https://cnb.cool/mira-intelligence/mira-secrets/-/blob/main/env.yml
   stages:
     - name: verify github sync token
       image: alpine:3.20
