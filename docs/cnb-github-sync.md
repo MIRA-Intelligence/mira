@@ -40,8 +40,12 @@ Settings -> Actions -> General -> Workflow permissions -> Allow GitHub Actions t
 
 Configure these in the CNB key repository or repository variables:
 
-- `GITHUB_SYNC_USERNAME`: GitHub username for HTTPS Git authentication
-- `GITHUB_SYNC_TOKEN`: GitHub fine-grained token for `MIRA-Intelligence/mira`
+- `GH_SYNC_TOKEN`: GitHub fine-grained token for `MIRA-Intelligence/mira`
+
+The CNB-to-GitHub Git push uses `x-access-token` as the HTTPS username, so no
+separate GitHub username or email variable is required. The same `GH_SYNC_TOKEN`
+name is used in GitHub repository secrets and in CNB key-repository imports to
+avoid name drift.
 
 The GitHub token needs:
 

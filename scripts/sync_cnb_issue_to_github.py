@@ -191,9 +191,9 @@ def sync_comment(repo: str, token: str, issue: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    token = env("GITHUB_SYNC_TOKEN")
+    token = env("GH_SYNC_TOKEN") or env("GITHUB_SYNC_TOKEN")
     if not token:
-        raise RuntimeError("GITHUB_SYNC_TOKEN is required")
+        raise RuntimeError("GH_SYNC_TOKEN is required")
 
     event = env("CNB_EVENT")
     if not event.startswith("issue."):
