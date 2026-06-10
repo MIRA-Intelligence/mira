@@ -1,0 +1,33 @@
+.github_branch_mirror: &github_branch_mirror
+  stages:
+    - name: mirror cnb branch to github
+      image: tencentcom/git-sync
+      settings:
+        target_url: https://github.com/MIRA-Intelligence/mira.git
+        auth_type: https
+        username: ${GITHUB_SYNC_USERNAME}
+        password: ${GITHUB_SYNC_TOKEN}
+        branch: ${CNB_BRANCH}
+        force: false
+
+.cnb_issue_to_github: &cnb_issue_to_github
+  stages:
+    - name: sync cnb issue to github
+      image: python:3.11-slim
+      script: python scripts/sync_cnb_issue_to_github.py
+
+"cnb/**":
+  push:
+    - *github_branch_mirror
+
+"$":
+  issue.open:
+    - *cnb_issue_to_github
+  issue.update:
+    - *cnb_issue_to_github
+  issue.close:
+    - *cnb_issue_to_github
+  issue.reopen:
+    - *cnb_issue_to_github
+  issue.comment:
+    - *cnb_issue_to_github
