@@ -23,8 +23,13 @@ Configure these in the GitHub repository secrets:
 - `CNB_REPO_URL`: CNB HTTPS Git URL, for example `https://cnb.cool/<group>/mira.git`
 - `CNB_GIT_USERNAME`: CNB Git username, usually `cnb`
 - `CNB_GIT_TOKEN`: CNB token with write access to the mirrored repository
+- `GITHUB_SYNC_TOKEN`: optional but recommended. Use the same fine-grained
+  GitHub token described below so the `cnb/**` inbound PR workflow can create
+  pull requests even when the organization disables write access for
+  `GITHUB_TOKEN`.
 
-Also enable GitHub Actions to create pull requests:
+If you do not configure `GITHUB_SYNC_TOKEN` as a GitHub repository secret, also
+enable GitHub Actions to create pull requests:
 
 ```text
 Settings -> Actions -> General -> Workflow permissions -> Allow GitHub Actions to create and approve pull requests
