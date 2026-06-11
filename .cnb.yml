@@ -18,7 +18,7 @@
         branch: ${CNB_BRANCH}
         force: false
 
-.cnb_issue_to_github: &cnb_issue_to_github
+.cnb_metadata_to_github: &cnb_metadata_to_github
   imports: https://cnb.cool/mira-intelligence/mira-secrets/-/blob/main/env.yml
   stages:
     - name: verify github sync token
@@ -28,7 +28,7 @@
           echo "GH_SYNC_TOKEN is required in CNB via key-repository imports."
           exit 1
         fi
-    - name: sync cnb issue to github
+    - name: sync cnb metadata to github
       image: python:3.11-slim
       script: python scripts/sync_cnb_issue_to_github.py
 
@@ -37,13 +37,19 @@
     - *github_branch_mirror
 
 "$":
+  pull_request:
+    - *cnb_metadata_to_github
+  pull_request.update:
+    - *cnb_metadata_to_github
+  pull_request.comment:
+    - *cnb_metadata_to_github
   issue.open:
-    - *cnb_issue_to_github
+    - *cnb_metadata_to_github
   issue.update:
-    - *cnb_issue_to_github
+    - *cnb_metadata_to_github
   issue.close:
-    - *cnb_issue_to_github
+    - *cnb_metadata_to_github
   issue.reopen:
-    - *cnb_issue_to_github
+    - *cnb_metadata_to_github
   issue.comment:
-    - *cnb_issue_to_github
+    - *cnb_metadata_to_github
