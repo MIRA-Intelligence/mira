@@ -701,6 +701,34 @@ def _resolve_upload_destination(
     return _next_available_path(parent, safe_parts[-1])
 
 
+_PROJECT_FILE_LIST_SKIP_DIRS = frozenset({".mira", "__pycache__", ".git", "node_modules"})
+
+
+def _collect_project_file_entries(project_dir: Path) -> list[dict[str, Any]]:
+    """Walk a project directory and return file rows for the UI explorer."""
+    entries: list[dict[str, Any]] = []
+    for path in sorted(project_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(project_dir).as_posix()
+        if any(part in _PROJECT_FILE_LIST_SKIP_DIRS for part in rel.split("/")):
+            continue
+        if path.name == ".DS_Store":
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append({
+            "name": path.name,
+            "path": rel,
+            "size": stat.st_size,
+            "mtime": int(stat.st_mtime),
+            "is_dir": False,
+        })
+    return entries
+
+
 def _next_available_dir(base_dir: Path, dirname: str) -> Path:
     """Return a non-colliding directory path inside *base_dir*."""
     candidate = base_dir / dirname
@@ -1147,6 +1175,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
         self._app.router.add_post("/api/projects/{session_id}/remove", self._handle_remove_project)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
+        self._app.router.add_get("/api/projects/{session_id}/files", self._handle_list_project_files)
         self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
         self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
         self._app.router.add_get("/api/projects/{session_id}/skill-plugins", self._handle_skill_plugins_list)
@@ -2914,6 +2943,21 @@ class UiChannel(BaseChannel):
             details={"files_preserved": True},
         )
         return web.json_response({"deleted": False, "removed": True})
+
+    async def _handle_list_project_files(self, request: web.Request) -> web.Response:
+        """List files under projects_root/<session_id> for the UI resource explorer."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not project_dir.is_dir():
+            return web.json_response({"error": "project not found"}, status=404)
+
+        return web.json_response({
+            "session_id": session_id,
+            "files": _collect_project_file_entries(project_dir),
+        })
 
     async def _handle_upload_project_files(self, request: web.Request) -> web.Response:
         """Upload files into projects_root/<session_id>/data for web clients."""

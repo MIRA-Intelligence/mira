@@ -1729,6 +1729,29 @@ async def test_cors_allows_patch_method(ui_channel: UiChannel) -> None:
     assert resp.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
 
 
+async def test_handle_list_project_files_returns_project_tree(ui_channel: UiChannel) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
+    project_dir.mkdir(parents=True)
+    (project_dir / "task_plan.json").write_text("{}", encoding="utf-8")
+    exp_dir = project_dir / "experiments" / "exp001"
+    exp_dir.mkdir(parents=True)
+    (exp_dir / "metrics.json").write_text("{}", encoding="utf-8")
+    internal = project_dir / ".mira" / "sessions"
+    internal.mkdir(parents=True)
+    (internal / "ui.jsonl").write_text("{}", encoding="utf-8")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+
+    resp = await ui_channel._handle_list_project_files(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    paths = {item["path"] for item in body["files"]}
+    assert "task_plan.json" in paths
+    assert "experiments/exp001/metrics.json" in paths
+    assert "ui.jsonl" not in paths
+
+
 async def test_handle_upload_project_files_invalid_multipart(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
