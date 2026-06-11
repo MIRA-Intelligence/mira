@@ -1,0 +1,176 @@
+"""Mira Community Platform channel.
+
+Connects the local engine to the Mira Community Platform (mira-intelligence).
+Unlike chat channels, the peer here is the Mira cloud: the channel opens an
+authenticated websocket to receive *community events* (mentions, replies,
+votes, feature proposals, review/build invites) and posts the agent's
+responses back over HTTP.
+
+Events are authenticated at the websocket layer by the agent token, so they
+are published to the bus directly rather than going through the per-sender
+``allow_from`` gate used by public chat platforms.
+
+The cloud endpoints are provided by the community API (see
+``MIRA-Intelligence/mira-community``). Until the agent gateway is live the
+channel simply retries the connection with backoff and never crashes the
+engine.
+"""
+
+import asyncio
+import json
+from typing import Any
+from urllib.parse import urlparse, urlunparse
+
+import httpx
+import websockets
+from loguru import logger
+
+from mira_engine.bus.events import InboundMessage, OutboundMessage
+from mira_engine.bus.queue import MessageBus
+from mira_engine.channels.base import BaseChannel
+
+RECONNECT_BACKOFF_S = (2, 5, 10, 30, 60)
+
+
+def _ws_url(api_base: str) -> str:
+    """Derive the agent-gateway websocket URL from the REST api base."""
+    parsed = urlparse(api_base.rstrip("/"))
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    path = f"{parsed.path}/agents/ws"
+    return urlunparse((scheme, parsed.netloc, path, "", "", ""))
+
+
+class CommunityChannel(BaseChannel):
+    """Engine-side connection to the Mira Community Platform."""
+
+    name = "community"
+    display_name = "Mira Community"
+
+    def __init__(self, config: Any, bus: MessageBus):
+        super().__init__(config, bus)
+        self.api_base: str = (getattr(config, "api_base", "") or "").rstrip("/")
+        self.agent_token: str = getattr(config, "agent_token", "") or ""
+        self.agent_id: str = getattr(config, "agent_id", "") or ""
+        self._ws: Any | None = None
+        self._http: httpx.AsyncClient | None = None
+
+    @property
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.agent_token}"}
+
+    async def start(self) -> None:
+        if not self.agent_token:
+            logger.warning(
+                "community channel enabled but no agent token; run `mira community login`"
+            )
+            return
+        if not self.api_base:
+            logger.warning("community channel enabled but apiBase is empty")
+            return
+
+        self._running = True
+        self._http = httpx.AsyncClient(timeout=30.0, headers=self._auth_headers)
+        url = _ws_url(self.api_base)
+        attempt = 0
+
+        while self._running:
+            try:
+                logger.info("Connecting to Mira Community gateway at {}...", url)
+                async with websockets.connect(
+                    url, additional_headers=self._auth_headers, open_timeout=20
+                ) as ws:
+                    self._ws = ws
+                    attempt = 0
+                    logger.info("Mira Community gateway connected")
+                    await self._recv_loop(ws)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not self._running:
+                    break
+                delay = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
+                attempt += 1
+                logger.warning("Mira Community gateway error: {} (retry in {}s)", e, delay)
+                await asyncio.sleep(delay)
+            finally:
+                self._ws = None
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        if self._http:
+            await self._http.aclose()
+            self._http = None
+
+    async def _recv_loop(self, ws: Any) -> None:
+        async for raw in ws:
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Invalid event from community gateway: {}", str(raw)[:120])
+                continue
+            try:
+                await self._handle_event(event)
+            except Exception as e:
+                logger.warning("Failed to handle community event: {}", e)
+
+    async def _handle_event(self, event: dict[str, Any]) -> None:
+        """Map a cloud event onto an inbound message for the agent."""
+        etype = event.get("type")
+        if etype in (None, "pong", "ack", "ping"):
+            return
+
+        thread_id = str(
+            event.get("thread_id") or event.get("chat_id") or event.get("id") or "community"
+        )
+        actor = str(event.get("actor") or event.get("author") or "community")
+        content = self._format_event(event)
+        if not content:
+            return
+
+        msg = InboundMessage(
+            channel=self.name,
+            sender_id=actor,
+            chat_id=thread_id,
+            content=content,
+            metadata={"community_event": event},
+        )
+        await self.bus.publish_inbound(msg)
+
+    @staticmethod
+    def _format_event(event: dict[str, Any]) -> str:
+        """Render a community event as a prompt the agent can reason about."""
+        etype = event.get("type", "event")
+        body = event.get("content") or event.get("body") or event.get("text") or ""
+        title = event.get("title")
+        url = event.get("url")
+        parts = [f"[Mira Community] {etype}"]
+        if title:
+            parts.append(f"title: {title}")
+        if body:
+            parts.append(str(body))
+        if url:
+            parts.append(f"link: {url}")
+        return "\n".join(parts).strip()
+
+    async def send(self, msg: OutboundMessage) -> None:
+        """Post the agent's reply back to the community thread over HTTP."""
+        if not self._http or not self.api_base:
+            logger.warning("community channel not connected; dropping outbound message")
+            return
+        payload: dict[str, Any] = {
+            "thread_id": msg.chat_id,
+            "content": msg.content,
+        }
+        if msg.reply_to:
+            payload["reply_to"] = msg.reply_to
+        try:
+            resp = await self._http.post(f"{self.api_base}/agents/messages", json=payload)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.warning("Failed to post community reply: {}", e)
