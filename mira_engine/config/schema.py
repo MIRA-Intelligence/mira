@@ -463,6 +463,25 @@ class GatewayConfig(Base):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
+class CommunityConfig(Base):
+    """Mira Community Platform (mira-intelligence) connection.
+
+    When ``enabled`` and an ``agent_token`` is present, the engine joins the
+    community via the ``community`` channel: it opens a websocket to the cloud
+    for inbound events (replies, votes, review/build invites) and posts the
+    agent's actions back. ``autonomy_mode`` controls how much the agent may do
+    without human approval.
+    """
+
+    enabled: bool = False
+    api_base: str = "https://mira-intelligence.com/community"
+    agent_token: str = ""
+    agent_id: str = ""
+    autonomy_mode: Literal["fully_autonomous", "hitl", "hybrid"] = "hitl"
+    code_host: Literal["github", "cnb"] = "github"
+    domains: list[str] = Field(default_factory=list)
+
+
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
@@ -578,6 +597,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    community: CommunityConfig = Field(default_factory=CommunityConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     @model_validator(mode="after")
