@@ -2776,6 +2776,183 @@ def channels_login(
 
 
 # ============================================================================
+# Community Commands
+# ============================================================================
+
+community_app = typer.Typer(help="Mira Community Platform (mira-intelligence)")
+app.add_typer(community_app, name="community")
+
+
+def _load_community_config(config: str | None):
+    """Load config (optionally from a custom path) for community commands."""
+    from mira_engine.config.loader import load_config, set_config_path
+
+    if config:
+        set_config_path(Path(config).expanduser().resolve())
+    return load_config()
+
+
+@community_app.command("login")
+def community_login(
+    api_base: str = typer.Option(None, "--api-base", help="Community API base URL"),
+    autonomy: str = typer.Option(
+        None, "--autonomy", help="Autonomy mode: fully_autonomous | hitl | hybrid"
+    ),
+    code_host: str = typer.Option(None, "--code-host", help="Preferred code host: github | cnb"),
+    domains: str = typer.Option(
+        None, "--domains", help="Comma-separated areas of interest (e.g. channels,agent)"
+    ),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Pair this agent with the Mira Community Platform (device flow)."""
+    import time
+    import webbrowser
+
+    import httpx
+
+    from mira_engine.config.loader import save_config
+
+    cfg = _load_community_config(config)
+    base = (api_base or cfg.community.api_base).rstrip("/")
+
+    if autonomy:
+        if autonomy not in ("fully_autonomous", "hitl", "hybrid"):
+            console.print("[red]--autonomy must be fully_autonomous, hitl, or hybrid[/red]")
+            raise typer.Exit(1)
+        cfg.community.autonomy_mode = autonomy
+    if code_host:
+        if code_host not in ("github", "cnb"):
+            console.print("[red]--code-host must be github or cnb[/red]")
+            raise typer.Exit(1)
+        cfg.community.code_host = code_host
+    if domains is not None:
+        cfg.community.domains = [d.strip() for d in domains.split(",") if d.strip()]
+
+    console.print(f"{__logo__} Pairing with Mira Community at [cyan]{base}[/cyan]\n")
+
+    start_payload = {
+        "code_host": cfg.community.code_host,
+        "autonomy_mode": cfg.community.autonomy_mode,
+        "domains": cfg.community.domains,
+    }
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(f"{base}/agents/pair/start", json=start_payload)
+            if resp.status_code == 404:
+                console.print(
+                    "[yellow]Pairing endpoint not available yet.[/yellow] "
+                    "The cloud agent gateway (#108/#109) is not deployed."
+                )
+                raise typer.Exit(1)
+            resp.raise_for_status()
+            data = resp.json()
+
+            verification_url = data.get("verification_url") or data.get("verification_uri")
+            user_code = data.get("user_code") or data.get("pairing_code")
+            poll_token = data.get("poll_token") or data.get("device_code")
+            interval = int(data.get("interval", 5))
+            expires_in = int(data.get("expires_in", 300))
+
+            if not (verification_url and poll_token):
+                console.print("[red]Unexpected pairing response from server[/red]")
+                raise typer.Exit(1)
+
+            console.print("To authorize this agent, open:")
+            console.print(f"  [link={verification_url}]{verification_url}[/link]")
+            if user_code:
+                console.print(f"and enter code: [bold cyan]{user_code}[/bold cyan]")
+            try:
+                webbrowser.open(verification_url)
+            except Exception:
+                pass
+            console.print("\n[dim]Waiting for authorization...[/dim]")
+
+            deadline = time.monotonic() + expires_in
+            agent_token = None
+            agent_id = ""
+            while time.monotonic() < deadline:
+                time.sleep(interval)
+                poll = client.post(f"{base}/agents/pair/poll", json={"poll_token": poll_token})
+                if poll.status_code in (202, 425):
+                    continue
+                if poll.status_code == 200:
+                    pdata = poll.json()
+                    agent_token = pdata.get("agent_token")
+                    agent_id = pdata.get("agent_id", "")
+                    if agent_token:
+                        break
+                else:
+                    console.print(f"[red]Pairing failed: HTTP {poll.status_code}[/red]")
+                    raise typer.Exit(1)
+    except httpx.HTTPError as e:
+        console.print(f"[red]Network error contacting community: {e}[/red]")
+        raise typer.Exit(1)
+
+    if not agent_token:
+        console.print("[red]Pairing timed out. Run `mira community login` to try again.[/red]")
+        raise typer.Exit(1)
+
+    cfg.community.enabled = True
+    cfg.community.api_base = base
+    cfg.community.agent_token = agent_token
+    cfg.community.agent_id = agent_id
+    save_config(cfg)
+    console.print(
+        "\n[green]✓[/green] Joined the Mira Community"
+        + (f"  [dim]agent {agent_id}[/dim]" if agent_id else "")
+    )
+    console.print("[dim]Restart the gateway to activate the community channel.[/dim]")
+
+
+@community_app.command("status")
+def community_status(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Show Mira Community connection status."""
+    import httpx
+
+    cfg = _load_community_config(config)
+    c = cfg.community
+
+    console.print(f"{__logo__} Mira Community\n")
+    console.print(f"Enabled: {'[green]✓[/green]' if c.enabled else '[dim]no[/dim]'}")
+    console.print(f"API base: {c.api_base}")
+    console.print(
+        "Logged in: "
+        + ("[green]✓[/green]" if c.agent_token else "[dim]no — run `mira community login`[/dim]")
+        + (f"  [dim]agent {c.agent_id}[/dim]" if c.agent_id else "")
+    )
+    console.print(f"Autonomy: {c.autonomy_mode}")
+    console.print(f"Code host: {c.code_host}")
+    console.print(f"Domains: {', '.join(c.domains) if c.domains else '[dim]none[/dim]'}")
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(f"{c.api_base.rstrip('/')}/health")
+        if resp.status_code == 200:
+            console.print(f"Service: [green]✓ reachable[/green] [dim]{resp.text.strip()}[/dim]")
+        else:
+            console.print(f"Service: [yellow]HTTP {resp.status_code}[/yellow]")
+    except Exception as e:
+        console.print(f"Service: [red]unreachable[/red] [dim]{e}[/dim]")
+
+
+@community_app.command("logout")
+def community_logout(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Disconnect this agent from the Mira Community Platform."""
+    from mira_engine.config.loader import save_config
+
+    cfg = _load_community_config(config)
+    cfg.community.enabled = False
+    cfg.community.agent_token = ""
+    cfg.community.agent_id = ""
+    save_config(cfg)
+    console.print("[green]✓[/green] Left the Mira Community (local credentials cleared)")
+
+
+# ============================================================================
 # Status Commands
 # ============================================================================
 
