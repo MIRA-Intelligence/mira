@@ -1,0 +1,26 @@
+name: Sync GitHub Metadata to CNB
+
+on:
+  issues:
+    types:
+      - closed
+      - reopened
+  pull_request:
+    types:
+      - closed
+      - reopened
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync GitHub metadata to CNB
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_GIT_TOKEN }}
+          CNB_REPO_URL: ${{ secrets.CNB_REPO_URL }}
+        run: python scripts/sync_github_metadata_to_cnb.py
