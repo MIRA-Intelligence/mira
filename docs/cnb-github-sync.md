@@ -12,8 +12,12 @@ only GitHub can merge protected branches.
 2. CNB mirrors contributor branches back to GitHub only when the branch name
    matches `cnb/**`.
 3. GitHub opens or reuses a PR from the mirrored `cnb/**` branch into `dev`.
-4. CNB issue events create or update a GitHub issue with CNB metadata markers.
-5. Review, CI, and merge happen on GitHub. CNB protected branches should not be
+4. CNB PR events update the GitHub PR with the CNB title, description, source
+   link, and a de-duplicated opening comment. CNB PR comments are copied to the
+   GitHub PR conversation.
+5. CNB issue events create or update a GitHub issue with CNB metadata markers,
+   and CNB issue comments are copied to the GitHub issue conversation.
+6. Review, CI, and merge happen on GitHub. CNB protected branches should not be
    merged directly.
 
 ## Required GitHub Secrets
@@ -57,6 +61,28 @@ The GitHub token needs:
 
 - Contents: read and write
 - Issues: read and write
+- Pull requests: read and write
+
+If the CNB key repository restricts which events can import the file, allow the
+events used by this repository:
+
+```yaml
+GH_SYNC_TOKEN: github_pat_xxx
+
+allow_events:
+  - push
+  - pull_request
+  - pull_request.update
+  - pull_request.comment
+  - issue.open
+  - issue.update
+  - issue.close
+  - issue.reopen
+  - issue.comment
+```
+
+If the CNB run says `GH_SYNC_TOKEN is required`, the event probably did not get
+permission to import the key repository file.
 
 If the target GitHub repository changes, also set:
 
@@ -89,8 +115,15 @@ to GitHub, and GitHub will create the canonical PR into `dev`.
    commit.
 4. Confirm the same branch appears on GitHub.
 5. Confirm GitHub Actions opens a PR titled `[CNB] smoke: sync-test`.
-6. Create a CNB issue and confirm a GitHub issue appears with the
+6. Open or update a CNB PR with a description and confirm the GitHub PR body and
+   conversation contain the CNB description with `CNB-PR-ID` and
+   `CNB-PR-Opening-Comment-ID` markers.
+7. Add a CNB PR comment and confirm it appears in the GitHub PR conversation
+   with a `CNB-PR-Comment-ID` marker.
+8. Create a CNB issue and confirm a GitHub issue appears with the
    `CNB-Issue-ID` marker.
+9. Add a CNB issue comment and confirm it appears in the GitHub issue
+   conversation with a `CNB-Comment-ID` marker.
 
 ## Conflict Policy
 
@@ -99,7 +132,7 @@ local-only commits, the workflow fails instead of overwriting the branch.
 Resolve by moving the CNB-only work to a `cnb/**` branch and opening a GitHub
 PR.
 
-CNB issue sync is inbound-only. GitHub remains the canonical issue tracker once
-the issue has been created there. Full GitHub-to-CNB issue/comment mirroring
-can be added later with CNB OpenAPI calls, but should use the same marker-based
-deduplication approach.
+CNB issue and PR conversation sync is inbound-only. GitHub remains the canonical
+tracker once the thread has been created there. Full GitHub-to-CNB issue/comment
+mirroring can be added later with CNB OpenAPI calls, but should use the same
+marker-based deduplication approach.
