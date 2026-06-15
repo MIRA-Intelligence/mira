@@ -252,6 +252,7 @@ def build_ui_runtime_payload(
             "provider": defaults.provider,
             "model": defaults.model,
             "reasoning_effort": defaults.reasoning_effort,
+            "temperature": defaults.temperature,
             "max_tool_iterations": defaults.max_tool_iterations,
             "restrict_to_workspace": config.tools.restrict_to_workspace,
             "setup_required": setup_required,
@@ -322,6 +323,12 @@ def apply_ui_runtime_update_to_raw_data(
             reasoning_effort = runtime_payload["reasoning_effort"]
             value = None if reasoning_effort is None or reasoning_effort == "" else str(reasoning_effort)
             _set_alias_value(defaults, "reasoning_effort", value, alias="reasoningEffort")
+            changed = True
+
+        if "temperature" in runtime_payload:
+            raw_temperature = runtime_payload["temperature"]
+            value = None if raw_temperature in (None, "") else raw_temperature
+            _set_alias_value(defaults, "temperature", value)
             changed = True
 
         if "max_tool_iterations" in runtime_payload:
@@ -462,6 +469,20 @@ def apply_ui_runtime_update(
                 raise ValueError("runtime.reasoning_effort must be one of: low, medium, high, adaptive")
             if config.agents.defaults.reasoning_effort != next_effort:
                 config.agents.defaults.reasoning_effort = next_effort
+                changed = True
+
+        if "temperature" in runtime_payload:
+            temperature = runtime_payload["temperature"]
+            if temperature is None or temperature == "":
+                next_temperature: float | None = None
+            elif isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+                raise ValueError("runtime.temperature must be a number or null")
+            else:
+                next_temperature = float(temperature)
+                if not 0.0 <= next_temperature <= 2.0:
+                    raise ValueError("runtime.temperature must be between 0 and 2")
+            if config.agents.defaults.temperature != next_temperature:
+                config.agents.defaults.temperature = next_temperature
                 changed = True
 
         if "max_tool_iterations" in runtime_payload:

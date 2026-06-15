@@ -295,7 +295,7 @@ class AgentDefaults(Base):
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
     context_block_limit: int | None = None
-    temperature: float = 0.1
+    temperature: float | None = 0.1  # None => omit the parameter entirely
     max_tool_iterations: int = 200
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"

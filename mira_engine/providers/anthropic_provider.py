@@ -392,7 +392,7 @@ class AnthropicProvider(LLMProvider):
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4096)
             kwargs["temperature"] = 1.0
-        else:
+        elif temperature is not None:
             kwargs["temperature"] = temperature
 
         if anthropic_tools:

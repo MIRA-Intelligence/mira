@@ -295,10 +295,13 @@ class LiteLLMProvider(LLMProvider):
             "model": model,
             "messages": self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys),
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        # None => omit temperature entirely (let the model use its own default).
+        if temperature is not None:
+            kwargs["temperature"] = temperature
 
-        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
+        # Apply model-specific overrides (e.g. kimi-k2.5 temperature) — these may
+        # (re)introduce a required temperature even when the caller omitted one.
         self._apply_model_overrides(model, kwargs)
 
         # Pass api_key directly — more reliable than env vars alone
