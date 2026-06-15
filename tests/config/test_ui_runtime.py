@@ -225,3 +225,58 @@ def test_apply_ui_runtime_update_to_raw_data_preserves_routing_models() -> None:
     assert defaults["maxToolIterations"] == 64
     assert data["providers"]["openrouter"]["apiKey"] == "existing-key"
     assert data["providers"]["openrouter"]["apiBase"] == "https://openrouter.ai/api/v1"
+
+
+def test_build_ui_runtime_payload_includes_temperature() -> None:
+    cfg = Config()
+    cfg.agents.defaults.temperature = 0.42
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    assert payload["runtime"]["temperature"] == 0.42
+
+
+def test_apply_ui_runtime_update_sets_temperature() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"temperature": 1}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.temperature == 1.0
+
+
+def test_apply_ui_runtime_update_rejects_out_of_range_temperature() -> None:
+    cfg = Config()
+
+    for bad in (-0.1, 2.1, "hot", True):
+        try:
+            apply_ui_runtime_update(
+                cfg,
+                {"runtime": {"temperature": bad}},
+                current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+            )
+        except ValueError:
+            continue
+        raise AssertionError(f"temperature {bad!r} should have been rejected")
+
+
+def test_apply_ui_runtime_update_to_raw_data_sets_temperature() -> None:
+    data: dict = {"agents": {"defaults": {}}}
+
+    _, changed = apply_ui_runtime_update_to_raw_data(
+        data,
+        {"runtime": {"temperature": 0.9}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert data["agents"]["defaults"]["temperature"] == 0.9
