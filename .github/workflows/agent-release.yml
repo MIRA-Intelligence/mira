@@ -109,7 +109,10 @@ jobs:
 
           port = 18790
           exe_name = "mira-engine.exe" if platform.system() == "Windows" else "mira-engine"
-          exe_path = Path("dist") / exe_name
+          if platform.system() == "Windows":
+              exe_path = Path("dist") / "mira-engine" / exe_name
+          else:
+              exe_path = Path("dist") / exe_name
           if not exe_path.exists():
               raise SystemExit(f"standalone executable missing: {exe_path}")
 
@@ -231,7 +234,21 @@ jobs:
         run: |
           mkdir -p release-artifacts
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp dist/mira-engine.exe release-artifacts/mira-engine-windows-x86_64.exe
+            python <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          src = Path("dist") / "mira-engine"
+          exe = src / "mira-engine.exe"
+          if not exe.is_file():
+              raise SystemExit(f"Windows one-dir executable missing: {exe}")
+
+          zip_path = Path("release-artifacts") / "mira-engine-windows-x86_64.zip"
+          with ZipFile(zip_path, "w", ZIP_DEFLATED) as zf:
+              for path in sorted(src.rglob("*")):
+                  if path.is_file():
+                      zf.write(path, path.relative_to(src.parent).as_posix())
+          PY
           elif [ "${{ matrix.os }}" = "macos-latest" ]; then
             ARCH="$(uname -m)"
             cp dist/mira-engine release-artifacts/mira-engine-macos-${ARCH}
