@@ -49,8 +49,10 @@ class CustomProvider(LLMProvider):
                 self._sanitize_empty_content(messages), self._ALLOWED_KEYS,
             ),
             "max_tokens": max(1, max_tokens),
-            "temperature": temperature,
         }
+        # None => omit temperature entirely (for models that reject the param).
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
         if tools:

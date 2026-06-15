@@ -326,7 +326,9 @@ def apply_ui_runtime_update_to_raw_data(
             changed = True
 
         if "temperature" in runtime_payload:
-            _set_alias_value(defaults, "temperature", runtime_payload["temperature"])
+            raw_temperature = runtime_payload["temperature"]
+            value = None if raw_temperature in (None, "") else raw_temperature
+            _set_alias_value(defaults, "temperature", value)
             changed = True
 
         if "max_tool_iterations" in runtime_payload:
@@ -471,13 +473,16 @@ def apply_ui_runtime_update(
 
         if "temperature" in runtime_payload:
             temperature = runtime_payload["temperature"]
-            if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
-                raise ValueError("runtime.temperature must be a number")
-            temperature = float(temperature)
-            if not 0.0 <= temperature <= 2.0:
-                raise ValueError("runtime.temperature must be between 0 and 2")
-            if config.agents.defaults.temperature != temperature:
-                config.agents.defaults.temperature = temperature
+            if temperature is None or temperature == "":
+                next_temperature: float | None = None
+            elif isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+                raise ValueError("runtime.temperature must be a number or null")
+            else:
+                next_temperature = float(temperature)
+                if not 0.0 <= next_temperature <= 2.0:
+                    raise ValueError("runtime.temperature must be between 0 and 2")
+            if config.agents.defaults.temperature != next_temperature:
+                config.agents.defaults.temperature = next_temperature
                 changed = True
 
         if "max_tool_iterations" in runtime_payload:

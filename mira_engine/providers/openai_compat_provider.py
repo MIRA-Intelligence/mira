@@ -333,8 +333,9 @@ class OpenAICompatProvider(LLMProvider):
         }
 
         # GPT-5 and reasoning models (o1/o3/o4) reject temperature when
-        # reasoning_effort is active.  Only include it when safe.
-        if self._supports_temperature(model_name, reasoning_effort):
+        # reasoning_effort is active.  Only include it when safe and when the
+        # caller actually wants a temperature (None => omit the parameter).
+        if temperature is not None and self._supports_temperature(model_name, reasoning_effort):
             kwargs["temperature"] = temperature
 
         prefers_max_completion_tokens = any(token in model_name.lower() for token in ("gpt-5", "o1", "o3", "o4"))
@@ -485,7 +486,7 @@ class OpenAICompatProvider(LLMProvider):
             "stream": False,
         }
 
-        if self._supports_temperature(model_name, reasoning_effort):
+        if temperature is not None and self._supports_temperature(model_name, reasoning_effort):
             body["temperature"] = temperature
 
         if reasoning_effort and reasoning_effort.lower() != "none":

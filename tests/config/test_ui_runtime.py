@@ -254,6 +254,34 @@ def test_apply_ui_runtime_update_sets_temperature() -> None:
     assert cfg.agents.defaults.temperature == 1.0
 
 
+def test_apply_ui_runtime_update_clears_temperature_when_null() -> None:
+    cfg = Config()
+    cfg.agents.defaults.temperature = 0.7
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"temperature": None}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.temperature is None
+
+
+def test_apply_ui_runtime_update_clears_temperature_when_empty_string() -> None:
+    cfg = Config()
+    cfg.agents.defaults.temperature = 0.7
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"temperature": ""}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.temperature is None
+
+
 def test_apply_ui_runtime_update_rejects_out_of_range_temperature() -> None:
     cfg = Config()
 

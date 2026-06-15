@@ -76,7 +76,7 @@ class LLMResponse:
 class GenerationSettings:
     """Default generation settings."""
 
-    temperature: float = 0.7
+    temperature: float | None = 0.7
     max_tokens: int = 4096
     reasoning_effort: str | None = None
 

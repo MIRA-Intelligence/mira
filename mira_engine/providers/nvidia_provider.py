@@ -231,7 +231,7 @@ class NvidiaProvider(LLMProvider):
             "stream": False,
             "max_tokens": max(1, int(max_tokens)),
         }
-        if self._supports_temperature(model_name, reasoning_effort):
+        if temperature is not None and self._supports_temperature(model_name, reasoning_effort):
             payload["temperature"] = temperature
         if tools:
             payload["tools"] = tools
