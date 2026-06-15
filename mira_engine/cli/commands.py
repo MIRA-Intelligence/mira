@@ -506,7 +506,10 @@ class MiraCompleter(Completer):
                 for part in rel.parts
             ):
                 continue
-            entries.append((str(rel), f))
+            # Emit POSIX-style separators so completions are consistent across
+            # platforms (Windows ``str(rel)`` would yield backslashes, breaking
+            # "@dir/file" matching and downstream "/"-style path references).
+            entries.append((rel.as_posix(), f))
         entries.sort(key=lambda e: e[0])
         self._file_cache = entries
         return [p for p, _ in entries]
