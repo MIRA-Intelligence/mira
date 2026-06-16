@@ -40,17 +40,31 @@ def test_agent_defaults_prepends_provider_prefix() -> None:
     assert defaults.model_candidates == ["openrouter/claude-3-opus"]
 
 
-def test_agent_defaults_prepends_provider_prefix_to_tiers() -> None:
-    """Test that tier models without '/' get provider prefix."""
+def test_agent_defaults_prepends_provider_prefix_to_roles() -> None:
+    """Team role models without '/' inherit the global provider prefix."""
     defaults = AgentDefaults.model_validate(
         {
             "provider": "openrouter",
             "model": "claude-3-opus",
-            "smallModel": "gpt-4o-mini",
+            "studentModel": "gpt-4o-mini",
         }
     )
-    assert defaults.small_model == "openrouter/gpt-4o-mini"
-    assert defaults.small_model_candidates == ["openrouter/gpt-4o-mini"]
+    assert defaults.student_model == "openrouter/gpt-4o-mini"
+    assert defaults.student_model_candidates == ["openrouter/gpt-4o-mini"]
+
+
+def test_agent_defaults_role_provider_override_prefix() -> None:
+    """A role's own provider overrides the global provider for prefixing."""
+    defaults = AgentDefaults.model_validate(
+        {
+            "provider": "openrouter",
+            "model": "claude-3-opus",
+            "criticProvider": "deepseek",
+            "criticModel": "deepseek-chat",
+        }
+    )
+    assert defaults.critic_model == "deepseek/deepseek-chat"
+    assert defaults.role_provider("critic") == "deepseek"
 
 
 def test_agent_defaults_skips_prefix_if_already_present() -> None:

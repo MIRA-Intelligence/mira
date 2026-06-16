@@ -31,7 +31,7 @@ from mira_engine.agent.context import ContextBuilder
 from mira_engine.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from mira_engine.agent.memory import Consolidator, Dream, MemoryStore
 from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
-from mira_engine.agent.routing import ModelRouter, RoutedProviderManager
+from mira_engine.agent.routing import RoutedProviderManager
 from mira_engine.agent.runner import AgentRunner
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
@@ -47,6 +47,7 @@ from mira_engine.agent.tools.plan import SetPlanTool
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.agent.tools.search import GlobTool, GrepTool
 from mira_engine.agent.tools.shell import ExecTool
+from mira_engine.agent.tools.consult import ConsultRoleTool
 from mira_engine.agent.tools.spawn import SpawnTool
 from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
@@ -108,7 +109,8 @@ class BaseAgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         provider_factory: Callable[[str], LLMProvider] | None = None,
-        model_router: ModelRouter | None = None,
+        model_candidates: list[str] | None = None,
+        role_provider_factory: "Callable[[str], tuple[LLMProvider, str, tuple[str, ...]]] | None" = None,
         context_window_tokens: int | None = None,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
@@ -117,10 +119,11 @@ class BaseAgentLoop:
         self.bus = bus
         self.channels_config = channels_config
         self.provider_factory = provider_factory
-        self.model_router = model_router
+        self.role_provider_factory = role_provider_factory
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.model_candidates = list(model_candidates) if model_candidates else None
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -156,7 +159,8 @@ class BaseAgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             provider_factory=provider_factory,
-            model_router=model_router,
+            model_candidates=self.model_candidates,
+            role_provider_factory=role_provider_factory,
         )
         self._session_model_runtimes: dict[str, RoutedProviderManager] = {}
         self._hook = CompositeHook(list(hooks)) if hooks else None
@@ -232,7 +236,8 @@ class BaseAgentLoop:
         provider: LLMProvider,
         model: str,
         provider_factory: Callable[[str], LLMProvider] | None,
-        model_router: ModelRouter | None,
+        model_candidates: list[str] | None = None,
+        role_provider_factory: "Callable[[str], tuple[LLMProvider, str, tuple[str, ...]]] | None" = None,
         workspace: Path,
         max_iterations: int,
         max_tokens: int,
@@ -261,7 +266,8 @@ class BaseAgentLoop:
             self.provider = provider
             self.model = model or provider.get_default_model()
             self.provider_factory = provider_factory
-            self.model_router = model_router
+            self.model_candidates = list(model_candidates) if model_candidates else None
+            self.role_provider_factory = role_provider_factory
             self.workspace = next_workspace
             self.max_iterations = max_iterations
             self.max_tokens = max_tokens
@@ -295,7 +301,8 @@ class BaseAgentLoop:
             self.subagents.exec_config = self.exec_config
             self.subagents.restrict_to_workspace = self.restrict_to_workspace
             self.subagents.provider_factory = provider_factory
-            self.subagents.model_router = model_router
+            self.subagents.model_candidates = self.model_candidates
+            self.subagents.role_provider_factory = role_provider_factory
             self.subagents.runner = AgentRunner(provider)
             self.subagents._session_runtimes.clear()
 
@@ -367,6 +374,7 @@ class BaseAgentLoop:
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SetPlanTool())
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(ConsultRoleTool(manager=self.subagents))
         if self.cron_service:
             cron_tool = CronTool(self.cron_service)
             setattr(cron_tool, "_default_timezone", self.timezone)
@@ -635,25 +643,6 @@ class BaseAgentLoop:
             "path": path,
         }
 
-    @staticmethod
-    def _route_hint(
-        tier: str,
-        model: str,
-        candidates: tuple[str, ...],
-        score: int | None,
-        source: str,
-        reason: str | None,
-    ) -> str:
-        """Format a visible routing hint for progress output."""
-        details = f", {source}"
-        if candidates and model != candidates[0]:
-            details += f", fallback_from={candidates[0]}"
-        if reason:
-            details += f", reason={reason[:80]}"
-        if score is None:
-            return f"router -> {tier} ({model}{details})"
-        return f"router -> {tier} ({model}, score={score}{details})"
-
     def _compose_extra_system(
         self,
         ui_system_instructions: object,
@@ -684,8 +673,8 @@ class BaseAgentLoop:
             runtime = RoutedProviderManager(
                 default_provider=self.provider,
                 default_model=self.model,
-                router=self.model_router,
                 provider_factory=self.provider_factory,
+                default_candidates=tuple(self.model_candidates or [self.model]),
             )
             self._session_model_runtimes[session_key] = runtime
         return runtime
@@ -715,9 +704,7 @@ class BaseAgentLoop:
                 await hook.before_iteration(hook_ctx)
             iteration += 1
 
-            use_routed_runtime = model_runtime is not None and (
-                self.model_router is not None or self.provider_factory is not None
-            )
+            use_routed_runtime = model_runtime is not None and self.provider_factory is not None
             if not use_routed_runtime:
                 if on_stream is not None and hasattr(self.provider, "chat_stream_with_retry"):
                     streamed_raw = ""
@@ -823,24 +810,6 @@ class BaseAgentLoop:
             hook_ctx.response = response
             hook_ctx.usage = dict(response.usage or {})
             hook_ctx.tool_calls = list(response.tool_calls or [])
-
-            if (
-                iteration == 1
-                and on_progress
-                and self.model_router
-                and self.model_router.enabled
-                and active_route is not None
-            ):
-                await on_progress(
-                    self._route_hint(
-                        active_route.tier,
-                        active_route.model,
-                        active_route.candidates,
-                        active_route.score,
-                        active_route.source,
-                        active_route.reason,
-                    )
-                )
 
             if response.has_tool_calls:
                 if on_progress:

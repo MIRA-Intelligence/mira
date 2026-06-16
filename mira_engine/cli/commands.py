@@ -39,10 +39,9 @@ from rich.text import Text
 from loguru import logger
 
 from mira_engine import __logo__, __version__
-from mira_engine.agent.routing import ModelRouter
 from mira_engine.config.paths import get_workspace_path
 from mira_engine.config.schema import Config
-from mira_engine.providers.factory import make_provider
+from mira_engine.providers.factory import make_provider, make_role_provider
 from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
 from mira_engine.utils.helpers import sync_workspace_templates
 
@@ -1047,6 +1046,15 @@ def _make_provider_for_model(config: Config, model: str):
         raise typer.Exit(1) from exc
 
 
+def _routing_kwargs(config: Config) -> dict[str, object]:
+    """Provider/model fallback + team role provider wiring for agent loops."""
+    return dict(
+        provider_factory=lambda model: _make_provider_for_model(config, model),
+        model_candidates=config.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(config, role),
+    )
+
+
 def _workspace_cron_store(config: Config) -> Path:
     return config.workspace_path / "cron" / "jobs.json"
 
@@ -1207,7 +1215,6 @@ def gateway(
     _sync_workspace_templates_or_exit(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
     provider_factory = lambda model: _make_provider_for_model(config, model)
     default_tz = config.agents.defaults.timezone
     session_manager = SessionManager(config.workspace_path)
@@ -1237,7 +1244,8 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         provider_factory=provider_factory,
-        model_router=model_router,
+        model_candidates=config.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(config, role),
     )
 
     # Set cron callback (needs agent)
@@ -1356,10 +1364,9 @@ def gateway(
     )
 
     async def on_ui_runtime_config_updated(next_config: Config, projects_root: Path) -> None:
-        nonlocal config, provider, model_router, provider_factory, default_tz, session_manager
+        nonlocal config, provider, provider_factory, default_tz, session_manager
 
         next_provider = _make_provider(next_config)
-        next_model_router = ModelRouter(next_config.agents.defaults)
         next_provider_factory = lambda model: _make_provider_for_model(next_config, model)
         next_tz = next_config.agents.defaults.timezone
         next_workspace = projects_root.expanduser()
@@ -1368,7 +1375,8 @@ def gateway(
             provider=next_provider,
             model=next_config.agents.defaults.primary_model,
             provider_factory=next_provider_factory,
-            model_router=next_model_router,
+            model_candidates=next_config.agents.defaults.default_model_candidates,
+            role_provider_factory=lambda role: make_role_provider(next_config, role),
             workspace=next_workspace,
             max_iterations=next_config.agents.defaults.max_tool_iterations,
             max_tokens=next_config.agents.defaults.max_tokens,
@@ -1391,7 +1399,6 @@ def gateway(
 
         config = next_config
         provider = next_provider
-        model_router = next_model_router
         provider_factory = next_provider_factory
         default_tz = next_tz
         logger.info("Gateway runtime config reloaded from UI settings")
@@ -1455,7 +1462,6 @@ def serve(
     sync_workspace_templates(cfg.workspace_path)
 
     provider = _make_provider(cfg)
-    model_router = ModelRouter(cfg.agents.defaults)
     default_tz = cfg.agents.defaults.timezone
     agent_loop = AgentLoop(
         bus=MessageBus(),
@@ -1476,7 +1482,8 @@ def serve(
         mcp_servers=cfg.tools.mcp_servers,
         channels_config=cfg.channels,
         provider_factory=lambda model: _make_provider_for_model(cfg, model),
-        model_router=model_router,
+        model_candidates=cfg.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(cfg, role),
     )
 
     api_host = host if host is not None else cfg.api.host
@@ -1523,7 +1530,6 @@ def _build_agent_loop_kwargs(
     provider,
     config: Config,
     cron_service=None,
-    model_router=None,
 ) -> dict[str, object]:
     """Common keyword arguments shared by ``mira agent`` and ``mira research``."""
     default_tz = config.agents.defaults.timezone
@@ -1546,7 +1552,8 @@ def _build_agent_loop_kwargs(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         provider_factory=lambda model: _make_provider_for_model(config, model),
-        model_router=model_router,
+        model_candidates=config.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(config, role),
     )
 
 
@@ -2047,7 +2054,6 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
 
     cron_store_path = _workspace_cron_store(config)
     cron = CronService(cron_store_path)
@@ -2065,7 +2071,6 @@ def agent(
             provider=provider,
             config=config,
             cron_service=cron,
-            model_router=model_router,
         ),
     )
 
@@ -2102,7 +2107,7 @@ def research(
         "--profile",
         "-p",
         case_sensitive=False,
-        help="Agent profile: default | engineer | research. Selects AGENTS_*.md bootstrap.",
+        help="Agent profile: default | engineer | research | team. Selects AGENTS_*.md bootstrap.",
     ),
     max_tokens: int | None = typer.Option(
         None,
@@ -2136,10 +2141,10 @@ def research(
         )
         raise typer.Exit(1)
     profile_value = (profile or "default").strip().lower()
-    if profile_value not in {"default", "engineer", "research"}:
+    if profile_value not in {"default", "engineer", "research", "team"}:
         console.print(
             f"[red]Invalid --profile value: {profile!r}. "
-            "Expected one of: default, engineer, research.[/red]"
+            "Expected one of: default, engineer, research, team.[/red]"
         )
         raise typer.Exit(1)
     if max_tokens is not None and max_tokens <= 0:
@@ -2159,7 +2164,6 @@ def research(
 
     bus = MessageBus()
     provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
 
     cron_store_path = _workspace_cron_store(config)
     cron = CronService(cron_store_path)
@@ -2174,7 +2178,6 @@ def research(
             provider=provider,
             config=config,
             cron_service=cron,
-            model_router=model_router,
         ),
     )
 
@@ -2826,13 +2829,10 @@ def status():
         active_provider = (
             config.get_provider_name(config.agents.defaults.model) or config.agents.defaults.provider
         ).replace("-", "_")
-        if config.agents.defaults.route_by_complexity:
-            console.print("Routing: [green]enabled[/green]")
-            console.print(f"  small: {_format_model_selection(config.agents.defaults.small_model)}")
-            console.print(f"  medium: {_format_model_selection(config.agents.defaults.medium_model)}")
-            console.print(f"  large: {_format_model_selection(config.agents.defaults.large_model)}")
-        else:
-            console.print("Routing: [dim]disabled[/dim]")
+        for _role in ("supervisor", "student", "critic"):
+            _role_model = getattr(config.agents.defaults, f"{_role}_model", None)
+            if _role_model:
+                console.print(f"Team {_role}: {_format_model_selection(_role_model)}")
 
         # Check API keys from registry
         for spec in PROVIDERS:

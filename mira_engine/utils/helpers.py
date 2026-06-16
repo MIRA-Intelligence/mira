@@ -84,7 +84,7 @@ _TOOL_RESULT_PREVIEW_CHARS = 1200
 _TOOL_RESULTS_DIR = ".mira/tool-results"
 _TOOL_RESULT_RETENTION_SECS = 7 * 24 * 60 * 60
 _TOOL_RESULT_MAX_BUCKETS = 32
-_RUNTIME_BOOTSTRAP = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "HEARTBEAT.md", "AGENTS_EG.md", "AGENTS_RS.md")
+_RUNTIME_BOOTSTRAP = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "HEARTBEAT.md", "AGENTS_EG.md", "AGENTS_RS.md", "AGENTS_TM.md")
 
 def safe_filename(name: str) -> str:
     """Replace unsafe path characters with underscores."""

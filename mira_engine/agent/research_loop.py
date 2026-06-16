@@ -80,7 +80,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         """Parse agent profile, returning None when absent/invalid."""
         if isinstance(value, str):
             profile = value.strip().lower()
-            if profile in {"engineer", "research"}:
+            if profile in {"engineer", "research", "team"}:
                 return profile
         return None
 
@@ -221,6 +221,8 @@ class ResearchAgentLoop(BaseAgentLoop):
         """Map profile to its AGENTS bootstrap file."""
         if profile == "engineer":
             return "AGENTS_EG.md"
+        if profile == "team":
+            return "AGENTS_TM.md"
         if profile == "research":
             return "AGENTS_RS.md"
         return "AGENTS_RS.md"
