@@ -191,6 +191,162 @@ class CommunityVoteTool(_CommunityTool):
         )
 
 
+def _summarize_diff(diff: str) -> str:
+    """Lightweight unified-diff stats: files touched, +/- line counts."""
+    files = sum(1 for line in diff.splitlines() if line.startswith("diff --git "))
+    if files == 0:
+        files = sum(1 for line in diff.splitlines() if line.startswith("+++ "))
+    added = sum(
+        1 for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")
+    )
+    removed = sum(
+        1 for line in diff.splitlines() if line.startswith("-") and not line.startswith("---")
+    )
+    return f"{files} file(s), +{added}/-{removed} lines"
+
+
+class CommunityDraftPatchTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_draft_patch"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Validate and summarize a unified diff before submitting it as a "
+            "patch. Use this to self-check a diff (file count, line changes, "
+            "format) prior to community_submit_patch. Does not send anything."
+        )
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "diff": {"type": "string", "description": "Unified (git) diff to check."},
+            },
+            "required": ["diff"],
+        }
+
+    async def execute(self, diff: str, **_: Any) -> str:
+        looks_valid = any(
+            line.startswith(("diff --git ", "--- ", "+++ ", "@@ "))
+            for line in diff.splitlines()
+        )
+        if not looks_valid:
+            return (
+                "This does not look like a unified diff (no 'diff --git'/'@@' "
+                "hunks). Generate one with `git diff` and try again."
+            )
+        return f"Patch looks valid: {_summarize_diff(diff)}. Ready for community_submit_patch."
+
+
+class CommunitySubmitPatchTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_submit_patch"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Submit a unified-diff patch implementing a proposal. The "
+            "orchestrator opens a PR on your code host — you never write to the "
+            "repo directly. High-impact: may require human approval."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string", "description": "Proposal this patch implements."},
+                "repo": {"type": "string", "description": "Target repo, 'owner/name'."},
+                "diff": {"type": "string", "description": "Unified (git) diff."},
+                "title": {"type": "string", "description": "PR title."},
+                "body": {"type": "string", "description": "PR description (Markdown)."},
+                "base_ref": {
+                    "type": "string",
+                    "description": "Branch the PR targets (default 'main').",
+                },
+            },
+            "required": ["proposal_id", "repo", "diff", "title"],
+        }
+
+    async def execute(
+        self,
+        proposal_id: str,
+        repo: str,
+        diff: str,
+        title: str,
+        body: str = "",
+        base_ref: str = "main",
+        **_: Any,
+    ) -> str:
+        async def run() -> str:
+            res = await self._client.submit_patch(proposal_id, repo, diff, title, body, base_ref)
+            return f"Patch submitted (id {res.get('id')}); the orchestrator will open the PR."
+
+        return await self._gated(
+            "submit_patch",
+            {
+                "proposal_id": proposal_id,
+                "repo": repo,
+                "diff": diff,
+                "title": title,
+                "body": body,
+                "base_ref": base_ref,
+            },
+            run,
+        )
+
+
+class CommunityReviewPrTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_review_pr"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Review the PRs and patches linked to a proposal, including their "
+            "build/CI status. Use this before voting or commenting on an "
+            "implementation."
+        )
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string", "description": "Proposal id to inspect."},
+            },
+            "required": ["proposal_id"],
+        }
+
+    async def execute(self, proposal_id: str, **_: Any) -> str:
+        data = await self._client.get_proposal(proposal_id)
+        proposal = data.get("proposal") or {}
+        prs = data.get("prs") or []
+        header = f"Proposal '{proposal.get('title', proposal_id)}' [{proposal.get('status')}]"
+        if not prs:
+            return f"{header}\nNo pull requests yet."
+        lines = [
+            f"- [{pr.get('host')}] {pr.get('repo')}#{pr.get('pr_number')} "
+            f"status={pr.get('status')} ci={pr.get('ci_state') or 'n/a'} "
+            f"{pr.get('url') or ''}".rstrip()
+            for pr in prs
+        ]
+        return f"{header}\nPull requests:\n" + "\n".join(lines)
+
+
 def build_community_tools(community_config: Any) -> list[Tool]:
     """Build the community tool set when the agent is connected.
 
@@ -210,4 +366,7 @@ def build_community_tools(community_config: Any) -> list[Tool]:
         CommunityPostProposalTool(client, gate),
         CommunityCommentTool(client, gate),
         CommunityVoteTool(client, gate),
+        CommunityDraftPatchTool(client, gate),
+        CommunitySubmitPatchTool(client, gate),
+        CommunityReviewPrTool(client, gate),
     ]

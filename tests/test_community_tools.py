@@ -37,6 +37,26 @@ class FakeClient:
         self.calls.append(("vote", proposal_id, value))
         return {"score": 4}
 
+    async def submit_patch(self, proposal_id, repo, diff, title, body="", base_ref="main"):
+        self.calls.append(("submit_patch", proposal_id, repo, title, base_ref))
+        return {"id": "patch1"}
+
+    async def get_proposal(self, proposal_id):
+        self.calls.append(("get_proposal", proposal_id))
+        return {
+            "proposal": {"title": "Dark mode", "status": "building"},
+            "prs": [
+                {
+                    "host": "github",
+                    "repo": "o/r",
+                    "pr_number": 7,
+                    "status": "open",
+                    "ci_state": "passed",
+                    "url": "https://x/7",
+                }
+            ],
+        }
+
 
 def _cfg(**kw):
     base = dict(
@@ -64,6 +84,9 @@ def test_build_returns_full_set_when_connected():
         "community_post_proposal",
         "community_comment",
         "community_vote",
+        "community_draft_patch",
+        "community_submit_patch",
+        "community_review_pr",
     }
 
 
@@ -120,3 +143,42 @@ async def test_proposal_high_impact_queued_in_hybrid(monkeypatch):
     out = await tool.execute(title="T", body="B")
     assert "approval" in out.lower()
     assert client.calls == []
+
+
+async def test_draft_patch_validates_without_network():
+    client = FakeClient()
+    tool = community_tools.CommunityDraftPatchTool(client, AutonomyGate("hitl"))
+    good = await tool.execute(diff="diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n")
+    assert "valid" in good.lower()
+    bad = await tool.execute(diff="just some text")
+    assert "does not look like" in bad.lower()
+    assert client.calls == []
+
+
+async def test_submit_patch_runs_when_autonomous():
+    client = FakeClient()
+    tool = community_tools.CommunitySubmitPatchTool(client, AutonomyGate("fully_autonomous"))
+    out = await tool.execute(
+        proposal_id="p1", repo="o/r", diff="diff --git a/x b/x\n", title="Fix"
+    )
+    assert "submitted" in out.lower()
+    assert ("submit_patch", "p1", "o/r", "Fix", "main") in client.calls
+
+
+async def test_submit_patch_queued_in_hybrid(monkeypatch):
+    client = FakeClient()
+    gate = AutonomyGate("hybrid")
+    monkeypatch.setattr(gate, "enqueue_approval", lambda a, p: "appr-3")
+    tool = community_tools.CommunitySubmitPatchTool(client, gate)
+    out = await tool.execute(proposal_id="p1", repo="o/r", diff="d", title="Fix")
+    assert "approval" in out.lower()
+    assert client.calls == []
+
+
+async def test_review_pr_lists_prs():
+    client = FakeClient()
+    tool = community_tools.CommunityReviewPrTool(client, AutonomyGate("hitl"))
+    out = await tool.execute(proposal_id="p1")
+    assert "Dark mode" in out
+    assert "github" in out
+    assert "passed" in out
