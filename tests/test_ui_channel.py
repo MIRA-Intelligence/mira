@@ -2545,3 +2545,183 @@ async def test_handle_remove_project_keeps_files_hidden_from_list(ui_channel: Ui
     list_resp = await ui_channel._handle_list_projects(MagicMock(spec=web.Request))
     list_body = json.loads(list_resp.text)
     assert [item["id"] for item in list_body["projects"]] == []
+
+
+# --- Mira Community Platform endpoints (#114) -----------------------------
+async def test_handle_community_status_reports_state_without_token(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = Config()
+    cfg.community.enabled = True
+    cfg.community.agent_token = "secret-token"
+    cfg.community.agent_id = "agent-1"
+    cfg.community.autonomy_mode = "hybrid"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "list_approvals",
+        lambda status=None: [{"id": "1"}] if status == "pending" else [],
+    )
+
+    resp = await ui_channel._handle_community_status(MagicMock(spec=web.Request))
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["enabled"] is True
+    assert body["logged_in"] is True
+    assert body["agent_id"] == "agent-1"
+    assert body["autonomy_mode"] == "hybrid"
+    assert body["pending_count"] == 1
+    # The agent token must never be exposed to the desktop UI.
+    assert "secret-token" not in resp.text
+
+
+async def test_handle_community_autonomy_persists_mode(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = Config()
+    saved: dict = {}
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+    monkeypatch.setattr(
+        ui_channel_mod.config_loader,
+        "save_config",
+        lambda c, p=None: saved.update(mode=c.community.autonomy_mode),
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"mode": "fully_autonomous"})
+    resp = await ui_channel._handle_community_autonomy(req)
+
+    assert resp.status == 200
+    assert saved["mode"] == "fully_autonomous"
+    assert json.loads(resp.text)["autonomy_mode"] == "fully_autonomous"
+
+
+async def test_handle_community_autonomy_rejects_bad_mode(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"mode": "yolo"})
+    resp = await ui_channel._handle_community_autonomy(req)
+    assert resp.status == 400
+
+
+async def test_handle_community_approvals_lists(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "list_approvals",
+        lambda status=None: [{"id": "1", "status": status or "pending"}],
+    )
+    req = MagicMock(spec=web.Request)
+    req.query = {"status": "pending"}
+    resp = await ui_channel._handle_community_approvals(req)
+    assert resp.status == 200
+    assert json.loads(resp.text)["approvals"][0]["id"] == "1"
+
+
+async def test_handle_community_approvals_rejects_bad_status(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.query = {"status": "weird"}
+    resp = await ui_channel._handle_community_approvals(req)
+    assert resp.status == 400
+
+
+async def test_handle_community_decide_reject(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {"id": "1", "action": "comment", "status": "pending", "payload": {}}
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "set_status",
+        lambda i, s: {"id": "1", "status": s},
+    )
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "reject"})
+    req.match_info = {"approval_id": "1"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 200
+    assert json.loads(resp.text)["approval"]["status"] == "rejected"
+
+
+async def test_handle_community_decide_approve_executes(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {"id": "2", "action": "post_proposal", "status": "pending", "payload": {}}
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "set_status",
+        lambda i, s: {**rec, "status": s},
+    )
+
+    async def fake_exec(r, c):
+        return {"ok": True, "detail": "proposal created (p1)"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: Config())
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "2"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["ok"] is True
+    assert body["approval"]["status"] == "approved"
+
+
+async def test_handle_community_decide_keeps_pending_on_execution_failure(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {"id": "3", "action": "comment", "status": "pending", "payload": {}}
+    set_calls: list = []
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "set_status",
+        lambda i, s: set_calls.append(s) or rec,
+    )
+
+    async def fake_exec(r, c):
+        return {"ok": False, "detail": "boom"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: Config())
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "3"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 502
+    # Execution failed, so the item must remain pending (never marked approved).
+    assert set_calls == []
+
+
+async def test_handle_community_decide_not_found(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: None)
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "x"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 404
+
+
+async def test_handle_community_pair_start_requires_api_base(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = Config()
+    cfg.community.api_base = ""
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "save_config", lambda *a, **k: None)
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={})
+    resp = await ui_channel._handle_community_pair_start(req)
+    assert resp.status == 400
