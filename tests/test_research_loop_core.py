@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from mira_engine.agent.base_loop import BaseAgentLoop
@@ -43,7 +42,7 @@ def _make_loop(tmp_path: Path) -> ResearchAgentLoop:
     loop.reasoning_effort = None
     loop.context = ContextBuilder(tmp_path)
     loop.tools = ToolRegistry()
-    loop.model_router = SimpleNamespace(enabled=True)
+    loop.model_candidates = None
     loop._session_run_modes = {}
     loop._session_agent_profiles = {}
     loop._session_automation_policies = {}

@@ -111,7 +111,7 @@ def _normalize_run_mode(value: Any) -> str:
 def _normalize_agent_profile(value: Any) -> str:
     if isinstance(value, str):
         profile = value.strip().lower()
-        if profile in {"engineer", "default", "research"}:
+        if profile in {"engineer", "default", "research", "team"}:
             return profile
     return PROJECT_META_DEFAULT_AGENT_PROFILE
 

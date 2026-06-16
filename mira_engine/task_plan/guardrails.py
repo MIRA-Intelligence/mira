@@ -85,7 +85,7 @@ _IGNORED_JSON_SCAN_DIRS = {".git", ".mira", "__pycache__", "node_modules", ".ven
 def _normalize_profile(profile: object) -> str:
     if isinstance(profile, str):
         normalized = profile.strip().lower()
-        if normalized in {"research", "engineer", "default"}:
+        if normalized in {"research", "engineer", "default", "team"}:
             return normalized
     return "default"
 
@@ -130,7 +130,9 @@ def _required_completed_fields_for_profile(
 ) -> tuple[str, ...]:
     if contract_version < STRICT_CONTRACT_VERSION:
         return ()
-    if profile == "research":
+    # The team profile is research-oriented (supervisor plans rigorous work, the
+    # critic enforces falsifiability), so it reuses the research field contract.
+    if profile in {"research", "team"}:
         return _RESEARCH_REQUIRED_COMPLETED_FIELDS
     if profile == "engineer":
         return _ENGINEER_REQUIRED_COMPLETED_FIELDS
@@ -144,7 +146,7 @@ def _required_falsify_fields_for_profile(
 ) -> tuple[str, ...]:
     if contract_version < STRICT_CONTRACT_VERSION:
         return ()
-    if profile == "research":
+    if profile in {"research", "team"}:
         return _RESEARCH_REQUIRED_FALSIFY_FIELDS
     if profile == "engineer":
         return _ENGINEER_REQUIRED_FALSIFY_FIELDS
@@ -240,7 +242,7 @@ def _load_project_profile(project_dir: Path | None) -> str:
         profile = meta.get("agent_profile")
         if isinstance(profile, str):
             normalized = profile.strip().lower()
-            if normalized in {"research", "engineer", "default"}:
+            if normalized in {"research", "engineer", "default", "team"}:
                 return normalized
     return "default"
 
@@ -725,7 +727,7 @@ def _auto_fill_research_contract_fields(exp: dict[str, Any]) -> bool:
 def _auto_fill_contract_fields(
     exp: dict[str, Any], *, profile: str, contract_version: int
 ) -> bool:
-    if profile == "research" and contract_version >= STRICT_CONTRACT_VERSION:
+    if profile in {"research", "team"} and contract_version >= STRICT_CONTRACT_VERSION:
         return _auto_fill_research_contract_fields(exp)
     return False
 

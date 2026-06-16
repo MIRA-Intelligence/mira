@@ -10,6 +10,7 @@ The active `AGENTS*.md` profile defines the dominant methodology:
 - `AGENTS_EG.md`: engineering-first, delivery and metrics
 - `AGENTS.md`: balanced/default
 - `AGENTS_RS.md`: research-first, mechanism and propose novel method
+- `AGENTS_TM.md`: team mode — supervisor orchestrates a critic (review) and a student (implement)
 
 `SOUL.md` sets stable principles only. It must not override profile-specific workflow rules.
 

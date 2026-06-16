@@ -379,7 +379,7 @@ def _normalize_agent_profile(value: Any) -> str:
     """Normalize UI agent profile with a conservative fallback."""
     if isinstance(value, str):
         profile = value.strip().lower()
-        if profile in {"engineer", "research"}:
+        if profile in {"engineer", "research", "team"}:
             return profile
     return "research"
 
