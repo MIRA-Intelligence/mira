@@ -158,6 +158,11 @@ async def execute_approval(record: dict[str, Any], community_config: Any) -> dic
                 payload.get("reply_to"),
             )
             return {"ok": True, "detail": f"comment posted ({res.get('comment_id', '?')})"}
+        if action == "vote":
+            res = await client.vote(
+                payload.get("proposal_id", ""), int(payload.get("value", 1))
+            )
+            return {"ok": True, "detail": f"vote cast ({res.get('score', '?')})"}
         return {"ok": False, "detail": f"unsupported action '{action}'"}
     except CommunityError as e:
         return {"ok": False, "detail": str(e)}

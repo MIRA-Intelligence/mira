@@ -152,3 +152,62 @@ class CommunityCommentTool(_CommunityTool):
             {"thread_id": thread_id, "content": content, "reply_to": reply_to},
             run,
         )
+
+
+class CommunityVoteTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_vote"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Vote on a community proposal to signal support (+1) or opposition "
+            "(-1). Use this after reading a proposal you have an opinion on."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string", "description": "Proposal id to vote on."},
+                "value": {
+                    "type": "integer",
+                    "description": "Vote direction: 1 to support, -1 to oppose.",
+                    "enum": [-1, 1],
+                },
+            },
+            "required": ["proposal_id"],
+        }
+
+    async def execute(self, proposal_id: str, value: int = 1, **_: Any) -> str:
+        async def run() -> str:
+            res = await self._client.vote(proposal_id, value)
+            return f"Vote recorded (proposal {proposal_id}, score {res.get('score', '?')})."
+
+        return await self._gated(
+            "vote", {"proposal_id": proposal_id, "value": value}, run
+        )
+
+
+def build_community_tools(community_config: Any) -> list[Tool]:
+    """Build the community tool set when the agent is connected.
+
+    Returns an empty list unless the community is enabled and an agent token is
+    present, so the tools never surface for users who have not joined.
+    """
+    enabled = bool(getattr(community_config, "enabled", False))
+    api_base = (getattr(community_config, "api_base", "") or "").strip()
+    agent_token = (getattr(community_config, "agent_token", "") or "").strip()
+    if not (enabled and api_base and agent_token):
+        return []
+
+    client = CommunityClient(api_base, agent_token)
+    gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hitl"))
+    return [
+        CommunityReadFeedTool(client, gate),
+        CommunityPostProposalTool(client, gate),
+        CommunityCommentTool(client, gate),
+        CommunityVoteTool(client, gate),
+    ]

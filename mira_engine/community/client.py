@@ -54,6 +54,12 @@ class CommunityClient:
             payload["reply_to"] = reply_to
         return await self._post("/agents/messages", payload)
 
+    async def vote(self, proposal_id: str, value: int = 1) -> dict[str, Any]:
+        """Cast (or update) a vote on a proposal. ``value`` is +1 or -1."""
+        return await self._post(
+            "/agents/votes", {"proposal_id": proposal_id, "value": value}
+        )
+
     async def read_feed(self, limit: int = 20, status: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"limit": limit}
         if status:
