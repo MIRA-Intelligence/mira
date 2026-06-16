@@ -58,6 +58,7 @@ class HeartbeatService:
         model: str,
         on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        extra_context: Callable[[], Coroutine[Any, Any, str]] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
     ):
@@ -66,6 +67,9 @@ class HeartbeatService:
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
+        # Optional async provider of extra context (e.g. a community feed digest)
+        # folded into each tick so background participation feels seamless.
+        self.extra_context = extra_context
         self.interval_s = interval_s
         self.enabled = enabled
         self._running = False
@@ -82,6 +86,21 @@ class HeartbeatService:
             except Exception:
                 return None
         return None
+
+    async def _gather_extra(self) -> str:
+        """Collect optional extra context (e.g. community digest). Never raises."""
+        if not self.extra_context:
+            return ""
+        try:
+            return (await self.extra_context()) or ""
+        except Exception as e:
+            logger.warning("Heartbeat extra context failed: {}", e)
+            return ""
+
+    async def _build_content(self) -> str:
+        """Combine HEARTBEAT.md with any extra context into one decision prompt."""
+        parts = [p for p in (self._read_heartbeat_file(), await self._gather_extra()) if p and p.strip()]
+        return "\n\n".join(parts)
 
     async def _decide(self, content: str) -> tuple[str, str]:
         """Phase 1: ask LLM to decide skip/run via virtual tool call.
@@ -141,9 +160,9 @@ class HeartbeatService:
 
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
-        content = self._read_heartbeat_file()
+        content = await self._build_content()
         if not content:
-            logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
+            logger.debug("Heartbeat: nothing to review (no HEARTBEAT.md or context)")
             return
 
         logger.info("Heartbeat: checking for tasks...")
@@ -175,7 +194,7 @@ class HeartbeatService:
 
     async def trigger_now(self) -> str | None:
         """Manually trigger a heartbeat."""
-        content = self._read_heartbeat_file()
+        content = await self._build_content()
         if not content:
             return None
         action, tasks = await self._decide(content)

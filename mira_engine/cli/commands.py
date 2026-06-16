@@ -1235,6 +1235,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        community_config=config.community,
         provider_factory=provider_factory,
         model_router=model_router,
     )
@@ -1343,6 +1344,12 @@ def gateway(
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
+    async def gather_heartbeat_context() -> str:
+        """Fold relevant community activity into the heartbeat decision."""
+        from mira_engine.community.digest import gather_community_digest
+
+        return await gather_community_digest(config.community)
+
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
@@ -1350,6 +1357,7 @@ def gateway(
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
+        extra_context=gather_heartbeat_context,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
     )
@@ -1378,6 +1386,7 @@ def gateway(
             exec_config=next_config.tools.exec,
             timezone=next_tz,
             channels_config=next_config.channels,
+            community_config=next_config.community,
             context_window_tokens=next_config.agents.defaults.context_window_tokens,
         )
 

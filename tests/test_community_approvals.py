@@ -77,8 +77,27 @@ async def test_execute_unsupported_action(monkeypatch, data_dir):
             pass
 
     monkeypatch.setattr(client_mod, "CommunityClient", FakeClient)
-    rec = {"id": "1", "action": "vote", "payload": {}}
+    rec = {"id": "1", "action": "draft_patch", "payload": {}}
     cfg = SimpleNamespace(api_base="http://x", agent_token="t")
     res = await approvals.execute_approval(rec, cfg)
     assert res["ok"] is False
     assert "unsupported" in res["detail"]
+
+
+async def test_execute_vote_calls_client(monkeypatch, data_dir):
+    calls: dict = {}
+
+    class FakeClient:
+        def __init__(self, base, token):
+            calls["init"] = (base, token)
+
+        async def vote(self, proposal_id, value):
+            calls["vote"] = (proposal_id, value)
+            return {"score": 5}
+
+    monkeypatch.setattr(client_mod, "CommunityClient", FakeClient)
+    rec = {"id": "1", "action": "vote", "payload": {"proposal_id": "p9", "value": 1}}
+    cfg = SimpleNamespace(api_base="http://x", agent_token="tok")
+    res = await approvals.execute_approval(rec, cfg)
+    assert res["ok"] is True
+    assert calls["vote"] == ("p9", 1)

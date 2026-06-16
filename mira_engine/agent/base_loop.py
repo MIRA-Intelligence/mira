@@ -35,6 +35,7 @@ from mira_engine.agent.routing import ModelRouter, RoutedProviderManager
 from mira_engine.agent.runner import AgentRunner
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
+from mira_engine.agent.tools.community import build_community_tools
 from mira_engine.agent.tools.cron import CronTool
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
@@ -57,7 +58,7 @@ from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from mira_engine.config.schema import ChannelsConfig, ExecToolConfig
+    from mira_engine.config.schema import ChannelsConfig, CommunityConfig, ExecToolConfig
     from mira_engine.cron.service import CronService
 
 UNIFIED_SESSION_KEY = "unified:default"
@@ -107,6 +108,7 @@ class BaseAgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        community_config: CommunityConfig | None = None,
         provider_factory: Callable[[str], LLMProvider] | None = None,
         model_router: ModelRouter | None = None,
         context_window_tokens: int | None = None,
@@ -116,6 +118,7 @@ class BaseAgentLoop:
         from mira_engine.config.schema import ExecToolConfig
         self.bus = bus
         self.channels_config = channels_config
+        self.community_config = community_config
         self.provider_factory = provider_factory
         self.model_router = model_router
         self.provider = provider
@@ -243,6 +246,7 @@ class BaseAgentLoop:
         exec_config: ExecToolConfig | None = None,
         timezone: str | None = None,
         channels_config: ChannelsConfig | None = None,
+        community_config: CommunityConfig | None = None,
         context_window_tokens: int | None = None,
     ) -> None:
         """Apply UI-saved runtime config to the live agent loop."""
@@ -274,6 +278,8 @@ class BaseAgentLoop:
             self.restrict_to_workspace = restrict_to_workspace
             if channels_config is not None:
                 self.channels_config = channels_config
+            if community_config is not None:
+                self.community_config = community_config
             if context_window_tokens is not None:
                 self.context_window_tokens = context_window_tokens
 
@@ -371,6 +377,8 @@ class BaseAgentLoop:
             cron_tool = CronTool(self.cron_service)
             setattr(cron_tool, "_default_timezone", self.timezone)
             self.tools.register(cron_tool)
+        for community_tool in build_community_tools(self.community_config):
+            self.tools.register(community_tool)
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
         skill_access_dirs: list[Path] = []
