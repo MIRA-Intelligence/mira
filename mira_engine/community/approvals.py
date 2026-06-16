@@ -13,6 +13,7 @@ This module is the single source of truth for the on-disk format so the writer
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,8 +34,12 @@ def _now() -> str:
 
 
 def append_approval(action: str, payload: dict[str, Any]) -> str:
-    """Persist a pending action for later human review. Returns its id."""
-    approval_id = f"{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    """Persist a pending action for later human review. Returns its id.
+
+    The id pairs a millisecond timestamp (so ids sort roughly chronologically)
+    with a short random suffix so rapid successive calls never collide.
+    """
+    approval_id = f"{int(datetime.now(timezone.utc).timestamp() * 1000)}-{uuid.uuid4().hex[:8]}"
     record = {
         "id": approval_id,
         "action": action,
