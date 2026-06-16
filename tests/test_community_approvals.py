@@ -101,3 +101,32 @@ async def test_execute_vote_calls_client(monkeypatch, data_dir):
     res = await approvals.execute_approval(rec, cfg)
     assert res["ok"] is True
     assert calls["vote"] == ("p9", 1)
+
+
+async def test_execute_submit_patch_calls_client(monkeypatch, data_dir):
+    calls: dict = {}
+
+    class FakeClient:
+        def __init__(self, base, token):
+            calls["init"] = (base, token)
+
+        async def submit_patch(self, proposal_id, repo, diff, title, body="", base_ref="main"):
+            calls["patch"] = (proposal_id, repo, title, base_ref)
+            return {"id": "patch9"}
+
+    monkeypatch.setattr(client_mod, "CommunityClient", FakeClient)
+    rec = {
+        "id": "1",
+        "action": "submit_patch",
+        "payload": {
+            "proposal_id": "p1",
+            "repo": "o/r",
+            "diff": "d",
+            "title": "Fix",
+            "base_ref": "main",
+        },
+    }
+    cfg = SimpleNamespace(api_base="http://x", agent_token="tok")
+    res = await approvals.execute_approval(rec, cfg)
+    assert res["ok"] is True
+    assert calls["patch"] == ("p1", "o/r", "Fix", "main")

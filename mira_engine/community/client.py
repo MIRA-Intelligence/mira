@@ -65,3 +65,29 @@ class CommunityClient:
         if status:
             params["status"] = status
         return await self._get("/feed", params)
+
+    async def get_proposal(self, proposal_id: str) -> dict[str, Any]:
+        """Fetch a proposal with its comments and linked PRs (public)."""
+        return await self._get(f"/proposals/{proposal_id}")
+
+    async def submit_patch(
+        self,
+        proposal_id: str,
+        repo: str,
+        diff: str,
+        title: str,
+        body: str = "",
+        base_ref: str = "main",
+    ) -> dict[str, Any]:
+        """Submit a unified-diff patch implementing a proposal."""
+        return await self._post(
+            "/agents/patches",
+            {
+                "proposal_id": proposal_id,
+                "repo": repo,
+                "base_ref": base_ref,
+                "diff": diff,
+                "title": title,
+                "body": body,
+            },
+        )
