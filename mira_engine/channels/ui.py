@@ -36,6 +36,7 @@ from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
+from mira_engine.community import approvals as community_approvals
 from mira_engine.config import loader as config_loader
 from mira_engine.config.paths import get_runtime_subdir, get_workspace_path
 from mira_engine.config.schema import Config, UiChannelConfig
@@ -1139,6 +1140,14 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/feedback/config", self._handle_feedback_config)
         self._app.router.add_post("/api/feedback", self._handle_feedback)
+        self._app.router.add_get("/api/community/status", self._handle_community_status)
+        self._app.router.add_post("/api/community/autonomy", self._handle_community_autonomy)
+        self._app.router.add_get("/api/community/approvals", self._handle_community_approvals)
+        self._app.router.add_post(
+            "/api/community/approvals/{approval_id}/decide", self._handle_community_decide
+        )
+        self._app.router.add_post("/api/community/pair/start", self._handle_community_pair_start)
+        self._app.router.add_post("/api/community/pair/poll", self._handle_community_pair_poll)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_post("/api/projects", self._handle_create_project)
         self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
@@ -2266,6 +2275,197 @@ class UiChannel(BaseChannel):
             persisted=persisted,
         )
         payload["project_location"] = self._project_location_payload()
+        return web.json_response(payload)
+
+    # --- Mira Community Platform (#114) ----------------------------------
+    @staticmethod
+    def _community_status_payload(cfg: Config) -> dict[str, Any]:
+        c = cfg.community
+        return {
+            "enabled": bool(c.enabled),
+            "logged_in": bool(c.agent_token),
+            "agent_id": c.agent_id or "",
+            "api_base": c.api_base,
+            "autonomy_mode": c.autonomy_mode,
+            "code_host": c.code_host,
+            "domains": list(c.domains),
+        }
+
+    async def _handle_community_status(self, _request: web.Request) -> web.Response:
+        cfg = config_loader.load_config(config_loader.get_config_path().expanduser().resolve())
+        payload = self._community_status_payload(cfg)
+        payload["pending_count"] = len(community_approvals.list_approvals(status="pending"))
+        return web.json_response(payload)
+
+    async def _handle_community_autonomy(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        mode = body.get("mode") if isinstance(body, dict) else None
+        if mode not in ("fully_autonomous", "hitl", "hybrid"):
+            return web.json_response(
+                {"error": "mode must be fully_autonomous, hitl, or hybrid"}, status=400
+            )
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        cfg = config_loader.load_config(config_path)
+        cfg.community.autonomy_mode = mode
+        try:
+            config_loader.save_config(cfg, config_path)
+        except OSError as exc:
+            return web.json_response({"error": f"failed to persist config: {exc}"}, status=500)
+        self._audit(source="ui", action="community_autonomy_updated", details={"mode": mode})
+        payload = self._community_status_payload(cfg)
+        payload["persisted"] = True
+        return web.json_response(payload)
+
+    async def _handle_community_approvals(self, request: web.Request) -> web.Response:
+        status = request.query.get("status")
+        if status is not None and status not in ("pending", "approved", "rejected"):
+            return web.json_response({"error": "invalid status filter"}, status=400)
+        approvals = community_approvals.list_approvals(status=status)
+        return web.json_response({"approvals": approvals})
+
+    async def _handle_community_decide(self, request: web.Request) -> web.Response:
+        approval_id = request.match_info.get("approval_id", "")
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        decision = body.get("decision") if isinstance(body, dict) else None
+        if decision not in ("approve", "reject"):
+            return web.json_response({"error": "decision must be approve or reject"}, status=400)
+
+        record = community_approvals.get_approval(approval_id)
+        if record is None:
+            return web.json_response({"error": "approval not found"}, status=404)
+        if record.get("status") != "pending":
+            return web.json_response(
+                {"error": f"already {record.get('status')}", "approval": record}, status=409
+            )
+
+        if decision == "reject":
+            updated = community_approvals.set_status(approval_id, "rejected")
+            self._audit(
+                source="ui", action="community_approval_rejected", details={"id": approval_id}
+            )
+            return web.json_response({"ok": True, "approval": updated})
+
+        # decision == "approve": execute against the cloud, then record the outcome.
+        cfg = config_loader.load_config(config_loader.get_config_path().expanduser().resolve())
+        result = await community_approvals.execute_approval(record, cfg.community)
+        if not result.get("ok"):
+            return web.json_response(
+                {"ok": False, "error": result.get("detail"), "approval": record}, status=502
+            )
+        updated = community_approvals.set_status(approval_id, "approved")
+        self._audit(
+            source="ui",
+            action="community_approval_approved",
+            details={"id": approval_id, "action": record.get("action")},
+        )
+        return web.json_response({"ok": True, "approval": updated, "result": result.get("detail")})
+
+    async def _handle_community_pair_start(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        cfg = config_loader.load_config(config_path)
+        api_base = (body.get("api_base") or cfg.community.api_base or "").rstrip("/")
+        if not api_base:
+            return web.json_response({"error": "api_base is not configured"}, status=400)
+
+        autonomy = body.get("autonomy_mode")
+        if autonomy in ("fully_autonomous", "hitl", "hybrid"):
+            cfg.community.autonomy_mode = autonomy
+        code_host = body.get("code_host")
+        if code_host in ("github", "cnb"):
+            cfg.community.code_host = code_host
+        if isinstance(body.get("domains"), list):
+            cfg.community.domains = [str(d).strip() for d in body["domains"] if str(d).strip()]
+        cfg.community.api_base = api_base
+        try:
+            config_loader.save_config(cfg, config_path)
+        except OSError:
+            pass
+
+        start_payload = {
+            "code_host": cfg.community.code_host,
+            "autonomy_mode": cfg.community.autonomy_mode,
+            "domains": cfg.community.domains,
+        }
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+                async with session.post(
+                    f"{api_base}/agents/pair/start", json=start_payload
+                ) as resp:
+                    if resp.status == 404:
+                        return web.json_response(
+                            {"error": "pairing endpoint unavailable on the community service"},
+                            status=502,
+                        )
+                    if resp.status >= 400:
+                        return web.json_response(
+                            {"error": f"pairing failed: HTTP {resp.status}"}, status=502
+                        )
+                    data = await resp.json()
+        except (ClientError, asyncio.TimeoutError) as exc:
+            return web.json_response({"error": f"network error: {exc}"}, status=502)
+        return web.json_response(data)
+
+    async def _handle_community_pair_poll(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        poll_token = body.get("poll_token") if isinstance(body, dict) else None
+        if not poll_token:
+            return web.json_response({"error": "poll_token required"}, status=400)
+
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        cfg = config_loader.load_config(config_path)
+        api_base = (body.get("api_base") or cfg.community.api_base or "").rstrip("/")
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+                async with session.post(
+                    f"{api_base}/agents/pair/poll", json={"poll_token": poll_token}
+                ) as resp:
+                    if resp.status in (202, 425):
+                        return web.json_response({"status": "pending"})
+                    if resp.status == 410:
+                        return web.json_response({"status": "expired"})
+                    if resp.status >= 400:
+                        return web.json_response(
+                            {"error": f"poll failed: HTTP {resp.status}"}, status=502
+                        )
+                    data = await resp.json()
+        except (ClientError, asyncio.TimeoutError) as exc:
+            return web.json_response({"error": f"network error: {exc}"}, status=502)
+
+        agent_token = data.get("agent_token")
+        if not agent_token:
+            return web.json_response({"status": "pending"})
+
+        cfg.community.enabled = True
+        cfg.community.api_base = api_base
+        cfg.community.agent_token = agent_token
+        cfg.community.agent_id = data.get("agent_id", "")
+        try:
+            config_loader.save_config(cfg, config_path)
+        except OSError as exc:
+            return web.json_response({"error": f"failed to persist config: {exc}"}, status=500)
+        self._audit(
+            source="ui",
+            action="community_paired",
+            details={"agent_id": cfg.community.agent_id},
+        )
+        payload = self._community_status_payload(cfg)
+        payload["status"] = "authorized"
         return web.json_response(payload)
 
     async def _handle_feedback_config(self, _request: web.Request) -> web.Response:
