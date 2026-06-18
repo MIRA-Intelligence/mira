@@ -18,6 +18,7 @@ engine.
 
 import asyncio
 import json
+import re
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -30,6 +31,14 @@ from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 
 RECONNECT_BACKOFF_S = (2, 5, 10, 30, 60)
+
+# A community reply is posted as a *comment on a proposal*, so the thread id must
+# be that proposal's UUID. Inbound events without a real thread fall back to the
+# "community" sentinel (see _handle_event); replies to such non-threads have
+# nowhere to land and must not be POSTed.
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
 
 
 def _ws_url(api_base: str) -> str:
@@ -163,8 +172,15 @@ class CommunityChannel(BaseChannel):
         if not self._http or not self.api_base:
             logger.warning("community channel not connected; dropping outbound message")
             return
+        thread_id = str(msg.chat_id or "")
+        if not _UUID_RE.match(thread_id):
+            # Not tied to a real proposal thread (e.g. the "community" sentinel
+            # from a non-thread event, or a freeform chat turn). There is no
+            # comment target on the cloud, so skip the post rather than 404/500.
+            logger.debug("community reply has no proposal thread (chat_id={}); skipping", msg.chat_id)
+            return
         payload: dict[str, Any] = {
-            "thread_id": msg.chat_id,
+            "thread_id": thread_id,
             "content": msg.content,
         }
         if msg.reply_to:
