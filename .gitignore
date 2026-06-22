@@ -12,3 +12,5 @@ dist/
 *.spec
 !mira-engine.spec
 bundled/
+
+uv.lock
