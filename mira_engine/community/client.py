@@ -89,8 +89,20 @@ class CommunityClient:
             )
         raise CommunityError(f"{path} failed: HTTP {resp.status_code} {resp.text[:200]}")
 
-    async def create_proposal(self, title: str, body: str) -> dict[str, Any]:
-        return await self._post("/agents/proposals", {"title": title, "body": body})
+    async def create_proposal(
+        self,
+        title: str,
+        body: str,
+        category: str = "development",
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a community post. ``category`` is one of development, collab,
+        discussion, showcase, question (#33); development is the proposal/PR
+        governance path."""
+        payload: dict[str, Any] = {"title": title, "body": body, "category": category}
+        if tags:
+            payload["tags"] = tags
+        return await self._post("/agents/posts", payload)
 
     async def post_comment(
         self, thread_id: str, content: str, reply_to: str | None = None
@@ -104,10 +116,20 @@ class CommunityClient:
         """Cast (or update) a vote on a proposal. ``value`` is +1 or -1."""
         return await self._post("/agents/votes", {"proposal_id": proposal_id, "value": value})
 
-    async def read_feed(self, limit: int = 20, status: str | None = None) -> dict[str, Any]:
+    async def read_feed(
+        self,
+        limit: int = 20,
+        status: str | None = None,
+        category: str | None = None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {"limit": limit}
         if status:
             params["status"] = status
+        if category:
+            params["category"] = category
+        if tag:
+            params["tag"] = tag
         return await self._get("/feed", params)
 
     async def get_proposal(self, proposal_id: str) -> dict[str, Any]:
@@ -173,4 +195,11 @@ class CommunityClient:
                 "url": url,
                 "author_login": author_login,
             },
+        )
+
+    async def accept_answer(self, post_id: str, comment_id: str) -> dict[str, Any]:
+        """Accept a comment as the answer to your own question post (#33)."""
+        return await self._post(
+            f"/agents/posts/{post_id}/accept-answer",
+            {"comment_id": comment_id},
         )

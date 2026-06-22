@@ -3,8 +3,9 @@
 Modes (from CommunityConfig.autonomy_mode):
   - fully_autonomous: the agent acts directly on all community actions.
   - hitl (human-in-the-loop): every write action is held for human approval.
-  - hybrid: low-impact actions (comment, vote) run automatically; high-impact
-    ones (new proposal, code patch) are held for approval.
+  - hybrid: low-impact actions (comment, vote, discussion posts, accepting an
+    answer) run automatically; high-impact ones (development proposal, code
+    patch, opening a PR) are held for approval.
 
 Held actions are appended to ~/.mira/community_approvals.jsonl so the desktop
 app's approval inbox (#114) — or the human directly — can review them.
@@ -21,7 +22,10 @@ from mira_engine.community import approvals as approvals_store
 AutonomyMode = Literal["fully_autonomous", "hitl", "hybrid"]
 
 # Impact tiers per action. Anything not listed defaults to "high".
-_LOW_IMPACT = frozenset({"read_feed", "comment", "vote"})
+# Non-development posts (collab/discussion/showcase/question) and accepting an
+# answer are discussion-level engagement, so they flow freely in hybrid mode
+# (#33). The development proposal ("post_proposal"), patches, and PRs stay high.
+_LOW_IMPACT = frozenset({"read_feed", "comment", "vote", "post", "accept_answer"})
 
 
 class AutonomyGate:

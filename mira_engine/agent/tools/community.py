@@ -55,29 +55,114 @@ class CommunityReadFeedTool(_CommunityTool):
             "properties": {
                 "limit": {
                     "type": "integer",
-                    "description": "Max proposals to fetch (1-100).",
+                    "description": "Max posts to fetch (1-100).",
                     "minimum": 1,
                     "maximum": 100,
                 },
+                "category": {
+                    "type": "string",
+                    "description": (
+                        "Optional category filter: development, collab, discussion, "
+                        "showcase, or question."
+                    ),
+                    "enum": ["development", "collab", "discussion", "showcase", "question"],
+                },
+                "tag": {"type": "string", "description": "Optional single tag filter."},
                 "status": {
                     "type": "string",
-                    "description": "Optional status filter (open, voting, building, merged).",
+                    "description": "Optional status filter for development posts (open, voting, building, merged).",
                 },
             },
         }
 
-    async def execute(self, limit: int = 20, status: str | None = None, **_: Any) -> str:
-        data = await self._client.read_feed(limit=limit, status=status)
+    async def execute(
+        self,
+        limit: int = 20,
+        status: str | None = None,
+        category: str | None = None,
+        tag: str | None = None,
+        **_: Any,
+    ) -> str:
+        data = await self._client.read_feed(limit=limit, status=status, category=category, tag=tag)
         proposals = data.get("proposals", [])
         if not proposals:
             return "Community feed is empty."
-        lines = [
-            f"- [{p.get('status')}] {p.get('title')} "
-            f"(score {p.get('score', 0)}, {p.get('comment_count', 0)} comments) "
-            f"by {p.get('author_handle')} — id {p.get('id')}"
-            for p in proposals
-        ]
-        return "Recent community proposals:\n" + "\n".join(lines)
+        lines = []
+        for p in proposals:
+            cat = p.get("category", "development")
+            # Show status only for development posts (it drives the PR pipeline).
+            label = f"[{cat}:{p.get('status')}]" if cat == "development" else f"[{cat}]"
+            tags = p.get("tags") or []
+            tag_str = f" {{{', '.join(tags)}}}" if tags else ""
+            lines.append(
+                f"- {label} {p.get('title')}{tag_str} "
+                f"(score {p.get('score', 0)}, {p.get('comment_count', 0)} comments) "
+                f"by {p.get('author_handle')} — id {p.get('id')}"
+            )
+        return "Recent community posts:\n" + "\n".join(lines)
+
+
+_CATEGORY_GUIDE = (
+    "Categories: 'development' (propose a concrete change to MIRA; code lands as "
+    "a PR via the merge gate), 'collab' (recruit collaborators / coordinate work), "
+    "'discussion' (open-ended research/design/direction), 'showcase' (share what "
+    "you built or benchmarked), 'question' (ask a focused, answerable question)."
+)
+
+
+class CommunityPostTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_post"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Create a post in the Mira Community in the category that fits your "
+            "intent, with optional tags. " + _CATEGORY_GUIDE + " Use 'development' "
+            "only for concrete changes you want implemented and merged."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Short, descriptive title."},
+                "body": {"type": "string", "description": "Full content in Markdown."},
+                "category": {
+                    "type": "string",
+                    "description": "Which category this post belongs to.",
+                    "enum": ["development", "collab", "discussion", "showcase", "question"],
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional topic tags so others can find the post.",
+                },
+            },
+            "required": ["title", "body", "category"],
+        }
+
+    async def execute(
+        self,
+        title: str,
+        body: str,
+        category: str = "development",
+        tags: list[str] | None = None,
+        **_: Any,
+    ) -> str:
+        # Development posts are the governance/PR path and stay high-impact;
+        # other categories are discussion-level (low-impact in hybrid mode).
+        action = "post_proposal" if category == "development" else "post"
+
+        async def run() -> str:
+            res = await self._client.create_proposal(title, body, category=category, tags=tags)
+            return f"Posted to {category} (id {res.get('id')})."
+
+        return await self._gated(
+            action, {"title": title, "body": body, "category": category, "tags": tags}, run
+        )
 
 
 class CommunityPostProposalTool(_CommunityTool):
@@ -88,8 +173,10 @@ class CommunityPostProposalTool(_CommunityTool):
     @property
     def description(self) -> str:
         return (
-            "Submit a new feature proposal or improvement idea to the Mira "
-            "Community for other agents and maintainers to discuss and vote on."
+            "Submit a new feature proposal or improvement idea (the 'development' "
+            "category) to the Mira Community for other agents and maintainers to "
+            "discuss, vote on, and implement as a PR. For discussions, questions, "
+            "showcases, or finding collaborators, use community_post instead."
         )
 
     @property
@@ -108,10 +195,12 @@ class CommunityPostProposalTool(_CommunityTool):
 
     async def execute(self, title: str, body: str, **_: Any) -> str:
         async def run() -> str:
-            res = await self._client.create_proposal(title, body)
+            res = await self._client.create_proposal(title, body, category="development")
             return f"Proposal created (id {res.get('id')})."
 
-        return await self._gated("post_proposal", {"title": title, "body": body}, run)
+        return await self._gated(
+            "post_proposal", {"title": title, "body": body, "category": "development"}, run
+        )
 
 
 class CommunityCommentTool(_CommunityTool):
@@ -446,6 +535,45 @@ class CommunityReviewPrTool(_CommunityTool):
         return f"{header}\nPull requests:\n" + "\n".join(lines)
 
 
+class CommunityAcceptAnswerTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_accept_answer"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Accept a comment as the answer to your own question post. Marks the "
+            "question resolved and credits the answerer. Only works on questions "
+            "you authored."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "post_id": {"type": "string", "description": "Your question post id."},
+                "comment_id": {
+                    "type": "string",
+                    "description": "The comment to accept as the answer.",
+                },
+            },
+            "required": ["post_id", "comment_id"],
+        }
+
+    async def execute(self, post_id: str, comment_id: str, **_: Any) -> str:
+        async def run() -> str:
+            res = await self._client.accept_answer(post_id, comment_id)
+            return (
+                f"Accepted answer {res.get('accepted_comment_id', comment_id)} on post {post_id}."
+            )
+
+        return await self._gated(
+            "accept_answer", {"post_id": post_id, "comment_id": comment_id}, run
+        )
+
+
 def build_community_tools(community_config: Any) -> list[Tool]:
     """Build the community tool set when the agent is connected.
 
@@ -462,9 +590,11 @@ def build_community_tools(community_config: Any) -> list[Tool]:
     gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hitl"))
     return [
         CommunityReadFeedTool(client, gate),
+        CommunityPostTool(client, gate),
         CommunityPostProposalTool(client, gate),
         CommunityCommentTool(client, gate),
         CommunityVoteTool(client, gate),
+        CommunityAcceptAnswerTool(client, gate),
         CommunityDraftPatchTool(client, gate),
         CommunityOpenPrTool(client, gate),
         CommunitySubmitPatchTool(client, gate),
