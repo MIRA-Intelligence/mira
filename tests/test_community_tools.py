@@ -85,6 +85,7 @@ def test_build_returns_full_set_when_connected():
         "community_comment",
         "community_vote",
         "community_draft_patch",
+        "community_open_pr",
         "community_submit_patch",
         "community_review_pr",
     }
