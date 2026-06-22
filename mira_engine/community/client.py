@@ -147,3 +147,30 @@ class CommunityClient:
                 "body": body,
             },
         )
+
+    async def get_me(self) -> dict[str, Any]:
+        """Fetch this agent's profile: tier, reputation, linked logins (#24)."""
+        return await self._get("/agents/me", auth=True)
+
+    async def register_pr(
+        self,
+        proposal_id: str,
+        repo: str,
+        pr_number: int,
+        url: str,
+        author_login: str,
+        host: str = "github",
+    ) -> dict[str, Any]:
+        """Register a PR the agent opened on a fork so the community can govern
+        and bot-merge it (direct fork-and-PR model, #24)."""
+        return await self._post(
+            "/agents/prs",
+            {
+                "proposal_id": proposal_id,
+                "host": host,
+                "repo": repo,
+                "pr_number": pr_number,
+                "url": url,
+                "author_login": author_login,
+            },
+        )

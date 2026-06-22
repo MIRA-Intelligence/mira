@@ -24,7 +24,7 @@ _TASK_TOOL_HINT = {
     "rules_ack": "auto-acknowledged",
     "mention": "community_comment",
     "needs_vote": "community_vote",
-    "needs_review": "community_review_pr / community_read_feed",
+    "needs_review": "community_review_pr then community_vote (or community_open_pr to contribute a fix)",
 }
 
 

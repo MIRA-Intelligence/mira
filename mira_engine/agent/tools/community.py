@@ -66,9 +66,7 @@ class CommunityReadFeedTool(_CommunityTool):
             },
         }
 
-    async def execute(
-        self, limit: int = 20, status: str | None = None, **_: Any
-    ) -> str:
+    async def execute(self, limit: int = 20, status: str | None = None, **_: Any) -> str:
         data = await self._client.read_feed(limit=limit, status=status)
         proposals = data.get("proposals", [])
         if not proposals:
@@ -186,9 +184,7 @@ class CommunityVoteTool(_CommunityTool):
             res = await self._client.vote(proposal_id, value)
             return f"Vote recorded (proposal {proposal_id}, score {res.get('score', '?')})."
 
-        return await self._gated(
-            "vote", {"proposal_id": proposal_id, "value": value}, run
-        )
+        return await self._gated("vote", {"proposal_id": proposal_id, "value": value}, run)
 
 
 def _summarize_diff(diff: str) -> str:
@@ -234,8 +230,7 @@ class CommunityDraftPatchTool(_CommunityTool):
 
     async def execute(self, diff: str, **_: Any) -> str:
         looks_valid = any(
-            line.startswith(("diff --git ", "--- ", "+++ ", "@@ "))
-            for line in diff.splitlines()
+            line.startswith(("diff --git ", "--- ", "+++ ", "@@ ")) for line in diff.splitlines()
         )
         if not looks_valid:
             return (
@@ -304,6 +299,110 @@ class CommunitySubmitPatchTool(_CommunityTool):
         )
 
 
+class CommunityOpenPrTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_open_pr"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Contribute code by opening a real pull request directly on an "
+            "upstream repo. Commits your current working changes, pushes them to "
+            "your own GitHub fork using your local git credentials, opens the PR, "
+            "and registers it with the community so it can be reviewed and "
+            "bot-merged. Open to any active member — the merge gate (CI + "
+            "trust-weighted votes) decides if it lands. High-impact: may require "
+            "human approval. Prefer this over community_submit_patch when you have "
+            "a GitHub account linked."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string", "description": "Proposal this PR implements."},
+                "repo": {"type": "string", "description": "Upstream repo, 'owner/name'."},
+                "title": {"type": "string", "description": "PR title."},
+                "body": {"type": "string", "description": "PR description (Markdown)."},
+                "base_ref": {
+                    "type": "string",
+                    "description": "Branch the PR targets (default 'main').",
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "Optional head branch name (default derived from the title).",
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Local path to the git checkout with your changes (default '.').",
+                },
+            },
+            "required": ["proposal_id", "repo", "title"],
+        }
+
+    async def execute(
+        self,
+        proposal_id: str,
+        repo: str,
+        title: str,
+        body: str = "",
+        base_ref: str = "main",
+        branch: str | None = None,
+        working_dir: str = ".",
+        **_: Any,
+    ) -> str:
+        async def run() -> str:
+            from mira_engine.community.contribute import ContributeError, open_pr_github
+
+            try:
+                result = await open_pr_github(
+                    repo=repo,
+                    title=title,
+                    body=body,
+                    base_ref=base_ref,
+                    branch=branch,
+                    working_dir=working_dir,
+                )
+            except ContributeError as e:
+                return f"Could not open the PR: {e}"
+
+            try:
+                reg = await self._client.register_pr(
+                    proposal_id,
+                    repo,
+                    result.number,
+                    result.url,
+                    result.login,
+                    host="github",
+                )
+            except Exception as e:  # noqa: BLE001 - PR is open even if register fails
+                return (
+                    f"Opened PR {result.url}, but registering it with the community "
+                    f"failed: {e}. You can retry registration later."
+                )
+            pr_state = (reg.get("pr") or {}).get("state", "open")
+            return (
+                f"Opened and registered PR {result.url} (state {pr_state}). "
+                "The community merge gate (CI + trust-weighted votes) will decide if it lands."
+            )
+
+        return await self._gated(
+            "open_pr",
+            {
+                "proposal_id": proposal_id,
+                "repo": repo,
+                "title": title,
+                "body": body,
+                "base_ref": base_ref,
+                "branch": branch,
+                "working_dir": working_dir,
+            },
+            run,
+        )
+
+
 class CommunityReviewPrTool(_CommunityTool):
     @property
     def name(self) -> str:
@@ -367,6 +466,7 @@ def build_community_tools(community_config: Any) -> list[Tool]:
         CommunityCommentTool(client, gate),
         CommunityVoteTool(client, gate),
         CommunityDraftPatchTool(client, gate),
+        CommunityOpenPrTool(client, gate),
         CommunitySubmitPatchTool(client, gate),
         CommunityReviewPrTool(client, gate),
     ]
