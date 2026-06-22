@@ -19,6 +19,7 @@ engine.
 import asyncio
 import json
 import re
+import time
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -31,6 +32,38 @@ from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 
 RECONNECT_BACKOFF_S = (2, 5, 10, 30, 60)
+
+# A session must stay up at least this long to be considered healthy; only then
+# do we reset the reconnect backoff. Without this, a connection that completes
+# the handshake but is immediately dropped (e.g. the gateway rejecting the token
+# right after upgrade) would keep retrying at the shortest interval forever.
+MIN_STABLE_SESSION_S = 30.0
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """True when the gateway rejected our credentials (a permanent failure).
+
+    Two shapes: the HTTP upgrade is refused with 401/403, or the socket upgrades
+    and is then closed with 1008 (policy violation) — which the agent gateway
+    uses for an invalid/expired/unknown agent token. Reconnecting cannot fix
+    either; the user must re-authenticate.
+    """
+    if isinstance(exc, websockets.exceptions.InvalidStatus):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (401, 403):
+            return True
+
+    if isinstance(exc, websockets.exceptions.ConnectionClosed):
+        for frame in (getattr(exc, "rcvd", None), getattr(exc, "sent", None)):
+            if frame is None:
+                continue
+            if getattr(frame, "code", None) == 1008:
+                return True
+            reason = (getattr(frame, "reason", "") or "").lower()
+            if "unauthor" in reason or "forbidden" in reason:
+                return True
+    return False
+
 
 # A community reply is posted as a *comment on a proposal*, so the thread id must
 # be that proposal's UUID. Inbound events without a real thread fall back to the
@@ -83,13 +116,14 @@ class CommunityChannel(BaseChannel):
         attempt = 0
 
         while self._running:
+            connected_at: float | None = None
             try:
                 logger.info("Connecting to Mira Community gateway at {}...", url)
                 async with websockets.connect(
                     url, additional_headers=self._auth_headers, open_timeout=20
                 ) as ws:
                     self._ws = ws
-                    attempt = 0
+                    connected_at = time.monotonic()
                     logger.info("Mira Community gateway connected")
                     await self._recv_loop(ws)
             except asyncio.CancelledError:
@@ -97,12 +131,33 @@ class CommunityChannel(BaseChannel):
             except Exception as e:
                 if not self._running:
                     break
-                delay = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
-                attempt += 1
-                logger.warning("Mira Community gateway error: {} (retry in {}s)", e, delay)
-                await asyncio.sleep(delay)
+                # A rejected token is permanent: stop reconnecting and tell the
+                # user how to recover, instead of hammering the gateway forever.
+                if _is_auth_error(e):
+                    logger.error(
+                        "Mira Community gateway rejected the agent token ({}). "
+                        "Stopping reconnect — run `mira community login` to "
+                        "re-authenticate, then restart.",
+                        e,
+                    )
+                    self._running = False
+                    break
+                logger.warning("Mira Community gateway error: {}", e)
             finally:
                 self._ws = None
+
+            if not self._running:
+                break
+            # Reconnect with escalating backoff (covers both an error above and a
+            # clean server close). Only a session that stayed up a while counts as
+            # healthy and resets the backoff; otherwise keep escalating so repeated
+            # fast failures don't retry at the shortest interval forever.
+            if connected_at is not None and time.monotonic() - connected_at >= MIN_STABLE_SESSION_S:
+                attempt = 0
+            delay = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
+            attempt += 1
+            logger.info("Reconnecting to Mira Community gateway in {}s", delay)
+            await asyncio.sleep(delay)
 
     async def stop(self) -> None:
         self._running = False
