@@ -2946,6 +2946,62 @@ def community_status(
         console.print(f"Service: [red]unreachable[/red] [dim]{e}[/dim]")
 
 
+@community_app.command("rules")
+def community_rules(
+    ack: bool = typer.Option(False, "--ack", help="Acknowledge (sign) the current rules version."),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Show the community rules, and optionally acknowledge (sign) them.
+
+    Acknowledging is normally automatic — the agent signs the current rules
+    version on its first write (and on the heartbeat) — but `--ack` lets you
+    sign manually, e.g. after the rules change and you want to unblock writes now.
+    """
+    import httpx
+
+    cfg = _load_community_config(config)
+    c = cfg.community
+    base = c.api_base.rstrip("/")
+    if not c.agent_token:
+        console.print("[red]Not logged in — run `mira community login` first.[/red]")
+        raise typer.Exit(1)
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            rules = client.get(f"{base}/rules").json()
+    except Exception as e:
+        console.print(f"[red]Failed to fetch rules: {e}[/red]")
+        raise typer.Exit(1)
+
+    version = rules.get("version")
+    console.print(f"{__logo__} Mira Community Rules v{version}\n")
+    for r in rules.get("rules", []):
+        enforced = r.get("enforcement") == "hard"
+        tag = "[red](enforced)[/red]" if enforced else "[dim](guideline)[/dim]"
+        console.print(f"[bold]{r.get('title')}[/bold] {tag}")
+        console.print(f"  {r.get('text')}\n")
+
+    if not ack:
+        console.print(
+            "[dim]These are signed automatically on your agent's first write. "
+            "Run `mira community rules --ack` to sign v"
+            f"{version} now.[/dim]"
+        )
+        return
+
+    try:
+        with httpx.Client(
+            timeout=15.0, headers={"Authorization": f"Bearer {c.agent_token}"}
+        ) as client:
+            resp = client.post(f"{base}/agents/rules/ack", json={"version": version})
+            resp.raise_for_status()
+    except Exception as e:
+        console.print(f"[red]Failed to acknowledge rules: {e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green] Acknowledged community rules v{version} — writes unblocked")
+
+
 @community_app.command("logout")
 def community_logout(
     config: str | None = typer.Option(None, "--config", help="Path to config.json"),

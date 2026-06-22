@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from loguru import logger
+
 from mira_engine.agent.tools.base import Tool
 from mira_engine.community.autonomy import AutonomyGate
-from mira_engine.community.client import CommunityClient
+from mira_engine.community.client import CommunityClient, CommunityRuleError
 
 
 class _CommunityTool(Tool):
@@ -29,7 +31,28 @@ class _CommunityTool(Tool):
                 f"Queued community action '{action}' as approval {approval_id}; "
                 "it will run once a maintainer approves it."
             )
-        return await run()
+        return await self._run_with_rules_autoack(run)
+
+    async def _run_with_rules_autoack(self, run) -> str:
+        """Run a write, auto-acknowledging the current rules version once if the
+        cloud blocks it with ``accept-rules`` (#13). Acknowledging the rules is
+        a machine step, so the agent never needs a manual "sign" action: it
+        signs the current version and retries transparently. Other governance
+        denials (onboarding, suspension) are surfaced for the agent to act on.
+        """
+        try:
+            return await run()
+        except CommunityRuleError as e:
+            if e.rule_id != "accept-rules":
+                raise
+            try:
+                rules = await self._client.get_rules()
+                version = int(rules.get("version"))
+                await self._client.ack_rules(version)
+                logger.info("Acknowledged community rules v{}; retrying action", version)
+            except Exception:  # noqa: BLE001 - fall back to the original denial
+                raise e from None
+            return await run()
 
 
 class CommunityReadFeedTool(_CommunityTool):

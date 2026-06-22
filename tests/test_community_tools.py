@@ -35,6 +35,14 @@ class FakeClient:
         self.calls.append(("accept_answer", post_id, comment_id))
         return {"accepted_comment_id": comment_id}
 
+    async def get_rules(self):
+        self.calls.append(("get_rules",))
+        return {"version": 2}
+
+    async def ack_rules(self, version):
+        self.calls.append(("ack_rules", version))
+        return {"ok": True, "acked_version": version}
+
     async def post_comment(self, thread_id, content, reply_to=None):
         self.calls.append(("post_comment", thread_id, content, reply_to))
         return {"comment_id": "c1"}
@@ -184,6 +192,61 @@ async def test_accept_answer_runs_when_autonomous():
     out = await tool.execute(post_id="q1", comment_id="c9")
     assert "accepted" in out.lower()
     assert ("accept_answer", "q1", "c9") in client.calls
+
+
+async def test_comment_auto_acks_rules_then_retries(monkeypatch):
+    from mira_engine.community.client import CommunityRuleError
+
+    class BlockingClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self._blocked = True
+
+        async def post_comment(self, thread_id, content, reply_to=None):
+            # Block once with a rules-ack denial, succeed after the ack.
+            if self._blocked:
+                self._blocked = False
+                raise CommunityRuleError(
+                    "/agents/messages blocked: rules acknowledgement required",
+                    rule_id="accept-rules",
+                    reason="must ack v2",
+                    how_to_resolve="POST /agents/rules/ack",
+                    status_code=403,
+                )
+            return await super().post_comment(thread_id, content, reply_to)
+
+    client = BlockingClient()
+    tool = community_tools.CommunityCommentTool(client, AutonomyGate("fully_autonomous"))
+    out = await tool.execute(thread_id="p1", content="hi")
+    assert "Comment posted" in out
+    # It signed the current rules version and retried the comment.
+    assert ("get_rules",) in client.calls
+    assert ("ack_rules", 2) in client.calls
+    assert ("post_comment", "p1", "hi", None) in client.calls
+
+
+async def test_non_rules_denial_is_not_auto_acked():
+    from mira_engine.community.client import CommunityRuleError
+
+    class OnboardingBlockedClient(FakeClient):
+        async def post_comment(self, thread_id, content, reply_to=None):
+            raise CommunityRuleError(
+                "/agents/messages blocked: onboarding required",
+                rule_id="onboarding",
+                reason="complete the connection test",
+                how_to_resolve="reply in the onboarding thread",
+                status_code=403,
+            )
+
+    client = OnboardingBlockedClient()
+    tool = community_tools.CommunityCommentTool(client, AutonomyGate("fully_autonomous"))
+    try:
+        await tool.execute(thread_id="p1", content="hi")
+        raise AssertionError("expected CommunityRuleError to propagate")
+    except CommunityRuleError as e:
+        assert e.rule_id == "onboarding"
+    # No ack attempt for a non-rules denial.
+    assert ("ack_rules", 2) not in client.calls
 
 
 async def test_draft_patch_validates_without_network():
