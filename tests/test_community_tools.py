@@ -10,13 +10,15 @@ class FakeClient:
     def __init__(self):
         self.calls: list[tuple] = []
 
-    async def read_feed(self, limit=20, status=None):
-        self.calls.append(("read_feed", limit, status))
+    async def read_feed(self, limit=20, status=None, category=None, tag=None):
+        self.calls.append(("read_feed", limit, status, category, tag))
         return {
             "proposals": [
                 {
                     "id": "p1",
                     "status": "open",
+                    "category": "development",
+                    "tags": [],
                     "title": "Add dark mode",
                     "score": 3,
                     "comment_count": 2,
@@ -25,9 +27,13 @@ class FakeClient:
             ]
         }
 
-    async def create_proposal(self, title, body):
-        self.calls.append(("create_proposal", title, body))
+    async def create_proposal(self, title, body, category="development", tags=None):
+        self.calls.append(("create_proposal", title, body, category, tags))
         return {"id": "p2"}
+
+    async def accept_answer(self, post_id, comment_id):
+        self.calls.append(("accept_answer", post_id, comment_id))
+        return {"accepted_comment_id": comment_id}
 
     async def post_comment(self, thread_id, content, reply_to=None):
         self.calls.append(("post_comment", thread_id, content, reply_to))
@@ -81,9 +87,11 @@ def test_build_returns_full_set_when_connected():
     names = {t.name for t in tools}
     assert names == {
         "community_read_feed",
+        "community_post",
         "community_post_proposal",
         "community_comment",
         "community_vote",
+        "community_accept_answer",
         "community_draft_patch",
         "community_open_pr",
         "community_submit_patch",
@@ -97,7 +105,7 @@ async def test_read_feed_formats_proposals():
     out = await tool.execute(limit=5)
     assert "Add dark mode" in out
     assert "p1" in out
-    assert client.calls[0] == ("read_feed", 5, None)
+    assert client.calls[0] == ("read_feed", 5, None, None, None)
 
 
 async def test_vote_runs_when_fully_autonomous():
@@ -146,6 +154,38 @@ async def test_proposal_high_impact_queued_in_hybrid(monkeypatch):
     assert client.calls == []
 
 
+async def test_community_post_discussion_low_impact_runs_in_hybrid():
+    client = FakeClient()
+    tool = community_tools.CommunityPostTool(client, AutonomyGate("hybrid"))
+    out = await tool.execute(title="T", body="B", category="discussion", tags=["ml"])
+    assert "discussion" in out.lower()
+    assert ("create_proposal", "T", "B", "discussion", ["ml"]) in client.calls
+
+
+async def test_community_post_development_high_impact_queued_in_hybrid(monkeypatch):
+    client = FakeClient()
+    gate = AutonomyGate("hybrid")
+    captured: dict = {}
+    monkeypatch.setattr(
+        gate,
+        "enqueue_approval",
+        lambda a, p: captured.update(action=a, payload=p) or "appr-d",
+    )
+    tool = community_tools.CommunityPostTool(client, gate)
+    out = await tool.execute(title="T", body="B", category="development")
+    assert "approval" in out.lower()
+    assert captured["action"] == "post_proposal"
+    assert client.calls == []
+
+
+async def test_accept_answer_runs_when_autonomous():
+    client = FakeClient()
+    tool = community_tools.CommunityAcceptAnswerTool(client, AutonomyGate("fully_autonomous"))
+    out = await tool.execute(post_id="q1", comment_id="c9")
+    assert "accepted" in out.lower()
+    assert ("accept_answer", "q1", "c9") in client.calls
+
+
 async def test_draft_patch_validates_without_network():
     client = FakeClient()
     tool = community_tools.CommunityDraftPatchTool(client, AutonomyGate("hitl"))
@@ -159,9 +199,7 @@ async def test_draft_patch_validates_without_network():
 async def test_submit_patch_runs_when_autonomous():
     client = FakeClient()
     tool = community_tools.CommunitySubmitPatchTool(client, AutonomyGate("fully_autonomous"))
-    out = await tool.execute(
-        proposal_id="p1", repo="o/r", diff="diff --git a/x b/x\n", title="Fix"
-    )
+    out = await tool.execute(proposal_id="p1", repo="o/r", diff="diff --git a/x b/x\n", title="Fix")
     assert "submitted" in out.lower()
     assert ("submit_patch", "p1", "o/r", "Fix", "main") in client.calls
 

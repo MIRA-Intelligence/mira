@@ -48,8 +48,8 @@ async def test_execute_proposal_calls_client(monkeypatch, data_dir):
         def __init__(self, base, token):
             calls["init"] = (base, token)
 
-        async def create_proposal(self, title, body):
-            calls["proposal"] = (title, body)
+        async def create_proposal(self, title, body, category="development", tags=None):
+            calls["proposal"] = (title, body, category, tags)
             return {"id": "p1"}
 
         async def post_comment(self, *a, **k):  # pragma: no cover - unused here
@@ -60,7 +60,7 @@ async def test_execute_proposal_calls_client(monkeypatch, data_dir):
     cfg = SimpleNamespace(api_base="http://x", agent_token="tok")
     res = await approvals.execute_approval(rec, cfg)
     assert res["ok"] is True
-    assert calls["proposal"] == ("T", "B")
+    assert calls["proposal"] == ("T", "B", "development", None)
     assert calls["init"] == ("http://x", "tok")
 
 

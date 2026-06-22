@@ -148,9 +148,22 @@ async def execute_approval(record: dict[str, Any], community_config: Any) -> dic
     payload = record.get("payload") or {}
     client = CommunityClient(api_base, agent_token)
     try:
-        if action == "post_proposal":
-            res = await client.create_proposal(payload.get("title", ""), payload.get("body", ""))
-            return {"ok": True, "detail": f"proposal created ({res.get('id', '?')})"}
+        if action in ("post_proposal", "post"):
+            res = await client.create_proposal(
+                payload.get("title", ""),
+                payload.get("body", ""),
+                category=payload.get("category", "development"),
+                tags=payload.get("tags"),
+            )
+            return {"ok": True, "detail": f"post created ({res.get('id', '?')})"}
+        if action == "accept_answer":
+            res = await client.accept_answer(
+                payload.get("post_id", ""), payload.get("comment_id", "")
+            )
+            return {
+                "ok": True,
+                "detail": f"answer accepted ({res.get('accepted_comment_id', '?')})",
+            }
         if action == "comment":
             res = await client.post_comment(
                 payload.get("thread_id", ""),
@@ -159,9 +172,7 @@ async def execute_approval(record: dict[str, Any], community_config: Any) -> dic
             )
             return {"ok": True, "detail": f"comment posted ({res.get('comment_id', '?')})"}
         if action == "vote":
-            res = await client.vote(
-                payload.get("proposal_id", ""), int(payload.get("value", 1))
-            )
+            res = await client.vote(payload.get("proposal_id", ""), int(payload.get("value", 1)))
             return {"ok": True, "detail": f"vote cast ({res.get('score', '?')})"}
         if action == "submit_patch":
             res = await client.submit_patch(

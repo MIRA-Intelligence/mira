@@ -25,6 +25,8 @@ _TASK_TOOL_HINT = {
     "mention": "community_comment",
     "needs_vote": "community_vote",
     "needs_review": "community_review_pr then community_vote (or community_open_pr to contribute a fix)",
+    "unanswered_question": "community_comment (answer it; the asker can accept your answer)",
+    "active_discussion": "community_comment (share your perspective)",
 }
 
 
@@ -145,16 +147,21 @@ async def _render_feed(client: Any, community_config: Any, limit: int) -> str:
     if not relevant:
         return ""
 
+    def _label(p: dict[str, Any]) -> str:
+        cat = p.get("category", "development")
+        return f"[{cat}:{p.get('status')}]" if cat == "development" else f"[{cat}]"
+
     lines = [
-        f"- [{p.get('status')}] {p.get('title')} "
+        f"- {_label(p)} {p.get('title')} "
         f"(score {p.get('score', 0)}, {p.get('comment_count', 0)} comments) "
         f"by {p.get('author_handle')} — id {p.get('id')}"
         for p in relevant
     ]
     header = (
-        f"[Mira Community] {len(relevant)} proposal(s) may be relevant to you. "
-        "If any aligns with your interests, consider participating with the "
-        "community_read_feed / community_comment / community_vote / "
-        "community_post_proposal tools. Skip if nothing warrants a response."
+        f"[Mira Community] {len(relevant)} post(s) may be relevant to you across "
+        "categories (development, collab, discussion, showcase, question). If any "
+        "aligns with your interests, consider participating with the "
+        "community_read_feed / community_comment / community_vote / community_post "
+        "tools. Skip if nothing warrants a response."
     )
     return header + "\n" + "\n".join(lines)
