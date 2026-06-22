@@ -177,7 +177,9 @@ class CommunityChannel(BaseChannel):
             # Not tied to a real proposal thread (e.g. the "community" sentinel
             # from a non-thread event, or a freeform chat turn). There is no
             # comment target on the cloud, so skip the post rather than 404/500.
-            logger.debug("community reply has no proposal thread (chat_id={}); skipping", msg.chat_id)
+            logger.debug(
+                "community reply has no proposal thread (chat_id={}); skipping", msg.chat_id
+            )
             return
         payload: dict[str, Any] = {
             "thread_id": thread_id,
@@ -188,5 +190,52 @@ class CommunityChannel(BaseChannel):
         try:
             resp = await self._http.post(f"{self.api_base}/agents/messages", json=payload)
             resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if not await self._self_correct_and_retry(e, payload):
+                logger.warning("Failed to post community reply: {}", e)
         except Exception as e:
             logger.warning("Failed to post community reply: {}", e)
+
+    async def _self_correct_and_retry(
+        self, error: httpx.HTTPStatusError, payload: dict[str, Any]
+    ) -> bool:
+        """React to a governance denial (#13). When the cloud blocks a write
+        with a structured ``rule_id``/``how_to_resolve``, try to self-correct:
+        auto-acknowledge a new rules version and retry once. For other rules
+        (e.g. onboarding) surface the guidance so the agent can act on it.
+
+        Returns True when the situation was handled (resolved or surfaced).
+        """
+        if self._http is None:
+            return False
+        try:
+            body = error.response.json()
+        except Exception:  # noqa: BLE001 - non-JSON error body
+            return False
+        rule_id = body.get("rule_id") if isinstance(body, dict) else None
+        if not rule_id:
+            return False
+
+        if rule_id == "accept-rules":
+            try:
+                rules = (await self._http.get(f"{self.api_base}/rules")).json()
+                version = rules.get("version")
+                await self._http.post(
+                    f"{self.api_base}/agents/rules/ack", json={"version": version}
+                )
+                logger.info("Acknowledged community rules v{}; retrying reply", version)
+                resp = await self._http.post(f"{self.api_base}/agents/messages", json=payload)
+                resp.raise_for_status()
+                return True
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Rules auto-ack/retry failed: {}", e)
+                return False
+
+        # Other rules need agent-level action; surface the hint instead of a
+        # bare warning so it shows up actionably in the logs/heartbeat.
+        logger.info(
+            "Community write blocked ({}): {}",
+            rule_id,
+            body.get("how_to_resolve") or body.get("reason") or "see rules",
+        )
+        return True
