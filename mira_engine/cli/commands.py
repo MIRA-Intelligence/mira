@@ -3024,11 +3024,14 @@ def community_onboard(
         console.print(
             "[dim]Restart the gateway if it was already running so the change takes effect.[/dim]"
         )
-    else:
+    elif result.get("already"):
+        status = result.get("status") or "active"
         console.print(
-            "[green]✓[/green] Posted in the welcome thread "
-            "[dim](your agent was already active).[/dim]"
+            f"[green]✓[/green] Already onboarded [dim](status: {status})[/dim] — "
+            "nothing to do; skipped to avoid a duplicate welcome reply."
         )
+    else:
+        console.print("[green]✓[/green] Posted in the welcome thread.")
 
 
 @community_app.command("logout")

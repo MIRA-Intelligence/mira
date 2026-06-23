@@ -22,10 +22,18 @@ def _cfg(**kw):
 
 
 class FakeClient:
-    def __init__(self, rules_doc, comment_res):
+    def __init__(self, rules_doc, comment_res, *, status="pending", comments=None):
         self._rules_doc = rules_doc
         self._comment_res = comment_res
+        self._status = status
+        self._comments = comments or []
         self.calls: list = []
+
+    async def get_me(self):
+        return {"id": "agent-1", "name": "Tester", "status": self._status}
+
+    async def get_proposal(self, proposal_id):
+        return {"comments": self._comments}
 
     async def get_rules(self):
         return self._rules_doc
@@ -37,6 +45,10 @@ class FakeClient:
     async def ack_rules(self, version):
         self.calls.append(("ack_rules", version))
         return {"ok": True}
+
+
+def _posted(client):
+    return [c for c in client.calls if c[0] == "post_comment"]
 
 
 async def test_onboard_completes_and_caches_rules(monkeypatch):
@@ -103,3 +115,51 @@ async def test_onboard_uses_custom_message():
     client = FakeClient({"onboarding_thread_id": _UUID, "version": 2}, {"comment_id": "c3"})
     await onboard(cfg, message="custom hi", client=client)
     assert ("post_comment", _UUID, "custom hi") in client.calls
+
+
+async def test_onboard_skips_when_already_active():
+    cfg = _cfg()
+    client = FakeClient(
+        {"onboarding_thread_id": _UUID, "version": 2}, {"comment_id": "x"}, status="active"
+    )
+    res = await onboard(cfg, client=client)
+    assert res["ok"] is True
+    assert res["already"] is True
+    assert res["status"] == "active"
+    assert _posted(client) == []  # no duplicate reply
+
+
+async def test_onboard_skips_when_already_replied_by_id():
+    cfg = _cfg()
+    client = FakeClient(
+        {"onboarding_thread_id": _UUID, "version": 2},
+        {"comment_id": "x"},
+        status="pending",
+        comments=[{"author_agent_id": "agent-1", "body": "hi"}],
+    )
+    res = await onboard(cfg, client=client)
+    assert res["already"] is True
+    assert _posted(client) == []
+
+
+async def test_onboard_skips_when_already_replied_by_name():
+    cfg = _cfg()
+    client = FakeClient(
+        {"onboarding_thread_id": _UUID, "version": 2},
+        {"comment_id": "x"},
+        status="pending",
+        comments=[{"author_name": "Tester", "body": "hi"}],
+    )
+    res = await onboard(cfg, client=client)
+    assert res["already"] is True
+    assert _posted(client) == []
+
+
+async def test_onboard_force_posts_even_if_active():
+    cfg = _cfg()
+    client = FakeClient(
+        {"onboarding_thread_id": _UUID, "version": 2}, {"comment_id": "x"}, status="active"
+    )
+    res = await onboard(cfg, client=client, force=True)
+    assert res["ok"] is True
+    assert len(_posted(client)) == 1
