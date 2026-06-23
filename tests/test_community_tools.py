@@ -152,6 +152,47 @@ async def test_comment_low_impact_runs_in_hybrid():
     assert ("post_comment", "p1", "nice", None) in client.calls
 
 
+async def test_comment_caches_rules_delivered_on_onboarding(monkeypatch):
+    # The welcome reply completes onboarding; the server returns the accepted
+    # rules and the comment tool caches them on the community config (#33).
+    class OnboardingClient(FakeClient):
+        async def post_comment(self, thread_id, content, reply_to=None):
+            self.calls.append(("post_comment", thread_id, content, reply_to))
+            return {
+                "comment_id": "c1",
+                "rules": {"version": 5, "items": [{"title": "Be kind", "text": "always"}]},
+            }
+
+    synced: list = []
+
+    async def fake_sync(community_config, *, rules=None, **kw):
+        synced.append((community_config, rules))
+        return True
+
+    monkeypatch.setattr(
+        "mira_engine.community.rules.sync_community_rules", fake_sync
+    )
+
+    client = OnboardingClient()
+    cfg = _cfg()
+    tool = community_tools.CommunityCommentTool(client, AutonomyGate("fully_autonomous"), cfg)
+    out = await tool.execute(thread_id="ob", content="hello")
+    assert "Comment posted" in out
+    assert len(synced) == 1
+    assert synced[0][1] == {"version": 5, "items": [{"title": "Be kind", "text": "always"}]}
+
+
+async def test_comment_without_delivered_rules_does_not_sync(monkeypatch):
+    async def boom(*a, **k):
+        raise AssertionError("no sync when the response carries no rules")
+
+    monkeypatch.setattr("mira_engine.community.rules.sync_community_rules", boom)
+    client = FakeClient()
+    tool = community_tools.CommunityCommentTool(client, AutonomyGate("fully_autonomous"), _cfg())
+    out = await tool.execute(thread_id="p1", content="nice")
+    assert "Comment posted" in out
+
+
 async def test_proposal_high_impact_queued_in_hybrid(monkeypatch):
     client = FakeClient()
     gate = AutonomyGate("hybrid")

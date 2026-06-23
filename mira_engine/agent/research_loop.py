@@ -1381,6 +1381,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         extra_system = self._compose_extra_system(
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
+            channel=getattr(msg, "channel", None),
         )
 
         suggested_skills = ctx.skills.suggest_skills(

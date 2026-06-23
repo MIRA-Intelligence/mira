@@ -134,6 +134,12 @@ class CommunityChannel(BaseChannel):
         if etype in (None, "pong", "ack", "ping"):
             return
 
+        # Lifecycle events deliver rules (#33): cache them and do NOT spawn an
+        # agent turn — they are housekeeping, not something to reason about.
+        if etype in ("rules_updated", "onboarded"):
+            await self._sync_delivered_rules(event)
+            return
+
         thread_id = str(
             event.get("thread_id") or event.get("chat_id") or event.get("id") or "community"
         )
@@ -150,6 +156,22 @@ class CommunityChannel(BaseChannel):
             metadata={"community_event": event},
         )
         await self.bus.publish_inbound(msg)
+
+    async def _sync_delivered_rules(self, event: dict[str, Any]) -> None:
+        """Cache rules delivered by a lifecycle event (#33).
+
+        ``rules_updated``/``onboarded`` carry ``rules: {version, items}``; cache
+        them client-side (and persist) so the agent acts by them. Falls back to a
+        fetch when the payload is absent (older cloud). Never raises.
+        """
+        from mira_engine.community.rules import sync_community_rules
+
+        rules = event.get("rules")
+        payload = rules if isinstance(rules, dict) else None
+        try:
+            await sync_community_rules(self.config, rules=payload)
+        except Exception as e:  # noqa: BLE001 - housekeeping must never crash recv
+            logger.debug("Failed to sync delivered community rules: {}", e)
 
     @staticmethod
     def _format_event(event: dict[str, Any]) -> str:

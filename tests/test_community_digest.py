@@ -20,7 +20,11 @@ def _cfg(**kw):
 def _install_client(
     monkeypatch, *, tasks=None, rules=None, feed=None, tasks_raises=None, recorder=None
 ):
-    """Install a fake CommunityClient with configurable task/rules/feed behavior."""
+    """Install a fake CommunityClient with configurable task/rules/feed behavior.
+
+    Rules sync is exercised for real against the fake client, but its on-disk
+    persistence is neutralized so tests never touch the user's config.
+    """
 
     class FakeClient:
         def __init__(self, *a, **k):
@@ -43,6 +47,7 @@ def _install_client(
             return {"proposals": feed or []}
 
     monkeypatch.setattr(client_mod, "CommunityClient", FakeClient)
+    monkeypatch.setattr("mira_engine.community.rules._persist", lambda *a, **k: None)
 
 
 async def test_disabled_returns_empty():
@@ -73,25 +78,40 @@ async def test_tasks_render_next_actions(monkeypatch):
     assert "needs_vote" in out
     assert "p1" in out
     assert "community_vote" in out
-    assert "rules v2" in out.lower()
+    # Rules live in the agent's system prompt now — not repeated in the digest.
+    assert "rules v2" not in out.lower()
 
 
-async def test_rules_ack_is_auto_acknowledged(monkeypatch):
+async def test_rules_synced_and_ack_task_dropped(monkeypatch):
     recorder = []
     _install_client(
         monkeypatch,
         tasks=[
-            {"type": "rules_ack", "target_id": "rules:1", "title": "Ack rules", "reason": "stale"},
+            {"type": "rules_ack", "target_id": "rules:1", "title": "Rules updated", "reason": "info"},
             {"type": "onboarding", "target_id": "ob", "title": "Connect", "reason": "verify"},
         ],
         rules={"version": 1, "rules": [{"title": "Be nice"}], "onboarding_thread_id": "ob"},
         recorder=recorder,
     )
     out = await digest.gather_community_digest(_cfg())
-    # The rules_ack task is acknowledged and removed; onboarding remains.
+    # Rules are synced (silently acked) out of band; the informational rules_ack
+    # task is dropped from the digest while onboarding remains.
     assert ("ack", 1) in recorder
     assert "rules_ack" not in out
     assert "onboarding" in out
+
+
+async def test_rules_cached_on_config(monkeypatch):
+    cfg = _cfg()
+    _install_client(
+        monkeypatch,
+        tasks=[],
+        rules={"version": 3, "rules": [{"title": "Be excellent", "text": "to each other"}]},
+    )
+    await digest.gather_community_digest(cfg)
+    # The digest's sync caches the rules on the live config for prompt injection.
+    assert cfg.rules_version == 3
+    assert "Be excellent" in cfg.rules_text
 
 
 async def test_falls_back_to_feed_when_tasks_unavailable(monkeypatch):

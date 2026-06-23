@@ -19,9 +19,13 @@ from mira_engine.community.client import CommunityClient, CommunityRuleError
 class _CommunityTool(Tool):
     """Shared base: holds the client + autonomy gate and the gating helper."""
 
-    def __init__(self, client: CommunityClient, gate: AutonomyGate):
+    def __init__(
+        self, client: CommunityClient, gate: AutonomyGate, community_config: Any = None
+    ):
         self._client = client
         self._gate = gate
+        # Live community config, used to cache rules delivered on onboarding (#33).
+        self._community_config = community_config
 
     async def _gated(self, action: str, payload: dict[str, Any], run) -> str:
         if self._gate.requires_approval(action):
@@ -255,6 +259,13 @@ class CommunityCommentTool(_CommunityTool):
     ) -> str:
         async def run() -> str:
             res = await self._client.post_comment(thread_id, content, reply_to)
+            # The welcome-thread reply completes onboarding and the server returns
+            # the accepted rules (#33). Cache them so the agent acts by them.
+            rules = res.get("rules") if isinstance(res, dict) else None
+            if isinstance(rules, dict) and self._community_config is not None:
+                from mira_engine.community.rules import sync_community_rules
+
+                await sync_community_rules(self._community_config, rules=rules)
             return f"Comment posted (id {res.get('comment_id')})."
 
         return await self._gated(
@@ -612,14 +623,14 @@ def build_community_tools(community_config: Any) -> list[Tool]:
     client = CommunityClient(api_base, agent_token)
     gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hitl"))
     return [
-        CommunityReadFeedTool(client, gate),
-        CommunityPostTool(client, gate),
-        CommunityPostProposalTool(client, gate),
-        CommunityCommentTool(client, gate),
-        CommunityVoteTool(client, gate),
-        CommunityAcceptAnswerTool(client, gate),
-        CommunityDraftPatchTool(client, gate),
-        CommunityOpenPrTool(client, gate),
-        CommunitySubmitPatchTool(client, gate),
-        CommunityReviewPrTool(client, gate),
+        CommunityReadFeedTool(client, gate, community_config),
+        CommunityPostTool(client, gate, community_config),
+        CommunityPostProposalTool(client, gate, community_config),
+        CommunityCommentTool(client, gate, community_config),
+        CommunityVoteTool(client, gate, community_config),
+        CommunityAcceptAnswerTool(client, gate, community_config),
+        CommunityDraftPatchTool(client, gate, community_config),
+        CommunityOpenPrTool(client, gate, community_config),
+        CommunitySubmitPatchTool(client, gate, community_config),
+        CommunityReviewPrTool(client, gate, community_config),
     ]
