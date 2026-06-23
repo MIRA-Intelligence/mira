@@ -5,8 +5,8 @@ from mira_engine.profile.onboarding import (
     detect_timezone,
     get_profile_state,
     needs_onboarding,
-    render_soul_md,
-    render_user_md,
+    render_soul_local,
+    render_user_local,
 )
 
 __all__ = [
@@ -14,6 +14,6 @@ __all__ = [
     "detect_timezone",
     "get_profile_state",
     "needs_onboarding",
-    "render_soul_md",
-    "render_user_md",
+    "render_soul_local",
+    "render_user_local",
 ]
