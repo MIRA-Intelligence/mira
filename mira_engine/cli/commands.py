@@ -3064,7 +3064,9 @@ def community_logout(
     from mira_engine.config.loader import save_config
 
     cfg = _load_community_config(config)
-    cfg.community.enabled = False
+    # Only clear credentials — leave ``enabled`` alone so the always-on channel
+    # idles instead of being torn down. A running gateway auto-disconnects when
+    # it notices the token is gone; no restart needed.
     cfg.community.agent_token = ""
     cfg.community.agent_id = ""
     save_config(cfg)
