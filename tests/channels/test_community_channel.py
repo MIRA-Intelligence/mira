@@ -189,3 +189,18 @@ async def test_ordinary_event_still_publishes(monkeypatch):
 
     assert len(bus.published) == 1
     assert bus.published[0].channel == "community"
+
+
+async def test_ready_and_error_events_do_not_spawn_turn(monkeypatch):
+    channel, bus = _channel()
+
+    async def boom(*a, **k):
+        raise AssertionError("housekeeping events must not trigger rules sync")
+
+    monkeypatch.setattr(rules_mod, "sync_community_rules", boom)
+
+    await channel._handle_event({"type": "ready", "agent_id": "a1", "name": "mira"})
+    await channel._handle_event({"type": "error", "error": "onboarding required"})
+
+    # Neither the connection greeting nor a denial envelope becomes an agent turn.
+    assert bus.published == []

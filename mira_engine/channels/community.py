@@ -232,7 +232,18 @@ class CommunityChannel(BaseChannel):
     async def _handle_event(self, event: dict[str, Any]) -> None:
         """Map a cloud event onto an inbound message for the agent."""
         etype = event.get("type")
-        if etype in (None, "pong", "ack", "ping"):
+        # Connection/keepalive greetings carry no task. ``ready`` is the gateway's
+        # hello on connect; turning it into an agent turn made the agent post a
+        # spurious "connection test complete" acknowledgement, which looked like
+        # (but was not) the welcome reply. These never spawn a turn.
+        if etype in (None, "pong", "ack", "ping", "ready"):
+            return
+
+        # Server-side denials (e.g. a write blocked by a governance gate) are
+        # diagnostics, not prompts — log and move on rather than asking the agent
+        # to "reason" about a raw error envelope.
+        if etype == "error":
+            logger.warning("Community gateway error event: {}", event.get("error") or event)
             return
 
         # Lifecycle events deliver rules (#33): cache them and do NOT spawn an
