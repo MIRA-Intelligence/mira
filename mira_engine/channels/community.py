@@ -19,6 +19,7 @@ engine.
 import asyncio
 import json
 import re
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -31,6 +32,10 @@ from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 
 RECONNECT_BACKOFF_S = (2, 5, 10, 30, 60)
+# How often to poll config.json for credentials while idle (not logged in), and
+# while connected (to detect logout / a re-login with a new token).
+IDLE_POLL_S = 5.0
+CRED_WATCH_S = 8.0
 
 # A community reply is posted as a *comment on a proposal*, so the thread id must
 # be that proposal's UUID. Inbound events without a real thread fall back to the
@@ -97,42 +102,108 @@ class CommunityChannel(BaseChannel):
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.agent_token}"}
 
-    async def start(self) -> None:
-        if not self.agent_token:
-            logger.warning(
-                "community channel enabled but no agent token; run `mira community login`"
-            )
-            return
-        if not self.api_base:
-            logger.warning("community channel enabled but apiBase is empty")
-            return
+    def _read_credentials(self) -> tuple[str, str, str]:
+        """Read live credentials from config.json so login/logout take effect
+        without a gateway restart. Falls back to the construction snapshot when
+        the file can't be read."""
+        try:
+            from mira_engine.config.loader import get_config_path
 
+            data = json.loads(Path(get_config_path()).read_text())
+            c = data.get("community", {}) if isinstance(data, dict) else {}
+            if not isinstance(c, dict):
+                c = {}
+            api_base = (c.get("apiBase") or c.get("api_base") or "").rstrip("/")
+            token = c.get("agentToken") or c.get("agent_token") or ""
+            agent_id = c.get("agentId") or c.get("agent_id") or ""
+            return api_base, token, agent_id
+        except Exception:  # noqa: BLE001 - fall back to the snapshot
+            return self.api_base, self.agent_token, self.agent_id
+
+    async def start(self) -> None:
+        """Run until stopped, managing the connection lifecycle on its own.
+
+        The channel is always created (community is a first-class feature), so it
+        idles until credentials exist, auto-connects when the user logs in (CLI
+        or UI), reconnects on a re-login with a new token, and disconnects on
+        logout — all without a gateway restart.
+        """
         self._running = True
-        self._http = httpx.AsyncClient(timeout=30.0, headers=self._auth_headers)
-        url = _ws_url(self.api_base)
-        attempt = 0
+        idle_logged = False
 
         while self._running:
+            api_base, token, agent_id = self._read_credentials()
+            if not (api_base and token):
+                if not idle_logged:
+                    logger.info("Community channel idle — waiting for `mira community login`")
+                    idle_logged = True
+                await asyncio.sleep(IDLE_POLL_S)
+                continue
+            idle_logged = False
+
+            self.api_base, self.agent_token, self.agent_id = api_base, token, agent_id
+            self._http = httpx.AsyncClient(timeout=30.0, headers=self._auth_headers)
+            attempt = 0
             try:
-                logger.info("Connecting to Mira Community gateway at {}...", url)
-                async with websockets.connect(
-                    url, additional_headers=self._auth_headers, open_timeout=20
-                ) as ws:
-                    self._ws = ws
-                    attempt = 0
-                    logger.info("Mira Community gateway connected")
-                    await self._recv_loop(ws)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                if not self._running:
-                    break
-                delay = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
-                attempt += 1
-                logger.warning("Mira Community gateway error: {} (retry in {}s)", e, delay)
-                await asyncio.sleep(delay)
+                while self._running:
+                    # Pick up a re-login (new token) or logout before reconnecting.
+                    api_base, token, agent_id = self._read_credentials()
+                    if not (api_base and token):
+                        break  # logged out → back to idle
+                    self.api_base, self.agent_token, self.agent_id = api_base, token, agent_id
+                    self._http.headers["Authorization"] = f"Bearer {self.agent_token}"
+                    url = _ws_url(self.api_base)
+                    try:
+                        logger.info("Connecting to Mira Community gateway at {}...", url)
+                        async with websockets.connect(
+                            url, additional_headers=self._auth_headers, open_timeout=20
+                        ) as ws:
+                            self._ws = ws
+                            attempt = 0
+                            logger.info("Mira Community gateway connected")
+                            await self._recv_until_creds_change(ws)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        if not self._running:
+                            break
+                        delay = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
+                        attempt += 1
+                        logger.warning(
+                            "Mira Community gateway error: {} (retry in {}s)", e, delay
+                        )
+                        await asyncio.sleep(delay)
+                    finally:
+                        self._ws = None
             finally:
-                self._ws = None
+                if self._http:
+                    await self._http.aclose()
+                    self._http = None
+
+    async def _recv_until_creds_change(self, ws: Any) -> None:
+        """Receive events until the socket closes or credentials change on disk
+        (logout / re-login), so the outer loop can re-evaluate the connection."""
+        watcher = asyncio.create_task(self._watch_credentials(ws))
+        try:
+            await self._recv_loop(ws)
+        finally:
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+    async def _watch_credentials(self, ws: Any) -> None:
+        while self._running:
+            await asyncio.sleep(CRED_WATCH_S)
+            _, token, _ = self._read_credentials()
+            if token != self.agent_token:
+                logger.info("Community credentials changed; reconnecting")
+                try:
+                    await ws.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
 
     async def stop(self) -> None:
         self._running = False

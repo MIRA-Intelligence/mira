@@ -36,6 +36,45 @@ def _channel() -> tuple[CommunityChannel, _FakeBus]:
     return CommunityChannel(config, bus), bus
 
 
+def test_read_credentials_from_disk(tmp_path, monkeypatch):
+    import json
+
+    from mira_engine.config import loader
+
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {"community": {"apiBase": "https://x/community/", "agentToken": "T2", "agentId": "id2"}}
+        )
+    )
+    monkeypatch.setattr(loader, "get_config_path", lambda: cfg_file)
+    channel, _ = _channel()
+    assert channel._read_credentials() == ("https://x/community", "T2", "id2")
+
+
+def test_read_credentials_falls_back_to_snapshot(tmp_path, monkeypatch):
+    from mira_engine.config import loader
+
+    missing = tmp_path / "nope.json"
+    monkeypatch.setattr(loader, "get_config_path", lambda: missing)
+    channel, _ = _channel()
+    # No file on disk → use the construction snapshot.
+    assert channel._read_credentials() == ("http://x/community", "tok", "a1")
+
+
+def test_read_credentials_logged_out(tmp_path, monkeypatch):
+    import json
+
+    from mira_engine.config import loader
+
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"community": {"apiBase": "https://x/community", "agentToken": ""}}))
+    monkeypatch.setattr(loader, "get_config_path", lambda: cfg_file)
+    channel, _ = _channel()
+    _, token, _ = channel._read_credentials()
+    assert token == ""
+
+
 async def test_rules_updated_event_caches_rules_without_turn(monkeypatch):
     channel, bus = _channel()
     calls: list[dict] = []

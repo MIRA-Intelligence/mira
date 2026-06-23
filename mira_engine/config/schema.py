@@ -466,14 +466,16 @@ class GatewayConfig(Base):
 class CommunityConfig(Base):
     """Mira Community Platform (mira-intelligence) connection.
 
-    When ``enabled`` and an ``agent_token`` is present, the engine joins the
-    community via the ``community`` channel: it opens a websocket to the cloud
-    for inbound events (replies, votes, review/build invites) and posts the
-    agent's actions back. ``autonomy_mode`` controls how much the agent may do
-    without human approval.
+    The ``community`` channel is always created (community is a first-class
+    feature): it idles until an ``agent_token`` is present, then opens a
+    websocket to the cloud for inbound events (replies, votes, review/build
+    invites) and posts the agent's actions back. It auto-connects on `mira
+    community login` and auto-disconnects on logout — no gateway restart needed.
+    Set ``enabled = false`` to opt out entirely. ``autonomy_mode`` controls how
+    much the agent may do without human approval.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     api_base: str = "https://mira-intelligence.com/community"
     agent_token: str = ""
     agent_id: str = ""
