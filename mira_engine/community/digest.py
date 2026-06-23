@@ -2,8 +2,9 @@
 
 The engine's heartbeat loop (#112) folds this into its periodic wake-up so the
 agent participates proactively — completing its onboarding connection test,
-acknowledging community rules, answering @mentions, voting on relevant
-proposals, and reviewing patches — without the user having to ask.
+answering @mentions, voting on relevant proposals, and reviewing patches —
+without the user having to ask. Community rules are kept current out of band
+(see ``sync_community_rules``) and live in the agent's system prompt.
 
 It prefers the personalized task inbox (`GET /agents/tasks`, #16); against an
 older cloud without that endpoint it falls back to the public feed. The digest
@@ -21,7 +22,6 @@ from loguru import logger
 # Map each task type to the tool the agent should reach for.
 _TASK_TOOL_HINT = {
     "onboarding": "community_comment (reply in the onboarding thread)",
-    "rules_ack": "auto-acknowledged",
     "mention": "community_comment",
     "needs_vote": "community_vote",
     "needs_review": "community_review_pr then community_vote (or community_open_pr to contribute a fix)",
@@ -71,11 +71,17 @@ async def gather_community_digest(community_config: Any, limit: int = 10) -> str
         return ""
 
     from mira_engine.community.client import CommunityError
+    from mira_engine.community.rules import sync_community_rules
+
+    # Keep the cached community rules current (#33): silent fetch + ack on a
+    # version change. Rules live in the agent's system prompt (see base_loop),
+    # not in this digest, and are never a write gate.
+    await sync_community_rules(community_config, client=client)
 
     # Preferred path: the personalized task inbox (#16).
     try:
         tasks_resp = await client.get_tasks()
-        return await _render_tasks(client, tasks_resp)
+        return _render_tasks(tasks_resp)
     except CommunityError as e:
         logger.debug("Task inbox unavailable, falling back to feed: {}", e)
     except Exception as e:  # noqa: BLE001 - never break the heartbeat
@@ -89,33 +95,16 @@ async def gather_community_digest(community_config: Any, limit: int = 10) -> str
         return ""
 
 
-async def _render_tasks(client: Any, tasks_resp: dict[str, Any]) -> str:
-    """Render the task inbox, auto-acking rules and injecting rules context."""
-    tasks = list(tasks_resp.get("tasks", []) or [])
+def _render_tasks(tasks_resp: dict[str, Any]) -> str:
+    """Render the actionable task inbox for the heartbeat.
 
-    # Pull the rules summary + onboarding next-step into context, and silently
-    # acknowledge the current rules version (an acknowledgement, not an action,
-    # and a prerequisite for any participation).
-    rules_line = ""
-    try:
-        rules = await client.get_rules()
-        version = rules.get("version")
-        if any(t.get("type") == "rules_ack" for t in tasks) and version is not None:
-            try:
-                await client.ack_rules(int(version))
-                logger.info("Acknowledged community rules v{}", version)
-                tasks = [t for t in tasks if t.get("type") != "rules_ack"]
-            except Exception as e:  # noqa: BLE001
-                logger.debug("Rules auto-ack failed: {}", e)
-        rule_titles = [str(r.get("title")) for r in (rules.get("rules") or [])][:4]
-        if rule_titles:
-            rules_line = (
-                f"Community rules v{version}: " + "; ".join(rule_titles) + ". "
-                "Follow them — high-risk actions still respect your autonomy mode."
-            )
-    except Exception as e:  # noqa: BLE001
-        logger.debug("Rules fetch failed: {}", e)
-
+    Rules are kept current out of band (see ``sync_community_rules``) and live in
+    the agent's system prompt, so they are not repeated here. ``rules_ack`` tasks
+    are informational only (the client re-syncs automatically) and are dropped.
+    """
+    tasks = [
+        t for t in (tasks_resp.get("tasks", []) or []) if t.get("type") != "rules_ack"
+    ]
     if not tasks:
         return ""
 
@@ -132,10 +121,7 @@ async def _render_tasks(client: Any, tasks_resp: dict[str, Any]) -> str:
         f"[Mira Community] You have {len(tasks)} actionable item(s) right now. "
         "Address the ones that fit your interests and autonomy mode; skip the rest."
     )
-    parts = [header, *lines]
-    if rules_line:
-        parts.append(rules_line)
-    return "\n".join(parts)
+    return "\n".join([header, *lines])
 
 
 async def _render_feed(client: Any, community_config: Any, limit: int) -> str:

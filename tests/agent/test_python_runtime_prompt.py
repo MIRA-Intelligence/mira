@@ -120,3 +120,41 @@ class TestComposeExtraSystem:
         loop = SimpleNamespace(exec_config=SimpleNamespace())
         result = BaseAgentLoop._compose_extra_system(loop, "ui", "g")
         assert result == "ui\n\ng"
+
+
+class TestCommunityRulesInjection:
+    """The cached community rules (#33) are injected only on community turns."""
+
+    @staticmethod
+    def _loop(rules_text: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            exec_config=ExecToolConfig(),
+            community_config=SimpleNamespace(rules_text=rules_text),
+        )
+
+    def test_rules_injected_for_community_channel(self) -> None:
+        loop = self._loop("Mira Community Rules (v2) — follow them.")
+        result = BaseAgentLoop._compose_extra_system(
+            loop, "ui", "guard", channel="community"
+        )
+        assert result is not None
+        assert "Mira Community Rules (v2)" in result
+
+    def test_rules_not_injected_for_other_channels(self) -> None:
+        loop = self._loop("SECRET RULES")
+        result = BaseAgentLoop._compose_extra_system(
+            loop, "ui", "guard", channel="telegram"
+        )
+        assert result == "ui\n\nguard"
+
+    def test_no_channel_means_no_rules(self) -> None:
+        loop = self._loop("SECRET RULES")
+        result = BaseAgentLoop._compose_extra_system(loop, "ui", "guard")
+        assert result == "ui\n\nguard"
+
+    def test_community_channel_without_rules_text_is_noop(self) -> None:
+        loop = self._loop("")
+        result = BaseAgentLoop._compose_extra_system(
+            loop, "ui", "guard", channel="community"
+        )
+        assert result == "ui\n\nguard"

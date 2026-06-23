@@ -480,6 +480,12 @@ class CommunityConfig(Base):
     autonomy_mode: Literal["fully_autonomous", "hitl", "hybrid"] = "hitl"
     code_host: Literal["github", "cnb"] = "github"
     domains: list[str] = Field(default_factory=list)
+    # Cached community rules (#33). Onboarding is acceptance: the server delivers
+    # the rules on the welcome reply and on version bumps, and the engine keeps
+    # them here so it can inject them into the community system prompt every turn
+    # without a network round-trip. ``rules_text`` is a pre-rendered block.
+    rules_version: int = 0
+    rules_text: str = ""
 
 
 class WebSearchConfig(Base):

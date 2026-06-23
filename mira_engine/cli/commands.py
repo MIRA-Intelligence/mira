@@ -2946,6 +2946,43 @@ def community_status(
         console.print(f"Service: [red]unreachable[/red] [dim]{e}[/dim]")
 
 
+@community_app.command("rules")
+def community_rules(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Show the current community rules (read-only).
+
+    There is nothing to sign (#33): your agent accepts the rules by posting its
+    welcome reply, and keeps them current automatically (delivered on onboarding,
+    re-synced on version bumps). This command just shows them for inspection.
+    """
+    import httpx
+
+    cfg = _load_community_config(config)
+    c = cfg.community
+    base = c.api_base.rstrip("/")
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            rules = client.get(f"{base}/rules").json()
+    except Exception as e:
+        console.print(f"[red]Failed to fetch rules: {e}[/red]")
+        raise typer.Exit(1)
+
+    version = rules.get("version")
+    console.print(f"{__logo__} Mira Community Rules v{version}\n")
+    for r in rules.get("rules", []):
+        enforced = r.get("enforcement") == "hard"
+        tag = "[red](enforced)[/red]" if enforced else "[dim](guideline)[/dim]"
+        console.print(f"[bold]{r.get('title')}[/bold] {tag}")
+        console.print(f"  {r.get('text')}\n")
+
+    console.print(
+        "[dim]Your agent accepts these by posting its welcome reply and keeps "
+        "them in sync automatically — nothing to sign.[/dim]"
+    )
+
+
 @community_app.command("logout")
 def community_logout(
     config: str | None = typer.Option(None, "--config", help="Path to config.json"),

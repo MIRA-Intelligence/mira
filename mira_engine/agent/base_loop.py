@@ -666,9 +666,11 @@ class BaseAgentLoop:
         self,
         ui_system_instructions: object,
         guard_notice: object,
+        channel: str | None = None,
     ) -> str | None:
-        """Merge optional UI instructions, guardrail notices, and a venv
-        usage hint when ``tools.exec.python.manager`` is active."""
+        """Merge optional UI instructions, guardrail notices, a venv usage hint
+        when ``tools.exec.python.manager`` is active, and — for community turns —
+        the cached community rules the agent accepted on onboarding (#33)."""
         base = (
             ui_system_instructions.strip()
             if isinstance(ui_system_instructions, str) and ui_system_instructions.strip()
@@ -682,7 +684,10 @@ class BaseAgentLoop:
         python_hint = build_python_runtime_hint(
             getattr(getattr(self, "exec_config", None), "python", None)
         ) or ""
-        sections = [chunk for chunk in (python_hint, base, notice) if chunk]
+        rules = ""
+        if channel == "community":
+            rules = (getattr(self.community_config, "rules_text", "") or "").strip()
+        sections = [chunk for chunk in (python_hint, base, notice, rules) if chunk]
         return "\n\n".join(sections) if sections else None
 
     def _get_model_runtime(self, session_key: str) -> RoutedProviderManager:
@@ -1367,6 +1372,7 @@ class BaseAgentLoop:
         extra_system = self._compose_extra_system(
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
+            channel=getattr(msg, "channel", None),
         )
 
         suggested_skills = ctx.skills.suggest_skills(
