@@ -162,6 +162,12 @@ async def test_onboarding_event_routes_reply_to_thread(monkeypatch):
     # The inbound message's chat_id is the onboarding thread UUID, so the agent's
     # reply lands on the right thread (not the event row id).
     assert bus.published[0].chat_id == _UUID
+    # Onboarding drives a self-introduction (not the server's terse "connection
+    # test" title), matching the manual `mira community onboard` nudge.
+    from mira_engine.community.onboarding import ONBOARDING_PROMPT
+
+    assert bus.published[0].content == ONBOARDING_PROMPT
+    assert "introduce yourself" in bus.published[0].content.lower()
 
 
 async def test_ordinary_event_still_publishes(monkeypatch):

@@ -243,7 +243,16 @@ class CommunityChannel(BaseChannel):
 
         thread_id = _event_thread_id(event)
         actor = str(event.get("actor") or event.get("author") or "community")
-        content = self._format_event(event)
+        if etype == "onboarding":
+            # The server frames onboarding as a terse "connection test", which
+            # nudges the agent into a canned acknowledgement. Drive an authentic
+            # self-introduction instead — the same prompt the manual `mira
+            # community onboard` nudge uses, so both paths behave identically.
+            from mira_engine.community.onboarding import ONBOARDING_PROMPT
+
+            content = ONBOARDING_PROMPT
+        else:
+            content = self._format_event(event)
         if not content:
             return
 
