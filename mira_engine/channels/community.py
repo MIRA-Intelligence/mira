@@ -41,6 +41,36 @@ _UUID_RE = re.compile(
 )
 
 
+def _event_thread_id(event: dict[str, Any]) -> str:
+    """Resolve the proposal thread an event's reply should land on.
+
+    Targeted task events (onboarding, mention, needs_vote, ...) arrive as
+    ``agent_events`` flushed as ``{type, id, target_id, title, action}``. The
+    actionable thread is in ``action.body.thread_id`` (comment tasks) or
+    ``action.body.proposal_id`` (vote/review tasks), NOT the event row ``id`` —
+    using ``id`` (a bigint) made the agent's reply target a non-UUID thread that
+    the cloud has no comment endpoint for, so onboarding replies were dropped.
+    Falls back to an explicit thread on the event, then a UUID ``target_id``,
+    then the ``community`` sentinel for non-thread events.
+    """
+    action = event.get("action")
+    if isinstance(action, dict):
+        body = action.get("body")
+        if isinstance(body, dict):
+            for key in ("thread_id", "proposal_id"):
+                value = body.get(key)
+                if value and _UUID_RE.match(str(value)):
+                    return str(value)
+    for key in ("thread_id", "chat_id"):
+        value = event.get(key)
+        if value and _UUID_RE.match(str(value)):
+            return str(value)
+    target = event.get("target_id")
+    if target and _UUID_RE.match(str(target)):
+        return str(target)
+    return "community"
+
+
 def _ws_url(api_base: str) -> str:
     """Derive the agent-gateway websocket URL from the REST api base."""
     parsed = urlparse(api_base.rstrip("/"))
@@ -140,9 +170,7 @@ class CommunityChannel(BaseChannel):
             await self._sync_delivered_rules(event)
             return
 
-        thread_id = str(
-            event.get("thread_id") or event.get("chat_id") or event.get("id") or "community"
-        )
+        thread_id = _event_thread_id(event)
         actor = str(event.get("actor") or event.get("author") or "community")
         content = self._format_event(event)
         if not content:
@@ -212,11 +240,30 @@ class CommunityChannel(BaseChannel):
         try:
             resp = await self._http.post(f"{self.api_base}/agents/messages", json=payload)
             resp.raise_for_status()
+            await self._cache_rules_from_reply(resp)
         except httpx.HTTPStatusError as e:
             if not await self._self_correct_and_retry(e, payload):
                 logger.warning("Failed to post community reply: {}", e)
         except Exception as e:
             logger.warning("Failed to post community reply: {}", e)
+
+    async def _cache_rules_from_reply(self, resp: httpx.Response) -> None:
+        """When a reply completes onboarding the server returns the accepted
+        rules (#33). Cache them so the agent acts by them right away, instead of
+        waiting for the next heartbeat sync."""
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001 - empty/non-JSON body
+            return
+        rules = data.get("rules") if isinstance(data, dict) else None
+        if not isinstance(rules, dict):
+            return
+        from mira_engine.community.rules import sync_community_rules
+
+        try:
+            await sync_community_rules(self.config, rules=rules)
+        except Exception as e:  # noqa: BLE001 - caching is a nicety
+            logger.debug("Caching rules from onboarding reply failed: {}", e)
 
     async def _self_correct_and_retry(
         self, error: httpx.HTTPStatusError, payload: dict[str, Any]

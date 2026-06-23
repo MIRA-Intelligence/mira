@@ -32,7 +32,7 @@ from loguru import logger
 
 from mira_engine import __version__
 from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
-from mira_engine.bus.events import OutboundMessage
+from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
@@ -1148,6 +1148,7 @@ class UiChannel(BaseChannel):
         )
         self._app.router.add_post("/api/community/pair/start", self._handle_community_pair_start)
         self._app.router.add_post("/api/community/pair/poll", self._handle_community_pair_poll)
+        self._app.router.add_post("/api/community/onboard", self._handle_community_onboard)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_post("/api/projects", self._handle_create_project)
         self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
@@ -2295,7 +2296,75 @@ class UiChannel(BaseChannel):
         cfg = config_loader.load_config(config_loader.get_config_path().expanduser().resolve())
         payload = self._community_status_payload(cfg)
         payload["pending_count"] = len(community_approvals.list_approvals(status="pending"))
+        payload["member_status"] = await self._fetch_member_status(cfg)
         return web.json_response(payload)
+
+    @staticmethod
+    async def _fetch_member_status(cfg: Config) -> str | None:
+        """Best-effort lookup of the agent's server-side lifecycle status
+        (pending/active/suspended), used by the UI to surface an Onboard action.
+        Returns None when not logged in or the service is unreachable."""
+        c = cfg.community
+        base = (c.api_base or "").rstrip("/")
+        if not (base and c.agent_token):
+            return None
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=8)) as session:
+                async with session.get(
+                    f"{base}/agents/me",
+                    headers={"Authorization": f"Bearer {c.agent_token}"},
+                ) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json()
+        except (ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+            return None
+        agent = data.get("agent", data) if isinstance(data, dict) else {}
+        status = agent.get("status") if isinstance(agent, dict) else None
+        return str(status) if status else None
+
+    async def _handle_community_onboard(self, _request: web.Request) -> web.Response:
+        """Nudge the running agent to compose and post its own welcome reply,
+        which completes onboarding. Idempotent: skips when already onboarded /
+        already replied, and de-bounces rapid re-triggers while a reply is in
+        flight, so the agent is never driven into a duplicate post."""
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        cfg = config_loader.load_config(config_path)
+        if not cfg.community.agent_token:
+            return web.json_response(
+                {"error": "not logged in — pair the agent first"}, status=400
+            )
+
+        from mira_engine.community.onboarding import ONBOARDING_PROMPT, check_onboarding_needed
+
+        check = await check_onboarding_needed(cfg.community)
+        if check.get("error"):
+            return web.json_response({"ok": False, "error": check["error"]}, status=400)
+        if not check.get("needed"):
+            return web.json_response(
+                {"ok": True, "triggered": False, "already": True, "status": check.get("status")}
+            )
+
+        # De-bounce: a triggered reply takes a few seconds; don't drive a second
+        # one until it has had a chance to land (or status flips to active).
+        now = time.monotonic()
+        last = getattr(self, "_onboard_triggered_at", 0.0)
+        if now - last < 90.0:
+            return web.json_response(
+                {"ok": True, "triggered": False, "pending": True, "status": check.get("status")}
+            )
+        self._onboard_triggered_at = now
+
+        msg = InboundMessage(
+            channel="community",
+            sender_id="community",
+            chat_id=str(check["thread_id"]),
+            content=ONBOARDING_PROMPT,
+            metadata={"onboarding": True},
+        )
+        await self.bus.publish_inbound(msg)
+        self._audit(source="ui", action="community_onboard", details={"triggered": True})
+        return web.json_response({"ok": True, "triggered": True, "status": check.get("status")})
 
     async def _handle_community_autonomy(self, request: web.Request) -> web.Response:
         try:

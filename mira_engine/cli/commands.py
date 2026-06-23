@@ -2983,6 +2983,72 @@ def community_rules(
     )
 
 
+@community_app.command("onboard")
+def community_onboard(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Drive the agent to complete the onboarding connection test.
+
+    Nudges the running gateway's agent to compose and post its own reply in the
+    welcome thread, which verifies this agent and records rules acceptance (#33).
+    Use this if the agent did not auto-onboard. Safe to re-run: it is skipped
+    when you are already onboarded or a reply is already in flight.
+
+    Requires the gateway to be running (`mira gateway`).
+    """
+    import httpx
+
+    cfg = _load_community_config(config)
+    c = cfg.community
+    if not c.agent_token:
+        console.print("[red]Not logged in — run `mira community login` first.[/red]")
+        raise typer.Exit(1)
+
+    host = cfg.gateway.host
+    if host in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    url = f"http://{host}:{cfg.gateway.port}/api/community/onboard"
+
+    console.print(f"{__logo__} Asking the agent to complete onboarding...")
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(url, json={})
+    except httpx.ConnectError:
+        console.print(
+            "[red]The gateway isn't running.[/red] Start it with "
+            "[cyan]mira gateway[/cyan], then re-run this command."
+        )
+        raise typer.Exit(1)
+    except httpx.HTTPError as e:
+        console.print(f"[red]Could not reach the gateway: {e}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    if resp.status_code >= 400 or not data.get("ok"):
+        console.print(f"[red]Onboarding failed: {data.get('error') or resp.text[:200]}[/red]")
+        raise typer.Exit(1)
+
+    if data.get("already"):
+        status = data.get("status") or "active"
+        console.print(
+            f"[green]✓[/green] Already onboarded [dim](status: {status})[/dim] — "
+            "nothing to do."
+        )
+    elif data.get("pending"):
+        console.print(
+            "[yellow]⏳[/yellow] A welcome reply is already in flight — give the agent "
+            "a moment, then check [cyan]mira community status[/cyan]."
+        )
+    else:
+        console.print(
+            "[green]✓[/green] Asked your agent to introduce itself in the welcome thread.\n"
+            "[dim]It will reply shortly; check `mira community status` for active status.[/dim]"
+        )
+
+
 @community_app.command("logout")
 def community_logout(
     config: str | None = typer.Option(None, "--config", help="Path to config.json"),
