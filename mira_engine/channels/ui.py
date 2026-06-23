@@ -1138,6 +1138,8 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/plan/lint", self._handle_plan_lint)
         self._app.router.add_get("/api/config", self._handle_get_config)
         self._app.router.add_post("/api/config", self._handle_config)
+        self._app.router.add_get("/api/profile", self._handle_get_profile)
+        self._app.router.add_post("/api/profile", self._handle_save_profile)
         self._app.router.add_get("/api/feedback/config", self._handle_feedback_config)
         self._app.router.add_post("/api/feedback", self._handle_feedback)
         self._app.router.add_get("/api/community/status", self._handle_community_status)
@@ -2277,6 +2279,46 @@ class UiChannel(BaseChannel):
         )
         payload["project_location"] = self._project_location_payload()
         return web.json_response(payload)
+
+    async def _handle_get_profile(self, _request: web.Request) -> web.Response:
+        """Return first-run profile state (for prefilling the wizard / prompts)."""
+        from mira_engine.profile import get_profile_state
+
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        runtime_config = config_loader.load_config(config_path)
+        return web.json_response(get_profile_state(runtime_config))
+
+    async def _handle_save_profile(self, request: web.Request) -> web.Response:
+        """Persist the first-run profile: write USER.md/SOUL.md, sync config."""
+        from mira_engine.profile import apply_profile
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "profile payload must be an object"}, status=400)
+
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        runtime_config = config_loader.load_config(config_path)
+        try:
+            result = apply_profile(runtime_config, body, config_path=config_path)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except OSError as exc:
+            logger.warning("Failed to write profile files: {}", exc)
+            return web.json_response({"error": f"failed to write profile: {exc}"}, status=500)
+
+        # Hot-apply timezone/language so the running agent picks them up without a
+        # restart (USER.md/SOUL.md are already re-read from the workspace each turn).
+        if self._on_runtime_config_updated is not None:
+            try:
+                await self._on_runtime_config_updated(runtime_config, self.projects_root)
+            except Exception:
+                logger.exception("Failed to hot-apply config after profile save")
+
+        self._audit(source="ui", action="profile_onboarded", details={})
+        return web.json_response(result)
 
     # --- Mira Community Platform (#114) ----------------------------------
     @staticmethod

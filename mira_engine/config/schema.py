@@ -301,6 +301,7 @@ class AgentDefaults(Base):
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    language: str = ""  # Preferred response language(s), e.g. "English", "中文". Empty = auto.
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
@@ -597,6 +598,18 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class ProfileConfig(Base):
+    """First-run profile onboarding state.
+
+    ``onboarded`` flips to true once the user has completed the first-run
+    wizard (desktop) or ``mira onboard`` (CLI), which fills ``USER.md`` and
+    ``SOUL.md``. It is the shared completion flag for both surfaces so neither
+    re-prompts after setup.
+    """
+
+    onboarded: bool = False
+
+
 class Config(BaseSettings):
     """Root configuration for mira."""
 
@@ -606,6 +619,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     community: CommunityConfig = Field(default_factory=CommunityConfig)
+    profile: ProfileConfig = Field(default_factory=ProfileConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     @model_validator(mode="after")

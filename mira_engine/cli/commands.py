@@ -745,6 +745,62 @@ def _load_workspace_template(name: str) -> str:
     return ""
 
 
+def _run_profile_prompts(cfg, config_path: Path, *, force: bool = False) -> bool:
+    """Interactive first-run profile setup (USER.md + SOUL.md).
+
+    Prompts for the user's name + preferred language(s) and the agent's name
+    (+ optional identity), then writes the files and syncs timezone/language
+    into config via the shared :mod:`mira_engine.profile` module. Timezone is
+    auto-detected, never prompted. Returns True when a profile was saved.
+    """
+    from mira_engine.profile import apply_profile, detect_timezone, get_profile_state
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+
+    state = get_profile_state(cfg)
+    if not force and not state.get("needs_onboarding"):
+        return False
+
+    cur_user = state.get("user", {})
+    cur_agent = state.get("agent", {})
+
+    console.print(f"\n{__logo__} Let's set up your MIRA profile.")
+    console.print("[dim]This fills USER.md (about you) and SOUL.md (your agent's identity).[/dim]\n")
+
+    user_name = typer.prompt(
+        "Your name", default=cur_user.get("name") or "MIRA User"
+    ).strip()
+    languages = typer.prompt(
+        "Preferred language(s)", default=cur_user.get("languages") or "English"
+    ).strip()
+
+    agent_name = typer.prompt(
+        "Agent name", default=cur_agent.get("name") or "mira 🐈"
+    ).strip()
+    agent_identity = typer.prompt(
+        "Agent identity (one line, optional)",
+        default=cur_agent.get("identity") or "",
+        show_default=bool(cur_agent.get("identity")),
+    ).strip()
+
+    timezone = detect_timezone()
+    payload = {
+        "user": {"name": user_name, "timezone": timezone, "languages": languages},
+        "agent": {"name": agent_name, "identity": agent_identity},
+    }
+    try:
+        apply_profile(cfg, payload, config_path=config_path)
+    except ValueError as exc:
+        console.print(f"[red]Profile not saved: {exc}[/red]")
+        return False
+
+    console.print(
+        f"[green]✓[/green] Profile saved (timezone auto-detected: [cyan]{timezone}[/cyan])"
+    )
+    return True
+
+
 def _ensure_workspace_bootstrap(workspace: Path) -> list[str]:
     created: list[str] = []
     bootstrap = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "HEARTBEAT.md")
@@ -1000,6 +1056,11 @@ def onboard(
     for name in created:
         console.print(f"  [dim]Created {name}[/dim]")
 
+    # First-run profile (USER.md / SOUL.md). Reload so the helper sees the
+    # freshly created/saved config, then persist any profile back to disk.
+    cfg = load_config(config_path)
+    if _run_profile_prompts(cfg, config_path):
+        cfg = load_config(config_path)
 
     console.print(f"\n{__logo__} mira is ready!")
     console.print("\nNext steps:")
@@ -1013,6 +1074,35 @@ def onboard(
     config_hint = f" --config {config_path.resolve()}" if config else ""
     console.print(f"  2. Chat: [cyan]mira agent -m \"Hello!\"{config_hint}[/cyan]")
     console.print(f"  3. Gateway: [cyan]mira gateway{config_hint}[/cyan]")
+
+
+@app.command()
+def profile(
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    force: bool = typer.Option(False, "--force", help="Re-run even if already onboarded"),
+):
+    """Set up your user (USER.md) and agent (SOUL.md) profile."""
+    from mira_engine.config.loader import get_config_path, load_config, set_config_path
+
+    config_path = Path(config).expanduser().resolve() if config else get_config_path()
+    if config:
+        set_config_path(config_path)
+    if not config_path.exists():
+        console.print("[yellow]No config found. Run `mira onboard` first.[/yellow]")
+        raise typer.Exit(1)
+
+    cfg = load_config(config_path)
+    workspace_path = get_workspace_path(cfg.workspace_path)
+    _ensure_workspace_bootstrap(workspace_path)
+    cfg = load_config(config_path)
+
+    if not _run_profile_prompts(cfg, config_path, force=force):
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            console.print("[yellow]Profile setup needs an interactive terminal.[/yellow]")
+        else:
+            console.print(
+                "[dim]Profile already set up. Use --force to edit it again.[/dim]"
+            )
 
 
 def _merge_missing_defaults(existing: object, defaults: object) -> object:
@@ -1204,6 +1294,16 @@ def gateway(
 
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
     _sync_workspace_templates_or_exit(config.workspace_path)
+    try:
+        from mira_engine.profile import needs_onboarding
+
+        if needs_onboarding(config):
+            console.print(
+                "[dim]Tip: run [cyan]mira profile[/cyan] (or use the desktop app) to set up "
+                "your USER.md / SOUL.md profile.[/dim]"
+            )
+    except Exception:  # noqa: BLE001 - hint must never block startup
+        pass
     bus = MessageBus()
     provider = _make_provider(config)
     model_router = ModelRouter(config.agents.defaults)
@@ -2053,6 +2153,11 @@ def agent(
 
     sync_workspace_templates(config.workspace_path)
 
+    # First-run profile setup (interactive terminals only; no-op once onboarded).
+    from mira_engine.config.loader import get_config_path
+
+    _run_profile_prompts(config, get_config_path())
+
     bus = MessageBus()
     provider = _make_provider(config)
     model_router = ModelRouter(config.agents.defaults)
@@ -2164,6 +2269,11 @@ def research(
     config = _load_runtime_config(config, workspace)
 
     sync_workspace_templates(config.workspace_path)
+
+    # First-run profile setup (interactive terminals only; no-op once onboarded).
+    from mira_engine.config.loader import get_config_path
+
+    _run_profile_prompts(config, get_config_path())
 
     bus = MessageBus()
     provider = _make_provider(config)
