@@ -9,8 +9,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from mira_engine.channels.community import CommunityChannel
+from mira_engine.channels.community import CommunityChannel, _event_thread_id
 from mira_engine.community import rules as rules_mod
+
+_UUID = "24110f35-3c7d-4006-81e4-02a54584a7a4"
+_UUID2 = "11111111-1111-4111-8111-111111111111"
 
 
 class _FakeBus:
@@ -68,6 +71,58 @@ async def test_onboarded_event_caches_rules_without_turn(monkeypatch):
 
     assert bus.published == []
     assert calls == [{"version": 1, "items": []}]
+
+
+def test_event_thread_id_prefers_action_body_thread():
+    # Onboarding/mention tasks carry the thread in action.body.thread_id; the
+    # event row id must NOT be used (that was the dropped-reply bug).
+    event = {
+        "type": "onboarding",
+        "id": 2,
+        "target_id": _UUID,
+        "action": {"method": "POST", "path": "/agents/messages", "body": {"thread_id": _UUID}},
+    }
+    assert _event_thread_id(event) == _UUID
+
+
+def test_event_thread_id_uses_proposal_id_for_votes():
+    event = {
+        "type": "needs_vote",
+        "id": 7,
+        "target_id": _UUID,
+        "action": {"method": "POST", "path": "/agents/votes", "body": {"proposal_id": _UUID, "value": 1}},
+    }
+    assert _event_thread_id(event) == _UUID
+
+
+def test_event_thread_id_falls_back_to_target_then_sentinel():
+    assert _event_thread_id({"type": "x", "id": 9, "target_id": _UUID2}) == _UUID2
+    # No UUID anywhere -> sentinel (never the bigint row id).
+    assert _event_thread_id({"type": "x", "id": 9, "target_id": "rules:2"}) == "community"
+    assert _event_thread_id({"type": "ready"}) == "community"
+
+
+async def test_onboarding_event_routes_reply_to_thread(monkeypatch):
+    channel, bus = _channel()
+
+    async def no_sync(*a, **k):
+        return False
+
+    monkeypatch.setattr(rules_mod, "sync_community_rules", no_sync)
+
+    await channel._handle_event(
+        {
+            "type": "onboarding",
+            "id": 3,
+            "target_id": _UUID,
+            "title": "Complete your connection test",
+            "action": {"method": "POST", "path": "/agents/messages", "body": {"thread_id": _UUID}},
+        }
+    )
+    assert len(bus.published) == 1
+    # The inbound message's chat_id is the onboarding thread UUID, so the agent's
+    # reply lands on the right thread (not the event row id).
+    assert bus.published[0].chat_id == _UUID
 
 
 async def test_ordinary_event_still_publishes(monkeypatch):

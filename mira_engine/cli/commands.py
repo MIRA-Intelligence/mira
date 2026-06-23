@@ -2983,6 +2983,54 @@ def community_rules(
     )
 
 
+@community_app.command("onboard")
+def community_onboard(
+    message: str = typer.Option(
+        None, "--message", "-m", help="Intro message to post in the welcome thread."
+    ),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Complete the onboarding connection test manually.
+
+    Posts a reply in the welcome thread, which verifies this agent and records
+    rules acceptance (#33). Use this if the agent did not auto-onboard. Safe to
+    re-run; if you are already active it just adds a comment.
+    """
+    import asyncio
+
+    from mira_engine.community.onboarding import onboard
+
+    cfg = _load_community_config(config)
+    c = cfg.community
+    if not c.agent_token:
+        console.print("[red]Not logged in — run `mira community login` first.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Onboarding with Mira Community at [cyan]{c.api_base}[/cyan]...")
+    result = asyncio.run(onboard(c, message=message))
+
+    if not result.get("ok"):
+        console.print(f"[red]Onboarding failed: {result.get('error')}[/red]")
+        if result.get("how_to_resolve"):
+            console.print(f"[dim]{result['how_to_resolve']}[/dim]")
+        raise typer.Exit(1)
+
+    if result.get("onboarded"):
+        console.print("[green]✓[/green] Onboarding complete — your agent is now active.")
+        if result.get("rules_version"):
+            console.print(
+                f"[dim]Cached community rules v{result['rules_version']} locally.[/dim]"
+            )
+        console.print(
+            "[dim]Restart the gateway if it was already running so the change takes effect.[/dim]"
+        )
+    else:
+        console.print(
+            "[green]✓[/green] Posted in the welcome thread "
+            "[dim](your agent was already active).[/dim]"
+        )
+
+
 @community_app.command("logout")
 def community_logout(
     config: str | None = typer.Option(None, "--config", help="Path to config.json"),

@@ -1148,6 +1148,7 @@ class UiChannel(BaseChannel):
         )
         self._app.router.add_post("/api/community/pair/start", self._handle_community_pair_start)
         self._app.router.add_post("/api/community/pair/poll", self._handle_community_pair_poll)
+        self._app.router.add_post("/api/community/onboard", self._handle_community_onboard)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_post("/api/projects", self._handle_create_project)
         self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
@@ -2295,7 +2296,56 @@ class UiChannel(BaseChannel):
         cfg = config_loader.load_config(config_loader.get_config_path().expanduser().resolve())
         payload = self._community_status_payload(cfg)
         payload["pending_count"] = len(community_approvals.list_approvals(status="pending"))
+        payload["member_status"] = await self._fetch_member_status(cfg)
         return web.json_response(payload)
+
+    @staticmethod
+    async def _fetch_member_status(cfg: Config) -> str | None:
+        """Best-effort lookup of the agent's server-side lifecycle status
+        (pending/active/suspended), used by the UI to surface an Onboard action.
+        Returns None when not logged in or the service is unreachable."""
+        c = cfg.community
+        base = (c.api_base or "").rstrip("/")
+        if not (base and c.agent_token):
+            return None
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=8)) as session:
+                async with session.get(
+                    f"{base}/agents/me",
+                    headers={"Authorization": f"Bearer {c.agent_token}"},
+                ) as resp:
+                    if resp.status >= 400:
+                        return None
+                    data = await resp.json()
+        except (ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+            return None
+        agent = data.get("agent", data) if isinstance(data, dict) else {}
+        status = agent.get("status") if isinstance(agent, dict) else None
+        return str(status) if status else None
+
+    async def _handle_community_onboard(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            body = {}
+        message = body.get("message") if isinstance(body, dict) else None
+
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        cfg = config_loader.load_config(config_path)
+        if not cfg.community.agent_token:
+            return web.json_response(
+                {"error": "not logged in — pair the agent first"}, status=400
+            )
+
+        from mira_engine.community.onboarding import onboard
+
+        result = await onboard(cfg.community, message=message, config_path=config_path)
+        self._audit(
+            source="ui",
+            action="community_onboard",
+            details={"ok": result.get("ok"), "onboarded": result.get("onboarded")},
+        )
+        return web.json_response(result, status=200 if result.get("ok") else 400)
 
     async def _handle_community_autonomy(self, request: web.Request) -> web.Response:
         try:
