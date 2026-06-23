@@ -3011,7 +3011,9 @@ def community_onboard(
 
     console.print(f"{__logo__} Asking the agent to complete onboarding...")
     try:
-        with httpx.Client(timeout=30.0) as client:
+        # trust_env=False: never route the loopback call through a system/env
+        # proxy (macOS system proxies otherwise 502 on 127.0.0.1).
+        with httpx.Client(timeout=30.0, trust_env=False) as client:
             resp = client.post(url, json={})
     except httpx.ConnectError:
         console.print(
@@ -3028,7 +3030,12 @@ def community_onboard(
     except Exception:
         data = {}
     if resp.status_code >= 400 or not data.get("ok"):
-        console.print(f"[red]Onboarding failed: {data.get('error') or resp.text[:200]}[/red]")
+        detail = (
+            (data.get("error") if isinstance(data, dict) else None)
+            or (resp.text or "").strip()[:200]
+            or f"HTTP {resp.status_code} (empty response)"
+        )
+        console.print(f"[red]Onboarding failed: {detail}[/red]")
         raise typer.Exit(1)
 
     if data.get("already"):
