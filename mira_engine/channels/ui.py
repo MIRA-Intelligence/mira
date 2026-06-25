@@ -830,10 +830,12 @@ class UiChannel(BaseChannel):
         self._on_runtime_config_updated = on_runtime_config_updated
         storage_mode = getattr(config, "project_storage", "user_selectable")
         managed_root = getattr(config, "managed_project_root", None)
+        from mira_engine.config.loader import get_home_dir
+
         default_root = (
             Path(managed_root)
             if storage_mode == "managed" and isinstance(managed_root, str) and managed_root.strip()
-            else workspace or Path("~/.mira/workspace")
+            else workspace or get_home_dir() / "workspace"
         )
         self.projects_root: Path = default_root.expanduser().resolve()
         self.project_registry = ProjectRegistry(

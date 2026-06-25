@@ -4,7 +4,6 @@ import pytest
 import psutil
 import typer
 from unittest.mock import MagicMock, patch
-from pathlib import Path
 from mira_engine.cli.commands import _gateway_failsafe_check
 
 @pytest.fixture
@@ -19,9 +18,9 @@ def test_gateway_pid_lock_prevents_startup(mock_runtime_dir, monkeypatch):
     pid_file = mock_runtime_dir / "gateway.pid"
     locked_pid = 123456
     pid_file.write_text(str(locked_pid))
-    
-    # 劫持 Path.expanduser
-    monkeypatch.setattr(Path, "expanduser", lambda self: pid_file if "gateway.pid" in str(self) else self)
+
+    # 通过 MIRA_HOME 将主目录指向临时目录
+    monkeypatch.setenv("MIRA_HOME", str(mock_runtime_dir.parent))
     monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == locked_pid)
     proc = MagicMock()
     proc.cmdline.return_value = ["mira", "gateway"]
@@ -38,7 +37,7 @@ def test_gateway_port_conflict_prevents_startup(mock_runtime_dir, monkeypatch):
     if pid_file.exists():
         pid_file.unlink()
 
-    monkeypatch.setattr(Path, "expanduser", lambda self: pid_file if "gateway.pid" in str(self) else self)
+    monkeypatch.setenv("MIRA_HOME", str(mock_runtime_dir.parent))
     monkeypatch.setenv("MIRA_SKIP_GATEWAY_FAILSAVE", "")
 
     # 模拟一个正在监听的端口 (connect_ex 返回 0 表示成功连接，即端口被占用)
@@ -61,8 +60,8 @@ def test_gateway_creates_pid_file(mock_runtime_dir, monkeypatch):
     pid_file = mock_runtime_dir / "gateway.pid"
     if pid_file.exists():
         pid_file.unlink()
-    
-    monkeypatch.setattr(Path, "expanduser", lambda self: pid_file if "gateway.pid" in str(self) else self)
+
+    monkeypatch.setenv("MIRA_HOME", str(mock_runtime_dir.parent))
     monkeypatch.setenv("MIRA_SKIP_GATEWAY_FAILSAVE", "")
 
     # 模拟一个没有被占用的端口 (connect_ex 返回非 0)

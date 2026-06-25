@@ -113,12 +113,19 @@ class AgentPaths:
 
     @classmethod
     def default(cls) -> "AgentPaths":
-        return cls.for_home(Path.home())
+        from mira_engine.config.loader import get_home_dir
+
+        return cls._build(home=Path.home(), root=get_home_dir())
 
     @classmethod
     def for_home(cls, home: Path) -> "AgentPaths":
         home_path = home.expanduser()
-        root = home_path / ".mira"
+        return cls._build(home=home_path, root=home_path / ".mira")
+
+    @classmethod
+    def _build(cls, *, home: Path, root: Path) -> "AgentPaths":
+        home_path = home.expanduser()
+        root = root.expanduser()
         return cls(
             root=root,
             config_dir=root / "config",
@@ -668,11 +675,13 @@ class WindowsServiceManager(LocalServiceManager):
         home: str | None,
         config_path: str | None,
     ) -> tuple[Path, Path]:
+        from mira_engine.config.loader import get_home_dir
+
         home_path = Path(home).expanduser() if home else Path.home()
         config_file = (
             Path(config_path).expanduser()
             if config_path
-            else home_path / ".mira" / "config.json"
+            else (home_path / ".mira" / "config.json" if home else get_home_dir() / "config.json")
         )
         command = _gateway_service_args(host, port)
         executable = Path(command[0]).expanduser()
@@ -972,7 +981,7 @@ class LaunchdServiceManager(LocalServiceManager):
         config_file = (
             Path(config_path).expanduser()
             if config_path
-            else home_path / ".mira" / "config.json"
+            else (home_path / ".mira" / "config.json" if home else self.paths.root / "config.json")
         )
         payload = {
             "Label": LAUNCHD_LABEL,

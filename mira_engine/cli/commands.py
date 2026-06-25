@@ -1125,14 +1125,15 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
     import atexit
     import os
     import socket
-    from pathlib import Path
 
     import psutil
 
     if os.environ.get("MIRA_SKIP_GATEWAY_FAILSAVE"):
         return
 
-    pid_file = Path("~/.mira/runtime/gateway.pid").expanduser()
+    from mira_engine.config.loader import get_home_dir
+
+    pid_file = get_home_dir() / "runtime" / "gateway.pid"
     pid_file.parent.mkdir(parents=True, exist_ok=True)
 
     # 1. 检查 PID 文件

@@ -21,8 +21,10 @@ def migrate_legacy_home_dir() -> None:
     - If both exist, log a notice and leave both alone (user should merge
       manually to avoid silent data loss).
     """
+    from mira_engine.config.loader import get_home_dir
+
     legacy = Path.home() / ".medpilot"
-    target = Path.home() / ".mira"
+    target = get_home_dir()
     marker = target / _MARKER_NAME
 
     if target.exists() and marker.exists():

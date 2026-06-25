@@ -19,6 +19,19 @@ def set_config_path(path: Path) -> None:
     _current_config_path = path
 
 
+def get_home_dir() -> Path:
+    """Return the MIRA home directory.
+
+    Resolution order:
+    1. ``MIRA_HOME`` environment variable (``~`` is expanded), if set.
+    2. The default ``~/.mira``.
+    """
+    env_home = os.environ.get("MIRA_HOME")
+    if env_home:
+        return Path(env_home).expanduser()
+    return Path.home() / ".mira"
+
+
 def get_config_path() -> Path:
     """Get the configuration file path."""
     if _current_config_path:
@@ -26,7 +39,7 @@ def get_config_path() -> Path:
     env_path = os.environ.get("MIRA_CONFIG_PATH")
     if env_path:
         return Path(env_path).expanduser()
-    return Path.home() / ".mira" / "config.json"
+    return get_home_dir() / "config.json"
 
 
 def load_config(config_path: Path | None = None) -> Config:
