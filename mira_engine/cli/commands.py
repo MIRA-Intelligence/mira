@@ -45,9 +45,6 @@ from mira_engine.config.schema import Config
 from mira_engine.providers.factory import make_provider
 from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
 from mira_engine.utils.helpers import sync_workspace_templates
-from mira_engine.utils.migration import run_startup_migrations
-
-run_startup_migrations()
 
 app = typer.Typer(
     name="mira",

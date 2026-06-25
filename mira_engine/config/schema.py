@@ -10,6 +10,16 @@ from pydantic_settings import BaseSettings
 from mira_engine.cron.types import CronSchedule
 
 
+def _default_workspace() -> str:
+    """Default workspace path, resolved under the active MIRA home dir.
+
+    Imported lazily to avoid a circular import with ``config.loader``.
+    """
+    from mira_engine.config.loader import get_home_dir
+
+    return str(get_home_dir() / "workspace")
+
+
 def normalize_model_candidates(value: str | list[str] | None) -> list[str]:
     """Normalize a model or model-candidates value to a de-duplicated list."""
     if value is None:
@@ -277,7 +287,7 @@ class DreamConfig(Base):
 class AgentDefaults(Base):
     """Default agent configuration."""
 
-    workspace: str = "~/.mira/workspace"
+    workspace: str = Field(default_factory=_default_workspace)
     model: str = "anthropic/claude-opus-4-5"
     model_candidates: list[str] = Field(default_factory=list, exclude=True)
     route_model: str | None = None
