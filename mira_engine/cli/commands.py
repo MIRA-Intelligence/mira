@@ -1125,7 +1125,6 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
     import atexit
     import os
     import socket
-    from pathlib import Path
 
     import psutil
 
