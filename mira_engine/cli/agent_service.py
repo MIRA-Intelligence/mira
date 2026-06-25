@@ -25,10 +25,6 @@ from xml.sax.saxutils import escape as xml_escape
 import typer
 from rich.console import Console
 
-from mira_engine.utils.migration import run_startup_migrations
-
-run_startup_migrations()
-
 app = typer.Typer(
     name="mira-engine",
     help="Manage local Mira engine service lifecycle.",
