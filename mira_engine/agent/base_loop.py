@@ -1013,29 +1013,48 @@ class BaseAgentLoop:
                 return
             if exc is None:
                 return
-            logger.exception(
+            logger.opt(exception=exc).error(
                 "Unhandled error in dispatch for session {}", msg.session_key
             )
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 return
-            loop.create_task(self._publish_dispatch_failure(msg))
+            loop.create_task(self._publish_dispatch_failure(msg, exc))
 
         return _callback
 
-    async def _publish_dispatch_failure(self, msg: InboundMessage) -> None:
-        err_text = "Sorry, I encountered an error."
-        if msg.channel == "cli":
-            err_text += " Run `mira agent --logs` to view details."
-        await self.bus.publish_outbound(
-            OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=err_text,
-                metadata=dict(msg.metadata or {}),
-            )
+    def _build_error_outbound(
+        self, msg: InboundMessage, exc: BaseException
+    ) -> OutboundMessage:
+        """Build a user-facing error reply that explains *exc* concisely.
+
+        The English ``content`` serves channels without their own i18n (CLI,
+        Telegram, ...). The structured ``error_code``/``error_detail`` metadata
+        lets the UI localize the message via its own translation layer.
+        """
+        from mira_engine.utils.runtime import (
+            build_dispatch_error_text,
+            classify_exception,
+            error_detail_text,
         )
+
+        metadata = dict(msg.metadata or {})
+        metadata["_error"] = True
+        metadata["error_type"] = type(exc).__name__
+        metadata["error_code"] = classify_exception(exc)
+        metadata["error_detail"] = error_detail_text(exc)
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=build_dispatch_error_text(exc, channel=msg.channel),
+            metadata=metadata,
+        )
+
+    async def _publish_dispatch_failure(
+        self, msg: InboundMessage, exc: BaseException
+    ) -> None:
+        await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
 
     async def _handle_control(self, msg: InboundMessage, control: str) -> bool:
         """Hook for subclasses to handle ``_control`` metadata messages.
@@ -1126,16 +1145,9 @@ class BaseAgentLoop:
                 raise asyncio.CancelledError() from None
             except SystemExit:
                 raise asyncio.CancelledError() from None
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                err_text = "Sorry, I encountered an error."
-                if msg.channel == "cli":
-                    err_text += " Run `mira agent --logs` to view details."
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=err_text,
-                    metadata=dict(msg.metadata or {}),
-                ))
+                await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
             return
         async with self._processing_lock:
             try:
@@ -1154,16 +1166,9 @@ class BaseAgentLoop:
                 raise asyncio.CancelledError() from None
             except SystemExit:
                 raise asyncio.CancelledError() from None
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                err_text = "Sorry, I encountered an error."
-                if msg.channel == "cli":
-                    err_text += " Run `mira agent --logs` to view details."
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=err_text,
-                    metadata=dict(msg.metadata or {}),
-                ))
+                await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
 
     async def _warm_skill_scan_cache(self) -> None:
         """Pre-scan built-in skills off the event loop so Ctrl+C stays responsive."""

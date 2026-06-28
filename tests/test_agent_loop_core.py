@@ -438,18 +438,23 @@ async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
     assert empty.content == ""
 
     async def _boom(_msg):
-        raise RuntimeError("fail")
+        raise RuntimeError("kaboom detail")
 
     loop._process_message = _boom
     await loop._dispatch(msg)
     err = await loop.bus.consume_outbound()
-    assert err.content == "Sorry, I encountered an error."
+    assert err.content.startswith("Sorry, I ran into a problem")
+    assert "RuntimeError: kaboom detail" in err.content
+    assert err.metadata.get("_error") is True
+    assert err.metadata.get("error_type") == "RuntimeError"
+    assert err.metadata.get("error_code") == "unknown"
+    assert err.metadata.get("error_detail") == "RuntimeError: kaboom detail"
 
     cli_err_msg = InboundMessage(channel="cli", sender_id="u", chat_id="c", content="x")
     loop._process_message = _boom
     await loop._dispatch(cli_err_msg)
     cli_err = await loop.bus.consume_outbound()
-    assert "Sorry, I encountered an error." in cli_err.content
+    assert "RuntimeError: kaboom detail" in cli_err.content
     assert "mira agent --logs" in cli_err.content
 
 

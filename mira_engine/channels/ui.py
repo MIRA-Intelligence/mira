@@ -1282,7 +1282,8 @@ class UiChannel(BaseChannel):
             project_dir = self._resolve_project_dir(msg.chat_id) if msg.chat_id else None
         is_progress = metadata.get("_progress", False)
         is_activity_ping = bool(metadata.get("_activity_ping", False))
-        msg_type = "progress" if is_progress else "response"
+        is_error = bool(metadata.get("_error", False))
+        msg_type = "error" if is_error else ("progress" if is_progress else "response")
         common_details = {
             "type": msg_type,
             "tool_hint": bool(metadata.get("_tool_hint", False)),
