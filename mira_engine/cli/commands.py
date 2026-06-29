@@ -1046,6 +1046,40 @@ def _make_provider_for_model(config: Config, model: str):
         raise typer.Exit(1) from exc
 
 
+def _make_gateway_provider(config: Config, model: str | None = None):
+    """Create a provider for the long-running gateway.
+
+    Unlike the one-shot CLI helpers, the gateway must stay alive even when no
+    provider is configured yet so the UI (Providers page / onboarding) can
+    finish setup. When matching fails we fall back to the bundle-setup
+    placeholder, which returns an actionable message on every request instead
+    of crashing the gateway at boot.
+    """
+    from mira_engine.providers.factory import BundleSetupRequiredProvider
+
+    try:
+        return make_provider(config, model)
+    except ValueError as exc:
+        console.print(
+            f"[yellow]Warning: {exc} Gateway will start unconfigured — open the "
+            "Providers settings to add a provider.[/yellow]"
+        )
+        return BundleSetupRequiredProvider()
+
+
+def _make_gateway_role_provider(config: Config, role: str):
+    """Role provider factory for the gateway that tolerates an unconfigured setup."""
+    from mira_engine.providers.factory import BundleSetupRequiredProvider
+
+    defaults = config.agents.defaults
+    try:
+        return make_role_provider(config, role)
+    except ValueError:
+        model = defaults.role_model(role)
+        candidates = tuple(defaults.role_model_candidates(role))
+        return BundleSetupRequiredProvider(), model, candidates
+
+
 def _routing_kwargs(config: Config) -> dict[str, object]:
     """Provider/model fallback + team role provider wiring for agent loops."""
     return dict(
@@ -1214,8 +1248,8 @@ def gateway(
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
     _sync_workspace_templates_or_exit(config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(config)
-    provider_factory = lambda model: _make_provider_for_model(config, model)
+    provider = _make_gateway_provider(config)
+    provider_factory = lambda model: _make_gateway_provider(config, model)
     default_tz = config.agents.defaults.timezone
     session_manager = SessionManager(config.workspace_path)
 
@@ -1245,7 +1279,7 @@ def gateway(
         channels_config=config.channels,
         provider_factory=provider_factory,
         model_candidates=config.agents.defaults.default_model_candidates,
-        role_provider_factory=lambda role: make_role_provider(config, role),
+        role_provider_factory=lambda role: _make_gateway_role_provider(config, role),
     )
 
     # Set cron callback (needs agent)
@@ -1366,8 +1400,8 @@ def gateway(
     async def on_ui_runtime_config_updated(next_config: Config, projects_root: Path) -> None:
         nonlocal config, provider, provider_factory, default_tz, session_manager
 
-        next_provider = _make_provider(next_config)
-        next_provider_factory = lambda model: _make_provider_for_model(next_config, model)
+        next_provider = _make_gateway_provider(next_config)
+        next_provider_factory = lambda model: _make_gateway_provider(next_config, model)
         next_tz = next_config.agents.defaults.timezone
         next_workspace = projects_root.expanduser()
 
@@ -1376,7 +1410,7 @@ def gateway(
             model=next_config.agents.defaults.primary_model,
             provider_factory=next_provider_factory,
             model_candidates=next_config.agents.defaults.default_model_candidates,
-            role_provider_factory=lambda role: make_role_provider(next_config, role),
+            role_provider_factory=lambda role: _make_gateway_role_provider(next_config, role),
             workspace=next_workspace,
             max_iterations=next_config.agents.defaults.max_tool_iterations,
             max_tokens=next_config.agents.defaults.max_tokens,
