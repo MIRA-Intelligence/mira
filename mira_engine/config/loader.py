@@ -6,7 +6,15 @@ import re
 from pathlib import Path
 
 from mira_engine.config.schema import Config
+from mira_engine.providers.registry import set_user_model_param_rules
 from mira_engine.security.network import configure_ssrf_whitelist
+
+
+def _apply_runtime_registry_config(config: Config) -> None:
+    """Push config-derived runtime data into the (process-global) registry."""
+    set_user_model_param_rules(
+        [(rule.pattern, rule.params) for rule in config.providers.model_params]
+    )
 
 
 # Global variable to store current config path (for multi-instance support)
@@ -61,6 +69,7 @@ def load_config(config_path: Path | None = None) -> Config:
             data = _migrate_config(data)
             cfg = Config.model_validate(data)
             configure_ssrf_whitelist(cfg.tools.ssrf_whitelist)
+            _apply_runtime_registry_config(cfg)
             return cfg
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
@@ -68,6 +77,7 @@ def load_config(config_path: Path | None = None) -> Config:
 
     cfg = Config()
     configure_ssrf_whitelist(cfg.tools.ssrf_whitelist)
+    _apply_runtime_registry_config(cfg)
     return cfg
 
 

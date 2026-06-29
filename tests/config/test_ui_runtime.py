@@ -1,11 +1,14 @@
 from pathlib import Path
 
-from mira_engine.config.schema import Config
+import pytest
+
+from mira_engine.config.schema import Config, ModelParamRule
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
     apply_ui_runtime_update_to_raw_data,
     build_ui_runtime_payload,
 )
+from mira_engine.providers.registry import model_overrides_for, set_user_model_param_rules
 
 
 def test_build_ui_runtime_payload_includes_dynamic_provider_metadata() -> None:
@@ -32,6 +35,82 @@ def test_build_ui_runtime_payload_includes_dynamic_provider_metadata() -> None:
     assert payload["providers"]["deepseek"]["api_key_configured"] is True
     assert "proxy" not in payload["providers"]
     assert payload["provider_proxy"] == "http://127.0.0.1:7890"
+
+
+def test_build_ui_runtime_payload_serializes_model_params() -> None:
+    cfg = Config()
+    cfg.providers.model_params = [
+        ModelParamRule(pattern="*nemotron*", params={"temperature": 1.0}),
+        ModelParamRule(pattern="*o1*", params={"temperature": None}),
+    ]
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=True,
+    )
+
+    assert payload["model_params"] == [
+        {"pattern": "*nemotron*", "params": {"temperature": 1.0}},
+        {"pattern": "*o1*", "params": {"temperature": None}},
+    ]
+
+
+def test_build_ui_runtime_payload_defaults_model_params_empty() -> None:
+    payload = build_ui_runtime_payload(
+        Config(),
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=True,
+    )
+
+    assert payload["model_params"] == []
+
+
+def test_apply_ui_runtime_update_sets_model_params_and_registry() -> None:
+    set_user_model_param_rules(None)
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {
+            "model_params": [
+                {"pattern": "*my-model*", "params": {"temperature": 1.0}},
+                {"pattern": "  ", "params": {"temperature": 0.5}},  # blank -> dropped
+            ]
+        },
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert [r.pattern for r in cfg.providers.model_params] == ["*my-model*"]
+    # The rule is live in the registry immediately.
+    assert model_overrides_for("custom/my-model-v2") == {"temperature": 1.0}
+    set_user_model_param_rules(None)
+
+
+def test_apply_ui_runtime_update_rejects_bad_model_params() -> None:
+    cfg = Config()
+    with pytest.raises(ValueError):
+        apply_ui_runtime_update(
+            cfg,
+            {"model_params": [{"pattern": "x", "params": "nope"}]},
+            current_projects_root=Path("/tmp/workspace"),
+        )
+
+
+def test_apply_ui_runtime_update_to_raw_data_writes_model_params() -> None:
+    data: dict = {}
+    apply_ui_runtime_update_to_raw_data(
+        data,
+        {"model_params": [{"pattern": "*gpt-5*", "params": {"temperature": None}}]},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert data["providers"]["modelParams"] == [
+        {"pattern": "*gpt-5*", "params": {"temperature": None}}
+    ]
 
 
 def test_build_ui_runtime_payload_includes_nvidia_provider_metadata() -> None:

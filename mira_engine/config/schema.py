@@ -434,10 +434,28 @@ class ProviderConfig(Base):
     enabled: bool | None = None
 
 
+class ModelParamRule(Base):
+    """A user-defined, provider-agnostic per-model request-parameter rule.
+
+    ``pattern`` is matched against the model name (case-insensitive): a glob
+    (``*``/``?``/``[]``) is matched with fnmatch against the full model id and
+    its short form, otherwise it is treated as a substring. ``params`` maps
+    request kwargs to values; a ``null`` value drops that parameter entirely
+    (for models that reject it). These rules layer on top of mira's built-in
+    defaults and win on conflict, and default to an empty list.
+    """
+
+    pattern: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
     proxy: str | None = None  # Global proxy for LLM provider HTTP calls.
+    # User-editable per-model parameter rules (see ModelParamRule). Empty by
+    # default; surfaced and edited from the Providers UI.
+    model_params: list[ModelParamRule] = Field(default_factory=list)
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)

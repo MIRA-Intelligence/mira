@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import mira_engine.providers.nvidia_provider as nvidia_module
 from mira_engine.providers.nvidia_provider import NvidiaProvider
+from mira_engine.providers.registry import ProviderSpec
 
 
 def test_nvidia_provider_normalizes_host_only_base_url() -> None:
@@ -181,3 +182,59 @@ async def test_nvidia_provider_chat_stream_with_retry_ignores_content_delta(monk
     assert response.finish_reason == "stop"
     # A non-streaming provider produces no incremental deltas.
     assert deltas == []
+
+
+def _spec_with_overrides(overrides) -> ProviderSpec:
+    return ProviderSpec(
+        name="nvidia",
+        keywords=("nvidia", "nemotron"),
+        env_key="NVIDIA_API_KEY",
+        model_overrides=overrides,
+        is_direct=True,
+    )
+
+
+async def test_nvidia_provider_applies_registry_model_overrides(monkeypatch) -> None:
+    """A registry override can force a required temperature for an NVIDIA model."""
+
+    monkeypatch.setattr(
+        nvidia_module,
+        "find_by_name",
+        lambda name: _spec_with_overrides((("nemotron", {"temperature": 1.0}),)),
+    )
+    provider = NvidiaProvider(api_key="nvapi-test-key")
+
+    payload = provider._build_payload(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        tool_choice=None,
+        model="nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        max_tokens=64,
+        temperature=0.2,
+        reasoning_effort=None,
+    )
+
+    assert payload["temperature"] == 1.0
+
+
+async def test_nvidia_provider_override_can_drop_temperature(monkeypatch) -> None:
+    """A ``None`` override drops a parameter the model rejects."""
+
+    monkeypatch.setattr(
+        nvidia_module,
+        "find_by_name",
+        lambda name: _spec_with_overrides((("nemotron", {"temperature": None}),)),
+    )
+    provider = NvidiaProvider(api_key="nvapi-test-key")
+
+    payload = provider._build_payload(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        tool_choice=None,
+        model="nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        max_tokens=64,
+        temperature=0.2,
+        reasoning_effort=None,
+    )
+
+    assert "temperature" not in payload

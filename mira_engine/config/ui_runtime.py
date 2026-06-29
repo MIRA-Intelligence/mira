@@ -29,9 +29,10 @@ def _mask_secret(value: str) -> str | None:
 
 
 def _provider_field_names() -> tuple[str, ...]:
-    # ProvidersConfig also contains global provider settings such as `proxy`.
+    # ProvidersConfig also contains global settings (`proxy`, `model_params`).
     # The UI provider map below only serializes concrete ProviderConfig entries.
-    return tuple(name for name in ProvidersConfig.model_fields.keys() if name != "proxy")
+    _non_provider = {"proxy", "model_params"}
+    return tuple(name for name in ProvidersConfig.model_fields.keys() if name not in _non_provider)
 
 
 def _provider_display_name(provider_name: str) -> str:
@@ -294,7 +295,37 @@ def build_ui_runtime_payload(
         "runtime": runtime,
         "providers": providers,
         "provider_proxy": config.providers.proxy,
+        "model_params": [
+            {"pattern": rule.pattern, "params": dict(rule.params)}
+            for rule in config.providers.model_params
+        ],
     }
+
+
+def _normalize_model_param_rules(raw: Any) -> list[dict[str, Any]]:
+    """Validate + normalize an incoming ``model_params`` payload to JSON records.
+
+    Each rule must be ``{"pattern": str, "params": object}``. ``params`` values
+    are passed through verbatim (``null`` is allowed and means "drop the param").
+    Rules with a blank pattern are dropped.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("model_params must be a list")
+    rules: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"model_params[{index}] must be an object")
+        pattern = item.get("pattern")
+        if not isinstance(pattern, str):
+            raise ValueError(f"model_params[{index}].pattern must be a string")
+        pattern = pattern.strip()
+        if not pattern:
+            continue
+        params = item.get("params", {})
+        if not isinstance(params, dict):
+            raise ValueError(f"model_params[{index}].params must be an object")
+        rules.append({"pattern": pattern, "params": dict(params)})
+    return rules
 
 
 def _workspace_payload_value(raw_workspace: str, projects_root: Path) -> str:
@@ -398,6 +429,12 @@ def apply_ui_runtime_update_to_raw_data(
                 value = None if raw_model in (None, "") else str(raw_model).strip()
                 _set_alias_value(defaults, model_key, value, alias=to_camel(model_key))
                 changed = True
+
+    if "model_params" in payload:
+        rules = _normalize_model_param_rules(payload.get("model_params"))
+        providers = _ensure_json_record(data, "providers")
+        _set_alias_value(providers, "model_params", rules, alias="modelParams")
+        changed = True
 
     providers_payload = payload.get("providers")
     if isinstance(providers_payload, dict):
@@ -582,6 +619,21 @@ def apply_ui_runtime_update(
                 if getattr(config.agents.defaults, model_key) != next_model:
                     setattr(config.agents.defaults, model_key, next_model)
                     changed = True
+
+    if "model_params" in payload:
+        from mira_engine.config.schema import ModelParamRule
+        from mira_engine.providers.registry import set_user_model_param_rules
+
+        rules = _normalize_model_param_rules(payload.get("model_params"))
+        next_rules = [ModelParamRule(pattern=r["pattern"], params=r["params"]) for r in rules]
+        current = [
+            {"pattern": r.pattern, "params": dict(r.params)}
+            for r in config.providers.model_params
+        ]
+        if current != rules:
+            config.providers.model_params = next_rules
+            set_user_model_param_rules([(r["pattern"], r["params"]) for r in rules])
+            changed = True
 
     providers_payload = payload.get("providers")
     if providers_payload is not None:

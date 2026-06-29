@@ -17,6 +17,7 @@ from typing import Any
 import json_repair
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.registry import find_by_name, model_overrides_for
 
 _DEFAULT_API_BASE = "https://inference-api.nvidia.com/v1"
 _CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
@@ -236,6 +237,12 @@ class NvidiaProvider(LLMProvider):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice if tool_choice is not None else "auto"
+        # Per-model parameter overrides from the registry (e.g. force a required
+        # temperature, or drop one the model rejects). NVIDIA-hosted models always
+        # resolve against the nvidia spec.
+        self._apply_param_overrides(
+            payload, model_overrides_for(model_name, find_by_name("nvidia"))
+        )
         return payload
 
     def _request_headers(self) -> dict[str, str]:
