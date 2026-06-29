@@ -44,6 +44,15 @@ from mira_engine.config.ui_runtime import (
     build_ui_runtime_payload,
     save_ui_runtime_update,
 )
+from mira_engine.providers.model_fetch import (
+    ModelCache,
+    ModelFetchError,
+    fetch_models_to_cache,
+    fetch_provider_models,
+    is_cache_stale,
+    read_model_cache,
+)
+from mira_engine.providers.registry import find_by_name
 from mira_engine.projects import (
     PROJECT_DIR_INDEX_FILENAME,
     PROJECT_META_DEFAULT_AGENT_PROFILE,
@@ -1139,6 +1148,8 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/plan/lint", self._handle_plan_lint)
         self._app.router.add_get("/api/config", self._handle_get_config)
         self._app.router.add_post("/api/config", self._handle_config)
+        self._app.router.add_get("/api/providers/{name}/models", self._handle_provider_models)
+        self._app.router.add_post("/api/providers/{name}/test", self._handle_provider_test)
         self._app.router.add_get("/api/feedback/config", self._handle_feedback_config)
         self._app.router.add_post("/api/feedback", self._handle_feedback)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
@@ -2270,6 +2281,101 @@ class UiChannel(BaseChannel):
         )
         payload["project_location"] = self._project_location_payload()
         return web.json_response(payload)
+
+    @staticmethod
+    def _provider_models_response(cache: ModelCache) -> dict[str, Any]:
+        return {
+            "provider": cache.provider,
+            "api_base": cache.api_base,
+            "fetched_at": cache.fetched_at,
+            "models": [model.config_model for model in cache.models],
+            "model_details": [
+                {
+                    "id": model.id,
+                    "config_model": model.config_model,
+                    "display_name": model.display_name,
+                    "context_window_tokens": model.context_window_tokens,
+                }
+                for model in cache.models
+            ],
+        }
+
+    async def _handle_provider_models(self, request: web.Request) -> web.Response:
+        """Fetch (or read cached) available models for a provider."""
+        provider_name = request.match_info.get("name", "").strip()
+        spec = find_by_name(provider_name) if provider_name else None
+        if spec is None:
+            return web.json_response({"error": f"unknown provider: {provider_name}"}, status=400)
+        provider_name = spec.name
+
+        refresh = request.query.get("refresh", "").lower() in ("1", "true", "yes")
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        runtime_config = config_loader.load_config(config_path)
+
+        if not refresh:
+            cache = read_model_cache(provider_name, config_path)
+            if cache is not None and not is_cache_stale(cache):
+                payload = self._provider_models_response(cache)
+                payload["cached"] = True
+                return web.json_response(payload)
+
+        try:
+            cache, _ = await fetch_models_to_cache(runtime_config, provider_name, config_path)
+        except ModelFetchError as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        except Exception as exc:  # noqa: BLE001 - surface as actionable error
+            logger.warning("Provider model fetch failed for {}: {}", provider_name, exc)
+            return web.json_response({"error": f"model fetch failed: {exc}"}, status=502)
+
+        payload = self._provider_models_response(cache)
+        payload["cached"] = False
+        return web.json_response(payload)
+
+    async def _handle_provider_test(self, request: web.Request) -> web.Response:
+        """Validate provider connectivity using optional transient credentials."""
+        provider_name = request.match_info.get("name", "").strip()
+        spec = find_by_name(provider_name) if provider_name else None
+        if spec is None:
+            return web.json_response({"error": f"unknown provider: {provider_name}"}, status=400)
+        provider_name = spec.name
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            body = {}
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return web.json_response({"error": "request body must be an object"}, status=400)
+
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        runtime_config = config_loader.load_config(config_path)
+        provider_cfg = getattr(runtime_config.providers, provider_name, None)
+        if provider_cfg is None:
+            return web.json_response({"error": f"unknown provider: {provider_name}"}, status=400)
+
+        # Apply transient overrides to the in-memory config only (never persisted).
+        api_key = body.get("api_key")
+        if isinstance(api_key, str) and api_key.strip():
+            provider_cfg.api_key = api_key.strip()
+        if "api_base" in body:
+            api_base = body["api_base"]
+            provider_cfg.api_base = None if api_base in (None, "") else str(api_base).strip()
+
+        try:
+            cache = await fetch_provider_models(runtime_config, provider_name)
+        except ModelFetchError as exc:
+            return web.json_response({"ok": False, "message": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - report failure to the UI
+            return web.json_response({"ok": False, "message": f"connection failed: {exc}"})
+
+        return web.json_response(
+            {
+                "ok": True,
+                "message": "Connection succeeded",
+                "model_count": len(cache.models),
+            }
+        )
 
     async def _handle_feedback_config(self, _request: web.Request) -> web.Response:
         relay = _resolve_feedback_config(self.config)

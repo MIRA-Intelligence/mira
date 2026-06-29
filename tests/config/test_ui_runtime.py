@@ -308,3 +308,119 @@ def test_apply_ui_runtime_update_to_raw_data_sets_temperature() -> None:
 
     assert changed is True
     assert data["agents"]["defaults"]["temperature"] == 0.9
+
+
+def test_build_ui_runtime_payload_exposes_models_and_configured() -> None:
+    cfg = Config()
+    cfg.providers.deepseek.api_key = "sk-deepseek"
+    cfg.providers.deepseek.models = ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    deepseek = payload["providers"]["deepseek"]
+    assert deepseek["models"] == ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+    assert deepseek["configured"] is True
+    # A provider with no key/base/models and not local/oauth is not "configured".
+    assert payload["providers"]["openai"]["configured"] is False
+    assert payload["providers"]["openai"]["models"] == []
+
+
+def test_build_ui_runtime_payload_includes_team_role_bindings() -> None:
+    cfg = Config()
+    cfg.agents.defaults.supervisor_provider = "anthropic"
+    cfg.agents.defaults.supervisor_model = "anthropic/claude-opus-4-5"
+    cfg.agents.defaults.student_provider = "deepseek"
+    cfg.agents.defaults.student_model = "deepseek/deepseek-chat"
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    runtime = payload["runtime"]
+    assert runtime["supervisor_provider"] == "anthropic"
+    assert runtime["supervisor_model"] == "anthropic/claude-opus-4-5"
+    assert runtime["student_provider"] == "deepseek"
+    assert runtime["student_model"] == "deepseek/deepseek-chat"
+    # Unset role inherits: provider "auto", model null.
+    assert runtime["critic_provider"] == "auto"
+    assert runtime["critic_model"] is None
+
+
+def test_apply_ui_runtime_update_sets_provider_models() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"providers": {"deepseek": {"models": ["deepseek/deepseek-chat", "  ", "deepseek/deepseek-reasoner"]}}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    # Blank entries are dropped.
+    assert cfg.providers.deepseek.models == ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+
+
+def test_apply_ui_runtime_update_sets_role_bindings() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {
+            "runtime": {
+                "critic_provider": "anthropic",
+                "critic_model": "anthropic/claude-opus-4-5",
+                "student_model": "",
+            }
+        },
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.critic_provider == "anthropic"
+    assert cfg.agents.defaults.critic_model == "anthropic/claude-opus-4-5"
+    assert cfg.agents.defaults.student_model is None
+
+
+def test_apply_ui_runtime_update_rejects_unknown_role_provider() -> None:
+    cfg = Config()
+
+    try:
+        apply_ui_runtime_update(
+            cfg,
+            {"runtime": {"supervisor_provider": "not-a-provider"}},
+            current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+        )
+    except ValueError as exc:
+        assert "unsupported provider" in str(exc)
+    else:
+        raise AssertionError("unknown role provider should have been rejected")
+
+
+def test_apply_ui_runtime_update_to_raw_data_sets_role_and_models() -> None:
+    data: dict = {"agents": {"defaults": {}}, "providers": {}}
+
+    _, changed = apply_ui_runtime_update_to_raw_data(
+        data,
+        {
+            "runtime": {
+                "supervisor_provider": "anthropic",
+                "supervisor_model": "anthropic/claude-opus-4-5",
+            },
+            "providers": {"deepseek": {"models": ["deepseek/deepseek-chat"]}},
+        },
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    defaults = data["agents"]["defaults"]
+    assert defaults["supervisorProvider"] == "anthropic"
+    assert defaults["supervisorModel"] == "anthropic/claude-opus-4-5"
+    assert data["providers"]["deepseek"]["models"] == ["deepseek/deepseek-chat"]

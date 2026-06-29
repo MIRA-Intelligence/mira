@@ -12,6 +12,8 @@ from mira_engine.config.schema import AgentDefaults, Config, ProvidersConfig
 from mira_engine.providers.registry import find_by_name
 
 _ALLOWED_REASONING_EFFORTS = {"low", "medium", "high", "adaptive"}
+# ``team`` profile roles, each bindable to its own provider + model.
+_TEAM_ROLES = ("supervisor", "student", "critic")
 _BUNDLE_SETUP_PROVIDER = "custom"
 _BUNDLE_SETUP_MODEL = "custom/mira-ui-bundle-setup"
 _BUNDLE_SETUP_API_BASE = "http://127.0.0.1:9/v1"
@@ -149,16 +151,32 @@ def _build_provider_payload(config: Config) -> dict[str, dict[str, Any]]:
             "api_key_configured": False,
             "api_key_preview": None,
             "api_base": None,
+            "models": [],
+            "configured": False,
             **_provider_metadata("auto"),
         }
     }
     for provider_name in _provider_field_names():
         provider_cfg = getattr(config.providers, provider_name)
+        meta = _provider_metadata(provider_name)
+        api_key_configured = bool(provider_cfg.api_key)
+        models = list(provider_cfg.models)
+        # "Configured" (a.k.a. enabled in the UI) means the provider is usable:
+        # it has a credential/endpoint, is local/OAuth, or has a curated model list.
+        configured = (
+            api_key_configured
+            or bool(provider_cfg.api_base)
+            or bool(meta["is_local"])
+            or bool(meta["is_oauth"])
+            or bool(models)
+        )
         providers[provider_name] = {
-            "api_key_configured": bool(provider_cfg.api_key),
+            "api_key_configured": api_key_configured,
             "api_key_preview": _mask_secret(provider_cfg.api_key),
             "api_base": provider_cfg.api_base,
-            **_provider_metadata(provider_name),
+            "models": models,
+            "configured": configured,
+            **meta,
         }
     return providers
 
@@ -242,24 +260,32 @@ def build_ui_runtime_payload(
     resolved_projects_root = projects_root.expanduser().resolve(strict=False)
     raw_workspace = _workspace_payload_value(defaults.workspace, resolved_projects_root)
 
+    runtime: dict[str, Any] = {
+        "workspace": raw_workspace,
+        "workspace_resolved": str(resolved_projects_root),
+        "provider": defaults.provider,
+        "model": defaults.model,
+        "reasoning_effort": defaults.reasoning_effort,
+        "temperature": defaults.temperature,
+        "max_tool_iterations": defaults.max_tool_iterations,
+        "restrict_to_workspace": config.tools.restrict_to_workspace,
+        "setup_required": setup_required,
+        "setup_message": setup_message,
+        "setup_code": setup_code,
+        "setup_subject": setup_subject,
+    }
+    # ``team`` profile per-role bindings. ``*_provider`` is the explicit
+    # provider override ("auto" to inherit), ``*_model`` is the raw configured
+    # model (null inherits the primary model).
+    for role in _TEAM_ROLES:
+        runtime[f"{role}_provider"] = defaults.role_provider(role)
+        runtime[f"{role}_model"] = getattr(defaults, f"{role}_model", None)
+
     return {
         "projects_root": str(resolved_projects_root),
         "config_path": str(config_path),
         "persisted": persisted,
-        "runtime": {
-            "workspace": raw_workspace,
-            "workspace_resolved": str(resolved_projects_root),
-            "provider": defaults.provider,
-            "model": defaults.model,
-            "reasoning_effort": defaults.reasoning_effort,
-            "temperature": defaults.temperature,
-            "max_tool_iterations": defaults.max_tool_iterations,
-            "restrict_to_workspace": config.tools.restrict_to_workspace,
-            "setup_required": setup_required,
-            "setup_message": setup_message,
-            "setup_code": setup_code,
-            "setup_subject": setup_subject,
-        },
+        "runtime": runtime,
         "providers": providers,
         "provider_proxy": config.providers.proxy,
     }
@@ -350,6 +376,23 @@ def apply_ui_runtime_update_to_raw_data(
             )
             changed = True
 
+        for role in _TEAM_ROLES:
+            provider_key = f"{role}_provider"
+            model_key = f"{role}_model"
+            if provider_key in runtime_payload:
+                _set_alias_value(
+                    defaults,
+                    provider_key,
+                    str(runtime_payload[provider_key]).strip(),
+                    alias=to_camel(provider_key),
+                )
+                changed = True
+            if model_key in runtime_payload:
+                raw_model = runtime_payload[model_key]
+                value = None if raw_model in (None, "") else str(raw_model).strip()
+                _set_alias_value(defaults, model_key, value, alias=to_camel(model_key))
+                changed = True
+
     providers_payload = payload.get("providers")
     if isinstance(providers_payload, dict):
         providers = _ensure_json_record(data, "providers")
@@ -370,6 +413,10 @@ def apply_ui_runtime_update_to_raw_data(
                 api_base = provider_update["api_base"]
                 value = None if api_base in (None, "") else str(api_base).strip()
                 _set_alias_value(provider_cfg, "api_base", value, alias="apiBase")
+                changed = True
+            if "models" in provider_update and isinstance(provider_update["models"], list):
+                cleaned = [str(m).strip() for m in provider_update["models"] if str(m).strip()]
+                _set_alias_value(provider_cfg, "models", cleaned)
                 changed = True
 
     return projects_root, changed
@@ -501,6 +548,31 @@ def apply_ui_runtime_update(
                 config.tools.restrict_to_workspace = restrict_to_workspace
                 changed = True
 
+        for role in _TEAM_ROLES:
+            provider_key = f"{role}_provider"
+            model_key = f"{role}_model"
+            if provider_key in runtime_payload:
+                provider = runtime_payload[provider_key]
+                if not isinstance(provider, str) or not provider.strip():
+                    raise ValueError(f"runtime.{provider_key} must be a non-empty string")
+                provider = provider.strip()
+                if provider != "auto" and provider not in _provider_field_names():
+                    raise ValueError(f"unsupported provider: {provider}")
+                if getattr(config.agents.defaults, provider_key) != provider:
+                    setattr(config.agents.defaults, provider_key, provider)
+                    changed = True
+            if model_key in runtime_payload:
+                raw_model = runtime_payload[model_key]
+                if raw_model is None or raw_model == "":
+                    next_model: str | None = None
+                elif isinstance(raw_model, str):
+                    next_model = raw_model.strip() or None
+                else:
+                    raise ValueError(f"runtime.{model_key} must be a string or null")
+                if getattr(config.agents.defaults, model_key) != next_model:
+                    setattr(config.agents.defaults, model_key, next_model)
+                    changed = True
+
     providers_payload = payload.get("providers")
     if providers_payload is not None:
         if not isinstance(providers_payload, dict):
@@ -543,6 +615,15 @@ def apply_ui_runtime_update(
                     raise ValueError(f"providers.{provider_name}.api_base must be a string or null")
                 if provider_cfg.api_base != next_api_base:
                     provider_cfg.api_base = next_api_base
+                    changed = True
+
+            if "models" in provider_update:
+                models = provider_update["models"]
+                if not isinstance(models, list):
+                    raise ValueError(f"providers.{provider_name}.models must be a list")
+                next_models = [str(m).strip() for m in models if str(m).strip()]
+                if provider_cfg.models != next_models:
+                    provider_cfg.models = next_models
                     changed = True
 
     return projects_root, changed
