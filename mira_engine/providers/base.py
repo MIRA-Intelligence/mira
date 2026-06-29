@@ -513,6 +513,11 @@ class LLMProvider(ABC):
         chat_stream = getattr(self, "chat_stream", None)
         if callable(chat_stream):
             return await chat_stream(**kwargs)
+        # Providers without a streaming implementation (e.g. NVIDIA, LiteLLM,
+        # custom) fall back to a single non-streaming chat() call. Their chat()
+        # signature does not accept the streaming-only ``on_content_delta``
+        # callback, so drop it before delegating.
+        kwargs.pop("on_content_delta", None)
         return await self.chat(**kwargs)
 
     async def _run_with_retry(

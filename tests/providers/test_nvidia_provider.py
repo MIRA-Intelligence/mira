@@ -144,3 +144,40 @@ async def test_nvidia_provider_returns_structured_http_error(monkeypatch) -> Non
     assert response.error_code == "rate_limit_exceeded"
     assert response.retry_after == 20.0
     assert response.error_retry_after_s == 20.0
+
+
+async def test_nvidia_provider_chat_stream_with_retry_ignores_content_delta(monkeypatch) -> None:
+    """Regression: the streaming entrypoint must not forward the streaming-only
+    ``on_content_delta`` callback to a non-streaming ``chat()`` implementation."""
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def fake_post(endpoint, payload):
+        return (
+            200,
+            {},
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+        )
+
+    monkeypatch.setattr(nvidia_module.asyncio, "to_thread", fake_to_thread)
+    provider = NvidiaProvider(api_key="nvapi-test-key")
+    monkeypatch.setattr(provider, "_post_json", fake_post)
+
+    deltas: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        deltas.append(text)
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=128,
+        temperature=0.2,
+        reasoning_effort=None,
+        on_content_delta=on_delta,
+    )
+
+    assert response.content == "ok"
+    assert response.finish_reason == "stop"
+    # A non-streaming provider produces no incremental deltas.
+    assert deltas == []

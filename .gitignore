@@ -12,3 +12,4 @@ dist/
 *.spec
 !mira-engine.spec
 bundled/
+.gstack/
