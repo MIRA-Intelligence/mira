@@ -427,6 +427,11 @@ class ProviderConfig(Base):
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
     models: list[str] = Field(default_factory=list)  # User-curated model ids for this provider
+    # Explicit on/off toggle from the Providers UI. ``None`` (the default) means
+    # "auto": the provider is treated as enabled whenever it is configured
+    # (has a credential/endpoint/model list, or is local/OAuth). ``True``/``False``
+    # force the state regardless of configuration.
+    enabled: bool | None = None
 
 
 class ProvidersConfig(Base):

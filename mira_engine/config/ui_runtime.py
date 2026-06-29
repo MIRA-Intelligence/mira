@@ -153,6 +153,7 @@ def _build_provider_payload(config: Config) -> dict[str, dict[str, Any]]:
             "api_base": None,
             "models": [],
             "configured": False,
+            "enabled": False,
             **_provider_metadata("auto"),
         }
     }
@@ -161,8 +162,8 @@ def _build_provider_payload(config: Config) -> dict[str, dict[str, Any]]:
         meta = _provider_metadata(provider_name)
         api_key_configured = bool(provider_cfg.api_key)
         models = list(provider_cfg.models)
-        # "Configured" (a.k.a. enabled in the UI) means the provider is usable:
-        # it has a credential/endpoint, is local/OAuth, or has a curated model list.
+        # "Configured" means the provider has enough to be usable: a
+        # credential/endpoint, a local/OAuth backend, or a curated model list.
         configured = (
             api_key_configured
             or bool(provider_cfg.api_base)
@@ -170,12 +171,17 @@ def _build_provider_payload(config: Config) -> dict[str, dict[str, Any]]:
             or bool(meta["is_oauth"])
             or bool(models)
         )
+        # "Enabled" is the explicit on/off toggle. ``None`` (unset) falls back to
+        # the derived ``configured`` state so existing configs keep working.
+        explicit_enabled = provider_cfg.enabled
+        enabled = configured if explicit_enabled is None else bool(explicit_enabled)
         providers[provider_name] = {
             "api_key_configured": api_key_configured,
             "api_key_preview": _mask_secret(provider_cfg.api_key),
             "api_base": provider_cfg.api_base,
             "models": models,
             "configured": configured,
+            "enabled": enabled,
             **meta,
         }
     return providers
@@ -418,6 +424,10 @@ def apply_ui_runtime_update_to_raw_data(
                 cleaned = [str(m).strip() for m in provider_update["models"] if str(m).strip()]
                 _set_alias_value(provider_cfg, "models", cleaned)
                 changed = True
+            if "enabled" in provider_update:
+                enabled = provider_update["enabled"]
+                _set_alias_value(provider_cfg, "enabled", None if enabled is None else bool(enabled))
+                changed = True
 
     return projects_root, changed
 
@@ -624,6 +634,14 @@ def apply_ui_runtime_update(
                 next_models = [str(m).strip() for m in models if str(m).strip()]
                 if provider_cfg.models != next_models:
                     provider_cfg.models = next_models
+                    changed = True
+
+            if "enabled" in provider_update:
+                enabled = provider_update["enabled"]
+                if enabled is not None and not isinstance(enabled, bool):
+                    raise ValueError(f"providers.{provider_name}.enabled must be a boolean or null")
+                if provider_cfg.enabled != enabled:
+                    provider_cfg.enabled = enabled
                     changed = True
 
     return projects_root, changed

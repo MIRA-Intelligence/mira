@@ -424,3 +424,81 @@ def test_apply_ui_runtime_update_to_raw_data_sets_role_and_models() -> None:
     assert defaults["supervisorProvider"] == "anthropic"
     assert defaults["supervisorModel"] == "anthropic/claude-opus-4-5"
     assert data["providers"]["deepseek"]["models"] == ["deepseek/deepseek-chat"]
+
+
+def test_build_ui_runtime_payload_enabled_defaults_to_configured() -> None:
+    cfg = Config()
+    cfg.providers.deepseek.api_key = "sk-deepseek"
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    # Unset enabled => follows the derived "configured" state.
+    assert payload["providers"]["deepseek"]["enabled"] is True
+    assert payload["providers"]["openai"]["enabled"] is False
+
+
+def test_build_ui_runtime_payload_enabled_explicit_overrides_configured() -> None:
+    cfg = Config()
+    # Configured (has a key) but explicitly disabled.
+    cfg.providers.deepseek.api_key = "sk-deepseek"
+    cfg.providers.deepseek.enabled = False
+    # Not configured but explicitly enabled.
+    cfg.providers.openai.enabled = True
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    assert payload["providers"]["deepseek"]["configured"] is True
+    assert payload["providers"]["deepseek"]["enabled"] is False
+    assert payload["providers"]["openai"]["enabled"] is True
+
+
+def test_apply_ui_runtime_update_sets_provider_enabled() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"providers": {"openai": {"enabled": True}, "deepseek": {"enabled": False}}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.providers.openai.enabled is True
+    assert cfg.providers.deepseek.enabled is False
+
+
+def test_apply_ui_runtime_update_rejects_non_boolean_enabled() -> None:
+    cfg = Config()
+
+    try:
+        apply_ui_runtime_update(
+            cfg,
+            {"providers": {"openai": {"enabled": "yes"}}},
+            current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+        )
+    except ValueError as exc:
+        assert "enabled must be a boolean" in str(exc)
+    else:
+        raise AssertionError("non-boolean enabled should have been rejected")
+
+
+def test_apply_ui_runtime_update_to_raw_data_sets_enabled() -> None:
+    data: dict = {"agents": {"defaults": {}}, "providers": {}}
+
+    _, changed = apply_ui_runtime_update_to_raw_data(
+        data,
+        {"providers": {"openai": {"enabled": True}}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert data["providers"]["openai"]["enabled"] is True
