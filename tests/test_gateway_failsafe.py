@@ -1,10 +1,17 @@
+import json
 import os
 import socket
 import pytest
 import psutil
 import typer
 from unittest.mock import MagicMock, patch
-from mira_engine.cli.commands import _gateway_failsafe_check
+from mira_engine.cli.commands import (
+    _gateway_failsafe_check,
+    _prepare_gateway_ui_channel,
+    _resolve_gateway_ui_enabled,
+    _ui_enabled_in_config_file,
+)
+from mira_engine.config.schema import Config
 
 @pytest.fixture
 def mock_runtime_dir(tmp_path):
@@ -79,3 +86,116 @@ def test_gateway_creates_pid_file(mock_runtime_dir, monkeypatch):
         
     assert pid_file.exists()
     assert pid_file.read_text() == str(os.getpid())
+
+
+# ---------------------------------------------------------------------------
+# Gateway UI-channel bootstrap (mira onboard no longer required)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_gateway_ui_enabled_defaults_on_when_unset():
+    """A fresh home (no explicit value) turns the UI channel on."""
+    assert _resolve_gateway_ui_enabled(None, no_ui=False) is True
+
+
+def test_resolve_gateway_ui_enabled_respects_explicit_disable():
+    """An explicit channels.ui.enabled=false is honored."""
+    assert _resolve_gateway_ui_enabled(False, no_ui=False) is False
+
+
+def test_resolve_gateway_ui_enabled_no_ui_flag_wins():
+    """--no-ui overrides everything, even an explicit enable."""
+    assert _resolve_gateway_ui_enabled(True, no_ui=True) is False
+    assert _resolve_gateway_ui_enabled(None, no_ui=True) is False
+
+
+def test_ui_enabled_in_config_file_missing_returns_none(tmp_path):
+    assert _ui_enabled_in_config_file(tmp_path / "nope.json") is None
+    assert _ui_enabled_in_config_file(None) is None
+
+
+def test_ui_enabled_in_config_file_reads_explicit_value(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"channels": {"ui": {"enabled": False}}}))
+    assert _ui_enabled_in_config_file(path) is False
+
+    path.write_text(json.dumps({"channels": {"ui": {"enabled": True}}}))
+    assert _ui_enabled_in_config_file(path) is True
+
+
+def test_ui_enabled_in_config_file_honors_legacy_web_alias(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"channels": {"web": {"enabled": True}}}))
+    assert _ui_enabled_in_config_file(path) is True
+
+
+def test_ui_enabled_in_config_file_unset_section_returns_none(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"channels": {"ui": {"allowFrom": ["*"]}}}))
+    assert _ui_enabled_in_config_file(path) is None
+
+
+def test_prepare_gateway_ui_channel_bootstraps_fresh_home(tmp_path, monkeypatch):
+    """No config.json on disk: UI channel is enabled and a default config is written."""
+    monkeypatch.setenv("MIRA_HOME", str(tmp_path))
+    # Make sure no cached config path leaks across tests.
+    monkeypatch.setattr("mira_engine.config.loader._current_config_path", None, raising=False)
+
+    config = Config()
+    assert config.channels.ui.enabled is False  # schema default stays conservative
+
+    _prepare_gateway_ui_channel(config, no_ui=False)
+
+    assert config.channels.ui.enabled is True
+    assert config.channels.ui.allow_from == ["*"]
+
+    config_path = tmp_path / "config.json"
+    assert config_path.exists()
+    written = json.loads(config_path.read_text())
+    assert written["channels"]["ui"]["enabled"] is True
+
+
+def test_prepare_gateway_ui_channel_no_ui_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRA_HOME", str(tmp_path))
+    monkeypatch.setattr("mira_engine.config.loader._current_config_path", None, raising=False)
+
+    config = Config()
+    _prepare_gateway_ui_channel(config, no_ui=True)
+
+    assert config.channels.ui.enabled is False
+
+
+def test_prepare_gateway_ui_channel_respects_existing_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRA_HOME", str(tmp_path))
+    monkeypatch.setattr("mira_engine.config.loader._current_config_path", None, raising=False)
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"channels": {"ui": {"enabled": False}}}))
+
+    config = Config()
+    _prepare_gateway_ui_channel(config, no_ui=False)
+
+    assert config.channels.ui.enabled is False
+
+
+def test_prepare_gateway_ui_channel_normalizes_dict_section(tmp_path, monkeypatch):
+    """A config loaded from disk keeps channels.ui as a dict; normalize it."""
+    from mira_engine.config.loader import load_config
+    from mira_engine.config.schema import UiChannelConfig
+
+    monkeypatch.setenv("MIRA_HOME", str(tmp_path))
+    monkeypatch.setattr("mira_engine.config.loader._current_config_path", None, raising=False)
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"channels": {"ui": {"allowFrom": []}}}))
+
+    config = load_config(config_path)
+    # Sanity: loaded-from-JSON channel sections are raw dicts, not models.
+    assert isinstance(config.channels.ui, (dict, UiChannelConfig))
+
+    _prepare_gateway_ui_channel(config, no_ui=False)
+
+    ui = config.channels.ui
+    assert isinstance(ui, UiChannelConfig)
+    assert ui.enabled is True
+    assert ui.allow_from == ["*"]

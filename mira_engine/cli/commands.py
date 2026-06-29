@@ -1137,6 +1137,95 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
     return loaded
 
 
+def _ui_enabled_in_config_file(config_path: Path | None) -> bool | None:
+    """Return the explicit ``channels.ui.enabled`` from disk, or ``None`` if unset.
+
+    We inspect the raw JSON instead of the parsed config so we can tell the
+    difference between "user never configured the UI channel" (``None`` →
+    gateway turns it on) and "user explicitly disabled it" (``False`` → leave
+    it off). The legacy ``web`` alias is honored for older configs.
+    """
+    if not config_path or not config_path.exists():
+        return None
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    channels = payload.get("channels")
+    if not isinstance(channels, dict):
+        return None
+    for key in ("ui", "web"):
+        section = channels.get(key)
+        if isinstance(section, dict) and "enabled" in section:
+            return bool(section["enabled"])
+    return None
+
+
+def _resolve_gateway_ui_enabled(explicit: bool | None, no_ui: bool) -> bool:
+    """Decide whether the gateway should run the local control-plane UI channel.
+
+    ``--no-ui`` always wins (headless/messaging-only deployments). Otherwise an
+    explicit on-disk value is respected, and an unset value defaults the UI on
+    so the desktop/browser app and the Providers onboarding page work without a
+    prior ``mira onboard``.
+    """
+    if no_ui:
+        return False
+    if explicit is None:
+        return True
+    return explicit
+
+
+def _prepare_gateway_ui_channel(config: Config, *, no_ui: bool) -> None:
+    """Ensure the gateway exposes the UI channel and bootstraps a config file.
+
+    The UI channel is the control plane for the desktop/browser client. Without
+    it there is no way to reach onboarding or the Providers settings page, so the
+    gateway turns it on by default (unless explicitly disabled or ``--no-ui``).
+    On a fresh home with no ``config.json`` we also persist the defaults so the
+    setup no longer depends on running ``mira onboard`` first.
+    """
+    from mira_engine.config.loader import get_config_path, save_config
+    from mira_engine.config.schema import UiChannelConfig
+
+    config_path = get_config_path()
+    explicit = _ui_enabled_in_config_file(config_path)
+    enabled = _resolve_gateway_ui_enabled(explicit, no_ui)
+
+    # ``channels.ui`` is a typed model on a freshly built config, but a raw dict
+    # when loaded from disk (ChannelsConfig keeps channels as extra fields).
+    # Normalize to the typed model so downstream access and serialization are
+    # consistent, then store it back in the channels extras.
+    section = getattr(config.channels, "ui", None)
+    if isinstance(section, UiChannelConfig):
+        ui = section
+    elif isinstance(section, dict):
+        ui = UiChannelConfig.model_validate(section)
+    else:
+        ui = UiChannelConfig()
+    ui.enabled = enabled
+    # An enabled UI channel with an empty allowFrom denies everyone and aborts
+    # startup; fall back to the local-control-plane default of "*".
+    if ui.enabled and not ui.allow_from:
+        ui.allow_from = ["*"]
+    extras = config.channels.__pydantic_extra__
+    if extras is None:
+        extras = {}
+        object.__setattr__(config.channels, "__pydantic_extra__", extras)
+    extras["ui"] = ui
+
+    if not config_path.exists():
+        try:
+            save_config(config, config_path)
+        except OSError:
+            # Non-fatal: the UI's own save path will create the file later.
+            return
+        console.print(
+            f"[green]✓[/green] Created default config at {config_path} "
+            "— open MIRA and use the Providers page to add a model provider."
+        )
+
+
 def _sync_workspace_templates_or_exit(workspace: Path) -> None:
     """Initialize workspace templates or fail with an actionable config error."""
     try:
@@ -1218,6 +1307,11 @@ def gateway(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    no_ui: bool = typer.Option(
+        False,
+        "--no-ui",
+        help="Do not start the UI channel (headless / messaging-only gateway)",
+    ),
 ):
     """Start the mira gateway."""
     from mira_engine.agent.loop import AgentLoop
@@ -1233,6 +1327,7 @@ def gateway(
         logging.basicConfig(level=logging.DEBUG)
 
     config = _load_runtime_config(config, workspace)
+    _prepare_gateway_ui_channel(config, no_ui=no_ui)
 
     if host is not None:
         config.gateway.host = host
