@@ -121,6 +121,24 @@ def test_ui_channel_receives_gateway_bind_host_port(monkeypatch) -> None:
     assert ui.init_kwargs["bind_port"] == 19991
 
 
+def test_ui_channel_receives_restrict_to_workspace_from_config(monkeypatch) -> None:
+    # The UI channel's data-path visibility check keys off
+    # ``restrict_to_workspace``; it must reflect the config value rather than
+    # the constructor default (which is True), otherwise the UI warns that a
+    # data path is "outside workspace" even when the user disabled the limit.
+    for restrict in (False, True):
+        _install_channel_module(monkeypatch, "mira_engine.channels.ui", "UiChannel")
+        cfg = Config()
+        cfg.channels.ui.enabled = True
+        cfg.channels.ui.allow_from = ["*"]
+        cfg.tools.restrict_to_workspace = restrict
+
+        mgr = ChannelManager(cfg, MessageBus())
+        ui = mgr.get_channel("ui")
+        assert isinstance(ui, _DummyChannel)
+        assert ui.init_kwargs["restrict_to_workspace"] is restrict
+
+
 async def test_start_all_and_stop_all_with_channels(monkeypatch) -> None:
     _install_channel_module(monkeypatch, "mira_engine.channels.telegram", "TelegramChannel")
     cfg = Config()

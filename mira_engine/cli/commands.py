@@ -1526,6 +1526,13 @@ def gateway(
         heartbeat.enabled = next_config.gateway.heartbeat.enabled
         session_manager = agent.sessions
 
+        # Keep the live UI channel's workspace-access policy in sync so the
+        # data-path visibility check reflects the latest setting without a
+        # gateway restart.
+        ui_channel = channels.channels.get("ui")
+        if ui_channel is not None and hasattr(ui_channel, "restrict_to_workspace"):
+            ui_channel.restrict_to_workspace = next_config.tools.restrict_to_workspace
+
         config = next_config
         provider = next_provider
         provider_factory = next_provider_factory
