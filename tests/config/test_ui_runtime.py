@@ -1,12 +1,15 @@
+import json
 from pathlib import Path
 
 import pytest
 
+from mira_engine.config.loader import load_config
 from mira_engine.config.schema import Config, ModelParamRule
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
     apply_ui_runtime_update_to_raw_data,
     build_ui_runtime_payload,
+    save_ui_runtime_update,
 )
 from mira_engine.providers.registry import model_overrides_for, set_user_model_param_rules
 
@@ -581,3 +584,61 @@ def test_apply_ui_runtime_update_to_raw_data_sets_enabled() -> None:
 
     assert changed is True
     assert data["providers"]["openai"]["enabled"] is True
+
+
+def test_save_ui_runtime_update_writes_full_config(tmp_path) -> None:
+    """A UI save persists the fully-resolved config (defaults included)."""
+    config_path = tmp_path / "config.json"
+    # A sparse on-disk config, as produced by an older surgical-merge save.
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"provider": "nvidia", "model": "nvidia/foo"}},
+                "providers": {"nvidia": {"apiKey": "sk-secret", "models": ["nvidia/foo"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    save_ui_runtime_update(
+        config,
+        {"runtime": {"reasoning_effort": "high"}},
+        current_projects_root=tmp_path,
+        config_path=config_path,
+    )
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    # Schema defaults that were absent on disk are now materialized.
+    assert "gateway" in saved
+    assert "api" in saved
+    # User values are preserved.
+    assert saved["providers"]["nvidia"]["apiKey"] == "sk-secret"
+    assert saved["providers"]["nvidia"]["models"] == ["nvidia/foo"]
+    assert saved["agents"]["defaults"]["reasoningEffort"] == "high"
+
+
+def test_save_ui_runtime_update_preserves_unknown_keys(tmp_path) -> None:
+    """Legacy top-level keys the schema does not model survive a UI save."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"provider": "nvidia", "model": "nvidia/foo"}},
+                "providers": {"nvidia": {"apiKey": "sk-secret"}},
+                "legacySection": {"kept": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    save_ui_runtime_update(
+        config,
+        {"runtime": {"reasoning_effort": "low"}},
+        current_projects_root=tmp_path,
+        config_path=config_path,
+    )
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["legacySection"] == {"kept": True}

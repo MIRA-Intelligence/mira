@@ -469,6 +469,23 @@ def apply_ui_runtime_update_to_raw_data(
     return projects_root, changed
 
 
+def _fill_missing_defaults(base: Any, overlay: Any) -> Any:
+    """Deep-merge ``overlay`` over ``base`` with ``overlay`` taking precedence.
+
+    ``base`` supplies default values for any key the ``overlay`` omits, while
+    ``overlay`` (the user's raw on-disk JSON) wins wherever it defines a value.
+    This materializes schema defaults for full visibility without normalizing
+    away authored forms the schema can't round-trip (e.g. model candidate
+    lists) or dropping legacy/unknown keys.
+    """
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        merged = dict(base)
+        for key, value in overlay.items():
+            merged[key] = _fill_missing_defaults(base.get(key), value) if key in base else value
+        return merged
+    return overlay
+
+
 def save_ui_runtime_update(
     config: Config,
     payload: dict[str, Any],
@@ -476,18 +493,27 @@ def save_ui_runtime_update(
     current_projects_root: Path,
     config_path: Path,
 ) -> None:
-    """Persist a UI settings update while preserving unrelated raw JSON fields."""
+    """Persist a UI settings update as a fully-resolved config.
+
+    The base is the complete ``model_dump`` of the loaded config, so every
+    parameter (including schema defaults) is written to disk, giving users
+    full visibility over the effective configuration. The existing raw file is
+    deep-merged on top so authored forms the schema cannot round-trip (model
+    candidate lists) and any legacy/unknown keys are preserved verbatim.
+    """
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # ``config`` is loaded from ``config_path`` at the call site, so this dump
+    # already reflects on-disk user values merged with schema defaults.
     data = config.model_dump(by_alias=True)
     if config_path.exists():
         try:
             with open(config_path, encoding="utf-8") as f:
                 existing = json.load(f)
             if isinstance(existing, dict):
-                data = existing
+                data = _fill_missing_defaults(data, existing)
         except (OSError, json.JSONDecodeError, ValueError):
-            data = config.model_dump(by_alias=True)
+            pass
 
     apply_ui_runtime_update_to_raw_data(
         data,
