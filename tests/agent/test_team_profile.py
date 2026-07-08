@@ -156,3 +156,34 @@ def test_role_provider_cross_provider_override() -> None:
     # The global provider remains openrouter; the role overrides only itself.
     assert defaults.provider == "openrouter"
     assert defaults.role_provider("student") == "deepseek"
+
+
+def test_role_provider_override_ignored_without_role_model() -> None:
+    """A provider override with no role model must not force the inherited model.
+
+    Regression: a role with ``criticProvider=nvidia`` but no ``criticModel``
+    inherits the deepseek *primary* model. Forcing the NVIDIA provider onto it
+    routed the deepseek model to the NVIDIA endpoint ("Error calling NVIDIA
+    API"). The role should inherit the primary's provider instead.
+    """
+    from mira_engine.providers.factory import make_role_provider
+    from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
+
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "deepseek",
+                    "model": "deepseek/deepseek-v4-pro",
+                    "criticProvider": "nvidia",
+                }
+            }
+        }
+    )
+    config.providers.deepseek.api_key = "k-deepseek"
+    config.providers.nvidia.api_key = "k-nvidia"
+
+    provider, model, _candidates = make_role_provider(config, "critic")
+
+    assert model == "deepseek/deepseek-v4-pro"
+    assert isinstance(provider, OpenAICompatProvider)

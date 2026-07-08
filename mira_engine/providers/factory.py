@@ -52,6 +52,13 @@ def make_role_provider(config: Config, role: str) -> tuple[LLMProvider, str, tup
     model = defaults.role_model(role)
     candidates = tuple(defaults.role_model_candidates(role))
     override = defaults.role_provider(role)
+    # A provider override only makes sense alongside the role's own model. When
+    # the role has no explicit model it inherits the *primary* model, which is
+    # served by the global provider; forcing the role's override onto it would
+    # route e.g. a deepseek primary model to the NVIDIA endpoint. Inherit the
+    # global provider (None) so the role behaves exactly like the primary.
+    if not getattr(defaults, f"{role}_model", None):
+        override = None
     provider = make_provider(config, model, provider_override=override)
     return provider, model, candidates
 
