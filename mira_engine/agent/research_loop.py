@@ -32,12 +32,21 @@ from mira_engine.task_plan.guardrails import (
 class ResearchAgentLoop(BaseAgentLoop):
     """Research-flavoured agent loop with auto-mode and task-plan contracts."""
 
-    _AUTO_MAX_ROUNDS = 20
+    # Fallback default used when no ``auto_max_rounds`` is supplied (e.g. the
+    # SDK facade or tests). The gateway threads the configured value through.
+    _AUTO_MAX_ROUNDS = 100
     _AUTO_GUARD_REPAIR_MAX = 1
     _AUTO_CHECKPOINT_REPAIR_MAX = 1
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, auto_max_rounds: int | None = None, **kwargs: Any
+    ) -> None:
         super().__init__(*args, **kwargs)
+        self._auto_max_rounds = (
+            auto_max_rounds
+            if isinstance(auto_max_rounds, int) and auto_max_rounds > 0
+            else self._AUTO_MAX_ROUNDS
+        )
         self._session_run_modes: dict[str, str] = {}
         self._session_agent_profiles: dict[str, str] = {}
         self._session_automation_policies: dict[str, dict[str, Any] | None] = {}
@@ -1010,9 +1019,10 @@ class ResearchAgentLoop(BaseAgentLoop):
             return False, "awaiting plan approval"
         if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
             return False, "task_plan guardrail blocking"
-        if auto_round >= self._AUTO_MAX_ROUNDS:
-            logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
-            return False, f"max rounds reached ({self._AUTO_MAX_ROUNDS})"
+        max_rounds = getattr(self, "_auto_max_rounds", None) or self._AUTO_MAX_ROUNDS
+        if auto_round >= max_rounds:
+            logger.warning("Auto mode max rounds ({}) reached", max_rounds)
+            return False, f"max rounds reached ({max_rounds})"
         strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
         if strict_heuristics and self._looks_like_provider_error(final_content):
             return False, "provider error"
@@ -1084,7 +1094,7 @@ class ResearchAgentLoop(BaseAgentLoop):
           replan up to that budget.
         - With a policy that only carries ``maxTokens`` /
           ``strictHeuristics`` and no goals/budget, default to replanning;
-          ``maxTokens`` and ``_AUTO_MAX_ROUNDS`` keep the loop bounded.
+          ``maxTokens`` and ``auto_max_rounds`` keep the loop bounded.
         """
         if cls._plan_has_pending_work(plan):
             return False

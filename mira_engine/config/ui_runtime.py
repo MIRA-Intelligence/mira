@@ -275,6 +275,7 @@ def build_ui_runtime_payload(
         "reasoning_effort": defaults.reasoning_effort,
         "temperature": defaults.temperature,
         "max_tool_iterations": defaults.max_tool_iterations,
+        "auto_max_rounds": defaults.auto_max_rounds,
         "restrict_to_workspace": config.tools.restrict_to_workspace,
         "setup_required": setup_required,
         "setup_message": setup_message,
@@ -400,6 +401,15 @@ def apply_ui_runtime_update_to_raw_data(
                 "max_tool_iterations",
                 runtime_payload["max_tool_iterations"],
                 alias="maxToolIterations",
+            )
+            changed = True
+
+        if "auto_max_rounds" in runtime_payload:
+            _set_alias_value(
+                defaults,
+                "auto_max_rounds",
+                runtime_payload["auto_max_rounds"],
+                alias="autoMaxRounds",
             )
             changed = True
 
@@ -611,6 +621,16 @@ def apply_ui_runtime_update(
                 raise ValueError("runtime.max_tool_iterations must be a positive integer")
             if config.agents.defaults.max_tool_iterations != max_tool_iterations:
                 config.agents.defaults.max_tool_iterations = max_tool_iterations
+                changed = True
+
+        if "auto_max_rounds" in runtime_payload:
+            auto_max_rounds = runtime_payload["auto_max_rounds"]
+            if isinstance(auto_max_rounds, bool) or not isinstance(auto_max_rounds, int):
+                raise ValueError("runtime.auto_max_rounds must be a positive integer")
+            if auto_max_rounds < 1:
+                raise ValueError("runtime.auto_max_rounds must be a positive integer")
+            if config.agents.defaults.auto_max_rounds != auto_max_rounds:
+                config.agents.defaults.auto_max_rounds = auto_max_rounds
                 changed = True
 
         if "restrict_to_workspace" in runtime_payload:

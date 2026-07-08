@@ -392,6 +392,57 @@ def test_apply_ui_runtime_update_to_raw_data_sets_temperature() -> None:
     assert data["agents"]["defaults"]["temperature"] == 0.9
 
 
+def test_build_ui_runtime_payload_exposes_auto_max_rounds() -> None:
+    cfg = Config()
+    cfg.agents.defaults.auto_max_rounds = 42
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    assert payload["runtime"]["auto_max_rounds"] == 42
+
+
+def test_apply_ui_runtime_update_sets_auto_max_rounds() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"auto_max_rounds": 250}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.auto_max_rounds == 250
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True, "10"])
+def test_apply_ui_runtime_update_rejects_invalid_auto_max_rounds(bad) -> None:
+    cfg = Config()
+    with pytest.raises(ValueError):
+        apply_ui_runtime_update(
+            cfg,
+            {"runtime": {"auto_max_rounds": bad}},
+            current_projects_root=Path("/tmp/workspace"),
+        )
+
+
+def test_apply_ui_runtime_update_to_raw_data_sets_auto_max_rounds() -> None:
+    data: dict = {"agents": {"defaults": {}}}
+
+    _, changed = apply_ui_runtime_update_to_raw_data(
+        data,
+        {"runtime": {"auto_max_rounds": 75}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert data["agents"]["defaults"]["autoMaxRounds"] == 75
+
+
 def test_build_ui_runtime_payload_exposes_models_and_configured() -> None:
     cfg = Config()
     cfg.providers.deepseek.api_key = "sk-deepseek"

@@ -1375,6 +1375,7 @@ def gateway(
         provider_factory=provider_factory,
         model_candidates=config.agents.defaults.default_model_candidates,
         role_provider_factory=lambda role: _make_gateway_role_provider(config, role),
+        auto_max_rounds=config.agents.defaults.auto_max_rounds,
     )
 
     # Set cron callback (needs agent)
@@ -1620,6 +1621,7 @@ def serve(
         provider_factory=lambda model: _make_provider_for_model(cfg, model),
         model_candidates=cfg.agents.defaults.default_model_candidates,
         role_provider_factory=lambda role: make_role_provider(cfg, role),
+        auto_max_rounds=cfg.agents.defaults.auto_max_rounds,
     )
 
     api_host = host if host is not None else cfg.api.host
@@ -2315,6 +2317,7 @@ def research(
             config=config,
             cron_service=cron,
         ),
+        auto_max_rounds=config.agents.defaults.auto_max_rounds,
     )
 
     inbound_metadata = _build_research_inbound_metadata(

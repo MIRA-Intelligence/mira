@@ -312,6 +312,9 @@ class AgentDefaults(Base):
     context_block_limit: int | None = None
     temperature: float | None = 0.1  # None => omit the parameter entirely
     max_tool_iterations: int = 200
+    # Hard cap on auto-mode continuation rounds before the research loop stops
+    # itself. Guards against runaway auto-runs; surfaced/editable from the UI.
+    auto_max_rounds: int = 100
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
