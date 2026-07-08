@@ -587,6 +587,12 @@ def apply_ui_runtime_update(
             model = model.strip()
             if config.agents.defaults.model != model:
                 config.agents.defaults.model = model
+                # ``model_candidates`` is only derived by the validator at
+                # construction, so a live model switch would otherwise keep the
+                # previous provider's candidates around. Left stale, those
+                # fallbacks get routed through the *new* forced provider (e.g. a
+                # leftover ``gpt-5.5`` sent to DeepSeek), which the API rejects.
+                config.agents.defaults.model_candidates = [model]
                 changed = True
 
         if "reasoning_effort" in runtime_payload:
@@ -664,6 +670,14 @@ def apply_ui_runtime_update(
                     raise ValueError(f"runtime.{model_key} must be a string or null")
                 if getattr(config.agents.defaults, model_key) != next_model:
                     setattr(config.agents.defaults, model_key, next_model)
+                    # Keep the role's candidate list in sync (see the primary
+                    # ``model`` handling above): a live role-model switch must
+                    # not leave the prior model as a stale routing fallback.
+                    setattr(
+                        config.agents.defaults,
+                        f"{role}_model_candidates",
+                        [next_model] if next_model else [],
+                    )
                     changed = True
 
     if "model_params" in payload:

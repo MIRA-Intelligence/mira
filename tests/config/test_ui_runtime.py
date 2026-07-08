@@ -419,6 +419,60 @@ def test_apply_ui_runtime_update_sets_auto_max_rounds() -> None:
     assert cfg.agents.defaults.auto_max_rounds == 250
 
 
+def test_apply_ui_runtime_update_resyncs_model_candidates_on_model_switch() -> None:
+    """A live model switch must clear the prior provider's stale candidates.
+
+    Regression: switching provider->model to DeepSeek left ``model_candidates``
+    at the previous ``openai/openai/gpt-5.5`` value, which the forced DeepSeek
+    provider then rejected ("you passed gpt-5.5").
+    """
+    from mira_engine.config.schema import AgentDefaults
+
+    cfg = Config()
+    cfg.agents.defaults = AgentDefaults.model_validate(
+        {"provider": "nvidia", "model": "openai/openai/gpt-5.5"}
+    )
+    assert cfg.agents.defaults.default_model_candidates == ["openai/openai/gpt-5.5"]
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"provider": "deepseek", "model": "deepseek/deepseek-v4-pro"}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.model == "deepseek/deepseek-v4-pro"
+    assert cfg.agents.defaults.default_model_candidates == ["deepseek/deepseek-v4-pro"]
+
+
+def test_apply_ui_runtime_update_resyncs_role_candidates_on_role_model_switch() -> None:
+    from mira_engine.config.schema import AgentDefaults
+
+    cfg = Config()
+    cfg.agents.defaults = AgentDefaults.model_validate(
+        {
+            "provider": "deepseek",
+            "model": "deepseek/deepseek-v4-pro",
+            "supervisor_provider": "nvidia",
+            "supervisor_model": "openai/openai/gpt-5.5",
+        }
+    )
+    assert cfg.agents.defaults.role_model_candidates("supervisor") == [
+        "openai/openai/gpt-5.5"
+    ]
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"supervisor_model": "deepseek/deepseek-v4-flash"}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.role_model_candidates("supervisor") == [
+        "deepseek/deepseek-v4-flash"
+    ]
+
+
 @pytest.mark.parametrize("bad", [0, -1, 1.5, True, "10"])
 def test_apply_ui_runtime_update_rejects_invalid_auto_max_rounds(bad) -> None:
     cfg = Config()
