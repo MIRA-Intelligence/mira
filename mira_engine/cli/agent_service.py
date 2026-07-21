@@ -1421,7 +1421,14 @@ def run_gateway(
 ) -> None:
     from mira_engine.cli.commands import gateway as gateway_cmd
 
-    gateway_cmd(host=host, port=port, workspace=None, verbose=False, config=None)
+    gateway_cmd(
+        host=host,
+        port=port,
+        workspace=None,
+        verbose=False,
+        config=None,
+        no_ui=False,
+    )
 
 
 if __name__ == "__main__":
