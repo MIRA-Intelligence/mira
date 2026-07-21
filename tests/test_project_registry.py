@@ -70,6 +70,67 @@ def test_project_registry_can_hide_legacy_project_without_deleting_files(tmp_pat
     assert [ref.project_id for ref in restarted.list_projects()] == ["PRJ-HIDE"]
 
 
+def test_project_registry_merges_updates_from_stale_instances(tmp_path: Path) -> None:
+    workspace_file = tmp_path / ".mira" / "workspace.json"
+    legacy_index = tmp_path / ".mira" / "ui" / "project-dirs.json"
+    projects_root = tmp_path / "default-projects"
+    project_a = tmp_path / "external" / "a"
+    project_b = tmp_path / "external" / "b"
+    project_a.mkdir(parents=True)
+    project_b.mkdir(parents=True)
+
+    first = ProjectRegistry(
+        projects_root,
+        workspace_path=workspace_file,
+        legacy_index_path=legacy_index,
+    )
+    second = ProjectRegistry(
+        projects_root,
+        workspace_path=workspace_file,
+        legacy_index_path=legacy_index,
+    )
+
+    first.register_project_dir("a", project_a)
+    second.register_project_dir("b", project_b)
+
+    payload = json.loads(workspace_file.read_text(encoding="utf-8"))
+    assert {project["id"] for project in payload["projects"]} == {"a", "b"}
+    assert set(json.loads(legacy_index.read_text(encoding="utf-8"))) == {"a", "b"}
+
+
+def test_project_registry_concurrent_delete_is_not_resurrected(tmp_path: Path) -> None:
+    workspace_file = tmp_path / ".mira" / "workspace.json"
+    legacy_index = tmp_path / ".mira" / "ui" / "project-dirs.json"
+    projects_root = tmp_path / "default-projects"
+    project_a = tmp_path / "external" / "a"
+    project_b = tmp_path / "external" / "b"
+    project_a.mkdir(parents=True)
+    project_b.mkdir(parents=True)
+
+    seed = ProjectRegistry(
+        projects_root,
+        workspace_path=workspace_file,
+        legacy_index_path=legacy_index,
+    )
+    seed.register_project_dir("a", project_a)
+    stale = ProjectRegistry(
+        projects_root,
+        workspace_path=workspace_file,
+        legacy_index_path=legacy_index,
+    )
+    remover = ProjectRegistry(
+        projects_root,
+        workspace_path=workspace_file,
+        legacy_index_path=legacy_index,
+    )
+
+    remover.drop_project_dir_registration("a")
+    stale.register_project_dir("b", project_b)
+
+    payload = json.loads(workspace_file.read_text(encoding="utf-8"))
+    assert {project["id"] for project in payload["projects"]} == {"b"}
+
+
 def test_project_registry_supports_unicode_project_names(tmp_path: Path) -> None:
     registry = ProjectRegistry(
         tmp_path / "default",

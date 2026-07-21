@@ -1,10 +1,12 @@
+import hashlib
 import json
 import os
-import socket
-import pytest
+from unittest.mock import MagicMock
+
 import psutil
+import pytest
 import typer
-from unittest.mock import MagicMock, patch
+
 from mira_engine.cli.commands import (
     _gateway_failsafe_check,
     _prepare_gateway_ui_channel,
@@ -13,6 +15,13 @@ from mira_engine.cli.commands import (
 )
 from mira_engine.config.schema import Config
 
+
+def _gateway_pid_file(runtime_dir, host: str, port: int):
+    endpoint = f"{host}:{port}"
+    key = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:16]
+    return runtime_dir / "gateways" / f"{key}.pid"
+
+
 @pytest.fixture
 def mock_runtime_dir(tmp_path):
     """模拟 ~/.mira/runtime 目录"""
@@ -20,9 +29,11 @@ def mock_runtime_dir(tmp_path):
     runtime_dir.mkdir(parents=True)
     return runtime_dir
 
+
 def test_gateway_pid_lock_prevents_startup(mock_runtime_dir, monkeypatch):
     """测试：当 PID 文件存在且进程运行时，应触发退出"""
-    pid_file = mock_runtime_dir / "gateway.pid"
+    pid_file = _gateway_pid_file(mock_runtime_dir, "127.0.0.1", 9999)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
     locked_pid = 123456
     pid_file.write_text(str(locked_pid))
 
@@ -33,14 +44,14 @@ def test_gateway_pid_lock_prevents_startup(mock_runtime_dir, monkeypatch):
     proc.cmdline.return_value = ["mira", "gateway"]
     monkeypatch.setattr(psutil, "Process", lambda pid: proc)
     monkeypatch.setenv("MIRA_SKIP_GATEWAY_FAILSAVE", "")
-    
+
     with pytest.raises(typer.Exit) as exc:
         _gateway_failsafe_check("127.0.0.1", 9999)
     assert exc.value.exit_code == 1
 
 def test_gateway_port_conflict_prevents_startup(mock_runtime_dir, monkeypatch):
     """测试：当端口已被占用时，应触发退出"""
-    pid_file = mock_runtime_dir / "gateway.pid"
+    pid_file = _gateway_pid_file(mock_runtime_dir, "127.0.0.1", 8888)
     if pid_file.exists():
         pid_file.unlink()
 
@@ -57,14 +68,14 @@ def test_gateway_port_conflict_prevents_startup(mock_runtime_dir, monkeypatch):
         def close(self): pass
 
     monkeypatch.setattr("socket.socket", MockSocket)
-    
+
     with pytest.raises(typer.Exit) as exc:
         _gateway_failsafe_check("127.0.0.1", 8888)
     assert exc.value.exit_code == 1
 
 def test_gateway_creates_pid_file(mock_runtime_dir, monkeypatch):
     """测试：正常检测通过后应创建 PID 文件"""
-    pid_file = mock_runtime_dir / "gateway.pid"
+    pid_file = _gateway_pid_file(mock_runtime_dir, "127.0.0.1", 7777)
     if pid_file.exists():
         pid_file.unlink()
 
@@ -83,9 +94,41 @@ def test_gateway_creates_pid_file(mock_runtime_dir, monkeypatch):
     monkeypatch.setattr("socket.socket", MockSocket)
 
     _gateway_failsafe_check("127.0.0.1", 7777)
-        
+
     assert pid_file.exists()
     assert pid_file.read_text() == str(os.getpid())
+    discovery = json.loads((mock_runtime_dir / "gateways.json").read_text(encoding="utf-8"))
+    assert any(
+        item["port"] == 7777 and item["pid"] == os.getpid()
+        for item in discovery["instances"].values()
+    )
+
+
+def test_gateway_pid_on_other_port_does_not_block_startup(mock_runtime_dir, monkeypatch):
+    first_pid = _gateway_pid_file(mock_runtime_dir, "127.0.0.1", 7001)
+    first_pid.parent.mkdir(parents=True, exist_ok=True)
+    first_pid.write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setenv("MIRA_HOME", str(mock_runtime_dir.parent))
+    monkeypatch.setenv("MIRA_SKIP_GATEWAY_FAILSAVE", "")
+
+    class MockSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def settimeout(self, *_args):
+            return None
+
+        def connect_ex(self, *_args):
+            return 111
+
+    monkeypatch.setattr("socket.socket", MockSocket)
+
+    _gateway_failsafe_check("127.0.0.1", 7002)
+
+    assert _gateway_pid_file(mock_runtime_dir, "127.0.0.1", 7002).exists()
 
 
 # ---------------------------------------------------------------------------

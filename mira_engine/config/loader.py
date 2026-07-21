@@ -94,8 +94,12 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     data = config.model_dump(by_alias=True)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    # config.json is shared across all instances; serialize concurrent writes
+    # and replace atomically so a crashed/racing writer never leaves a partial
+    # (unparseable) config on disk.
+    from mira_engine.utils.locks import locked_write_text
+
+    locked_write_text(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def resolve_config_env_vars(config: Config) -> Config:

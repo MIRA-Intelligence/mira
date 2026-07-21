@@ -8,6 +8,7 @@ import signal
 import socket
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1249,8 +1250,9 @@ def _sync_workspace_templates_or_exit(workspace: Path) -> None:
 
 
 def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool = False) -> None:
-    """Check for existing Mira instances by PID file and port."""
+    """Reserve one gateway endpoint without blocking gateways on other ports."""
     import atexit
+    import hashlib
     import os
     import socket
 
@@ -1260,11 +1262,16 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
         return
 
     from mira_engine.config.loader import get_home_dir
+    from mira_engine.utils.locks import locked_update_text, locked_write_text
 
-    pid_file = get_home_dir() / "runtime" / "gateway.pid"
+    runtime_dir = get_home_dir() / "runtime"
+    endpoint = f"{gateway_host}:{gateway_port}"
+    endpoint_key = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:16]
+    pid_file = runtime_dir / "gateways" / f"{endpoint_key}.pid"
+    discovery_file = runtime_dir / "gateways.json"
     pid_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. 检查 PID 文件
+    # 1. Check only this endpoint's PID reservation. Other ports may coexist.
     if pid_file.exists():
         try:
             old_pid = int(pid_file.read_text().strip())
@@ -1275,12 +1282,12 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
                     print(f"错误: Mira 已经在运行中 (PID: {old_pid})。")
                     print("提示: 请先停止旧进程，或使用 `mira-engine stop`。")
                     raise typer.Exit(1)
-        except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied, typer.Exit):
-            if isinstance(sys.exc_info()[1], typer.Exit):
-                raise
-            pass
+        except typer.Exit:
+            raise
+        except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
+            pid_file.unlink(missing_ok=True)
 
-    # 2. 检查端口占用
+    # 2. Check the actual endpoint in case its owner did not create a PID file.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
@@ -1295,9 +1302,51 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
         if verbose:
             print(f"端口探测异常: {e}")
 
-    # 3. 写入当前 PID
-    pid_file.write_text(str(os.getpid()))
-    atexit.register(lambda: pid_file.unlink(missing_ok=True))
+    # 3. Atomically publish this gateway for local discovery.
+    current_pid = os.getpid()
+    locked_write_text(pid_file, str(current_pid))
+
+    def update_discovery(current_text: str) -> str:
+        try:
+            payload = json.loads(current_text) if current_text.strip() else {}
+        except json.JSONDecodeError:
+            payload = {}
+        instances = payload.get("instances") if isinstance(payload, dict) else None
+        if not isinstance(instances, dict):
+            instances = {}
+        instances[endpoint_key] = {
+            "host": gateway_host,
+            "port": gateway_port,
+            "pid": current_pid,
+            "endpoint": endpoint,
+        }
+        return json.dumps({"instances": instances}, indent=2, ensure_ascii=False) + "\n"
+
+    locked_update_text(discovery_file, update_discovery)
+
+    def release_endpoint() -> None:
+        try:
+            if pid_file.exists() and pid_file.read_text().strip() == str(current_pid):
+                pid_file.unlink(missing_ok=True)
+
+            def remove_from_discovery(current_text: str) -> str:
+                try:
+                    payload = json.loads(current_text) if current_text.strip() else {}
+                except json.JSONDecodeError:
+                    payload = {}
+                instances = payload.get("instances") if isinstance(payload, dict) else None
+                if not isinstance(instances, dict):
+                    instances = {}
+                current = instances.get(endpoint_key)
+                if isinstance(current, dict) and current.get("pid") == current_pid:
+                    instances.pop(endpoint_key, None)
+                return json.dumps({"instances": instances}, indent=2, ensure_ascii=False) + "\n"
+
+            locked_update_text(discovery_file, remove_from_discovery)
+        except OSError:
+            pass
+
+    atexit.register(release_endpoint)
 
 
 @app.command()
@@ -2166,10 +2215,34 @@ def _build_research_inbound_metadata(
     return metadata
 
 
+def _resolve_cli_session_id(session_id: str | None, *, prefix: str) -> str:
+    """Resolve the session id for an interactive CLI invocation.
+
+    Each CLI process must default to its *own* isolated session so that two
+    concurrently running ``mira`` instances never append to the same session
+    transcript (which would interleave/cross-contaminate their conversations).
+
+    - When the user passes ``--session``/``-s`` explicitly, honour it verbatim
+      so an existing conversation can be resumed.
+    - Otherwise mint a unique, per-process session id (``<prefix>:<uuid>``),
+      mirroring how Cursor/Codex/Claude Code give every instance a fresh
+      session while still sharing global config/persona/long-term memory.
+    """
+    if session_id is not None and session_id.strip():
+        return session_id.strip()
+    return f"{prefix}:{uuid.uuid4().hex[:12]}"
+
+
 @app.command()
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
-    session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
+    session_id: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Session ID to resume. Defaults to a unique per-instance session so "
+        "concurrent CLIs stay isolated.",
+    ),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
@@ -2181,6 +2254,8 @@ def agent(
     from mira_engine.agent.base_loop import BaseAgentLoop
     from mira_engine.bus.queue import MessageBus
     from mira_engine.cron.service import CronService
+
+    session_id = _resolve_cli_session_id(session_id, prefix="cli")
 
     if workspace is None and sys.stdin.isatty():
         if typer.confirm("Do you want to use the current directory as a project workspace?"):
@@ -2230,7 +2305,13 @@ def agent(
 @app.command()
 def research(
     message: str = typer.Option(None, "--message", help="Message to send to the research agent"),
-    session_id: str = typer.Option("cli:research", "--session", "-s", help="Session ID"),
+    session_id: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Session ID to resume. Defaults to a unique per-instance session so "
+        "concurrent CLIs stay isolated.",
+    ),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     mode: str = typer.Option(
@@ -2271,6 +2352,8 @@ def research(
     from mira_engine.agent.research_loop import ResearchAgentLoop
     from mira_engine.bus.queue import MessageBus
     from mira_engine.cron.service import CronService
+
+    session_id = _resolve_cli_session_id(session_id, prefix="research")
 
     mode_value = (mode or "manual").strip().lower()
     if mode_value not in {"manual", "auto"}:
