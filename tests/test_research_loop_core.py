@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from mira_engine.agent.base_loop import BaseAgentLoop
@@ -43,7 +42,7 @@ def _make_loop(tmp_path: Path) -> ResearchAgentLoop:
     loop.reasoning_effort = None
     loop.context = ContextBuilder(tmp_path)
     loop.tools = ToolRegistry()
-    loop.model_router = SimpleNamespace(enabled=True)
+    loop.model_candidates = None
     loop._session_run_modes = {}
     loop._session_agent_profiles = {}
     loop._session_automation_policies = {}
@@ -55,6 +54,7 @@ def _make_loop(tmp_path: Path) -> ResearchAgentLoop:
     loop._last_task_plan_guard_blocking = False
     loop._project_sessions = {}
     loop._TOOL_RESULT_MAX_CHARS = 20
+    loop._auto_max_rounds = ResearchAgentLoop._AUTO_MAX_ROUNDS
     return loop
 
 
@@ -569,6 +569,37 @@ def test_auto_run_decision_helpers(tmp_path: Path) -> None:
     assert status_restored.get("status") == "in_progress"
     persisted = json.loads(plan_file.read_text(encoding="utf-8"))
     assert persisted.get("status") == "in_progress"
+
+
+def test_evaluate_continuation_honors_configured_auto_max_rounds(tmp_path: Path) -> None:
+    """The auto-round cap is instance-configurable, not hardcoded."""
+    loop = _make_loop(tmp_path)
+    loop._auto_max_rounds = 3
+    project = tmp_path / "projects" / "cap"
+    project.mkdir(parents=True)
+    (project / "task_plan.json").write_text(
+        json.dumps({"plan": {"phase": "approved"}, "experiments": [{"status": "pending"}]}),
+        encoding="utf-8",
+    )
+
+    # Below the configured cap the loop is willing to continue.
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=2,
+    )
+    assert decision is True and reason is None
+
+    # At the configured cap it stops, echoing the configured number.
+    decision, reason = loop._evaluate_continuation(
+        run_mode="auto",
+        project_dir=str(project),
+        final_content="all good",
+        auto_round=3,
+    )
+    assert decision is False
+    assert reason == "max rounds reached (3)"
 
 
 def test_format_stop_reason_detail_inlines_provider_error_snippet() -> None:

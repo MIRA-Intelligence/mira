@@ -23,7 +23,7 @@ class ContextBuilder:
 
     def __init__(self, workspace: Path):
         from mira_engine.utils.helpers import get_mira_dir
-        
+
         self.workspace = workspace
         self.mira_dir = get_mira_dir(workspace)
         self.memory = MemoryStore(workspace)
@@ -143,35 +143,50 @@ class ContextBuilder:
         return None
 
     def _load_bootstrap_files(self, agents_filename: str = "AGENTS.md") -> str:
-        """Load bootstrap files with override / append / fallback resolution.
+        """Load shared persona followed by project-specific overlays.
 
         Per file (e.g. AGENTS.md):
-          1. workspace/AGENTS.md exists  →  use it              (override)
-          2. else                        →  built-in template   (fallback)
-          3. workspace/AGENTS.local.md   →  append to base      (append)
+          1. global workspace file, or built-in template as fallback
+          2. global ``*.local.md``
+          3. project file when this is a project workspace
+          4. project ``*.local.md``
+
+        Later sections have higher prompt priority while preserving the global
+        user persona in every CLI instance and UI project.
         """
+        from mira_engine.config.paths import get_workspace_path
+
         parts = []
+        global_workspace = get_workspace_path(None)
+        workspace = self.workspace.expanduser().resolve(strict=False)
+        global_workspace = global_workspace.expanduser().resolve(strict=False)
 
         for filename in self.BOOTSTRAP_FILES:
             effective_name = agents_filename if filename == "AGENTS.md" else filename
             stem = effective_name.rsplit(".", 1)[0]
+            layers: list[str] = []
 
-            ws_file = self.workspace / effective_name
-            if ws_file.exists():
-                content = ws_file.read_text(encoding="utf-8")
+            global_file = global_workspace / effective_name
+            if global_file.exists():
+                layers.append(global_file.read_text(encoding="utf-8"))
             else:
-                content = self._load_builtin_template(effective_name) or ""
+                layers.append(self._load_builtin_template(effective_name) or "")
 
-            if not content.strip():
-                continue
+            global_local = global_workspace / f"{stem}.local.md"
+            if global_local.exists():
+                layers.append(global_local.read_text(encoding="utf-8"))
 
-            local_file = self.workspace / f"{stem}.local.md"
-            if local_file.exists():
-                extra = local_file.read_text(encoding="utf-8")
-                if extra.strip():
-                    content = content.rstrip() + "\n\n" + extra
+            if workspace != global_workspace:
+                project_file = workspace / effective_name
+                if project_file.exists():
+                    layers.append(project_file.read_text(encoding="utf-8"))
+                project_local = workspace / f"{stem}.local.md"
+                if project_local.exists():
+                    layers.append(project_local.read_text(encoding="utf-8"))
 
-            parts.append(f"## {effective_name}\n\n{content}")
+            content = "\n\n".join(layer.strip() for layer in layers if layer.strip())
+            if content:
+                parts.append(f"## {effective_name}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
 

@@ -524,9 +524,9 @@ def _handle_context_window_field(
 
 _FIELD_HANDLERS: dict[str, Any] = {
     "model": _handle_model_field,
-    "small_model": _handle_model_field,
-    "medium_model": _handle_model_field,
-    "large_model": _handle_model_field,
+    "supervisor_model": _handle_model_field,
+    "student_model": _handle_model_field,
+    "critic_model": _handle_model_field,
     "context_window_tokens": _handle_context_window_field,
 }
 

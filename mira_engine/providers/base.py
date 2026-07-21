@@ -159,6 +159,19 @@ class LLMProvider(ABC):
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
 
+    @staticmethod
+    def _apply_param_overrides(kwargs: dict[str, Any], overrides: dict[str, Any]) -> None:
+        """Merge registry per-model overrides into request ``kwargs``.
+
+        A value of ``None`` means "drop this parameter" (the model rejects it);
+        any other value forces that parameter. See ``registry.model_overrides_for``.
+        """
+        for key, value in overrides.items():
+            if value is None:
+                kwargs.pop(key, None)
+            else:
+                kwargs[key] = value
+
     def supports_vision(self, model: str | None = None) -> bool:
         """Return True when the (resolved) model accepts image input.
 
@@ -513,6 +526,11 @@ class LLMProvider(ABC):
         chat_stream = getattr(self, "chat_stream", None)
         if callable(chat_stream):
             return await chat_stream(**kwargs)
+        # Providers without a streaming implementation (e.g. NVIDIA, LiteLLM,
+        # custom) fall back to a single non-streaming chat() call. Their chat()
+        # signature does not accept the streaming-only ``on_content_delta``
+        # callback, so drop it before delegating.
+        kwargs.pop("on_content_delta", None)
         return await self.chat(**kwargs)
 
     async def _run_with_retry(
