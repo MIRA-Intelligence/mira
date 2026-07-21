@@ -290,23 +290,31 @@ class AgentDefaults(Base):
     workspace: str = Field(default_factory=_default_workspace)
     model: str = "anthropic/claude-opus-4-5"
     model_candidates: list[str] = Field(default_factory=list, exclude=True)
-    route_model: str | None = None
-    route_model_candidates: list[str] = Field(default_factory=list, exclude=True)
-    small_model: str | None = None
-    small_model_candidates: list[str] = Field(default_factory=list, exclude=True)
-    medium_model: str | None = None
-    medium_model_candidates: list[str] = Field(default_factory=list, exclude=True)
-    large_model: str | None = None
-    large_model_candidates: list[str] = Field(default_factory=list, exclude=True)
-    route_by_complexity: bool = False
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
+    # ``team`` profile role models. Each role may target a different provider
+    # and model (e.g. critic on Anthropic, student on DeepSeek). ``*_provider``
+    # defaults to "auto" (resolve provider from the model prefix/keyword); set
+    # it explicitly to pin a role to a provider even when the global
+    # ``provider`` above is forced. Unset ``*_model`` falls back to ``model``.
+    supervisor_provider: str = "auto"
+    supervisor_model: str | None = None
+    supervisor_model_candidates: list[str] = Field(default_factory=list, exclude=True)
+    student_provider: str = "auto"
+    student_model: str | None = None
+    student_model_candidates: list[str] = Field(default_factory=list, exclude=True)
+    critic_provider: str = "auto"
+    critic_model: str | None = None
+    critic_model_candidates: list[str] = Field(default_factory=list, exclude=True)
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
     context_block_limit: int | None = None
     temperature: float | None = 0.1  # None => omit the parameter entirely
     max_tool_iterations: int = 200
+    # Hard cap on auto-mode continuation rounds before the research loop stops
+    # itself. Guards against runaway auto-runs; surfaced/editable from the UI.
+    auto_max_rounds: int = 100
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
@@ -320,14 +328,34 @@ class AgentDefaults(Base):
         if not isinstance(data, dict):
             return data
         payload = dict(data)
-        aliases = {
-            "model": ("model",),
-            "route_model": ("route_model", "routeModel"),
-            "small_model": ("small_model", "smallModel"),
-            "medium_model": ("medium_model", "mediumModel"),
-            "large_model": ("large_model", "largeModel"),
+        # model key -> (input aliases, provider-source field). Role models use
+        # their own ``*_provider`` field for prefixing; when that is "auto"
+        # they inherit the global ``provider``.
+        aliases: dict[str, tuple[tuple[str, ...], str]] = {
+            "model": (("model",), "provider"),
+            "supervisor_model": (("supervisor_model", "supervisorModel"), "supervisor_provider"),
+            "student_model": (("student_model", "studentModel"), "student_provider"),
+            "critic_model": (("critic_model", "criticModel"), "critic_provider"),
         }
-        for key, key_aliases in aliases.items():
+
+        def _provider_for(provider_key: str) -> str:
+            # ``mode="before"`` runs prior to alias conversion, so the input may
+            # carry either snake_case or camelCase provider keys.
+            camel = provider_key
+            if "_" in provider_key:
+                head, *rest = provider_key.split("_")
+                camel = head + "".join(part.title() for part in rest)
+            for candidate_key in (provider_key, camel):
+                value = payload.get(candidate_key)
+                if isinstance(value, str) and value.strip() and value != "auto":
+                    return value
+            if provider_key != "provider":
+                global_provider = payload.get("provider", "auto")
+                if isinstance(global_provider, str) and global_provider != "auto":
+                    return global_provider
+            return "auto"
+
+        for key, (key_aliases, provider_key) in aliases.items():
             found = False
             value = None
             matched_alias = None
@@ -341,7 +369,7 @@ class AgentDefaults(Base):
                 candidates = normalize_model_candidates(value)
 
                 # Prepend provider prefix if missing and provider is specified
-                provider = payload.get("provider", "auto")
+                provider = _provider_for(provider_key)
                 if provider != "auto":
                     from mira_engine.providers.registry import find_by_name
 
@@ -370,35 +398,23 @@ class AgentDefaults(Base):
     def default_model_candidates(self) -> list[str]:
         return self.model_candidates or [self.model]
 
-    @property
-    def primary_routing_model(self) -> str:
-        return self.route_model or self.small_model or self.primary_model
+    def role_model(self, role: str) -> str:
+        """Return the model for a ``team`` role, falling back to ``model``."""
+        value = getattr(self, f"{role}_model", None)
+        return value or self.primary_model
 
-    @property
-    def routing_model_candidates(self) -> list[str]:
-        if self.route_model_candidates:
-            return self.route_model_candidates
-        if self.route_model:
-            return [self.route_model]
-        return self.tier_model_candidates("small")
+    def role_model_candidates(self, role: str) -> list[str]:
+        """Return the candidate models for a ``team`` role, with fallback."""
+        candidates = getattr(self, f"{role}_model_candidates", None) or []
+        if candidates:
+            return list(candidates)
+        value = getattr(self, f"{role}_model", None)
+        return [value] if value else self.default_model_candidates
 
-    def primary_model_for_tier(self, tier: str) -> str:
-        if tier == "small":
-            return self.small_model or self.primary_model
-        if tier == "medium":
-            return self.medium_model or self.primary_model
-        if tier == "large":
-            return self.large_model or self.primary_model
-        return self.primary_model
-
-    def tier_model_candidates(self, tier: str) -> list[str]:
-        if tier == "small":
-            return self.small_model_candidates or ([self.small_model] if self.small_model else [self.primary_model])
-        if tier == "medium":
-            return self.medium_model_candidates or ([self.medium_model] if self.medium_model else [self.primary_model])
-        if tier == "large":
-            return self.large_model_candidates or ([self.large_model] if self.large_model else [self.primary_model])
-        return self.default_model_candidates
+    def role_provider(self, role: str) -> str:
+        """Return the explicit provider override for a role ('auto' if none)."""
+        value = getattr(self, f"{role}_provider", None)
+        return value if isinstance(value, str) and value.strip() else "auto"
 
 
 class AgentsConfig(Base):
@@ -413,12 +429,36 @@ class ProviderConfig(Base):
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    models: list[str] = Field(default_factory=list)  # User-curated model ids for this provider
+    # Explicit on/off toggle from the Providers UI. ``None`` (the default) means
+    # "auto": the provider is treated as enabled whenever it is configured
+    # (has a credential/endpoint/model list, or is local/OAuth). ``True``/``False``
+    # force the state regardless of configuration.
+    enabled: bool | None = None
+
+
+class ModelParamRule(Base):
+    """A user-defined, provider-agnostic per-model request-parameter rule.
+
+    ``pattern`` is matched against the model name (case-insensitive): a glob
+    (``*``/``?``/``[]``) is matched with fnmatch against the full model id and
+    its short form, otherwise it is treated as a substring. ``params`` maps
+    request kwargs to values; a ``null`` value drops that parameter entirely
+    (for models that reject it). These rules layer on top of mira's built-in
+    defaults and win on conflict, and default to an empty list.
+    """
+
+    pattern: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
     proxy: str | None = None  # Global proxy for LLM provider HTTP calls.
+    # User-editable per-model parameter rules (see ModelParamRule). Empty by
+    # default; surfaced and edited from the Providers UI.
+    model_params: list[ModelParamRule] = Field(default_factory=list)
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -603,9 +643,15 @@ class Config(BaseSettings):
         return Path(self.agents.defaults.workspace).expanduser()
 
     def _match_provider(
-        self, model: str | None = None
+        self, model: str | None = None, provider_override: str | None = None
     ) -> tuple["ProviderConfig | None", str | None]:
-        """Match provider config and its registry name. Returns (config, spec_name)."""
+        """Match provider config and its registry name. Returns (config, spec_name).
+
+        ``provider_override`` lets a caller (e.g. a ``team`` role) pin a
+        specific provider regardless of the global ``agents.defaults.provider``
+        setting. Pass ``"auto"`` to explicitly force auto-detection even when a
+        global provider is configured; pass ``None`` to inherit the global.
+        """
         from mira_engine.providers.registry import PROVIDERS, find_by_name
 
         def _normalized_provider_name(value: str | None) -> str | None:
@@ -619,7 +665,10 @@ class Config(BaseSettings):
                 chars.append(ch.lower())
             return "".join(chars)
 
-        forced = self.agents.defaults.provider
+        if provider_override is not None:
+            forced = provider_override
+        else:
+            forced = self.agents.defaults.provider
         if forced != "auto":
             forced_normalized = _normalized_provider_name(forced)
             spec = find_by_name(forced_normalized or forced)
@@ -679,26 +728,34 @@ class Config(BaseSettings):
                 return p, spec.name
         return None, None
 
-    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
+    def get_provider(
+        self, model: str | None = None, provider_override: str | None = None
+    ) -> ProviderConfig | None:
         """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
-        p, _ = self._match_provider(model)
+        p, _ = self._match_provider(model, provider_override)
         return p
 
-    def get_provider_name(self, model: str | None = None) -> str | None:
+    def get_provider_name(
+        self, model: str | None = None, provider_override: str | None = None
+    ) -> str | None:
         """Get the registry name of the matched provider (e.g. "deepseek", "openrouter")."""
-        _, name = self._match_provider(model)
+        _, name = self._match_provider(model, provider_override)
         return name
 
-    def get_api_key(self, model: str | None = None) -> str | None:
+    def get_api_key(
+        self, model: str | None = None, provider_override: str | None = None
+    ) -> str | None:
         """Get API key for the given model. Falls back to first available key."""
-        p = self.get_provider(model)
+        p = self.get_provider(model, provider_override)
         return p.api_key if p else None
 
-    def get_api_base(self, model: str | None = None) -> str | None:
+    def get_api_base(
+        self, model: str | None = None, provider_override: str | None = None
+    ) -> str | None:
         """Get API base URL for the given model. Applies default URLs for gateway/local providers."""
         from mira_engine.providers.registry import find_by_name
 
-        p, name = self._match_provider(model)
+        p, name = self._match_provider(model, provider_override)
         if p and p.api_base:
             return p.api_base
         # Only gateways get a default api_base here. Standard providers

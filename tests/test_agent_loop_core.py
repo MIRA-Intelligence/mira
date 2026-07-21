@@ -122,7 +122,8 @@ def _make_loop(tmp_path: Path) -> BaseAgentLoop:
     loop.context = ContextBuilder(tmp_path)
     loop.tools = ToolRegistry()
     loop.tools.register(_EchoTool())
-    loop.model_router = SimpleNamespace(enabled=True)
+    loop.model_candidates = None
+    loop.provider_factory = lambda _model: None
     loop._project_sessions = {}
     loop._TOOL_RESULT_MAX_CHARS = 20
     return loop
@@ -151,10 +152,12 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
     new_workspace.mkdir()
     loop = _make_real_loop(old_workspace)
     new_provider = _NoopProvider()
-    new_router = SimpleNamespace(enabled=True)
 
     def new_factory(_model: str) -> _NoopProvider:
         return new_provider
+
+    def new_role_factory(_role: str):
+        return new_provider, "custom/new-model", ("custom/new-model",)
 
     loop._session_model_runtimes["ui:user"] = object()  # type: ignore[assignment]
     loop.subagents._session_runtimes["ui:user"] = object()  # type: ignore[assignment]
@@ -163,7 +166,8 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
         provider=new_provider,
         model="custom/new-model",
         provider_factory=new_factory,
-        model_router=new_router,
+        model_candidates=["custom/new-model"],
+        role_provider_factory=new_role_factory,
         workspace=new_workspace,
         max_iterations=64,
         max_tokens=2048,
@@ -179,7 +183,8 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
     assert loop.provider is new_provider
     assert loop.model == "custom/new-model"
     assert loop.provider_factory is new_factory
-    assert loop.model_router is new_router
+    assert loop.model_candidates == ["custom/new-model"]
+    assert loop.role_provider_factory is new_role_factory
     assert loop.workspace == new_workspace
     assert loop.max_iterations == 64
     assert loop.max_tokens == 2048
@@ -188,7 +193,7 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
     assert loop._session_model_runtimes == {}
     assert loop.subagents.provider is new_provider
     assert loop.subagents.provider_factory is new_factory
-    assert loop.subagents.model_router is new_router
+    assert loop.subagents.role_provider_factory is new_role_factory
     assert loop.subagents._session_runtimes == {}
     assert loop.subagents.runner.provider is new_provider
     assert loop.consolidator.provider is new_provider
@@ -243,7 +248,6 @@ def test_static_helper_methods(tmp_path: Path) -> None:
         tool_name="read_file", arguments={"path": "/a/skills/demo/SKILL.md"}
     ) == {"tool": "read_file", "skill_name": "demo", "path": "/a/skills/demo/SKILL.md"}
     assert BaseAgentLoop._build_skill_invoked_event(tool_name="exec", arguments={}) is None
-    assert "score=3" in BaseAgentLoop._route_hint("small", "m", ("x",), 3, "instinct", "r")
 
     merged = loop._compose_extra_system("UI rules", "Guard notice")
     assert merged == "UI rules\n\nGuard notice"

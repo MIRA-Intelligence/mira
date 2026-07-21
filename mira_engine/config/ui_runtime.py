@@ -12,6 +12,8 @@ from mira_engine.config.schema import AgentDefaults, Config, ProvidersConfig
 from mira_engine.providers.registry import find_by_name
 
 _ALLOWED_REASONING_EFFORTS = {"low", "medium", "high", "adaptive"}
+# ``team`` profile roles, each bindable to its own provider + model.
+_TEAM_ROLES = ("supervisor", "student", "critic")
 _BUNDLE_SETUP_PROVIDER = "custom"
 _BUNDLE_SETUP_MODEL = "custom/mira-ui-bundle-setup"
 _BUNDLE_SETUP_API_BASE = "http://127.0.0.1:9/v1"
@@ -27,9 +29,10 @@ def _mask_secret(value: str) -> str | None:
 
 
 def _provider_field_names() -> tuple[str, ...]:
-    # ProvidersConfig also contains global provider settings such as `proxy`.
+    # ProvidersConfig also contains global settings (`proxy`, `model_params`).
     # The UI provider map below only serializes concrete ProviderConfig entries.
-    return tuple(name for name in ProvidersConfig.model_fields.keys() if name != "proxy")
+    _non_provider = {"proxy", "model_params"}
+    return tuple(name for name in ProvidersConfig.model_fields.keys() if name not in _non_provider)
 
 
 def _provider_display_name(provider_name: str) -> str:
@@ -149,16 +152,38 @@ def _build_provider_payload(config: Config) -> dict[str, dict[str, Any]]:
             "api_key_configured": False,
             "api_key_preview": None,
             "api_base": None,
+            "models": [],
+            "configured": False,
+            "enabled": False,
             **_provider_metadata("auto"),
         }
     }
     for provider_name in _provider_field_names():
         provider_cfg = getattr(config.providers, provider_name)
+        meta = _provider_metadata(provider_name)
+        api_key_configured = bool(provider_cfg.api_key)
+        models = list(provider_cfg.models)
+        # "Configured" means the provider has enough to be usable: a
+        # credential/endpoint, a local/OAuth backend, or a curated model list.
+        configured = (
+            api_key_configured
+            or bool(provider_cfg.api_base)
+            or bool(meta["is_local"])
+            or bool(meta["is_oauth"])
+            or bool(models)
+        )
+        # "Enabled" is the explicit on/off toggle. ``None`` (unset) falls back to
+        # the derived ``configured`` state so existing configs keep working.
+        explicit_enabled = provider_cfg.enabled
+        enabled = configured if explicit_enabled is None else bool(explicit_enabled)
         providers[provider_name] = {
-            "api_key_configured": bool(provider_cfg.api_key),
+            "api_key_configured": api_key_configured,
             "api_key_preview": _mask_secret(provider_cfg.api_key),
             "api_base": provider_cfg.api_base,
-            **_provider_metadata(provider_name),
+            "models": models,
+            "configured": configured,
+            "enabled": enabled,
+            **meta,
         }
     return providers
 
@@ -242,27 +267,66 @@ def build_ui_runtime_payload(
     resolved_projects_root = projects_root.expanduser().resolve(strict=False)
     raw_workspace = _workspace_payload_value(defaults.workspace, resolved_projects_root)
 
+    runtime: dict[str, Any] = {
+        "workspace": raw_workspace,
+        "workspace_resolved": str(resolved_projects_root),
+        "provider": defaults.provider,
+        "model": defaults.model,
+        "reasoning_effort": defaults.reasoning_effort,
+        "temperature": defaults.temperature,
+        "max_tool_iterations": defaults.max_tool_iterations,
+        "auto_max_rounds": defaults.auto_max_rounds,
+        "restrict_to_workspace": config.tools.restrict_to_workspace,
+        "setup_required": setup_required,
+        "setup_message": setup_message,
+        "setup_code": setup_code,
+        "setup_subject": setup_subject,
+    }
+    # ``team`` profile per-role bindings. ``*_provider`` is the explicit
+    # provider override ("auto" to inherit), ``*_model`` is the raw configured
+    # model (null inherits the primary model).
+    for role in _TEAM_ROLES:
+        runtime[f"{role}_provider"] = defaults.role_provider(role)
+        runtime[f"{role}_model"] = getattr(defaults, f"{role}_model", None)
+
     return {
         "projects_root": str(resolved_projects_root),
         "config_path": str(config_path),
         "persisted": persisted,
-        "runtime": {
-            "workspace": raw_workspace,
-            "workspace_resolved": str(resolved_projects_root),
-            "provider": defaults.provider,
-            "model": defaults.model,
-            "reasoning_effort": defaults.reasoning_effort,
-            "temperature": defaults.temperature,
-            "max_tool_iterations": defaults.max_tool_iterations,
-            "restrict_to_workspace": config.tools.restrict_to_workspace,
-            "setup_required": setup_required,
-            "setup_message": setup_message,
-            "setup_code": setup_code,
-            "setup_subject": setup_subject,
-        },
+        "runtime": runtime,
         "providers": providers,
         "provider_proxy": config.providers.proxy,
+        "model_params": [
+            {"pattern": rule.pattern, "params": dict(rule.params)}
+            for rule in config.providers.model_params
+        ],
     }
+
+
+def _normalize_model_param_rules(raw: Any) -> list[dict[str, Any]]:
+    """Validate + normalize an incoming ``model_params`` payload to JSON records.
+
+    Each rule must be ``{"pattern": str, "params": object}``. ``params`` values
+    are passed through verbatim (``null`` is allowed and means "drop the param").
+    Rules with a blank pattern are dropped.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("model_params must be a list")
+    rules: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"model_params[{index}] must be an object")
+        pattern = item.get("pattern")
+        if not isinstance(pattern, str):
+            raise ValueError(f"model_params[{index}].pattern must be a string")
+        pattern = pattern.strip()
+        if not pattern:
+            continue
+        params = item.get("params", {})
+        if not isinstance(params, dict):
+            raise ValueError(f"model_params[{index}].params must be an object")
+        rules.append({"pattern": pattern, "params": dict(params)})
+    return rules
 
 
 def _workspace_payload_value(raw_workspace: str, projects_root: Path) -> str:
@@ -340,6 +404,15 @@ def apply_ui_runtime_update_to_raw_data(
             )
             changed = True
 
+        if "auto_max_rounds" in runtime_payload:
+            _set_alias_value(
+                defaults,
+                "auto_max_rounds",
+                runtime_payload["auto_max_rounds"],
+                alias="autoMaxRounds",
+            )
+            changed = True
+
         if "restrict_to_workspace" in runtime_payload:
             tools = _ensure_json_record(data, "tools")
             _set_alias_value(
@@ -349,6 +422,29 @@ def apply_ui_runtime_update_to_raw_data(
                 alias="restrictToWorkspace",
             )
             changed = True
+
+        for role in _TEAM_ROLES:
+            provider_key = f"{role}_provider"
+            model_key = f"{role}_model"
+            if provider_key in runtime_payload:
+                _set_alias_value(
+                    defaults,
+                    provider_key,
+                    str(runtime_payload[provider_key]).strip(),
+                    alias=to_camel(provider_key),
+                )
+                changed = True
+            if model_key in runtime_payload:
+                raw_model = runtime_payload[model_key]
+                value = None if raw_model in (None, "") else str(raw_model).strip()
+                _set_alias_value(defaults, model_key, value, alias=to_camel(model_key))
+                changed = True
+
+    if "model_params" in payload:
+        rules = _normalize_model_param_rules(payload.get("model_params"))
+        providers = _ensure_json_record(data, "providers")
+        _set_alias_value(providers, "model_params", rules, alias="modelParams")
+        changed = True
 
     providers_payload = payload.get("providers")
     if isinstance(providers_payload, dict):
@@ -371,8 +467,33 @@ def apply_ui_runtime_update_to_raw_data(
                 value = None if api_base in (None, "") else str(api_base).strip()
                 _set_alias_value(provider_cfg, "api_base", value, alias="apiBase")
                 changed = True
+            if "models" in provider_update and isinstance(provider_update["models"], list):
+                cleaned = [str(m).strip() for m in provider_update["models"] if str(m).strip()]
+                _set_alias_value(provider_cfg, "models", cleaned)
+                changed = True
+            if "enabled" in provider_update:
+                enabled = provider_update["enabled"]
+                _set_alias_value(provider_cfg, "enabled", None if enabled is None else bool(enabled))
+                changed = True
 
     return projects_root, changed
+
+
+def _fill_missing_defaults(base: Any, overlay: Any) -> Any:
+    """Deep-merge ``overlay`` over ``base`` with ``overlay`` taking precedence.
+
+    ``base`` supplies default values for any key the ``overlay`` omits, while
+    ``overlay`` (the user's raw on-disk JSON) wins wherever it defines a value.
+    This materializes schema defaults for full visibility without normalizing
+    away authored forms the schema can't round-trip (e.g. model candidate
+    lists) or dropping legacy/unknown keys.
+    """
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        merged = dict(base)
+        for key, value in overlay.items():
+            merged[key] = _fill_missing_defaults(base.get(key), value) if key in base else value
+        return merged
+    return overlay
 
 
 def save_ui_runtime_update(
@@ -382,18 +503,27 @@ def save_ui_runtime_update(
     current_projects_root: Path,
     config_path: Path,
 ) -> None:
-    """Persist a UI settings update while preserving unrelated raw JSON fields."""
+    """Persist a UI settings update as a fully-resolved config.
+
+    The base is the complete ``model_dump`` of the loaded config, so every
+    parameter (including schema defaults) is written to disk, giving users
+    full visibility over the effective configuration. The existing raw file is
+    deep-merged on top so authored forms the schema cannot round-trip (model
+    candidate lists) and any legacy/unknown keys are preserved verbatim.
+    """
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # ``config`` is loaded from ``config_path`` at the call site, so this dump
+    # already reflects on-disk user values merged with schema defaults.
     data = config.model_dump(by_alias=True)
     if config_path.exists():
         try:
             with open(config_path, encoding="utf-8") as f:
                 existing = json.load(f)
             if isinstance(existing, dict):
-                data = existing
+                data = _fill_missing_defaults(data, existing)
         except (OSError, json.JSONDecodeError, ValueError):
-            data = config.model_dump(by_alias=True)
+            pass
 
     apply_ui_runtime_update_to_raw_data(
         data,
@@ -457,6 +587,12 @@ def apply_ui_runtime_update(
             model = model.strip()
             if config.agents.defaults.model != model:
                 config.agents.defaults.model = model
+                # ``model_candidates`` is only derived by the validator at
+                # construction, so a live model switch would otherwise keep the
+                # previous provider's candidates around. Left stale, those
+                # fallbacks get routed through the *new* forced provider (e.g. a
+                # leftover ``gpt-5.5`` sent to DeepSeek), which the API rejects.
+                config.agents.defaults.model_candidates = [model]
                 changed = True
 
         if "reasoning_effort" in runtime_payload:
@@ -493,6 +629,16 @@ def apply_ui_runtime_update(
                 config.agents.defaults.max_tool_iterations = max_tool_iterations
                 changed = True
 
+        if "auto_max_rounds" in runtime_payload:
+            auto_max_rounds = runtime_payload["auto_max_rounds"]
+            if isinstance(auto_max_rounds, bool) or not isinstance(auto_max_rounds, int):
+                raise ValueError("runtime.auto_max_rounds must be a positive integer")
+            if auto_max_rounds < 1:
+                raise ValueError("runtime.auto_max_rounds must be a positive integer")
+            if config.agents.defaults.auto_max_rounds != auto_max_rounds:
+                config.agents.defaults.auto_max_rounds = auto_max_rounds
+                changed = True
+
         if "restrict_to_workspace" in runtime_payload:
             restrict_to_workspace = runtime_payload["restrict_to_workspace"]
             if not isinstance(restrict_to_workspace, bool):
@@ -500,6 +646,54 @@ def apply_ui_runtime_update(
             if config.tools.restrict_to_workspace != restrict_to_workspace:
                 config.tools.restrict_to_workspace = restrict_to_workspace
                 changed = True
+
+        for role in _TEAM_ROLES:
+            provider_key = f"{role}_provider"
+            model_key = f"{role}_model"
+            if provider_key in runtime_payload:
+                provider = runtime_payload[provider_key]
+                if not isinstance(provider, str) or not provider.strip():
+                    raise ValueError(f"runtime.{provider_key} must be a non-empty string")
+                provider = provider.strip()
+                if provider != "auto" and provider not in _provider_field_names():
+                    raise ValueError(f"unsupported provider: {provider}")
+                if getattr(config.agents.defaults, provider_key) != provider:
+                    setattr(config.agents.defaults, provider_key, provider)
+                    changed = True
+            if model_key in runtime_payload:
+                raw_model = runtime_payload[model_key]
+                if raw_model is None or raw_model == "":
+                    next_model: str | None = None
+                elif isinstance(raw_model, str):
+                    next_model = raw_model.strip() or None
+                else:
+                    raise ValueError(f"runtime.{model_key} must be a string or null")
+                if getattr(config.agents.defaults, model_key) != next_model:
+                    setattr(config.agents.defaults, model_key, next_model)
+                    # Keep the role's candidate list in sync (see the primary
+                    # ``model`` handling above): a live role-model switch must
+                    # not leave the prior model as a stale routing fallback.
+                    setattr(
+                        config.agents.defaults,
+                        f"{role}_model_candidates",
+                        [next_model] if next_model else [],
+                    )
+                    changed = True
+
+    if "model_params" in payload:
+        from mira_engine.config.schema import ModelParamRule
+        from mira_engine.providers.registry import set_user_model_param_rules
+
+        rules = _normalize_model_param_rules(payload.get("model_params"))
+        next_rules = [ModelParamRule(pattern=r["pattern"], params=r["params"]) for r in rules]
+        current = [
+            {"pattern": r.pattern, "params": dict(r.params)}
+            for r in config.providers.model_params
+        ]
+        if current != rules:
+            config.providers.model_params = next_rules
+            set_user_model_param_rules([(r["pattern"], r["params"]) for r in rules])
+            changed = True
 
     providers_payload = payload.get("providers")
     if providers_payload is not None:
@@ -543,6 +737,23 @@ def apply_ui_runtime_update(
                     raise ValueError(f"providers.{provider_name}.api_base must be a string or null")
                 if provider_cfg.api_base != next_api_base:
                     provider_cfg.api_base = next_api_base
+                    changed = True
+
+            if "models" in provider_update:
+                models = provider_update["models"]
+                if not isinstance(models, list):
+                    raise ValueError(f"providers.{provider_name}.models must be a list")
+                next_models = [str(m).strip() for m in models if str(m).strip()]
+                if provider_cfg.models != next_models:
+                    provider_cfg.models = next_models
+                    changed = True
+
+            if "enabled" in provider_update:
+                enabled = provider_update["enabled"]
+                if enabled is not None and not isinstance(enabled, bool):
+                    raise ValueError(f"providers.{provider_name}.enabled must be a boolean or null")
+                if provider_cfg.enabled != enabled:
+                    provider_cfg.enabled = enabled
                     changed = True
 
     return projects_root, changed

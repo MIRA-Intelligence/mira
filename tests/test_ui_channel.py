@@ -2545,3 +2545,128 @@ async def test_handle_remove_project_keeps_files_hidden_from_list(ui_channel: Ui
     list_resp = await ui_channel._handle_list_projects(MagicMock(spec=web.Request))
     list_body = json.loads(list_resp.text)
     assert [item["id"] for item in list_body["projects"]] == []
+
+
+def _model_cache(provider: str = "deepseek") -> "Any":
+    from mira_engine.providers.model_fetch import ModelCache, ModelInfo
+
+    return ModelCache(
+        provider=provider,
+        api_base="https://api.deepseek.com",
+        fetched_at="2026-05-13T12:00:00Z",
+        models=[
+            ModelInfo(id="deepseek-chat", config_model="deepseek/deepseek-chat"),
+            ModelInfo(id="deepseek-reasoner", config_model="deepseek/deepseek-reasoner"),
+        ],
+    )
+
+
+async def test_handle_provider_models_fetches_and_returns_ids(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod, "read_model_cache", lambda *_a, **_k: None)
+
+    async def fake_fetch(cfg, provider, cfg_path):
+        return _model_cache(provider), tmp_path / "models" / "deepseek.json"
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_models_to_cache", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "deepseek"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["provider"] == "deepseek"
+    assert body["models"] == ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+    assert body["cached"] is False
+
+
+async def test_handle_provider_models_rejects_unknown_provider(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "not-a-provider"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+
+    assert resp.status == 400
+    assert "unknown provider" in json.loads(resp.text)["error"]
+
+
+async def test_handle_provider_models_surfaces_fetch_error(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod, "read_model_cache", lambda *_a, **_k: None)
+
+    async def fake_fetch(*_a, **_k):
+        raise ui_channel_mod.ModelFetchError("bad api key")
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_models_to_cache", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "deepseek"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+
+    assert resp.status == 502
+    assert json.loads(resp.text)["error"] == "bad api key"
+
+
+async def test_handle_provider_test_reports_success(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+
+    captured: dict[str, Any] = {}
+
+    async def fake_fetch(cfg, provider):
+        captured["api_key"] = cfg.providers.deepseek.api_key
+        return _model_cache(provider)
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_provider_models", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "deepseek"}
+    req.json = AsyncMock(return_value={"api_key": "sk-transient"})
+    resp = await ui_channel._handle_provider_test(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body == {"ok": True, "message": "Connection succeeded", "model_count": 2}
+    # Transient credential applied to the in-memory config (not persisted).
+    assert captured["api_key"] == "sk-transient"
+
+
+async def test_handle_provider_test_reports_failure(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+
+    async def fake_fetch(*_a, **_k):
+        raise ui_channel_mod.ModelFetchError("unauthorized")
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_provider_models", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "deepseek"}
+    req.json = AsyncMock(return_value={})
+    resp = await ui_channel._handle_provider_test(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["ok"] is False
+    assert body["message"] == "unauthorized"

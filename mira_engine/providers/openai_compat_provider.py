@@ -26,6 +26,7 @@ else:
     from openai import AsyncOpenAI
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.registry import model_overrides_for
 from mira_engine.providers.openai_responses import (
     consume_sdk_stream,
     convert_messages,
@@ -344,12 +345,7 @@ class OpenAICompatProvider(LLMProvider):
         else:
             kwargs["max_tokens"] = max(1, max_tokens)
 
-        if spec:
-            model_lower = model_name.lower()
-            for pattern, overrides in spec.model_overrides:
-                if pattern in model_lower:
-                    kwargs.update(overrides)
-                    break
+        self._apply_param_overrides(kwargs, model_overrides_for(model_name, spec))
 
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
