@@ -61,3 +61,35 @@ def test_memory_same_workspace(tmp_path, monkeypatch):
     # Backup should be None when workspace is global
     assert store.backup_dir is None
 
+
+def test_global_memory_is_shared_across_projects(tmp_path, monkeypatch):
+    """Global long-term memory is shared across all projects (per-user).
+
+    Regression: previously ``read_global_term`` gated on the project living
+    under the global workspace, so an independent project_dir never saw global
+    memory learned elsewhere. Under the "global shared + per-project overlay"
+    model, project B must see global memory written by project A, while each
+    project's own memory stays isolated.
+    """
+    global_ws = tmp_path / "global_workspace"
+    project_a = tmp_path / "project_a"
+    project_b = tmp_path / "project_b"
+
+    import mira_engine.config.paths
+    monkeypatch.setattr(mira_engine.config.paths, "get_workspace_path", lambda x: global_ws)
+
+    store_a = MemoryStore(workspace=project_a)
+    store_a.write_global_term("SHARED GLOBAL FACT")
+    store_a.write_long_term("PROJECT A ONLY")
+
+    # A fresh store for project B (no explicit global write of its own) must
+    # still see the shared global memory, but NOT project A's local memory.
+    store_b = MemoryStore(workspace=project_b)
+    store_b.write_long_term("PROJECT B ONLY")
+
+    assert store_b.read_global_term() == "SHARED GLOBAL FACT"
+    context_b = store_b.get_memory_context()
+    assert "SHARED GLOBAL FACT" in context_b
+    assert "PROJECT B ONLY" in context_b
+    assert "PROJECT A ONLY" not in context_b
+

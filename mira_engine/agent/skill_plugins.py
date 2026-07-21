@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -22,6 +23,23 @@ _GLOBAL_STATE_FILENAME = "plugin_state.json"
 _PROJECT_OVERRIDES_FILENAME = "plugin_overrides.json"
 _BUILTIN_PLUGIN_ID = "builtin-skills"
 _BUILTIN_PLUGIN_NAME = "Built-in Skills"
+_BUILTIN_MANIFEST_UNCACHED = object()
+# Directories skipped when scanning built-in skills (keeps startup/interrupt responsive).
+_BUILTIN_SCAN_SKIP_DIRS = frozenset({
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".coverage",
+    "htmlcov",
+})
 
 
 class SkillPluginError(ValueError):
@@ -78,6 +96,12 @@ class SkillPluginManager:
         self.global_state_path = self.global_skills_dir / _GLOBAL_STATE_FILENAME
         self.project_overrides_path = self.project_skills_dir / _PROJECT_OVERRIDES_FILENAME
         self.builtin_skills_dir = Path(__file__).parent.parent / "skills"
+        self._builtin_manifest_cache: dict[str, Any] | None | object = _BUILTIN_MANIFEST_UNCACHED
+
+    def warm_builtin_manifest_cache(self) -> None:
+        """Build and cache the built-in skill manifest (safe to call from a worker thread)."""
+        if self._builtin_manifest_cache is _BUILTIN_MANIFEST_UNCACHED:
+            self._builtin_manifest_cache = self._build_builtin_manifest()
 
     def _read_json(self, path: Path) -> dict[str, Any]:
         if not path.is_file():
@@ -142,14 +166,27 @@ class SkillPluginManager:
         )
 
     def _build_builtin_manifest(self) -> dict[str, Any] | None:
+        if isinstance(self._builtin_manifest_cache, dict):
+            return self._builtin_manifest_cache
+
         root = self.builtin_skills_dir
         if not root.is_dir():
+            self._builtin_manifest_cache = _BUILTIN_MANIFEST_UNCACHED
             return None
 
         skills: list[dict[str, Any]] = []
         groups_map: dict[str, set[str]] = {}
         seen: set[str] = set()
-        for skill_file in sorted(root.rglob("SKILL.md")):
+        skill_files: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if d not in _BUILTIN_SCAN_SKIP_DIRS and not d.startswith(".")
+            ]
+            if "SKILL.md" in filenames:
+                skill_files.append(Path(dirpath) / "SKILL.md")
+        for skill_file in sorted(skill_files):
             rel = skill_file.relative_to(root)
             parts = rel.parts
             if len(parts) < 2:
@@ -170,6 +207,7 @@ class SkillPluginManager:
             })
 
         if not skills:
+            self._builtin_manifest_cache = _BUILTIN_MANIFEST_UNCACHED
             return None
 
         groups = [
@@ -180,7 +218,7 @@ class SkillPluginManager:
             }
             for group_id, skill_ids in sorted(groups_map.items(), key=lambda item: item[0])
         ]
-        return {
+        manifest = {
             "id": _BUILTIN_PLUGIN_ID,
             "name": _BUILTIN_PLUGIN_NAME,
             "version": "1.0.0",
@@ -189,10 +227,17 @@ class SkillPluginManager:
             "groups": groups,
             "skills": skills,
         }
+        self._builtin_manifest_cache = manifest
+        return manifest
 
     def _iter_plugin_records(self) -> list[tuple[dict[str, Any], Path, dict[str, str]]]:
         records: list[tuple[dict[str, Any], Path, dict[str, str]]] = []
-        builtin = self._build_builtin_manifest()
+        self.warm_builtin_manifest_cache()
+        builtin = (
+            self._builtin_manifest_cache
+            if isinstance(self._builtin_manifest_cache, dict)
+            else None
+        )
         if builtin is not None:
             records.append(
                 (

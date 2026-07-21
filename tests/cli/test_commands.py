@@ -13,6 +13,7 @@ from mira_engine.bus.events import OutboundMessage
 from mira_engine.cli.commands import _make_provider, app
 from mira_engine.config.schema import Config
 from mira_engine.cron.types import CronJob, CronPayload
+from mira_engine.providers.model_fetch import ModelCache, ModelInfo, write_model_cache
 from mira_engine.providers.openai_codex_provider import _strip_model_prefix
 from mira_engine.providers.registry import find_by_name
 
@@ -245,6 +246,193 @@ def test_config_dump_excludes_oauth_provider_blocks():
 
     assert "openaiCodex" not in providers
     assert "githubCopilot" not in providers
+
+
+def test_status_reports_oauth_not_logged_in_without_token(tmp_path, monkeypatch):
+    from mira_engine.cli import commands
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "github_copilot",
+                    "model": "github_copilot/gpt-4.1",
+                    "workspace": str(tmp_path / "workspace"),
+                }
+            }
+        }
+    )
+
+    monkeypatch.setattr("mira_engine.config.loader.get_config_path", lambda: config_path)
+    monkeypatch.setattr("mira_engine.config.loader.load_config", lambda: config)
+    monkeypatch.setattr(commands, "_oauth_login_status", lambda _name: (False, None))
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    output = _strip_ansi(result.stdout)
+    assert "OpenAI Codex: not logged in" in output
+    assert "GitHub Copilot: not logged in" in output
+    assert "OpenAI Codex: ✓ (OAuth)" not in output
+    assert "GitHub Copilot: ✓ (OAuth)" not in output
+
+
+def test_status_reports_oauth_authenticated_only_when_token_exists(tmp_path, monkeypatch):
+    from mira_engine.cli import commands
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "github_copilot",
+                    "model": "github_copilot/gpt-4.1",
+                    "workspace": str(tmp_path / "workspace"),
+                }
+            }
+        }
+    )
+
+    def fake_oauth_status(name: str) -> tuple[bool, str | None]:
+        if name == "github_copilot":
+            return True, "octocat"
+        return False, None
+
+    monkeypatch.setattr("mira_engine.config.loader.get_config_path", lambda: config_path)
+    monkeypatch.setattr("mira_engine.config.loader.load_config", lambda: config)
+    monkeypatch.setattr(commands, "_oauth_login_status", fake_oauth_status)
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    output = _strip_ansi(result.stdout)
+    assert "OpenAI Codex: not logged in" in output
+    assert "GitHub Copilot: ✓ OAuth octocat" in output
+
+
+def test_oauth_login_status_reads_github_copilot_token(monkeypatch):
+    from mira_engine.cli import commands
+    import mira_engine.providers.github_copilot_provider as github_provider
+
+    monkeypatch.setattr(
+        github_provider,
+        "get_github_copilot_login_status",
+        lambda: SimpleNamespace(access="github-token", account_id="octocat"),
+    )
+
+    assert commands._oauth_login_status("github_copilot") == (True, "octocat")
+
+
+def test_oauth_login_status_reads_openai_codex_token(monkeypatch):
+    import oauth_cli_kit
+    from mira_engine.cli import commands
+
+    monkeypatch.setattr(commands, "ensure_oauth_state_dirs_for_runtime", lambda: None)
+    monkeypatch.setattr(
+        oauth_cli_kit,
+        "get_token",
+        lambda: SimpleNamespace(access="codex-token", account_id="acct-123"),
+    )
+
+    assert commands._oauth_login_status("openai_codex") == (True, "acct-123")
+
+
+def test_oauth_login_status_treats_missing_token_as_logged_out(monkeypatch):
+    from mira_engine.cli import commands
+    import mira_engine.providers.github_copilot_provider as github_provider
+
+    monkeypatch.setattr(github_provider, "get_github_copilot_login_status", lambda: None)
+
+    assert commands._oauth_login_status("github_copilot") == (False, None)
+
+
+def test_models_list_reads_cached_provider_models(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "provider": "github_copilot",
+                        "model": "github_copilot/gpt-4.1",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_model_cache(
+        ModelCache(
+            provider="github_copilot",
+            fetched_at="2026-05-13T12:00:00Z",
+            models=[
+                ModelInfo(
+                    id="gpt-4.1",
+                    display_name="GPT 4.1",
+                    config_model="github_copilot/gpt-4.1",
+                )
+            ],
+        ),
+        config_path,
+    )
+
+    result = runner.invoke(app, ["models", "list", "github_copilot", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    output = _strip_ansi(result.stdout)
+    assert "github_copilot/gpt-4.1" in output
+
+
+def test_models_select_writes_selected_cached_model(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "provider": "github_copilot",
+                        "model": "github_copilot/gpt-4.1",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_model_cache(
+        ModelCache(
+            provider="github_copilot",
+            fetched_at="2026-05-13T12:00:00Z",
+            models=[
+                ModelInfo(
+                    id="gemini-3.1-pro",
+                    display_name="Gemini 3.1 Pro",
+                    config_model="github_copilot/gemini-3.1-pro",
+                )
+            ],
+        ),
+        config_path,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "models",
+            "select",
+            "github_copilot",
+            "--model",
+            "gemini-3.1-pro",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    saved = Config.model_validate(json.loads(config_path.read_text(encoding="utf-8")))
+    assert saved.agents.defaults.provider == "github_copilot"
+    assert saved.agents.defaults.model == "github_copilot/gemini-3.1-pro"
 
 
 def test_config_matches_explicit_ollama_prefix_without_api_key():
@@ -826,9 +1014,14 @@ def _patch_cli_command_runtime(
         "mira_engine.cli.commands.sync_workspace_templates",
         sync_templates or (lambda _path: None),
     )
+    provider_factory = make_provider or (lambda _config: object())
     monkeypatch.setattr(
         "mira_engine.cli.commands._make_provider",
-        make_provider or (lambda _config: object()),
+        provider_factory,
+    )
+    monkeypatch.setattr(
+        "mira_engine.cli.commands._make_gateway_provider",
+        provider_factory,
     )
 
     if message_bus is not None:
@@ -994,6 +1187,10 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     monkeypatch.setattr("mira_engine.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("mira_engine.cli.commands.sync_workspace_templates", lambda _path: None)
     monkeypatch.setattr("mira_engine.cli.commands._make_provider", lambda _config: provider)
+    monkeypatch.setattr(
+        "mira_engine.cli.commands._make_gateway_provider",
+        lambda _config, _model=None: provider,
+    )
     monkeypatch.setattr("mira_engine.bus.queue.MessageBus", lambda: bus)
     monkeypatch.setattr("mira_engine.session.manager.SessionManager", lambda _workspace: object())
 

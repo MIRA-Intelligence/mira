@@ -1,11 +1,17 @@
+import json
 from pathlib import Path
 
-from mira_engine.config.schema import Config
+import pytest
+
+from mira_engine.config.loader import load_config
+from mira_engine.config.schema import Config, ModelParamRule
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
     apply_ui_runtime_update_to_raw_data,
     build_ui_runtime_payload,
+    save_ui_runtime_update,
 )
+from mira_engine.providers.registry import model_overrides_for, set_user_model_param_rules
 
 
 def test_build_ui_runtime_payload_includes_dynamic_provider_metadata() -> None:
@@ -32,6 +38,102 @@ def test_build_ui_runtime_payload_includes_dynamic_provider_metadata() -> None:
     assert payload["providers"]["deepseek"]["api_key_configured"] is True
     assert "proxy" not in payload["providers"]
     assert payload["provider_proxy"] == "http://127.0.0.1:7890"
+
+
+def test_build_ui_runtime_payload_serializes_model_params() -> None:
+    cfg = Config()
+    cfg.providers.model_params = [
+        ModelParamRule(pattern="*nemotron*", params={"temperature": 1.0}),
+        ModelParamRule(pattern="*o1*", params={"temperature": None}),
+    ]
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=True,
+    )
+
+    assert payload["model_params"] == [
+        {"pattern": "*nemotron*", "params": {"temperature": 1.0}},
+        {"pattern": "*o1*", "params": {"temperature": None}},
+    ]
+
+
+def test_build_ui_runtime_payload_defaults_model_params_empty() -> None:
+    payload = build_ui_runtime_payload(
+        Config(),
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=True,
+    )
+
+    assert payload["model_params"] == []
+
+
+def test_apply_ui_runtime_update_sets_model_params_and_registry() -> None:
+    set_user_model_param_rules(None)
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {
+            "model_params": [
+                {"pattern": "*my-model*", "params": {"temperature": 1.0}},
+                {"pattern": "  ", "params": {"temperature": 0.5}},  # blank -> dropped
+            ]
+        },
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert [r.pattern for r in cfg.providers.model_params] == ["*my-model*"]
+    # The rule is live in the registry immediately.
+    assert model_overrides_for("custom/my-model-v2") == {"temperature": 1.0}
+    set_user_model_param_rules(None)
+
+
+def test_apply_ui_runtime_update_rejects_bad_model_params() -> None:
+    cfg = Config()
+    with pytest.raises(ValueError):
+        apply_ui_runtime_update(
+            cfg,
+            {"model_params": [{"pattern": "x", "params": "nope"}]},
+            current_projects_root=Path("/tmp/workspace"),
+        )
+
+
+def test_apply_ui_runtime_update_to_raw_data_writes_model_params() -> None:
+    data: dict = {}
+    apply_ui_runtime_update_to_raw_data(
+        data,
+        {"model_params": [{"pattern": "*gpt-5*", "params": {"temperature": None}}]},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert data["providers"]["modelParams"] == [
+        {"pattern": "*gpt-5*", "params": {"temperature": None}}
+    ]
+
+
+def test_build_ui_runtime_payload_includes_nvidia_provider_metadata() -> None:
+    cfg = Config()
+    cfg.agents.defaults.provider = "nvidia"
+    cfg.agents.defaults.model = "nvidia/deepseek-ai/deepseek-v4-pro"
+    cfg.providers.nvidia.api_key = "nvapi-test-key"
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=True,
+    )
+
+    assert payload["runtime"]["setup_required"] is False
+    assert payload["providers"]["nvidia"]["display_name"] == "NVIDIA"
+    assert payload["providers"]["nvidia"]["api_key_required"] is True
+    assert payload["providers"]["nvidia"]["api_base_required"] is False
+    assert payload["providers"]["nvidia"]["default_api_base"] == "https://inference-api.nvidia.com/v1"
 
 
 def test_build_ui_runtime_payload_returns_raw_and_resolved_workspace(tmp_path, monkeypatch) -> None:
@@ -205,3 +307,443 @@ def test_apply_ui_runtime_update_to_raw_data_preserves_routing_models() -> None:
     assert defaults["maxToolIterations"] == 64
     assert data["providers"]["openrouter"]["apiKey"] == "existing-key"
     assert data["providers"]["openrouter"]["apiBase"] == "https://openrouter.ai/api/v1"
+
+
+def test_build_ui_runtime_payload_includes_temperature() -> None:
+    cfg = Config()
+    cfg.agents.defaults.temperature = 0.42
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    assert payload["runtime"]["temperature"] == 0.42
+
+
+def test_apply_ui_runtime_update_sets_temperature() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"temperature": 1}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.temperature == 1.0
+
+
+def test_apply_ui_runtime_update_clears_temperature_when_null() -> None:
+    cfg = Config()
+    cfg.agents.defaults.temperature = 0.7
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"temperature": None}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.temperature is None
+
+
+def test_apply_ui_runtime_update_clears_temperature_when_empty_string() -> None:
+    cfg = Config()
+    cfg.agents.defaults.temperature = 0.7
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"temperature": ""}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.temperature is None
+
+
+def test_apply_ui_runtime_update_rejects_out_of_range_temperature() -> None:
+    cfg = Config()
+
+    for bad in (-0.1, 2.1, "hot", True):
+        try:
+            apply_ui_runtime_update(
+                cfg,
+                {"runtime": {"temperature": bad}},
+                current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+            )
+        except ValueError:
+            continue
+        raise AssertionError(f"temperature {bad!r} should have been rejected")
+
+
+def test_apply_ui_runtime_update_to_raw_data_sets_temperature() -> None:
+    data: dict = {"agents": {"defaults": {}}}
+
+    _, changed = apply_ui_runtime_update_to_raw_data(
+        data,
+        {"runtime": {"temperature": 0.9}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert data["agents"]["defaults"]["temperature"] == 0.9
+
+
+def test_build_ui_runtime_payload_exposes_auto_max_rounds() -> None:
+    cfg = Config()
+    cfg.agents.defaults.auto_max_rounds = 42
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    assert payload["runtime"]["auto_max_rounds"] == 42
+
+
+def test_apply_ui_runtime_update_sets_auto_max_rounds() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"auto_max_rounds": 250}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.auto_max_rounds == 250
+
+
+def test_apply_ui_runtime_update_resyncs_model_candidates_on_model_switch() -> None:
+    """A live model switch must clear the prior provider's stale candidates.
+
+    Regression: switching provider->model to DeepSeek left ``model_candidates``
+    at the previous ``openai/openai/gpt-5.5`` value, which the forced DeepSeek
+    provider then rejected ("you passed gpt-5.5").
+    """
+    from mira_engine.config.schema import AgentDefaults
+
+    cfg = Config()
+    cfg.agents.defaults = AgentDefaults.model_validate(
+        {"provider": "nvidia", "model": "openai/openai/gpt-5.5"}
+    )
+    assert cfg.agents.defaults.default_model_candidates == ["openai/openai/gpt-5.5"]
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"provider": "deepseek", "model": "deepseek/deepseek-v4-pro"}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.model == "deepseek/deepseek-v4-pro"
+    assert cfg.agents.defaults.default_model_candidates == ["deepseek/deepseek-v4-pro"]
+
+
+def test_apply_ui_runtime_update_resyncs_role_candidates_on_role_model_switch() -> None:
+    from mira_engine.config.schema import AgentDefaults
+
+    cfg = Config()
+    cfg.agents.defaults = AgentDefaults.model_validate(
+        {
+            "provider": "deepseek",
+            "model": "deepseek/deepseek-v4-pro",
+            "supervisor_provider": "nvidia",
+            "supervisor_model": "openai/openai/gpt-5.5",
+        }
+    )
+    assert cfg.agents.defaults.role_model_candidates("supervisor") == [
+        "openai/openai/gpt-5.5"
+    ]
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"runtime": {"supervisor_model": "deepseek/deepseek-v4-flash"}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.role_model_candidates("supervisor") == [
+        "deepseek/deepseek-v4-flash"
+    ]
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True, "10"])
+def test_apply_ui_runtime_update_rejects_invalid_auto_max_rounds(bad) -> None:
+    cfg = Config()
+    with pytest.raises(ValueError):
+        apply_ui_runtime_update(
+            cfg,
+            {"runtime": {"auto_max_rounds": bad}},
+            current_projects_root=Path("/tmp/workspace"),
+        )
+
+
+def test_apply_ui_runtime_update_to_raw_data_sets_auto_max_rounds() -> None:
+    data: dict = {"agents": {"defaults": {}}}
+
+    _, changed = apply_ui_runtime_update_to_raw_data(
+        data,
+        {"runtime": {"auto_max_rounds": 75}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert data["agents"]["defaults"]["autoMaxRounds"] == 75
+
+
+def test_build_ui_runtime_payload_exposes_models_and_configured() -> None:
+    cfg = Config()
+    cfg.providers.deepseek.api_key = "sk-deepseek"
+    cfg.providers.deepseek.models = ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    deepseek = payload["providers"]["deepseek"]
+    assert deepseek["models"] == ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+    assert deepseek["configured"] is True
+    # A provider with no key/base/models and not local/oauth is not "configured".
+    assert payload["providers"]["openai"]["configured"] is False
+    assert payload["providers"]["openai"]["models"] == []
+
+
+def test_build_ui_runtime_payload_includes_team_role_bindings() -> None:
+    cfg = Config()
+    cfg.agents.defaults.supervisor_provider = "anthropic"
+    cfg.agents.defaults.supervisor_model = "anthropic/claude-opus-4-5"
+    cfg.agents.defaults.student_provider = "deepseek"
+    cfg.agents.defaults.student_model = "deepseek/deepseek-chat"
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    runtime = payload["runtime"]
+    assert runtime["supervisor_provider"] == "anthropic"
+    assert runtime["supervisor_model"] == "anthropic/claude-opus-4-5"
+    assert runtime["student_provider"] == "deepseek"
+    assert runtime["student_model"] == "deepseek/deepseek-chat"
+    # Unset role inherits: provider "auto", model null.
+    assert runtime["critic_provider"] == "auto"
+    assert runtime["critic_model"] is None
+
+
+def test_apply_ui_runtime_update_sets_provider_models() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"providers": {"deepseek": {"models": ["deepseek/deepseek-chat", "  ", "deepseek/deepseek-reasoner"]}}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    # Blank entries are dropped.
+    assert cfg.providers.deepseek.models == ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+
+
+def test_apply_ui_runtime_update_sets_role_bindings() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {
+            "runtime": {
+                "critic_provider": "anthropic",
+                "critic_model": "anthropic/claude-opus-4-5",
+                "student_model": "",
+            }
+        },
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.agents.defaults.critic_provider == "anthropic"
+    assert cfg.agents.defaults.critic_model == "anthropic/claude-opus-4-5"
+    assert cfg.agents.defaults.student_model is None
+
+
+def test_apply_ui_runtime_update_rejects_unknown_role_provider() -> None:
+    cfg = Config()
+
+    try:
+        apply_ui_runtime_update(
+            cfg,
+            {"runtime": {"supervisor_provider": "not-a-provider"}},
+            current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+        )
+    except ValueError as exc:
+        assert "unsupported provider" in str(exc)
+    else:
+        raise AssertionError("unknown role provider should have been rejected")
+
+
+def test_apply_ui_runtime_update_to_raw_data_sets_role_and_models() -> None:
+    data: dict = {"agents": {"defaults": {}}, "providers": {}}
+
+    _, changed = apply_ui_runtime_update_to_raw_data(
+        data,
+        {
+            "runtime": {
+                "supervisor_provider": "anthropic",
+                "supervisor_model": "anthropic/claude-opus-4-5",
+            },
+            "providers": {"deepseek": {"models": ["deepseek/deepseek-chat"]}},
+        },
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    defaults = data["agents"]["defaults"]
+    assert defaults["supervisorProvider"] == "anthropic"
+    assert defaults["supervisorModel"] == "anthropic/claude-opus-4-5"
+    assert data["providers"]["deepseek"]["models"] == ["deepseek/deepseek-chat"]
+
+
+def test_build_ui_runtime_payload_enabled_defaults_to_configured() -> None:
+    cfg = Config()
+    cfg.providers.deepseek.api_key = "sk-deepseek"
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    # Unset enabled => follows the derived "configured" state.
+    assert payload["providers"]["deepseek"]["enabled"] is True
+    assert payload["providers"]["openai"]["enabled"] is False
+
+
+def test_build_ui_runtime_payload_enabled_explicit_overrides_configured() -> None:
+    cfg = Config()
+    # Configured (has a key) but explicitly disabled.
+    cfg.providers.deepseek.api_key = "sk-deepseek"
+    cfg.providers.deepseek.enabled = False
+    # Not configured but explicitly enabled.
+    cfg.providers.openai.enabled = True
+
+    payload = build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=False,
+    )
+
+    assert payload["providers"]["deepseek"]["configured"] is True
+    assert payload["providers"]["deepseek"]["enabled"] is False
+    assert payload["providers"]["openai"]["enabled"] is True
+
+
+def test_apply_ui_runtime_update_sets_provider_enabled() -> None:
+    cfg = Config()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {"providers": {"openai": {"enabled": True}, "deepseek": {"enabled": False}}},
+        current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+    )
+
+    assert changed is True
+    assert cfg.providers.openai.enabled is True
+    assert cfg.providers.deepseek.enabled is False
+
+
+def test_apply_ui_runtime_update_rejects_non_boolean_enabled() -> None:
+    cfg = Config()
+
+    try:
+        apply_ui_runtime_update(
+            cfg,
+            {"providers": {"openai": {"enabled": "yes"}}},
+            current_projects_root=Path(cfg.agents.defaults.workspace).expanduser(),
+        )
+    except ValueError as exc:
+        assert "enabled must be a boolean" in str(exc)
+    else:
+        raise AssertionError("non-boolean enabled should have been rejected")
+
+
+def test_apply_ui_runtime_update_to_raw_data_sets_enabled() -> None:
+    data: dict = {"agents": {"defaults": {}}, "providers": {}}
+
+    _, changed = apply_ui_runtime_update_to_raw_data(
+        data,
+        {"providers": {"openai": {"enabled": True}}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert data["providers"]["openai"]["enabled"] is True
+
+
+def test_save_ui_runtime_update_writes_full_config(tmp_path) -> None:
+    """A UI save persists the fully-resolved config (defaults included)."""
+    config_path = tmp_path / "config.json"
+    # A sparse on-disk config, as produced by an older surgical-merge save.
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"provider": "nvidia", "model": "nvidia/foo"}},
+                "providers": {"nvidia": {"apiKey": "sk-secret", "models": ["nvidia/foo"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    save_ui_runtime_update(
+        config,
+        {"runtime": {"reasoning_effort": "high"}},
+        current_projects_root=tmp_path,
+        config_path=config_path,
+    )
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    # Schema defaults that were absent on disk are now materialized.
+    assert "gateway" in saved
+    assert "api" in saved
+    # User values are preserved.
+    assert saved["providers"]["nvidia"]["apiKey"] == "sk-secret"
+    assert saved["providers"]["nvidia"]["models"] == ["nvidia/foo"]
+    assert saved["agents"]["defaults"]["reasoningEffort"] == "high"
+
+
+def test_save_ui_runtime_update_preserves_unknown_keys(tmp_path) -> None:
+    """Legacy top-level keys the schema does not model survive a UI save."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"provider": "nvidia", "model": "nvidia/foo"}},
+                "providers": {"nvidia": {"apiKey": "sk-secret"}},
+                "legacySection": {"kept": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    save_ui_runtime_update(
+        config,
+        {"runtime": {"reasoning_effort": "low"}},
+        current_projects_root=tmp_path,
+        config_path=config_path,
+    )
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["legacySection"] == {"kept": True}

@@ -115,6 +115,7 @@ class ChannelManager:
                     kwargs["workspace"] = self.config.workspace_path
                     kwargs["bind_host"] = self.config.gateway.host
                     kwargs["bind_port"] = self.config.gateway.port
+                    kwargs["restrict_to_workspace"] = self.config.tools.restrict_to_workspace
                     kwargs["on_runtime_config_updated"] = self.on_ui_runtime_config_updated
                 self.channels[name] = cls(self._to_ns(section), self.bus, **kwargs)
                 logger.info("{} channel enabled", name)
@@ -263,7 +264,11 @@ class ChannelManager:
                     if msg.metadata.get("_activity_ping"):
                         if msg.channel != "ui":
                             continue
-                    elif msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
+                    elif (
+                        msg.metadata.get("_tool_hint")
+                        and msg.channel != "ui"
+                        and not self.config.channels.send_tool_hints
+                    ):
                         continue
                     elif not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
                         continue

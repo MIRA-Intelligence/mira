@@ -28,6 +28,26 @@ Before writing code, verify if the task is well-defined from an engineering pers
 3. **Fallback for Ambiguity**
    - If the user isn't sure about the best method, provide a comparison of 2-3 standard approaches detailing their Trade-offs (Speed vs. Accuracy vs. Implementation Complexity) and recommend one.
 
+## Interactive Plan Mode — Mandatory Before Experiments (project sessions)
+
+In a project session you MUST run an interactive planning stage before creating
+or running experiments. If literature review is enabled, do this after the
+research survey; otherwise do it immediately after creating `task_plan.json`.
+Drive the stage with the `set_plan` tool:
+
+1. Call `set_plan` with `phase="questions"` and 3-6 concise questions needed to
+   choose the engineering direction, target metric, constraints, or experiment
+   scope. After the tool call, stop and wait for the user's answers.
+2. When answers arrive in `task_plan.json` under `plan.answers`, call `set_plan`
+   with `phase="draft"` containing a short summary and proposed experiments.
+   Stop and wait for approval or revision feedback.
+3. Only after approval, call `set_plan` with `phase="approved"`, then create
+   `pending` experiment entries in `task_plan.json` and execute them according
+   to the current run mode.
+
+Do not ask these questions only in prose. The UI plan stage only renders content
+written through `set_plan`.
+
 ### The Cycle
 
 ```

@@ -1,5 +1,6 @@
 """Interactive onboarding questionnaire for mira."""
 
+import asyncio
 import json
 import types
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from mira_engine.cli.models import (
     get_model_suggestions,
 )
 from mira_engine.config.loader import get_config_path, load_config
-from mira_engine.config.schema import Config
+from mira_engine.config.schema import Config, UiChannelConfig
 
 console = Console()
 
@@ -523,9 +524,9 @@ def _handle_context_window_field(
 
 _FIELD_HANDLERS: dict[str, Any] = {
     "model": _handle_model_field,
-    "small_model": _handle_model_field,
-    "medium_model": _handle_model_field,
-    "large_model": _handle_model_field,
+    "supervisor_model": _handle_model_field,
+    "student_model": _handle_model_field,
+    "critic_model": _handle_model_field,
     "context_window_tokens": _handle_context_window_field,
 }
 
@@ -676,7 +677,6 @@ def _get_provider_info() -> dict[str, tuple[str, bool, bool, str]]:
             spec.default_api_base,
         )
         for spec in PROVIDERS
-        if not spec.is_oauth
     }
 
 
@@ -688,6 +688,19 @@ def _get_provider_names() -> dict[str, str]:
 
 def _provider_usage_hint(provider_name: str) -> str:
     """Return a short provider usage hint shown after provider selection."""
+    from mira_engine.providers.registry import find_by_name
+
+    spec = find_by_name(provider_name)
+    if spec and spec.is_oauth:
+        return (
+            f"Selected provider: [bold]{provider_name}[/bold]\n"
+            "This provider uses OAuth, not an API key in config.json.\n"
+            "How to use it:\n"
+            "1. Complete the OAuth login flow.\n"
+            "2. Set `agents.defaults.model` to a model from this provider.\n"
+            "3. Verify with `mira status`."
+        )
+
     provider_slug = provider_name.replace("_", "-")
     return (
         f"Selected provider: [bold]{provider_name}[/bold]\n"
@@ -698,8 +711,62 @@ def _provider_usage_hint(provider_name: str) -> str:
     )
 
 
+def _run_oauth_login(provider_name: str) -> None:
+    """Start the OAuth login flow for an OAuth-backed provider."""
+    from mira_engine.cli.commands import _run_oauth_login as run_oauth_login
+
+    run_oauth_login(provider_name)
+
+
+def _maybe_fetch_provider_models(config: Config, provider_name: str) -> None:
+    """Optionally fetch provider models after credentials are configured."""
+    action = _get_questionary().select(
+        "Model list",
+        choices=["Fetch models now", "Skip model fetch"],
+        default="Fetch models now",
+    ).ask()
+    if action != "Fetch models now":
+        return
+
+    from mira_engine.providers.model_fetch import fetch_models_to_cache
+
+    try:
+        cache, cache_path = asyncio.run(
+            fetch_models_to_cache(config, provider_name, get_config_path())
+        )
+    except Exception as e:
+        console.print(f"[yellow]! Could not fetch models: {e}[/yellow]")
+        return
+
+    console.print(
+        f"[green]+ Fetched {len(cache.models)} models for {provider_name}[/green] "
+        f"[dim]{cache_path}[/dim]"
+    )
+    if not cache.models:
+        return
+
+    select_action = _get_questionary().select(
+        "Default model",
+        choices=["Select from fetched models", "Keep current model"],
+        default="Select from fetched models",
+    ).ask()
+    if select_action != "Select from fetched models":
+        return
+
+    choices = [model.config_model for model in cache.models] + ["<- Back"]
+    selected = _select_with_back("Select model:", choices)
+    if not selected or selected is _BACK_PRESSED or selected == "<- Back":
+        return
+    assert isinstance(selected, str)
+    config.agents.defaults.model = selected
+    _try_auto_fill_context_window(config.agents.defaults, selected)
+
+
 def _configure_provider(config: Config, provider_name: str) -> None:
     """Configure a single LLM provider."""
+    from mira_engine.providers.registry import find_by_name
+
+    spec = find_by_name(provider_name)
     provider_config = getattr(config.providers, provider_name, None)
     if provider_config is None:
         console.print(f"[red]Unknown provider: {provider_name}[/red]")
@@ -717,6 +784,17 @@ def _configure_provider(config: Config, provider_name: str) -> None:
         provider_config.api_base = default_api_base
 
     console.print(Panel(_provider_usage_hint(provider_name), title=f"[bold]{display_name}[/bold]"))
+
+    if spec and spec.is_oauth:
+        action = _get_questionary().select(
+            "OAuth login",
+            choices=["Start OAuth login now", "Skip login for now"],
+            default="Start OAuth login now",
+        ).ask()
+        if action == "Start OAuth login now":
+            _run_oauth_login(provider_name)
+            _maybe_fetch_provider_models(config, provider_name)
+        return
 
     # Custom provider requires explicit apiBase configuration
     if provider_name == "custom":
@@ -765,17 +843,23 @@ def _configure_provider(config: Config, provider_name: str) -> None:
             provider_config.api_key = api_key.strip()
 
     setattr(config.providers, provider_name, provider_config)
+    if provider_config.api_key or provider_config.api_base or (spec and spec.is_local):
+        _maybe_fetch_provider_models(config, provider_name)
 
 
 def _configure_providers(config: Config) -> None:
     """Configure LLM providers."""
+    from mira_engine.providers.registry import find_by_name
 
     def get_provider_choices() -> list[str]:
         """Build provider choices with config status indicators."""
         choices = []
         for name, display in _get_provider_names().items():
             provider = getattr(config.providers, name, None)
-            if provider and provider.api_key:
+            spec = find_by_name(name)
+            if spec and spec.is_oauth and config.agents.defaults.provider == name:
+                choices.append(f"{display} *")
+            elif provider and provider.api_key:
                 choices.append(f"{display} *")
             else:
                 choices.append(display)
@@ -784,7 +868,10 @@ def _configure_providers(config: Config) -> None:
     while True:
         try:
             console.clear()
-            _show_section_header("LLM Providers", "Select a provider to configure API key and endpoint")
+            _show_section_header(
+                "LLM Providers",
+                "Select a provider to configure API key, OAuth, and endpoint",
+            )
             choices = get_provider_choices()
             answer = _select_with_back("Select provider:", choices)
 
@@ -888,23 +975,71 @@ def _configure_channels(config: Config) -> None:
             break
 
 
+def _get_ui_channel_config(config: Config) -> UiChannelConfig:
+    """Return the UI channel config as a typed model for gateway editing."""
+    current = getattr(config.channels, "ui", None)
+    if isinstance(current, UiChannelConfig):
+        return current
+    if isinstance(current, BaseModel):
+        return UiChannelConfig.model_validate(current.model_dump(by_alias=True))
+    if isinstance(current, dict):
+        return UiChannelConfig.model_validate(current)
+    return UiChannelConfig()
+
+
+def _configure_gateway_settings(config: Config) -> None:
+    """Configure gateway server settings and UI channel runtime settings."""
+    choices = ["Gateway Server", "UI Channel", "<- Back"]
+
+    while True:
+        try:
+            console.clear()
+            _show_section_header(
+                "Gateway Settings",
+                "Configure the backend server and the desktop/browser UI channel",
+            )
+            answer = _select_with_back("Select gateway area:", choices)
+
+            if answer is _BACK_PRESSED or answer is None or answer == "<- Back":
+                break
+
+            if answer == "Gateway Server":
+                updated_gateway = _configure_pydantic_model(config.gateway, "Gateway Server")
+                if updated_gateway is not None:
+                    config.gateway = updated_gateway
+                continue
+
+            if answer == "UI Channel":
+                updated_ui = _configure_pydantic_model(
+                    _get_ui_channel_config(config),
+                    "UI Channel",
+                )
+                if updated_ui is not None:
+                    setattr(
+                        config.channels,
+                        "ui",
+                        updated_ui.model_dump(by_alias=True, exclude_none=True),
+                    )
+                continue
+        except KeyboardInterrupt:
+            console.print("\n[dim]Returning to main menu...[/dim]")
+            break
+
+
 # --- General Settings ---
 
 _SETTINGS_SECTIONS: dict[str, tuple[str, str, set[str] | None]] = {
     "Agent Settings": ("Agent Defaults", "Configure default model, temperature, and behavior", None),
-    "Gateway": ("Gateway Settings", "Configure server host, port, and heartbeat", None),
     "Tools": ("Tools Settings", "Configure web search, shell exec, and other tools", {"mcp_servers"}),
 }
 
 _SETTINGS_GETTER = {
     "Agent Settings": lambda c: c.agents.defaults,
-    "Gateway": lambda c: c.gateway,
     "Tools": lambda c: c.tools,
 }
 
 _SETTINGS_SETTER = {
     "Agent Settings": lambda c, v: setattr(c.agents, "defaults", v),
-    "Gateway": lambda c, v: setattr(c, "gateway", v),
     "Tools": lambda c, v: setattr(c, "tools", v),
 }
 
@@ -957,13 +1092,27 @@ def _print_summary_panel(rows: list[tuple[str, str]], title: str) -> None:
 
 def _show_summary(config: Config) -> None:
     """Display configuration summary using rich."""
+    from mira_engine.providers.registry import find_by_name
+
     console.print()
 
     # Providers
     provider_rows = []
     for name, display in _get_provider_names().items():
+        spec = find_by_name(name)
         provider = getattr(config.providers, name, None)
-        status = "[green]configured[/green]" if (provider and provider.api_key) else "[dim]not configured[/dim]"
+        if spec and spec.is_oauth:
+            status = (
+                "[green]selected (OAuth)[/green]"
+                if config.agents.defaults.provider == name
+                else "[dim]not selected[/dim]"
+            )
+        else:
+            status = (
+                "[green]configured[/green]"
+                if (provider and provider.api_key)
+                else "[dim]not configured[/dim]"
+            )
         provider_rows.append((display, status))
     _print_summary_panel(provider_rows, "LLM Providers")
 
@@ -1079,7 +1228,7 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
             "[P] LLM Provider": lambda: _configure_providers(config),
             "[C] Chat Channel": lambda: _configure_channels(config),
             "[A] Agent Settings": lambda: _configure_general_settings(config, "Agent Settings"),
-            "[G] Gateway": lambda: _configure_general_settings(config, "Gateway"),
+            "[G] Gateway": lambda: _configure_gateway_settings(config),
             "[T] Tools": lambda: _configure_general_settings(config, "Tools"),
             "[V] View Configuration Summary": lambda: _show_summary(config),
         }

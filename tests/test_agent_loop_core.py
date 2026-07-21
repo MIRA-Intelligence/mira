@@ -24,6 +24,7 @@ from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.config.schema import ChannelsConfig, ExecToolConfig
+from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from mira_engine.session.manager import Session, SessionManager
 
@@ -68,8 +69,11 @@ class _SlowEchoTool(_EchoTool):
 
 
 class _RuntimeStub:
-    def __init__(self, responses: list[LLMResponse]):
+    def __init__(self, responses: list[LLMResponse], stream_deltas: list[str] | None = None):
         self._responses = list(responses)
+        self.stream_deltas = list(stream_deltas or [])
+        self.chat_calls = 0
+        self.stream_calls = 0
         self.route = RoutedModel(
             tier="small",
             model="dummy/default",
@@ -83,10 +87,23 @@ class _RuntimeStub:
         return object(), self.route
 
     async def chat(self, route: RoutedModel, **kwargs: Any):
+        self.chat_calls += 1
         if self._responses:
             response = self._responses.pop(0)
         else:
             response = LLMResponse(content="done")
+        return response, route
+
+    async def chat_stream_with_retry(self, route: RoutedModel, **kwargs: Any):
+        self.stream_calls += 1
+        on_content_delta = kwargs.get("on_content_delta")
+        if on_content_delta is not None:
+            for delta in self.stream_deltas:
+                await on_content_delta(delta)
+        if self._responses:
+            response = self._responses.pop(0)
+        else:
+            response = LLMResponse(content="".join(self.stream_deltas) or "done")
         return response, route
 
 
@@ -105,7 +122,8 @@ def _make_loop(tmp_path: Path) -> BaseAgentLoop:
     loop.context = ContextBuilder(tmp_path)
     loop.tools = ToolRegistry()
     loop.tools.register(_EchoTool())
-    loop.model_router = SimpleNamespace(enabled=True)
+    loop.model_candidates = None
+    loop.provider_factory = lambda _model: None
     loop._project_sessions = {}
     loop._TOOL_RESULT_MAX_CHARS = 20
     return loop
@@ -134,10 +152,12 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
     new_workspace.mkdir()
     loop = _make_real_loop(old_workspace)
     new_provider = _NoopProvider()
-    new_router = SimpleNamespace(enabled=True)
 
     def new_factory(_model: str) -> _NoopProvider:
         return new_provider
+
+    def new_role_factory(_role: str):
+        return new_provider, "custom/new-model", ("custom/new-model",)
 
     loop._session_model_runtimes["ui:user"] = object()  # type: ignore[assignment]
     loop.subagents._session_runtimes["ui:user"] = object()  # type: ignore[assignment]
@@ -146,7 +166,8 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
         provider=new_provider,
         model="custom/new-model",
         provider_factory=new_factory,
-        model_router=new_router,
+        model_candidates=["custom/new-model"],
+        role_provider_factory=new_role_factory,
         workspace=new_workspace,
         max_iterations=64,
         max_tokens=2048,
@@ -162,7 +183,8 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
     assert loop.provider is new_provider
     assert loop.model == "custom/new-model"
     assert loop.provider_factory is new_factory
-    assert loop.model_router is new_router
+    assert loop.model_candidates == ["custom/new-model"]
+    assert loop.role_provider_factory is new_role_factory
     assert loop.workspace == new_workspace
     assert loop.max_iterations == 64
     assert loop.max_tokens == 2048
@@ -171,7 +193,7 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
     assert loop._session_model_runtimes == {}
     assert loop.subagents.provider is new_provider
     assert loop.subagents.provider_factory is new_factory
-    assert loop.subagents.model_router is new_router
+    assert loop.subagents.role_provider_factory is new_role_factory
     assert loop.subagents._session_runtimes == {}
     assert loop.subagents.runner.provider is new_provider
     assert loop.consolidator.provider is new_provider
@@ -226,7 +248,6 @@ def test_static_helper_methods(tmp_path: Path) -> None:
         tool_name="read_file", arguments={"path": "/a/skills/demo/SKILL.md"}
     ) == {"tool": "read_file", "skill_name": "demo", "path": "/a/skills/demo/SKILL.md"}
     assert BaseAgentLoop._build_skill_invoked_event(tool_name="exec", arguments={}) is None
-    assert "score=3" in BaseAgentLoop._route_hint("small", "m", ("x",), 3, "instinct", "r")
 
     merged = loop._compose_extra_system("UI rules", "Guard notice")
     assert merged == "UI rules\n\nGuard notice"
@@ -298,6 +319,32 @@ async def test_run_agent_loop_tool_call_and_finish(tmp_path: Path) -> None:
     assert any(item[0] == "working" for item in progress)
     assert any(item[1] for item in progress)
     assert any(m.get("role") == "tool" for m in messages)
+
+
+async def test_run_agent_loop_streams_when_routed_runtime_is_active(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    runtime = _RuntimeStub([LLMResponse(content="Hello world")], stream_deltas=["Hel", "lo", " world"])
+    deltas: list[str] = []
+    stream_end_calls: list[bool] = []
+
+    async def _on_stream(delta: str) -> None:
+        deltas.append(delta)
+
+    async def _on_stream_end(*, resuming: bool = False) -> None:
+        stream_end_calls.append(resuming)
+
+    final, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=runtime,  # type: ignore[arg-type]
+        on_stream=_on_stream,
+        on_stream_end=_on_stream_end,
+    )
+
+    assert final == "Hello world"
+    assert deltas == ["Hel", "lo", " world"]
+    assert stream_end_calls == [False]
+    assert runtime.stream_calls == 1
+    assert runtime.chat_calls == 0
 
 
 async def test_run_agent_loop_keeps_long_tool_visibly_active(
@@ -395,18 +442,23 @@ async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
     assert empty.content == ""
 
     async def _boom(_msg):
-        raise RuntimeError("fail")
+        raise RuntimeError("kaboom detail")
 
     loop._process_message = _boom
     await loop._dispatch(msg)
     err = await loop.bus.consume_outbound()
-    assert err.content == "Sorry, I encountered an error."
+    assert err.content.startswith("Sorry, I ran into a problem")
+    assert "RuntimeError: kaboom detail" in err.content
+    assert err.metadata.get("_error") is True
+    assert err.metadata.get("error_type") == "RuntimeError"
+    assert err.metadata.get("error_code") == "unknown"
+    assert err.metadata.get("error_detail") == "RuntimeError: kaboom detail"
 
     cli_err_msg = InboundMessage(channel="cli", sender_id="u", chat_id="c", content="x")
     loop._process_message = _boom
     await loop._dispatch(cli_err_msg)
     cli_err = await loop.bus.consume_outbound()
-    assert "Sorry, I encountered an error." in cli_err.content
+    assert "RuntimeError: kaboom detail" in cli_err.content
     assert "mira agent --logs" in cli_err.content
 
 
@@ -459,6 +511,57 @@ def test_set_tool_context_calls_supported_tools(tmp_path: Path) -> None:
     assert ("message", ("ui", "chat-1", "msg-9")) in calls
     assert ("spawn", ("ui", "chat-1")) in calls
     assert ("cron", ("ui", "chat-1")) in calls
+
+
+async def test_project_ref_scopes_session_cache_and_tools(tmp_path: Path) -> None:
+    instance_workspace = tmp_path / "instance"
+    project_dir = tmp_path / "projects" / "alpha"
+    instance_workspace.mkdir()
+    project_dir.mkdir(parents=True)
+    (instance_workspace / "note.txt").write_text("instance", encoding="utf-8")
+    (project_dir / "note.txt").write_text("alpha", encoding="utf-8")
+
+    loop = BaseAgentLoop(
+        bus=MessageBus(),
+        provider=_NoopProvider(),
+        workspace=instance_workspace,
+        model="dummy/default",
+        channels_config=ChannelsConfig(),
+        exec_config=ExecToolConfig(timeout=5),
+        session_manager=SessionManager(instance_workspace),
+        restrict_to_workspace=True,
+    )
+    ref = ProjectRef(project_id="alpha", project_dir=project_dir, metadata={})
+    other_ref = ProjectRef(project_id="alpha", project_dir=tmp_path / "other" / "alpha", metadata={})
+    other_ref.project_dir.mkdir(parents=True)
+    scoped_key = loop._scoped_session_key(ref, "ui:chat-1")
+
+    assert scoped_key.startswith("project:")
+    assert scoped_key.endswith(":ui:chat-1")
+    assert loop._scoped_session_key(other_ref, "ui:chat-1") != scoped_key
+    first = loop._get_project_sessions(ref)
+    second = loop._get_project_sessions(ref)
+    other = loop._get_project_sessions(other_ref)
+    assert first is second
+    assert other is not first
+    assert first.workspace == project_dir
+
+    loop._set_tool_context("ui", "chat-1", "msg-1", project_ref=ref, session_key=scoped_key)
+    read_tool = loop.tools.get("read_file")
+    assert read_tool is not None
+    assert await read_tool.execute("note.txt") == "alpha"
+
+    spawn_tool = loop.tools.get("spawn")
+    assert spawn_tool is not None
+    assert spawn_tool._runtime_session_key.get() == scoped_key
+    assert spawn_tool._runtime_project_id.get() == "alpha"
+    assert spawn_tool._runtime_project_dir.get() == project_dir
+
+    loop._set_tool_context("ui", "chat-2", "msg-2", session_key="ui:chat-2")
+    assert await read_tool.execute("note.txt") == "instance"
+    assert spawn_tool._runtime_session_key.get() == "ui:chat-2"
+    assert spawn_tool._runtime_project_id.get() is None
+    assert spawn_tool._runtime_project_dir.get() is None
 
 
 def test_real_loop_initialization_registers_default_tools(tmp_path: Path) -> None:

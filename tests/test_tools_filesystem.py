@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mira_engine.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from mira_engine.agent.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
+from mira_engine.agent.tools.search import GlobTool
 
 
 async def test_read_file_success_and_missing(tmp_path: Path) -> None:
@@ -89,3 +95,38 @@ async def test_list_dir_error_conditions(tmp_path: Path) -> None:
     file_path = tmp_path / "file.txt"
     file_path.write_text("a", encoding="utf-8")
     assert await tool.execute("file.txt") == "Error: Not a directory: file.txt"
+
+
+async def test_filesystem_tools_use_runtime_project_context(tmp_path: Path) -> None:
+    instance_workspace = tmp_path / "instance"
+    project_a = tmp_path / "projects" / "alpha"
+    project_b = tmp_path / "projects" / "beta"
+    instance_workspace.mkdir()
+    project_a.mkdir(parents=True)
+    project_b.mkdir(parents=True)
+    (instance_workspace / "note.txt").write_text("instance", encoding="utf-8")
+    (project_a / "note.txt").write_text("alpha", encoding="utf-8")
+    (project_b / "note.txt").write_text("beta", encoding="utf-8")
+
+    tool = ReadFileTool(workspace=instance_workspace, allowed_dir=instance_workspace)
+    assert await tool.execute("note.txt") == "instance"
+
+    tool.set_runtime_context(workspace=project_a, allowed_dir=project_a)
+    assert await tool.execute("note.txt") == "alpha"
+    assert "outside allowed directories" in await tool.execute(str(project_b / "note.txt"))
+
+    tool.clear_runtime_context()
+    assert await tool.execute("note.txt") == "instance"
+
+
+async def test_glob_display_paths_are_relative_to_runtime_project(tmp_path: Path) -> None:
+    instance_workspace = tmp_path / "instance"
+    project_dir = tmp_path / "projects" / "alpha"
+    (project_dir / "src").mkdir(parents=True)
+    instance_workspace.mkdir()
+    (project_dir / "src" / "main.py").write_text("print('ok')", encoding="utf-8")
+
+    tool = GlobTool(workspace=instance_workspace, allowed_dir=instance_workspace)
+    tool.set_runtime_context(workspace=project_dir, allowed_dir=project_dir)
+
+    assert await tool.execute("*.py", path="src") == "src/main.py"

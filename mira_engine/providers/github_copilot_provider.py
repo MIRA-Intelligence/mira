@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import webbrowser
 from collections.abc import Callable
+from typing import Any
 
 import httpx
 from oauth_cli_kit.models import OAuthToken
@@ -22,12 +23,12 @@ GITHUB_COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 GITHUB_COPILOT_SCOPE = "read:user"
 TOKEN_FILENAME = "github-copilot.json"
 TOKEN_APP_NAME = "mira"
-USER_AGENT = "mira/0.1"
-EDITOR_VERSION = "vscode/1.99.0"
-EDITOR_PLUGIN_VERSION = "copilot-chat/0.26.0"
+USER_AGENT = "GitHubCopilotChat/0.28.0"
+EDITOR_VERSION = "vscode/1.115.0"
+EDITOR_PLUGIN_VERSION = "copilot-chat/0.28.0"
+COPILOT_INTEGRATION_ID = "vscode-chat"
 _EXPIRY_SKEW_SECONDS = 60
 _LONG_LIVED_TOKEN_SECONDS = 315360000
-
 
 def _storage() -> FileTokenStorage:
     ensure_oauth_state_dirs_for_runtime()
@@ -45,7 +46,57 @@ def _copilot_headers(token: str) -> dict[str, str]:
         "User-Agent": USER_AGENT,
         "Editor-Version": EDITOR_VERSION,
         "Editor-Plugin-Version": EDITOR_PLUGIN_VERSION,
+        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
     }
+
+
+def _normalize_copilot_api_base(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    base = value.strip()
+    if not base:
+        return None
+    if not base.startswith(("http://", "https://")):
+        base = f"https://{base}"
+    try:
+        url = httpx.URL(base)
+    except httpx.InvalidURL:
+        return None
+    host = url.host or ""
+    if host != "githubcopilot.com" and not host.endswith(".githubcopilot.com"):
+        return None
+    if host.startswith(("telemetry.", "origin-tracker.")):
+        return None
+    netloc = host
+    if url.port is not None:
+        netloc = f"{netloc}:{url.port}"
+    path = url.path.rstrip("/")
+    for suffix in ("/chat/completions", "/models"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+            break
+    return f"{url.scheme}://{netloc}{path}".rstrip("/")
+
+
+def _extract_copilot_api_base(payload: dict[str, Any]) -> str | None:
+    endpoints = payload.get("endpoints")
+    if not isinstance(endpoints, dict):
+        return None
+
+    for key in ("api", "chat", "proxy", "completions", "copilot_api"):
+        base = _normalize_copilot_api_base(endpoints.get(key))
+        if base:
+            return base
+
+    for value in endpoints.values():
+        base = _normalize_copilot_api_base(value)
+        if base:
+            return base
+    return None
+
+
+def _normalize_copilot_model_name(model: str) -> str:
+    return model.split("/")[-1]
 
 
 def _load_github_token() -> OAuthToken | None:
@@ -160,22 +211,54 @@ def login_github_copilot(
 class GitHubCopilotProvider(OpenAICompatProvider):
     """Provider that exchanges a stored GitHub OAuth token for Copilot access tokens."""
 
-    def __init__(self, default_model: str = "github-copilot/gpt-4.1"):
+    def __init__(
+        self,
+        default_model: str = "github-copilot/gpt-4.1",
+        api_base: str | None = None,
+        proxy: str | None = None,
+    ):
         from mira_engine.providers.registry import find_by_name
 
         self._copilot_access_token: str | None = None
         self._copilot_expires_at: float = 0.0
+        self._configured_api_base = _normalize_copilot_api_base(api_base)
+        self._copilot_api_base = self._configured_api_base or DEFAULT_COPILOT_BASE_URL
+        self.proxy = proxy or None
+        self._openai_http_client = (
+            httpx.AsyncClient(proxy=self.proxy, trust_env=True) if self.proxy else None
+        )
         super().__init__(
             api_key="no-key",
-            api_base=DEFAULT_COPILOT_BASE_URL,
+            api_base=self._copilot_api_base,
             default_model=default_model,
             extra_headers={
                 "Editor-Version": EDITOR_VERSION,
                 "Editor-Plugin-Version": EDITOR_PLUGIN_VERSION,
+                "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+                "OpenAI-Intent": "conversation-panel",
                 "User-Agent": USER_AGENT,
             },
             spec=find_by_name("github_copilot"),
+            http_client=self._openai_http_client,
         )
+
+    def _set_copilot_api_base(self, api_base: str) -> None:
+        if api_base == self._copilot_api_base:
+            return
+        self._copilot_api_base = api_base
+        self.api_base = api_base
+        self._effective_base = api_base
+        try:
+            self._client.base_url = api_base
+        except Exception:
+            pass
+
+    def _build_kwargs(self, *args, **kwargs) -> dict[str, Any]:
+        request = super()._build_kwargs(*args, **kwargs)
+        model = request.get("model")
+        if isinstance(model, str):
+            request["model"] = _normalize_copilot_model_name(model)
+        return request
 
     async def _get_copilot_access_token(self) -> str:
         now = time.time()
@@ -187,13 +270,25 @@ class GitHubCopilotProvider(OpenAICompatProvider):
             raise RuntimeError("GitHub Copilot is not logged in. Run: mira onboard and choose Github Copilot.")
 
         timeout = httpx.Timeout(20.0, connect=20.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=True) as client:
+        client_kwargs: dict[str, Any] = {
+            "timeout": timeout,
+            "follow_redirects": True,
+            "trust_env": True,
+        }
+        if self.proxy:
+            client_kwargs["proxy"] = self.proxy
+        async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.get(
                 DEFAULT_COPILOT_TOKEN_URL,
                 headers=_copilot_headers(github_token.access),
             )
             response.raise_for_status()
             payload = response.json()
+
+        if not self._configured_api_base:
+            api_base = _extract_copilot_api_base(payload)
+            if api_base:
+                self._set_copilot_api_base(api_base)
 
         token = payload.get("token")
         if not token:

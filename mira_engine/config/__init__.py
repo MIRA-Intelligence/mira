@@ -1,6 +1,6 @@
 """Configuration module for mira."""
 
-from mira_engine.config.loader import get_config_path, load_config
+from mira_engine.config.loader import get_config_path, get_home_dir, load_config
 from mira_engine.config.paths import (
     get_bridge_install_dir,
     get_cli_history_path,
@@ -18,6 +18,7 @@ __all__ = [
     "Config",
     "load_config",
     "get_config_path",
+    "get_home_dir",
     "get_data_dir",
     "get_runtime_subdir",
     "get_media_dir",

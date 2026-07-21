@@ -1,0 +1,55 @@
+.github_branch_mirror: &github_branch_mirror
+  imports: https://cnb.cool/mira-intelligence/mira-secrets/-/blob/main/env.yml
+  stages:
+    - name: verify github sync token
+      image: alpine:3.20
+      script: |
+        if [ -z "${GH_SYNC_TOKEN}" ]; then
+          echo "GH_SYNC_TOKEN is required in CNB via key-repository imports."
+          exit 1
+        fi
+    - name: mirror cnb branch to github
+      image: tencentcom/git-sync
+      settings:
+        target_url: https://github.com/MIRA-Intelligence/mira.git
+        auth_type: https
+        username: x-access-token
+        password: ${GH_SYNC_TOKEN}
+        branch: ${CNB_BRANCH}
+        force: false
+
+.cnb_metadata_to_github: &cnb_metadata_to_github
+  imports: https://cnb.cool/mira-intelligence/mira-secrets/-/blob/main/env.yml
+  stages:
+    - name: verify github sync token
+      image: alpine:3.20
+      script: |
+        if [ -z "${GH_SYNC_TOKEN}" ]; then
+          echo "GH_SYNC_TOKEN is required in CNB via key-repository imports."
+          exit 1
+        fi
+    - name: sync cnb metadata to github
+      image: python:3.11-slim
+      script: python scripts/sync_cnb_issue_to_github.py
+
+"cnb/**":
+  push:
+    - *github_branch_mirror
+
+"$":
+  pull_request:
+    - *cnb_metadata_to_github
+  pull_request.update:
+    - *cnb_metadata_to_github
+  pull_request.comment:
+    - *cnb_metadata_to_github
+  issue.open:
+    - *cnb_metadata_to_github
+  issue.update:
+    - *cnb_metadata_to_github
+  issue.close:
+    - *cnb_metadata_to_github
+  issue.reopen:
+    - *cnb_metadata_to_github
+  issue.comment:
+    - *cnb_metadata_to_github

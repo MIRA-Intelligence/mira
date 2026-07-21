@@ -1552,6 +1552,71 @@ async def test_handle_list_projects_only_returns_prj_with_meta(ui_channel: UiCha
     assert meta["contract_version"] == 1
 
 
+async def test_handle_create_project_registers_custom_parent(ui_channel: UiChannel, tmp_path: Path) -> None:
+    parent = tmp_path / "chosen-parent"
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={
+        "project_id": "lung-ct-baseline",
+        "display_name": "Lung CT Baseline",
+        "project_parent_dir": str(parent),
+        "run_mode": "manual",
+        "agent_profile": "research",
+        "contract_version": 2,
+    })
+
+    resp = await ui_channel._handle_create_project(req)
+    body = json.loads(resp.text)
+
+    assert resp.status == 201
+    assert body["id"] == "lung-ct-baseline"
+    assert body["display_name"] == "Lung CT Baseline"
+    assert body["project_dir"] == str((parent / "lung-ct-baseline").resolve())
+    assert body["run_mode"] == "manual"
+    assert body["agent_profile"] == "research"
+    assert body["contract_version"] == 2
+
+    workspace_file = ui_channel._project_workspace_path
+    registry = json.loads(workspace_file.read_text(encoding="utf-8"))
+    assert registry["projects"][0]["id"] == "lung-ct-baseline"
+
+    list_resp = await ui_channel._handle_list_projects(MagicMock(spec=web.Request))
+    list_body = json.loads(list_resp.text)
+    assert [item["id"] for item in list_body["projects"]] == ["lung-ct-baseline"]
+
+
+async def test_handle_create_project_managed_mode_ignores_client_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = MagicMock(spec=UiChannelConfig)
+    config.project_storage = "managed"
+    config.managed_project_root = str(tmp_path / "managed")
+    bus = MagicMock(spec=MessageBus)
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setattr(
+        ui_channel_mod,
+        "get_runtime_subdir",
+        lambda name: (runtime_root / name).mkdir(parents=True, exist_ok=True) or (runtime_root / name),
+    )
+    with patch.object(BaseChannel, "__init__", _minimal_base_init):
+        with patch.object(ui_channel_mod, "_load_ui_instructions", return_value=""):
+            ch = UiChannel(config, bus, workspace=tmp_path / "local")
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={
+        "project_id": "cloud-project",
+        "display_name": "Cloud Project",
+        "project_parent_dir": str(tmp_path / "client-choice"),
+    })
+
+    resp = await ch._handle_create_project(req)
+    body = json.loads(resp.text)
+
+    assert resp.status == 201
+    assert body["project_dir"] == str((tmp_path / "managed" / "cloud-project").resolve())
+    assert ch._project_location_payload()["custom_dir_allowed"] is False
+
+
 async def test_handle_project_meta_updates_display_name(ui_channel: UiChannel) -> None:
     project_dir = ui_channel.projects_root / "PRJ-0001"
     project_dir.mkdir(parents=True)
@@ -1711,6 +1776,59 @@ async def test_handle_upload_project_files_writes_data_files(ui_channel: UiChann
     data_dir = ui_channel.projects_root / "PRJ-0001" / "data"
     assert (data_dir / "sample.csv").read_bytes() == b"a,b\n"
     assert (data_dir / "sample_1.csv").read_bytes() == b"c,d\n"
+
+
+async def test_handle_upload_project_files_preserves_data_directory_paths(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0002"}
+    req.query = {}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="dataset/tables/a.csv", chunks=[b"a,b\n"]),
+        _FakePart(name="files", filename="dataset/tables/a.csv", chunks=[b"c,d\n"]),
+        _FakePart(name="files", filename="dataset/notes/readme.txt", chunks=[b"ok"]),
+    ]))
+
+    resp = await ui_channel._handle_upload_project_files(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["uploaded"] == [
+        {"name": "a.csv", "path": "data/dataset/tables/a.csv", "size": 4},
+        {"name": "a_1.csv", "path": "data/dataset/tables/a_1.csv", "size": 4},
+        {"name": "readme.txt", "path": "data/dataset/notes/readme.txt", "size": 2},
+    ]
+
+    data_dir = ui_channel.projects_root / "PRJ-0002" / "data"
+    assert (data_dir / "dataset" / "tables" / "a.csv").read_bytes() == b"a,b\n"
+    assert (data_dir / "dataset" / "tables" / "a_1.csv").read_bytes() == b"c,d\n"
+    assert (data_dir / "dataset" / "notes" / "readme.txt").read_bytes() == b"ok"
+
+
+async def test_handle_upload_project_files_rejects_data_path_traversal(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0003"}
+    req.query = {}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="../escape.csv", chunks=[b"bad"]),
+    ]))
+
+    resp = await ui_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "unsafe upload path: ../escape.csv"}
+    assert not (ui_channel.projects_root / "escape.csv").exists()
+
+
+async def test_handle_upload_project_files_rejects_absolute_data_paths(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0004"}
+    req.query = {}
+    req.multipart = AsyncMock(return_value=_FakeMultipart([
+        _FakePart(name="files", filename="/tmp/escape.csv", chunks=[b"bad"]),
+    ]))
+
+    resp = await ui_channel._handle_upload_project_files(req)
+    assert resp.status == 400
+    assert json.loads(resp.text) == {"error": "unsafe upload path: /tmp/escape.csv"}
+    assert not (ui_channel.projects_root / "PRJ-0004" / "data" / "tmp").exists()
 
 
 async def test_handle_upload_project_files_references_extracts_zip(
@@ -2396,7 +2514,7 @@ async def test_handle_delete_project_paths(ui_channel: UiChannel, monkeypatch: p
     req_ok = MagicMock(spec=web.Request)
     req_ok.query = {"session_id": "PRJ-DEL"}
     ok = await ui_channel._handle_delete_project(req_ok)
-    assert json.loads(ok.text) == {"deleted": True}
+    assert json.loads(ok.text) == {"deleted": True, "removed": True}
 
     project2 = ui_channel.projects_root / "PRJ-ERR"
     project2.mkdir(parents=True)
@@ -2410,3 +2528,145 @@ async def test_handle_delete_project_paths(ui_channel: UiChannel, monkeypatch: p
     err = await ui_channel._handle_delete_project(req_err)
     assert err.status == 500
     assert "cannot delete" in json.loads(err.text)["error"]
+
+
+async def test_handle_remove_project_keeps_files_hidden_from_list(ui_channel: UiChannel) -> None:
+    project = ui_channel.projects_root / "PRJ-KEEP"
+    project.mkdir(parents=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-KEEP"}
+    resp = await ui_channel._handle_remove_project(req)
+
+    assert resp.status == 200
+    assert json.loads(resp.text) == {"deleted": False, "removed": True}
+    assert project.is_dir()
+
+    list_resp = await ui_channel._handle_list_projects(MagicMock(spec=web.Request))
+    list_body = json.loads(list_resp.text)
+    assert [item["id"] for item in list_body["projects"]] == []
+
+
+def _model_cache(provider: str = "deepseek") -> "Any":
+    from mira_engine.providers.model_fetch import ModelCache, ModelInfo
+
+    return ModelCache(
+        provider=provider,
+        api_base="https://api.deepseek.com",
+        fetched_at="2026-05-13T12:00:00Z",
+        models=[
+            ModelInfo(id="deepseek-chat", config_model="deepseek/deepseek-chat"),
+            ModelInfo(id="deepseek-reasoner", config_model="deepseek/deepseek-reasoner"),
+        ],
+    )
+
+
+async def test_handle_provider_models_fetches_and_returns_ids(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod, "read_model_cache", lambda *_a, **_k: None)
+
+    async def fake_fetch(cfg, provider, cfg_path):
+        return _model_cache(provider), tmp_path / "models" / "deepseek.json"
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_models_to_cache", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "deepseek"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["provider"] == "deepseek"
+    assert body["models"] == ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+    assert body["cached"] is False
+
+
+async def test_handle_provider_models_rejects_unknown_provider(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "not-a-provider"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+
+    assert resp.status == 400
+    assert "unknown provider" in json.loads(resp.text)["error"]
+
+
+async def test_handle_provider_models_surfaces_fetch_error(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod, "read_model_cache", lambda *_a, **_k: None)
+
+    async def fake_fetch(*_a, **_k):
+        raise ui_channel_mod.ModelFetchError("bad api key")
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_models_to_cache", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "deepseek"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+
+    assert resp.status == 502
+    assert json.loads(resp.text)["error"] == "bad api key"
+
+
+async def test_handle_provider_test_reports_success(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+
+    captured: dict[str, Any] = {}
+
+    async def fake_fetch(cfg, provider):
+        captured["api_key"] = cfg.providers.deepseek.api_key
+        return _model_cache(provider)
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_provider_models", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "deepseek"}
+    req.json = AsyncMock(return_value={"api_key": "sk-transient"})
+    resp = await ui_channel._handle_provider_test(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body == {"ok": True, "message": "Connection succeeded", "model_count": 2}
+    # Transient credential applied to the in-memory config (not persisted).
+    assert captured["api_key"] == "sk-transient"
+
+
+async def test_handle_provider_test_reports_failure(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config()
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+
+    async def fake_fetch(*_a, **_k):
+        raise ui_channel_mod.ModelFetchError("unauthorized")
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_provider_models", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "deepseek"}
+    req.json = AsyncMock(return_value={})
+    resp = await ui_channel._handle_provider_test(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["ok"] is False
+    assert body["message"] == "unauthorized"

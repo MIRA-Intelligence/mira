@@ -2,17 +2,23 @@
   "agents": {
     "defaults": {
       "model": "anthropic/claude-opus-4-5",
-      "routeModel": "openai/gpt-4.1-nano",
-      "smallModel": ["openai/gpt-4.1-mini", "openai/gpt-4.1-nano"],
-      "mediumModel": "anthropic/claude-sonnet-4-5",
-      "largeModel": "anthropic/claude-opus-4-5",
-      "routeByComplexity": false,
       "provider": "openrouter",
-      "workspace": "~/.mira/workspace"
+      "workspace": "~/.mira/workspace",
+      "_comment_team": "The 'team' profile maps each role to its own provider+model. *_provider may differ from the global provider above (cross-provider). Unset roles fall back to 'model'.",
+      "supervisorProvider": "anthropic",
+      "supervisorModel": "claude-opus-4-5",
+      "studentProvider": "deepseek",
+      "studentModel": "deepseek-chat",
+      "criticProvider": "anthropic",
+      "criticModel": "claude-opus-4-5"
     }
   },
   "providers": {
-    "proxy": null
+    "proxy": null,
+    "nvidia": {
+      "apiKey": "",
+      "apiBase": "https://inference-api.nvidia.com/v1"
+    }
   },
   "tools": {
     "restrictToWorkspace": false,

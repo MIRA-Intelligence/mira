@@ -17,6 +17,9 @@ STRICT_CONTRACT_VERSION = 2
 
 _VALID_PLAN_STATUS = {"in_progress", "completed", "failed"}
 _VALID_EXPERIMENT_STATUS = {"pending", "running", "completed", "failed", "skipped"}
+# Interactive plan-mode (the ``plan`` block inside task_plan.json).
+_VALID_PLAN_PHASES = {"questions", "draft", "approved"}
+_VALID_PLAN_QUESTION_KINDS = {"single", "multi", "text"}
 _EXP_ID_PATTERN = re.compile(r"(?i)^exp[-_ ]?(\d{1,4})$")
 _RESEARCH_REQUIRED_COMPLETED_FIELDS = (
     "theoretical_proof",
@@ -82,7 +85,7 @@ _IGNORED_JSON_SCAN_DIRS = {".git", ".mira", "__pycache__", "node_modules", ".ven
 def _normalize_profile(profile: object) -> str:
     if isinstance(profile, str):
         normalized = profile.strip().lower()
-        if normalized in {"research", "engineer", "default"}:
+        if normalized in {"research", "engineer", "default", "team"}:
             return normalized
     return "default"
 
@@ -127,7 +130,9 @@ def _required_completed_fields_for_profile(
 ) -> tuple[str, ...]:
     if contract_version < STRICT_CONTRACT_VERSION:
         return ()
-    if profile == "research":
+    # The team profile is research-oriented (supervisor plans rigorous work, the
+    # critic enforces falsifiability), so it reuses the research field contract.
+    if profile in {"research", "team"}:
         return _RESEARCH_REQUIRED_COMPLETED_FIELDS
     if profile == "engineer":
         return _ENGINEER_REQUIRED_COMPLETED_FIELDS
@@ -141,7 +146,7 @@ def _required_falsify_fields_for_profile(
 ) -> tuple[str, ...]:
     if contract_version < STRICT_CONTRACT_VERSION:
         return ()
-    if profile == "research":
+    if profile in {"research", "team"}:
         return _RESEARCH_REQUIRED_FALSIFY_FIELDS
     if profile == "engineer":
         return _ENGINEER_REQUIRED_FALSIFY_FIELDS
@@ -237,7 +242,7 @@ def _load_project_profile(project_dir: Path | None) -> str:
         profile = meta.get("agent_profile")
         if isinstance(profile, str):
             normalized = profile.strip().lower()
-            if normalized in {"research", "engineer", "default"}:
+            if normalized in {"research", "engineer", "default", "team"}:
                 return normalized
     return "default"
 
@@ -253,13 +258,31 @@ def _load_project_contract_version(project_dir: Path | None) -> int:
     return DEFAULT_CONTRACT_VERSION
 
 
-def _is_repairable_contract_issue(issue: str) -> bool:
-    return (
-        "completed experiment missing results/conclusion" in issue
-        or "profile missing required fields" in issue
-        or "hypothesis rejection requires fields" in issue
-        or ": evidence_refs" in issue
-    )
+# Severe issues make the plan machine-unreadable/unwritable, escape the
+# workspace, or corrupt experiment structure beyond auto-fix recovery. Only
+# these should ever halt the auto-continue loop. Everything else is a minor
+# content/quality issue: surfaced as a per-experiment warning marker and
+# repaired opportunistically (reconcile), but never blocking the whole run.
+_SEVERE_ISSUE_MARKERS = (
+    "failed to parse task_plan.json",
+    "failed to write normalized task_plan.json",
+    "task_plan root must be a JSON object",
+    "unsafe artifact path",
+    ": invalid status",
+    "more than one experiment marked as running",
+)
+
+
+def _is_severe_blocking_issue(issue: str) -> bool:
+    """Return whether an issue is severe enough to block auto-continue."""
+    if any(marker in issue for marker in _SEVERE_ISSUE_MARKERS):
+        return True
+    # Experiment-level structural corruption that survives reconcile.
+    if issue.startswith("experiment #") and (
+        "is not an object" in issue or "missing id" in issue
+    ):
+        return True
+    return False
 
 
 def _build_guard_result(
@@ -270,17 +293,16 @@ def _build_guard_result(
     issues: list[str],
     contract_version: int = DEFAULT_CONTRACT_VERSION,
 ) -> dict[str, Any]:
-    repairable_issues = [
-        issue for issue in issues if _is_repairable_contract_issue(issue)
-    ]
-    fatal_issues = [
-        issue for issue in issues if not _is_repairable_contract_issue(issue)
-    ]
+    severe_issues = [issue for issue in issues if _is_severe_blocking_issue(issue)]
+    minor_issues = [issue for issue in issues if not _is_severe_blocking_issue(issue)]
     if ok is None:
+        # Default contract: only severe issues halt the loop; minor issues are
+        # surfaced as per-experiment warning markers and repaired opportunistically.
+        # Strict contract (opt-in): every issue blocks, enforcing full rigor.
         blocking_issues = (
             issues
             if contract_version >= STRICT_CONTRACT_VERSION
-            else fatal_issues
+            else severe_issues
         )
         ok = len(blocking_issues) == 0
     else:
@@ -292,8 +314,12 @@ def _build_guard_result(
         "fixed": fixed,
         "blocking": len(blocking_issues) > 0,
         "issues": issues,
-        "repairable_issues": repairable_issues,
-        "fatal_issues": fatal_issues,
+        # ``repairable_issues``/``fatal_issues`` keys are kept for backward
+        # compatibility (research_loop reads them); they now mean minor/severe.
+        "repairable_issues": minor_issues,
+        "fatal_issues": severe_issues,
+        "minor_issues": minor_issues,
+        "severe_issues": severe_issues,
         "blocking_issues": blocking_issues,
     }
 
@@ -342,6 +368,25 @@ def _missing_required_fields(
     return missing
 
 
+_ARTIFACT_GLOB_RE = re.compile(r"[*?\[]")
+
+
+def _artifact_reference_exists(project_dir: Path, artifact: str) -> bool:
+    """Return whether an artifact reference resolves to at least one real file.
+
+    Supports glob patterns (e.g. ``outputs/exp010/predictions_lovo_*_*.csv``) so
+    plans that summarize many per-fold/per-seed outputs with a single wildcard
+    entry are not rejected as missing. Non-glob paths keep the exact
+    ``is_file`` semantics.
+    """
+    if _ARTIFACT_GLOB_RE.search(artifact):
+        try:
+            return any(match.is_file() for match in project_dir.glob(artifact))
+        except (ValueError, OSError):
+            return False
+    return (project_dir / artifact).is_file()
+
+
 def _looks_like_hypothesis_rejection(text: object) -> bool:
     if not isinstance(text, str):
         return False
@@ -376,8 +421,7 @@ def _validate_evidence_refs(
                     f"{exp_id}: evidence_refs[{idx}] metric_key '{metric_key}' not found in results.metrics"
                 )
         if isinstance(artifact, str) and artifact and project_dir is not None:
-            artifact_path = project_dir / artifact
-            if not artifact_path.is_file():
+            if not _artifact_reference_exists(project_dir, artifact):
                 issues.append(
                     f"{exp_id}: evidence_refs[{idx}] artifact '{artifact}' does not exist"
                 )
@@ -722,9 +766,62 @@ def _auto_fill_research_contract_fields(exp: dict[str, Any]) -> bool:
 def _auto_fill_contract_fields(
     exp: dict[str, Any], *, profile: str, contract_version: int
 ) -> bool:
-    if profile == "research" and contract_version >= STRICT_CONTRACT_VERSION:
+    if profile in {"research", "team"} and contract_version >= STRICT_CONTRACT_VERSION:
         return _auto_fill_research_contract_fields(exp)
     return False
+
+
+def lint_plan_block(plan: object) -> list[str]:
+    """Validate the interactive plan-mode ``plan`` block, if present.
+
+    The ``plan`` block is written by the ``set_plan`` tool and read by the UI
+    to render the interactive planning stage. It is optional; absence yields no
+    issues. Unknown keys are tolerated so the schema can evolve.
+    """
+    issues: list[str] = []
+    if plan is None:
+        return issues
+    if not _is_mapping(plan):
+        return ["plan must be a JSON object"]
+
+    phase = plan.get("phase")
+    if phase is not None and phase not in _VALID_PLAN_PHASES:
+        issues.append(f"plan.phase invalid: {phase!r}")
+
+    questions = plan.get("questions")
+    if questions is not None:
+        if not isinstance(questions, list):
+            issues.append("plan.questions must be a list")
+        else:
+            seen_ids: set[str] = set()
+            for idx, question in enumerate(questions, start=1):
+                if not _is_mapping(question):
+                    issues.append(f"plan question #{idx} is not an object")
+                    continue
+                qid = question.get("id")
+                if not isinstance(qid, str) or not qid.strip():
+                    issues.append(f"plan question #{idx} missing id")
+                elif qid in seen_ids:
+                    issues.append(f"duplicate plan question id: {qid}")
+                else:
+                    seen_ids.add(qid)
+                prompt = question.get("prompt")
+                if not isinstance(prompt, str) or not prompt.strip():
+                    issues.append(f"plan question {qid or idx} missing prompt")
+                kind = question.get("kind")
+                if kind not in _VALID_PLAN_QUESTION_KINDS:
+                    issues.append(f"plan question {qid or idx} invalid kind: {kind!r}")
+                elif kind in {"single", "multi"}:
+                    options = question.get("options")
+                    if not isinstance(options, list) or not options:
+                        issues.append(
+                            f"plan question {qid or idx} requires options for kind '{kind}'"
+                        )
+
+    draft = plan.get("draft")
+    if draft is not None and not _is_mapping(draft):
+        issues.append("plan.draft must be a JSON object")
+    return issues
 
 
 def lint_task_plan_data(
@@ -744,6 +841,8 @@ def lint_task_plan_data(
         effective_contract_version = _normalize_contract_version(
             _load_project_contract_version(project_dir)
         )
+
+    issues.extend(lint_plan_block(data.get("plan")))
 
     experiments = data.get("experiments")
     if not isinstance(experiments, list):
@@ -801,8 +900,7 @@ def lint_task_plan_data(
                     if artifact.startswith("/") or artifact.startswith("../") or "/../" in artifact:
                         issues.append(f"{exp_id}: unsafe artifact path '{artifact}'")
                         continue
-                    artifact_path = project_dir / artifact
-                    if not artifact_path.is_file():
+                    if not _artifact_reference_exists(project_dir, artifact):
                         issues.append(f"{exp_id}: artifact path does not exist '{artifact}'")
 
     if running_count > 1:
@@ -947,6 +1045,52 @@ def reconcile_task_plan_data(data: dict[str, Any], project_dir: Path) -> tuple[d
     return normalized, changed
 
 
+def _experiment_scoped_warnings(
+    minor_issues: list[str], valid_ids: set[str]
+) -> dict[str, list[str]]:
+    """Group minor issues under their owning experiment id (``ExpNNN: detail``)."""
+    warnings_by_id: dict[str, list[str]] = {}
+    for issue in minor_issues:
+        exp_id, sep, detail = issue.partition(": ")
+        if not sep:
+            continue
+        exp_id = exp_id.strip()
+        if exp_id not in valid_ids:
+            continue
+        warnings_by_id.setdefault(exp_id, []).append(detail.strip())
+    return warnings_by_id
+
+
+def _apply_guard_warnings(data: dict[str, Any], minor_issues: list[str]) -> bool:
+    """Write minor (non-blocking) issues onto their experiment as ``guard_warnings``.
+
+    The UI reads this list to render a warning marker after the experiment
+    title. Returns whether the plan payload changed.
+    """
+    experiments = data.get("experiments")
+    if not isinstance(experiments, list):
+        return False
+    valid_ids = {
+        exp.get("id")
+        for exp in experiments
+        if _is_mapping(exp) and isinstance(exp.get("id"), str)
+    }
+    warnings_by_id = _experiment_scoped_warnings(minor_issues, valid_ids)
+    changed = False
+    for exp in experiments:
+        if not _is_mapping(exp):
+            continue
+        new_warnings = sorted(warnings_by_id.get(exp.get("id"), []))
+        if new_warnings:
+            if exp.get("guard_warnings") != new_warnings:
+                exp["guard_warnings"] = new_warnings
+                changed = True
+        elif "guard_warnings" in exp:
+            del exp["guard_warnings"]
+            changed = True
+    return changed
+
+
 def guard_task_plan_file(
     project_dir: Path, auto_fix: bool = True, profile: str | None = None
 ) -> dict[str, Any]:
@@ -1002,6 +1146,17 @@ def guard_task_plan_file(
                 )
 
     issues = lint_task_plan_data(data, project_dir=project_dir, profile=profile)
+    if auto_fix:
+        minor_issues = [i for i in issues if not _is_severe_blocking_issue(i)]
+        if _apply_guard_warnings(data, minor_issues):
+            try:
+                plan_path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                fixed = True
+            except OSError:
+                pass
     return _build_guard_result(
         exists=True,
         fixed=fixed,

@@ -12,6 +12,7 @@ Every entry writes out all fields so you can copy-paste as a template.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -270,12 +271,12 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
         is_oauth=True,  # OAuth-based authentication
     ),
-    # Github Copilot: uses OAuth, not API key.
+    # GitHub Copilot: uses OAuth, not API key.
     ProviderSpec(
         name="github_copilot",
         keywords=("github_copilot", "copilot"),
         env_key="",  # OAuth-based, no API key
-        display_name="Github Copilot",
+        display_name="GitHub Copilot",
         litellm_prefix="github_copilot",  # github_copilot/model → github_copilot/model
         skip_prefixes=("github_copilot/",),
         env_extras=(),
@@ -308,6 +309,26 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://api.deepseek.com/v1",
         strip_model_prefix=True,  # deepseek/deepseek-chat → deepseek-chat on the wire
         model_overrides=(),
+    ),
+    # NVIDIA NIM public inference API.  This path is intentionally direct
+    # rather than LiteLLM/OpenAI-SDK based because NVIDIA's endpoint is
+    # OpenAI-shaped but has proven more reliable with a plain HTTP POST.
+    ProviderSpec(
+        name="nvidia",
+        keywords=("nvidia", "nemotron", "nvidia/"),
+        env_key="NVIDIA_API_KEY",
+        display_name="NVIDIA",
+        litellm_prefix="",
+        skip_prefixes=("nvidia/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="inference-api.nvidia.com",
+        default_api_base="https://inference-api.nvidia.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+        is_direct=True,
     ),
     # Gemini: needs "gemini/" prefix for LiteLLM.
     ProviderSpec(
@@ -601,6 +622,109 @@ def find_by_name(name: str) -> ProviderSpec | None:
         if spec.name == key:
             return spec
     return None
+
+
+# ---------------------------------------------------------------------------
+# Per-model parameter rules — the single knob for "this model wants different
+# args". Two layers, both keyed by model-name pattern:
+#
+#   1. MODEL_PARAM_RULES below: GLOBAL and provider-agnostic. A rule here
+#      applies to a model no matter which provider serves it (direct API,
+#      gateway, local, ...). Use this for model-family quirks.
+#   2. ProviderSpec.model_overrides (in PROVIDERS): provider-specific. These
+#      are layered on top and WIN on conflict, for "this provider's copy of
+#      the model is special".
+#
+# Pattern semantics (shared by both layers, case-insensitive):
+#   - contains a glob metachar (* ? [ ]) -> fnmatch against the full model id
+#     AND its short form (after the last "/"); e.g. "*/gpt-5*" or "*gpt-5*".
+#   - otherwise -> plain substring match; e.g. "gpt-5", "kimi-k2.5".
+#
+# Value semantics:
+#   - None  -> DROP the parameter entirely (model rejects it).
+#   - other -> FORCE the parameter to this value.
+# ---------------------------------------------------------------------------
+
+MODEL_PARAM_RULES: tuple[tuple[str, dict[str, Any]], ...] = (
+    # OpenAI GPT-5 family and o-series reasoning models reject a custom
+    # ``temperature`` (only the default is accepted). Dropping it keeps the
+    # request valid across every provider/gateway that fronts these models.
+    ("*gpt-5*", {"temperature": None}),
+    ("*o1*", {"temperature": None}),
+    ("*o3*", {"temperature": None}),
+    ("*o4*", {"temperature": None}),
+)
+
+
+def _model_pattern_matches(pattern: str, model_lower: str, short_lower: str) -> bool:
+    """Match a model-name *pattern* against a model id and its short form."""
+    pat = pattern.lower()
+    if any(ch in pat for ch in "*?[]"):
+        return fnmatch.fnmatch(model_lower, pat) or fnmatch.fnmatch(short_lower, pat)
+    return pat in model_lower or pat in short_lower
+
+
+# User-defined rules from config (providers.model_params), injected at config
+# load time via ``set_user_model_param_rules``. Empty until configured. These
+# layer on top of the built-in defaults AND provider-specific overrides, so a
+# rule a user adds in the UI always wins.
+_USER_MODEL_PARAM_RULES: tuple[tuple[str, dict[str, Any]], ...] = ()
+
+
+def set_user_model_param_rules(
+    rules: list[tuple[str, dict[str, Any]]] | None,
+) -> None:
+    """Replace the process-wide user model-parameter rules.
+
+    Accepts a list of ``(pattern, params)`` tuples; ``None`` or empty clears
+    them. Rules with a blank pattern are ignored.
+    """
+    cleaned: list[tuple[str, dict[str, Any]]] = []
+    for pattern, params in rules or ():
+        if isinstance(pattern, str) and pattern.strip() and isinstance(params, dict):
+            cleaned.append((pattern.strip(), dict(params)))
+    global _USER_MODEL_PARAM_RULES
+    _USER_MODEL_PARAM_RULES = tuple(cleaned)
+
+
+def model_overrides_for(
+    model: str | None,
+    spec: ProviderSpec | None = None,
+) -> dict[str, Any]:
+    """Return the resolved per-model request-parameter overrides for *model*.
+
+    Merges the global ``MODEL_PARAM_RULES`` (all matches, in order) with the
+    provider-specific ``spec.model_overrides`` (first match wins). Provider
+    rules are applied last so they win on conflict. When *spec* is omitted it
+    is resolved from the model name.
+
+    A value of ``None`` means "drop this parameter"; any other value forces it.
+    The caller applies the result via ``LLMProvider._apply_param_overrides``.
+    """
+    if not model:
+        return {}
+    model_lower = model.lower()
+    short_lower = model_lower.rsplit("/", 1)[-1]
+
+    result: dict[str, Any] = {}
+    for pattern, overrides in MODEL_PARAM_RULES:
+        if _model_pattern_matches(pattern, model_lower, short_lower):
+            result.update(overrides)
+
+    if spec is None:
+        spec = find_by_model(model)
+    if spec is not None:
+        for pattern, overrides in spec.model_overrides:
+            if _model_pattern_matches(pattern, model_lower, short_lower):
+                result.update(overrides)
+                break
+
+    # User-configured rules win over built-in defaults and provider overrides.
+    for pattern, overrides in _USER_MODEL_PARAM_RULES:
+        if _model_pattern_matches(pattern, model_lower, short_lower):
+            result.update(overrides)
+
+    return result
 
 
 # Substrings that identify vision-capable (multimodal) chat models. Matched on

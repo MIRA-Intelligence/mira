@@ -7,6 +7,8 @@ import select
 import signal
 import socket
 import sys
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
@@ -24,8 +26,12 @@ if sys.platform == "win32":
 
 import typer
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document as PtDocument
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
@@ -34,15 +40,11 @@ from rich.text import Text
 from loguru import logger
 
 from mira_engine import __logo__, __version__
-from mira_engine.agent.routing import ModelRouter
 from mira_engine.config.paths import get_workspace_path
 from mira_engine.config.schema import Config
-from mira_engine.providers.factory import make_provider
+from mira_engine.providers.factory import make_provider, make_role_provider
 from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
 from mira_engine.utils.helpers import sync_workspace_templates
-from mira_engine.utils.migration import run_startup_migrations
-
-run_startup_migrations()
 
 app = typer.Typer(
     name="mira",
@@ -226,9 +228,199 @@ def _coerce_model_for_provider(model: str, provider_name: str) -> str:
         return value
     return examples[0]
 
+
+def _load_models_command_config(config: str | None) -> tuple[Config, Path]:
+    """Load config for model cache commands and return config plus path."""
+    from mira_engine.config.loader import get_config_path, load_config, set_config_path
+
+    config_path = Path(config).expanduser().resolve() if config else get_config_path()
+    if config:
+        set_config_path(config_path)
+    return load_config(config_path), config_path
+
+
+def _resolve_models_provider(config: Config, provider: str | None) -> str:
+    """Resolve provider argument for model cache commands."""
+    from mira_engine.providers.model_fetch import current_provider_name
+    from mira_engine.providers.registry import find_by_name
+
+    value = (provider or "").strip().replace("-", "_")
+    if not value:
+        value = current_provider_name(config) or ""
+    spec = find_by_name(value) if value else None
+    if not spec:
+        raise typer.BadParameter(
+            "Provider is not configured. Pass a provider name, or set agents.defaults.provider."
+        )
+    return spec.name
+
+
+def _model_cache_table(caches) -> Table:
+    """Render model caches as a compact table."""
+    from mira_engine.providers.model_fetch import is_cache_stale
+
+    table = Table(title="Cached Models")
+    table.add_column("Provider")
+    table.add_column("Models", justify="right")
+    table.add_column("Fetched")
+    table.add_column("Status")
+    table.add_column("API Base")
+    for cache in caches:
+        status = "stale" if is_cache_stale(cache) else "fresh"
+        table.add_row(
+            cache.provider,
+            str(len(cache.models)),
+            cache.fetched_at or "-",
+            status,
+            cache.api_base or "-",
+        )
+    return table
+
+
+def _find_cached_model(cache, model: str):
+    """Find a model by native or config model id."""
+    target = model.strip()
+    for item in cache.models:
+        if target in {item.id, item.config_model}:
+            return item
+    return None
+
+
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
+
+CLI_CTRL_C_EXIT_HINT = "Press Ctrl+C again to quit"
+CLI_DOUBLE_CTRL_C_WINDOW_SEC = 2.0
+
+PROMPT_CTRL_C_IGNORE = "ignore"
+PROMPT_CTRL_C_SHOW_HINT = "show_hint"
+PROMPT_CTRL_C_EXIT = "exit"
+
+
+def resolve_prompt_ctrl_c_action(
+    *,
+    turn_done_set: bool,
+    exit_armed_until: float,
+    now: float,
+) -> str:
+    """Classify Ctrl+C at the ``You:`` prompt (ignore / hint / exit).
+
+    ``exit_armed_until`` is set only after the user sees the quit hint at the
+    prompt, so a Ctrl+C that interrupted an agent turn cannot be mistaken for
+    a double-press exit.
+    """
+    if not turn_done_set:
+        return PROMPT_CTRL_C_IGNORE
+    if exit_armed_until and now < exit_armed_until:
+        return PROMPT_CTRL_C_EXIT
+    return PROMPT_CTRL_C_SHOW_HINT
+
+
+def should_cancel_turn_on_sigint(*, turn_done_set: bool) -> bool:
+    """Return True when SIGINT should cancel the in-flight agent turn."""
+    return not turn_done_set
+
+
+def handle_cli_loop_sigint(
+    *,
+    turn_done: asyncio.Event | None,
+    interrupt_evt: asyncio.Event | None,
+    exit_armed_until: list[float],
+) -> str:
+    """Handle SIGINT delivered via ``loop.add_signal_handler``.
+
+    Returns ``turn_interrupt`` when an in-flight agent turn should stop, else
+    ``prompt`` (caller should raise or delegate to prompt_toolkit).
+    """
+    at_prompt = turn_done is None or turn_done.is_set()
+    if should_cancel_turn_on_sigint(turn_done_set=at_prompt):
+        exit_armed_until[0] = 0.0
+        if interrupt_evt is not None:
+            interrupt_evt.set()
+        return "turn_interrupt"
+    return "prompt"
+
+
+def install_cli_loop_sigint_handler(
+    loop: asyncio.AbstractEventLoop,
+    handler: object,
+) -> bool:
+    """Install a SIGINT handler on the running event loop. Returns False on unsupported platforms."""
+    try:
+        loop.add_signal_handler(signal.SIGINT, handler)  # type: ignore[arg-type]
+        return True
+    except (NotImplementedError, RuntimeError):
+        return False
+
+
+def remove_cli_loop_sigint_handler(loop: asyncio.AbstractEventLoop) -> None:
+    """Remove the loop SIGINT handler if present."""
+    try:
+        loop.remove_signal_handler(signal.SIGINT)
+    except (NotImplementedError, RuntimeError):
+        pass
+
+
+async def wait_cli_turn_or_interrupt(
+    *,
+    turn_done: asyncio.Event,
+    interrupt_evt: asyncio.Event,
+) -> bool:
+    """Wait for turn completion or a turn-interrupt signal.
+
+    Returns True when ``interrupt_evt`` fired (Ctrl+C during agent work).
+    """
+    wait_turn = asyncio.create_task(turn_done.wait())
+    wait_intr = asyncio.create_task(interrupt_evt.wait())
+    done, pending = await asyncio.wait(
+        {wait_turn, wait_intr},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    return interrupt_evt.is_set()
+
+
+async def interrupt_cli_agent_turn(
+    *,
+    turn_done: asyncio.Event,
+    turn_response: list[str],
+    turn_skills: set[str],
+    dispatch_tasks: list[asyncio.Task],
+    cancel_subagents: object | None = None,
+    on_interrupted: object | None = None,
+    user_interrupted: bool = False,
+    cancel_timeout: float = 1.0,
+) -> None:
+    """Stop the current CLI turn: unblock the prompt and cancel dispatch tasks."""
+    if not turn_done.is_set() or user_interrupted:
+        turn_response.clear()
+        turn_skills.clear()
+        turn_done.set()
+        if on_interrupted is not None:
+            on_interrupted()
+    for task in dispatch_tasks:
+        if not task.done():
+            task.cancel()
+    if dispatch_tasks:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*dispatch_tasks, return_exceptions=True),
+                timeout=cancel_timeout,
+            )
+        except asyncio.TimeoutError:
+            pass
+    if cancel_subagents is not None:
+        try:
+            await cancel_subagents()  # type: ignore[misc]
+        except Exception:
+            pass
+
 
 _PROMPT_SESSION: PromptSession | None = None
 _SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
@@ -272,7 +464,73 @@ def _restore_terminal() -> None:
         pass
 
 
-def _init_prompt_session() -> None:
+# Directories never suggested in file-path completions.
+_COMPLETER_IGNORE_DIRS = {
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".coverage",
+    "htmlcov",
+}
+
+
+class MiraCompleter(Completer):
+    """File-path completer triggered by @ in the CLI prompt."""
+
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+        self._file_cache: list[tuple[str, Path]] | None = None
+
+    def _scan_files(self) -> list[str]:
+        """Scan workspace once and return sorted relative paths as strings."""
+        if self._file_cache is not None:
+            return [p for p, _ in self._file_cache]
+        entries: list[tuple[str, Path]] = []
+        for f in self.workspace.rglob("*"):
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            rel = f.relative_to(self.workspace)
+            if any(
+                part.startswith(".") or part in _COMPLETER_IGNORE_DIRS
+                for part in rel.parts
+            ):
+                continue
+            # Emit POSIX-style separators so completions are consistent across
+            # platforms (Windows ``str(rel)`` would yield backslashes, breaking
+            # "@dir/file" matching and downstream "/"-style path references).
+            entries.append((rel.as_posix(), f))
+        entries.sort(key=lambda e: e[0])
+        self._file_cache = entries
+        return [p for p, _ in entries]
+
+    def get_completions(
+        self, document: PtDocument, complete_event: object | None
+    ) -> list[Completion]:
+        text = document.text_before_cursor
+        at_pos = text.rfind("@")
+        if at_pos == -1:
+            return []
+        raw_partial = text[at_pos + 1:]
+        filtered_partial = raw_partial.strip()
+        yielded = 0
+        for rel_str in self._scan_files():
+            if filtered_partial and filtered_partial not in rel_str:
+                continue
+            yield Completion(rel_str, -(len(raw_partial) + 1))
+            yielded += 1
+            if yielded >= 50:
+                break
+
+
+def _init_prompt_session(workspace: Path | None = None) -> None:
     """Create the prompt_toolkit session with persistent file history."""
     global _PROMPT_SESSION, _SAVED_TERM_ATTRS
 
@@ -288,11 +546,55 @@ def _init_prompt_session() -> None:
     history_file = get_cli_history_path()
     history_file.parent.mkdir(parents=True, exist_ok=True)
 
+    ws = workspace or Path.cwd()
+    completer = MiraCompleter(ws)
+
+    # Custom key bindings
+    kb = KeyBindings()
+
+    @kb.add("@")
+    def _(event):
+        """Insert @ then show file completion menu immediately."""
+        b = event.current_buffer
+        b.insert_text("@")
+        b.start_completion(insert_common_part=False)
+
+    @kb.add(Keys.Enter)
+    def _(event):
+        b = event.current_buffer
+        cs = b.complete_state
+        if cs is not None and len(cs.completions) > 0:
+            # Select first completion if none selected yet
+            completion = cs.current_completion
+            if completion is None:
+                b.complete_next()
+                completion = cs.current_completion
+            if completion is not None:
+                b.apply_completion(completion)
+            return
+        # Default behavior: submit
+        b.validate_and_handle()
+
+    def _refresh_completion(buffer):
+        """Buffer text changed — refresh completion if after @."""
+        text = buffer.text
+        at_pos = text.rfind("@")
+        if at_pos == -1:
+            return
+        # Cancel existing completion menu and restart so list updates
+        if buffer.complete_state:
+            buffer.cancel_completion()
+        buffer.start_completion(insert_common_part=False)
+
     _PROMPT_SESSION = PromptSession(
         history=SafeFileHistory(str(history_file)),
         enable_open_in_editor=False,
         multiline=False,   # Enter submits (single line mode)
+        complete_while_typing=False,
+        completer=completer,
+        key_bindings=kb,
     )
+    _PROMPT_SESSION.default_buffer.on_text_changed += _refresh_completion
 
 
 def _is_llm_error(text: str) -> bool:
@@ -405,8 +707,8 @@ async def _read_interactive_input_async() -> str:
             return await _PROMPT_SESSION.prompt_async(
                 HTML("<b fg='ansiblue'>You:</b> "),
             )
-    except EOFError as exc:
-        raise KeyboardInterrupt from exc
+    except EOFError:
+        raise KeyboardInterrupt
 
 
 
@@ -745,6 +1047,49 @@ def _make_provider_for_model(config: Config, model: str):
         raise typer.Exit(1) from exc
 
 
+def _make_gateway_provider(config: Config, model: str | None = None):
+    """Create a provider for the long-running gateway.
+
+    Unlike the one-shot CLI helpers, the gateway must stay alive even when no
+    provider is configured yet so the UI (Providers page / onboarding) can
+    finish setup. When matching fails we fall back to the bundle-setup
+    placeholder, which returns an actionable message on every request instead
+    of crashing the gateway at boot.
+    """
+    from mira_engine.providers.factory import BundleSetupRequiredProvider
+
+    try:
+        return make_provider(config, model)
+    except ValueError as exc:
+        console.print(
+            f"[yellow]Warning: {exc} Gateway will start unconfigured — open the "
+            "Providers settings to add a provider.[/yellow]"
+        )
+        return BundleSetupRequiredProvider()
+
+
+def _make_gateway_role_provider(config: Config, role: str):
+    """Role provider factory for the gateway that tolerates an unconfigured setup."""
+    from mira_engine.providers.factory import BundleSetupRequiredProvider
+
+    defaults = config.agents.defaults
+    try:
+        return make_role_provider(config, role)
+    except ValueError:
+        model = defaults.role_model(role)
+        candidates = tuple(defaults.role_model_candidates(role))
+        return BundleSetupRequiredProvider(), model, candidates
+
+
+def _routing_kwargs(config: Config) -> dict[str, object]:
+    """Provider/model fallback + team role provider wiring for agent loops."""
+    return dict(
+        provider_factory=lambda model: _make_provider_for_model(config, model),
+        model_candidates=config.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(config, role),
+    )
+
+
 def _workspace_cron_store(config: Config) -> Path:
     return config.workspace_path / "cron" / "jobs.json"
 
@@ -793,6 +1138,95 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
     return loaded
 
 
+def _ui_enabled_in_config_file(config_path: Path | None) -> bool | None:
+    """Return the explicit ``channels.ui.enabled`` from disk, or ``None`` if unset.
+
+    We inspect the raw JSON instead of the parsed config so we can tell the
+    difference between "user never configured the UI channel" (``None`` →
+    gateway turns it on) and "user explicitly disabled it" (``False`` → leave
+    it off). The legacy ``web`` alias is honored for older configs.
+    """
+    if not config_path or not config_path.exists():
+        return None
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    channels = payload.get("channels")
+    if not isinstance(channels, dict):
+        return None
+    for key in ("ui", "web"):
+        section = channels.get(key)
+        if isinstance(section, dict) and "enabled" in section:
+            return bool(section["enabled"])
+    return None
+
+
+def _resolve_gateway_ui_enabled(explicit: bool | None, no_ui: bool) -> bool:
+    """Decide whether the gateway should run the local control-plane UI channel.
+
+    ``--no-ui`` always wins (headless/messaging-only deployments). Otherwise an
+    explicit on-disk value is respected, and an unset value defaults the UI on
+    so the desktop/browser app and the Providers onboarding page work without a
+    prior ``mira onboard``.
+    """
+    if no_ui:
+        return False
+    if explicit is None:
+        return True
+    return explicit
+
+
+def _prepare_gateway_ui_channel(config: Config, *, no_ui: bool) -> None:
+    """Ensure the gateway exposes the UI channel and bootstraps a config file.
+
+    The UI channel is the control plane for the desktop/browser client. Without
+    it there is no way to reach onboarding or the Providers settings page, so the
+    gateway turns it on by default (unless explicitly disabled or ``--no-ui``).
+    On a fresh home with no ``config.json`` we also persist the defaults so the
+    setup no longer depends on running ``mira onboard`` first.
+    """
+    from mira_engine.config.loader import get_config_path, save_config
+    from mira_engine.config.schema import UiChannelConfig
+
+    config_path = get_config_path()
+    explicit = _ui_enabled_in_config_file(config_path)
+    enabled = _resolve_gateway_ui_enabled(explicit, no_ui)
+
+    # ``channels.ui`` is a typed model on a freshly built config, but a raw dict
+    # when loaded from disk (ChannelsConfig keeps channels as extra fields).
+    # Normalize to the typed model so downstream access and serialization are
+    # consistent, then store it back in the channels extras.
+    section = getattr(config.channels, "ui", None)
+    if isinstance(section, UiChannelConfig):
+        ui = section
+    elif isinstance(section, dict):
+        ui = UiChannelConfig.model_validate(section)
+    else:
+        ui = UiChannelConfig()
+    ui.enabled = enabled
+    # An enabled UI channel with an empty allowFrom denies everyone and aborts
+    # startup; fall back to the local-control-plane default of "*".
+    if ui.enabled and not ui.allow_from:
+        ui.allow_from = ["*"]
+    extras = config.channels.__pydantic_extra__
+    if extras is None:
+        extras = {}
+        object.__setattr__(config.channels, "__pydantic_extra__", extras)
+    extras["ui"] = ui
+
+    if not config_path.exists():
+        try:
+            save_config(config, config_path)
+        except OSError:
+            # Non-fatal: the UI's own save path will create the file later.
+            return
+        console.print(
+            f"[green]✓[/green] Created default config at {config_path} "
+            "— open MIRA and use the Providers page to add a model provider."
+        )
+
+
 def _sync_workspace_templates_or_exit(workspace: Path) -> None:
     """Initialize workspace templates or fail with an actionable config error."""
     try:
@@ -816,21 +1250,28 @@ def _sync_workspace_templates_or_exit(workspace: Path) -> None:
 
 
 def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool = False) -> None:
-    """Check for existing Mira instances by PID file and port."""
+    """Reserve one gateway endpoint without blocking gateways on other ports."""
     import atexit
+    import hashlib
     import os
     import socket
-    from pathlib import Path
 
     import psutil
 
     if os.environ.get("MIRA_SKIP_GATEWAY_FAILSAVE"):
         return
 
-    pid_file = Path("~/.mira/runtime/gateway.pid").expanduser()
+    from mira_engine.config.loader import get_home_dir
+    from mira_engine.utils.locks import locked_update_text, locked_write_text
+
+    runtime_dir = get_home_dir() / "runtime"
+    endpoint = f"{gateway_host}:{gateway_port}"
+    endpoint_key = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:16]
+    pid_file = runtime_dir / "gateways" / f"{endpoint_key}.pid"
+    discovery_file = runtime_dir / "gateways.json"
     pid_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. 检查 PID 文件
+    # 1. Check only this endpoint's PID reservation. Other ports may coexist.
     if pid_file.exists():
         try:
             old_pid = int(pid_file.read_text().strip())
@@ -841,12 +1282,12 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
                     print(f"错误: Mira 已经在运行中 (PID: {old_pid})。")
                     print("提示: 请先停止旧进程，或使用 `mira-engine stop`。")
                     raise typer.Exit(1)
-        except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied, typer.Exit):
-            if isinstance(sys.exc_info()[1], typer.Exit):
-                raise
-            pass
+        except typer.Exit:
+            raise
+        except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
+            pid_file.unlink(missing_ok=True)
 
-    # 2. 检查端口占用
+    # 2. Check the actual endpoint in case its owner did not create a PID file.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
@@ -861,9 +1302,51 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
         if verbose:
             print(f"端口探测异常: {e}")
 
-    # 3. 写入当前 PID
-    pid_file.write_text(str(os.getpid()))
-    atexit.register(lambda: pid_file.unlink(missing_ok=True))
+    # 3. Atomically publish this gateway for local discovery.
+    current_pid = os.getpid()
+    locked_write_text(pid_file, str(current_pid))
+
+    def update_discovery(current_text: str) -> str:
+        try:
+            payload = json.loads(current_text) if current_text.strip() else {}
+        except json.JSONDecodeError:
+            payload = {}
+        instances = payload.get("instances") if isinstance(payload, dict) else None
+        if not isinstance(instances, dict):
+            instances = {}
+        instances[endpoint_key] = {
+            "host": gateway_host,
+            "port": gateway_port,
+            "pid": current_pid,
+            "endpoint": endpoint,
+        }
+        return json.dumps({"instances": instances}, indent=2, ensure_ascii=False) + "\n"
+
+    locked_update_text(discovery_file, update_discovery)
+
+    def release_endpoint() -> None:
+        try:
+            if pid_file.exists() and pid_file.read_text().strip() == str(current_pid):
+                pid_file.unlink(missing_ok=True)
+
+            def remove_from_discovery(current_text: str) -> str:
+                try:
+                    payload = json.loads(current_text) if current_text.strip() else {}
+                except json.JSONDecodeError:
+                    payload = {}
+                instances = payload.get("instances") if isinstance(payload, dict) else None
+                if not isinstance(instances, dict):
+                    instances = {}
+                current = instances.get(endpoint_key)
+                if isinstance(current, dict) and current.get("pid") == current_pid:
+                    instances.pop(endpoint_key, None)
+                return json.dumps({"instances": instances}, indent=2, ensure_ascii=False) + "\n"
+
+            locked_update_text(discovery_file, remove_from_discovery)
+        except OSError:
+            pass
+
+    atexit.register(release_endpoint)
 
 
 @app.command()
@@ -873,6 +1356,11 @@ def gateway(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    no_ui: bool = typer.Option(
+        False,
+        "--no-ui",
+        help="Do not start the UI channel (headless / messaging-only gateway)",
+    ),
 ):
     """Start the mira gateway."""
     from mira_engine.agent.loop import AgentLoop
@@ -888,6 +1376,7 @@ def gateway(
         logging.basicConfig(level=logging.DEBUG)
 
     config = _load_runtime_config(config, workspace)
+    _prepare_gateway_ui_channel(config, no_ui=no_ui)
 
     if host is not None:
         config.gateway.host = host
@@ -903,9 +1392,8 @@ def gateway(
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
     _sync_workspace_templates_or_exit(config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
-    provider_factory = lambda model: _make_provider_for_model(config, model)
+    provider = _make_gateway_provider(config)
+    provider_factory = lambda model: _make_gateway_provider(config, model)
     default_tz = config.agents.defaults.timezone
     session_manager = SessionManager(config.workspace_path)
 
@@ -934,7 +1422,9 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         provider_factory=provider_factory,
-        model_router=model_router,
+        model_candidates=config.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: _make_gateway_role_provider(config, role),
+        auto_max_rounds=config.agents.defaults.auto_max_rounds,
     )
 
     # Set cron callback (needs agent)
@@ -954,11 +1444,20 @@ def gateway(
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
+            metadata = {
+                key: value
+                for key, value in {
+                    "project_id": job.payload.project_id,
+                    "project_dir": job.payload.project_dir,
+                }.items()
+                if value
+            }
             response = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                metadata=metadata,
             )
             response = _as_text_response(response)
         finally:
@@ -986,7 +1485,8 @@ def gateway(
             await bus.publish_outbound(OutboundMessage(
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to,
-                content=response
+                content=response,
+                metadata=metadata,
             ))
         return response
     cron.on_job = on_cron_job
@@ -1043,11 +1543,10 @@ def gateway(
     )
 
     async def on_ui_runtime_config_updated(next_config: Config, projects_root: Path) -> None:
-        nonlocal config, provider, model_router, provider_factory, default_tz, session_manager
+        nonlocal config, provider, provider_factory, default_tz, session_manager
 
-        next_provider = _make_provider(next_config)
-        next_model_router = ModelRouter(next_config.agents.defaults)
-        next_provider_factory = lambda model: _make_provider_for_model(next_config, model)
+        next_provider = _make_gateway_provider(next_config)
+        next_provider_factory = lambda model: _make_gateway_provider(next_config, model)
         next_tz = next_config.agents.defaults.timezone
         next_workspace = projects_root.expanduser()
 
@@ -1055,7 +1554,8 @@ def gateway(
             provider=next_provider,
             model=next_config.agents.defaults.primary_model,
             provider_factory=next_provider_factory,
-            model_router=next_model_router,
+            model_candidates=next_config.agents.defaults.default_model_candidates,
+            role_provider_factory=lambda role: _make_gateway_role_provider(next_config, role),
             workspace=next_workspace,
             max_iterations=next_config.agents.defaults.max_tool_iterations,
             max_tokens=next_config.agents.defaults.max_tokens,
@@ -1076,9 +1576,15 @@ def gateway(
         heartbeat.enabled = next_config.gateway.heartbeat.enabled
         session_manager = agent.sessions
 
+        # Keep the live UI channel's workspace-access policy in sync so the
+        # data-path visibility check reflects the latest setting without a
+        # gateway restart.
+        ui_channel = channels.channels.get("ui")
+        if ui_channel is not None and hasattr(ui_channel, "restrict_to_workspace"):
+            ui_channel.restrict_to_workspace = next_config.tools.restrict_to_workspace
+
         config = next_config
         provider = next_provider
-        model_router = next_model_router
         provider_factory = next_provider_factory
         default_tz = next_tz
         logger.info("Gateway runtime config reloaded from UI settings")
@@ -1142,7 +1648,6 @@ def serve(
     sync_workspace_templates(cfg.workspace_path)
 
     provider = _make_provider(cfg)
-    model_router = ModelRouter(cfg.agents.defaults)
     default_tz = cfg.agents.defaults.timezone
     agent_loop = AgentLoop(
         bus=MessageBus(),
@@ -1163,7 +1668,9 @@ def serve(
         mcp_servers=cfg.tools.mcp_servers,
         channels_config=cfg.channels,
         provider_factory=lambda model: _make_provider_for_model(cfg, model),
-        model_router=model_router,
+        model_candidates=cfg.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(cfg, role),
+        auto_max_rounds=cfg.agents.defaults.auto_max_rounds,
     )
 
     api_host = host if host is not None else cfg.api.host
@@ -1210,7 +1717,6 @@ def _build_agent_loop_kwargs(
     provider,
     config: Config,
     cron_service=None,
-    model_router=None,
 ) -> dict[str, object]:
     """Common keyword arguments shared by ``mira agent`` and ``mira research``."""
     default_tz = config.agents.defaults.timezone
@@ -1233,7 +1739,8 @@ def _build_agent_loop_kwargs(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         provider_factory=lambda model: _make_provider_for_model(config, model),
-        model_router=model_router,
+        model_candidates=config.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(config, role),
     )
 
 
@@ -1250,6 +1757,7 @@ def _run_cli_agent_session(
     interactive_banner: str | None = None,
     model_name: str | None = None,
     provider_name: str | None = None,
+    workspace: Path | None = None,
 ) -> None:
     """Drive a single message or REPL session against ``agent_loop``.
 
@@ -1334,9 +1842,10 @@ def _run_cli_agent_session(
 
     # Interactive mode — route through bus like other channels
     from mira_engine.bus.events import InboundMessage
-    _init_prompt_session()
+    _init_prompt_session(workspace)
     banner = interactive_banner or (
-        f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+        f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to interrupt, "
+        "[bold]Ctrl+C x2[/bold] at prompt to quit)\n"
     )
     console.print(banner)
 
@@ -1345,16 +1854,86 @@ def _run_cli_agent_session(
     else:
         cli_channel, cli_chat_id = "cli", session_id
 
-    def _handle_signal(signum, frame):
-        sig_name = signal.Signals(signum).name
-        _restore_terminal()
-        console.print(f"\nReceived {sig_name}, goodbye!")
-        sys.exit(0)
+    # Double-Ctrl+C to exit.
+    # First Ctrl+C: cancels the current agent turn (interrupts the request).
+    # Second Ctrl+C within 2 s: exits the session entirely.
+    _exit_armed_until = [0.0]
+    _cli_session_key = f"{cli_channel}:{cli_chat_id}"
+    _turn_done_ref: list[asyncio.Event | None] = [None]
+    _loop_ref: list[asyncio.AbstractEventLoop | None] = [None]
+    _cancel_turn_ref: list = [None]
+    _shutdown_ref: list = [None]
+    _turn_interrupt_evt_ref: list[asyncio.Event | None] = [None]
+    _loop_sigint_installed = [False]
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+    class _CliSessionExit(Exception):
+        """Raised to end the interactive loop without sys.exit() in a signal handler."""
+
+    def _schedule_on_loop(coro_factory) -> None:
+        loop = _loop_ref[0]
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(lambda: loop.create_task(coro_factory()))
+
+    def _on_cli_loop_sigint() -> None:
+        """SIGINT callback registered with ``loop.add_signal_handler`` (turn wait phase)."""
+        action = handle_cli_loop_sigint(
+            turn_done=_turn_done_ref[0],
+            interrupt_evt=_turn_interrupt_evt_ref[0],
+            exit_armed_until=_exit_armed_until,
+        )
+        if action == "turn_interrupt":
+            cancel_turn = _cancel_turn_ref[0]
+            if cancel_turn is not None:
+                _schedule_on_loop(cancel_turn)
+            return
+        raise KeyboardInterrupt
+
+    def _handle_sigint_fallback(signum, frame):
+        """POSIX fallback when ``add_signal_handler`` is unavailable."""
+        if (
+            handle_cli_loop_sigint(
+                turn_done=_turn_done_ref[0],
+                interrupt_evt=_turn_interrupt_evt_ref[0],
+                exit_armed_until=_exit_armed_until,
+            )
+            == "turn_interrupt"
+        ):
+            cancel_turn = _cancel_turn_ref[0]
+            if cancel_turn is not None:
+                _schedule_on_loop(cancel_turn)
+            return
+        raise KeyboardInterrupt
+
+    def _install_loop_sigint() -> None:
+        loop = _loop_ref[0]
+        if loop is None or _loop_sigint_installed[0]:
+            return
+        if install_cli_loop_sigint_handler(loop, _on_cli_loop_sigint):
+            _loop_sigint_installed[0] = True
+        else:
+            signal.signal(signal.SIGINT, _handle_sigint_fallback)
+
+    def _uninstall_loop_sigint() -> None:
+        loop = _loop_ref[0]
+        if loop is None or not _loop_sigint_installed[0]:
+            return
+        remove_cli_loop_sigint_handler(loop)
+        _loop_sigint_installed[0] = False
+
+    def _handle_term(signum, frame):
+        shutdown = _shutdown_ref[0]
+        if shutdown is not None:
+            _schedule_on_loop(shutdown)
+            return
+        _restore_terminal()
+        sig_name = signal.Signals(signum).name
+        console.print(f"\nReceived {sig_name}, goodbye!")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle_term)
     if hasattr(signal, 'SIGHUP'):
-        signal.signal(signal.SIGHUP, _handle_signal)
+        signal.signal(signal.SIGHUP, _handle_term)
     if hasattr(signal, 'SIGPIPE'):
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     if hasattr(signal, 'SIGTTOU'):
@@ -1363,11 +1942,67 @@ def _run_cli_agent_session(
         signal.signal(signal.SIGTTIN, signal.SIG_IGN)
 
     async def run_interactive():
+        _loop_ref[0] = asyncio.get_running_loop()
         bus_task = asyncio.create_task(agent_loop.run())
         turn_done = asyncio.Event()
+        turn_interrupt_evt = asyncio.Event()
+        _turn_done_ref[0] = turn_done
+        _turn_interrupt_evt_ref[0] = turn_interrupt_evt
         turn_done.set()
         turn_response: list[str] = []
         turn_skills: set[str] = set()
+
+        async def _collect_dispatch_tasks() -> list[asyncio.Task]:
+            tasks = list(agent_loop._active_tasks.get(_cli_session_key, []))
+            if not tasks:
+                tasks = [
+                    t
+                    for task_list in agent_loop._active_tasks.values()
+                    for t in task_list
+                    if not t.done()
+                ]
+            return tasks
+
+        _cancel_turn_in_flight = [False]
+
+        async def _cancel_current_turn() -> None:
+            """Cancel in-flight agent work for this CLI session (like /stop)."""
+            if _cancel_turn_in_flight[0]:
+                return
+            _cancel_turn_in_flight[0] = True
+            try:
+                await _cancel_current_turn_body()
+            finally:
+                _cancel_turn_in_flight[0] = False
+
+        async def _cancel_current_turn_body() -> None:
+            tasks = await _collect_dispatch_tasks()
+
+            async def _cancel_subagents() -> None:
+                await agent_loop.subagents.cancel_by_session(_cli_session_key)
+
+            user_intr = turn_interrupt_evt.is_set()
+            await interrupt_cli_agent_turn(
+                turn_done=turn_done,
+                turn_response=turn_response,
+                turn_skills=turn_skills,
+                dispatch_tasks=tasks,
+                cancel_subagents=_cancel_subagents,
+                on_interrupted=lambda: console.print("\n\n[dim]Interrupted[/dim]"),
+                user_interrupted=user_intr,
+            )
+            _exit_armed_until[0] = 0.0
+            turn_interrupt_evt.clear()
+
+        _cancel_turn_ref[0] = _cancel_current_turn
+
+        async def _shutdown_cli_session() -> None:
+            await _cancel_current_turn()
+            _restore_terminal()
+            console.print("\nGoodbye!")
+            raise _CliSessionExit()
+
+        _shutdown_ref[0] = _shutdown_cli_session
 
         async def _consume_outbound():
             while True:
@@ -1383,6 +2018,8 @@ def _run_cli_agent_session(
                                     console.print(f"  [cyan]↳ skill:[/cyan] {skill_name}")
                         continue
                     if msg.metadata.get("_progress"):
+                        if turn_done.is_set():
+                            continue
                         is_tool_hint = msg.metadata.get("_tool_hint", False)
                         ch = agent_loop.channels_config
                         if ch and is_tool_hint and not ch.send_tool_hints:
@@ -1404,12 +2041,38 @@ def _run_cli_agent_session(
                     break
 
         outbound_task = asyncio.create_task(_consume_outbound())
+        _install_loop_sigint()
+
+        async def _handle_prompt_keyboard_interrupt() -> None:
+            evt = _turn_done_ref[0]
+            now = time.monotonic()
+            action = resolve_prompt_ctrl_c_action(
+                turn_done_set=evt.is_set() if evt is not None else True,
+                exit_armed_until=_exit_armed_until[0],
+                now=now,
+            )
+            if action == PROMPT_CTRL_C_EXIT:
+                _exit_armed_until[0] = 0.0
+                _restore_terminal()
+                console.print("\nGoodbye!")
+                raise _CliSessionExit()
+            _exit_armed_until[0] = now + CLI_DOUBLE_CTRL_C_WINDOW_SEC
+            console.print(f"\n[dim]{CLI_CTRL_C_EXIT_HINT}[/dim]")
 
         try:
             while True:
                 try:
                     _flush_pending_tty_input()
-                    user_input = await _read_interactive_input_async()
+                    _uninstall_loop_sigint()
+                    try:
+                        try:
+                            user_input = await _read_interactive_input_async()
+                        except KeyboardInterrupt:
+                            await _handle_prompt_keyboard_interrupt()
+                            continue
+                    finally:
+                        _install_loop_sigint()
+
                     command = user_input.strip()
                     if not command:
                         continue
@@ -1417,11 +2080,13 @@ def _run_cli_agent_session(
                     if _is_exit_command(command):
                         _restore_terminal()
                         console.print("\nGoodbye!")
-                        break
+                        return
 
                     turn_done.clear()
                     turn_response.clear()
                     turn_skills.clear()
+                    _exit_armed_until[0] = 0.0
+                    turn_interrupt_evt.clear()
 
                     turn_metadata = dict(inbound_metadata)
                     if verbose_mode:
@@ -1435,29 +2100,90 @@ def _run_cli_agent_session(
                         metadata=turn_metadata,
                     ))
 
-                    with _thinking_ctx():
-                        await turn_done.wait()
+                    turn_interrupted = False
+                    try:
+                        with _thinking_ctx():
+                            try:
+                                turn_interrupted = await wait_cli_turn_or_interrupt(
+                                    turn_done=turn_done,
+                                    interrupt_evt=turn_interrupt_evt,
+                                )
+                            except KeyboardInterrupt:
+                                turn_interrupted = True
+                                if not turn_interrupt_evt.is_set():
+                                    turn_interrupt_evt.set()
+                    finally:
+                        if bus_task.done():
+                            bus_exc = bus_task.exception()
+                            if bus_exc is not None:
+                                console.print(
+                                    "\n[red]Agent loop stopped unexpectedly. "
+                                    "Check network/API settings or run `mira research --logs`.[/red]"
+                                )
+                                logger.exception("Agent loop task failed")
+                        if (
+                            not turn_done.is_set()
+                            and not turn_interrupted
+                            and not turn_interrupt_evt.is_set()
+                        ):
+                            console.print(
+                                "\n[yellow]No response received (request may have timed out).[/yellow]"
+                            )
+                            turn_done.set()
+
+                    if turn_interrupted:
+                        await _cancel_current_turn()
+                        continue
 
                     if turn_response:
                         _print_agent_response(turn_response[0], render_markdown=markdown)
+                    elif turn_done.is_set():
+                        console.print(
+                            "\n[dim]No assistant reply was produced for this turn.[/dim]"
+                        )
                     if verbose_mode:
                         used = ", ".join(sorted(turn_skills)) if turn_skills else "none"
                         console.print(f"  [cyan]↳ skills used:[/cyan] {used}")
                 except KeyboardInterrupt:
-                    _restore_terminal()
-                    console.print("\nGoodbye!")
-                    break
-                except EOFError:
-                    _restore_terminal()
-                    console.print("\nGoodbye!")
-                    break
+                    evt = _turn_done_ref[0]
+                    if evt is not None and not evt.is_set():
+                        if not turn_interrupt_evt.is_set():
+                            turn_interrupt_evt.set()
+                        await _cancel_current_turn()
+                        continue
+                    await _handle_prompt_keyboard_interrupt()
+        except KeyboardInterrupt:
+            evt = _turn_done_ref[0]
+            if evt is not None and not evt.is_set():
+                if _turn_interrupt_evt_ref[0] is not None:
+                    _turn_interrupt_evt_ref[0].set()
+                await _cancel_current_turn()
+        except _CliSessionExit:
+            pass
+        except EOFError:
+            _restore_terminal()
+            console.print("\nGoodbye!")
+        except Exception:
+            logger.exception("Interactive CLI session failed")
+            _restore_terminal()
+            console.print(
+                "\n[red]Session ended due to an unexpected error. "
+                "Run with --logs for details.[/red]"
+            )
         finally:
-            agent_loop.stop()
+            _uninstall_loop_sigint()
             outbound_task.cancel()
-            await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-            await agent_loop.close_mcp()
+            bus_task.cancel()
+            try:
+                await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
+            except KeyboardInterrupt:
+                pass
 
-    asyncio.run(run_interactive())
+    try:
+        asyncio.run(run_interactive())
+    except KeyboardInterrupt:
+        # Last-resort: avoid traceback if SIGINT escapes after session teardown.
+        _restore_terminal()
 
 
 def _build_research_inbound_metadata(
@@ -1489,10 +2215,34 @@ def _build_research_inbound_metadata(
     return metadata
 
 
+def _resolve_cli_session_id(session_id: str | None, *, prefix: str) -> str:
+    """Resolve the session id for an interactive CLI invocation.
+
+    Each CLI process must default to its *own* isolated session so that two
+    concurrently running ``mira`` instances never append to the same session
+    transcript (which would interleave/cross-contaminate their conversations).
+
+    - When the user passes ``--session``/``-s`` explicitly, honour it verbatim
+      so an existing conversation can be resumed.
+    - Otherwise mint a unique, per-process session id (``<prefix>:<uuid>``),
+      mirroring how Cursor/Codex/Claude Code give every instance a fresh
+      session while still sharing global config/persona/long-term memory.
+    """
+    if session_id is not None and session_id.strip():
+        return session_id.strip()
+    return f"{prefix}:{uuid.uuid4().hex[:12]}"
+
+
 @app.command()
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
-    session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
+    session_id: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Session ID to resume. Defaults to a unique per-instance session so "
+        "concurrent CLIs stay isolated.",
+    ),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
@@ -1505,6 +2255,8 @@ def agent(
     from mira_engine.bus.queue import MessageBus
     from mira_engine.cron.service import CronService
 
+    session_id = _resolve_cli_session_id(session_id, prefix="cli")
+
     if workspace is None and sys.stdin.isatty():
         if typer.confirm("Do you want to use the current directory as a project workspace?"):
             workspace = os.getcwd()
@@ -1515,7 +2267,6 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
 
     cron_store_path = _workspace_cron_store(config)
     cron = CronService(cron_store_path)
@@ -1533,7 +2284,6 @@ def agent(
             provider=provider,
             config=config,
             cron_service=cron,
-            model_router=model_router,
         ),
     )
 
@@ -1548,13 +2298,20 @@ def agent(
         inbound_metadata=None,
         model_name=config.agents.defaults.primary_model,
         provider_name=config.agents.defaults.provider,
+        workspace=config.workspace_path,
     )
 
 
 @app.command()
 def research(
     message: str = typer.Option(None, "--message", help="Message to send to the research agent"),
-    session_id: str = typer.Option("cli:research", "--session", "-s", help="Session ID"),
+    session_id: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Session ID to resume. Defaults to a unique per-instance session so "
+        "concurrent CLIs stay isolated.",
+    ),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     mode: str = typer.Option(
@@ -1569,7 +2326,7 @@ def research(
         "--profile",
         "-p",
         case_sensitive=False,
-        help="Agent profile: default | engineer | research. Selects AGENTS_*.md bootstrap.",
+        help="Agent profile: default | engineer | research | team. Selects AGENTS_*.md bootstrap.",
     ),
     max_tokens: int | None = typer.Option(
         None,
@@ -1596,6 +2353,8 @@ def research(
     from mira_engine.bus.queue import MessageBus
     from mira_engine.cron.service import CronService
 
+    session_id = _resolve_cli_session_id(session_id, prefix="research")
+
     mode_value = (mode or "manual").strip().lower()
     if mode_value not in {"manual", "auto"}:
         console.print(
@@ -1603,10 +2362,10 @@ def research(
         )
         raise typer.Exit(1)
     profile_value = (profile or "default").strip().lower()
-    if profile_value not in {"default", "engineer", "research"}:
+    if profile_value not in {"default", "engineer", "research", "team"}:
         console.print(
             f"[red]Invalid --profile value: {profile!r}. "
-            "Expected one of: default, engineer, research.[/red]"
+            "Expected one of: default, engineer, research, team.[/red]"
         )
         raise typer.Exit(1)
     if max_tokens is not None and max_tokens <= 0:
@@ -1626,7 +2385,6 @@ def research(
 
     bus = MessageBus()
     provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
 
     cron_store_path = _workspace_cron_store(config)
     cron = CronService(cron_store_path)
@@ -1641,8 +2399,8 @@ def research(
             provider=provider,
             config=config,
             cron_service=cron,
-            model_router=model_router,
         ),
+        auto_max_rounds=config.agents.defaults.auto_max_rounds,
     )
 
     inbound_metadata = _build_research_inbound_metadata(
@@ -1656,7 +2414,7 @@ def research(
     banner = (
         f"{__logo__} Research mode "
         f"(mode=[bold]{mode_value}[/bold], profile=[bold]{profile_value}[/bold]) "
-        "(type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+        "(type [bold]exit[/bold], [bold]Ctrl+C[/bold] to interrupt, [bold]Ctrl+C x2[/bold] at prompt to quit)\n"
     )
     _run_cli_agent_session(
         agent_loop=agent_loop,
@@ -1670,7 +2428,164 @@ def research(
         interactive_banner=banner,
         model_name=config.agents.defaults.primary_model,
         provider_name=config.agents.defaults.provider,
+        workspace=config.workspace_path,
     )
+
+
+# ============================================================================
+# Model Cache Commands
+# ============================================================================
+
+
+models_app = typer.Typer(help="Fetch and manage provider model lists")
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("fetch")
+def models_fetch(
+    provider: str | None = typer.Argument(None, help="Provider name (defaults to configured provider)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    select_model: bool = typer.Option(False, "--select", help="Select a model after fetching"),
+):
+    """Fetch provider models and cache them locally."""
+    from mira_engine.config.loader import save_config
+    from mira_engine.providers.model_fetch import fetch_models_to_cache
+
+    cfg, config_path = _load_models_command_config(config)
+    provider_name = _resolve_models_provider(cfg, provider)
+    try:
+        cache, cache_path = asyncio.run(fetch_models_to_cache(cfg, provider_name, config_path))
+    except Exception as e:
+        console.print(f"[red]Model fetch failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]✓[/green] Fetched {len(cache.models)} models for {cache.provider} "
+        f"-> {cache_path}"
+    )
+
+    if select_model and cache.models:
+        selected = _prompt_cached_model(cache)
+        if selected is None:
+            return
+        cfg.agents.defaults.provider = cache.provider
+        cfg.agents.defaults.model = selected.config_model
+        save_config(cfg, config_path)
+        console.print(f"[green]✓[/green] Set default model to {selected.config_model}")
+
+
+@models_app.command("list")
+def models_list(
+    provider: str | None = typer.Argument(None, help="Provider name (omit to list all caches)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    refresh: bool = typer.Option(False, "--refresh", help="Fetch before listing"),
+):
+    """List cached provider models."""
+    from mira_engine.providers.model_fetch import fetch_models_to_cache, read_all_model_caches, read_model_cache
+
+    cfg, config_path = _load_models_command_config(config)
+    caches = []
+    if refresh:
+        provider_name = _resolve_models_provider(cfg, provider)
+        try:
+            cache, _ = asyncio.run(fetch_models_to_cache(cfg, provider_name, config_path))
+        except Exception as e:
+            console.print(f"[red]Model fetch failed:[/red] {e}")
+            raise typer.Exit(1)
+        caches = [cache]
+    elif provider:
+        cache = read_model_cache(provider, config_path)
+        caches = [cache] if cache else []
+    else:
+        caches = read_all_model_caches(config_path)
+
+    if not caches:
+        console.print("[yellow]No cached models found. Run `mira models fetch` first.[/yellow]")
+        return
+
+    console.print(_model_cache_table(caches))
+    for cache in caches:
+        table = Table(title=f"{cache.provider} models")
+        table.add_column("Model")
+        table.add_column("Config Value")
+        table.add_column("Context", justify="right")
+        for model in cache.models:
+            context = str(model.context_window_tokens) if model.context_window_tokens else "-"
+            table.add_row(model.display_name or model.id, model.config_model, context)
+        console.print(table)
+
+
+@models_app.command("select")
+def models_select(
+    provider: str | None = typer.Argument(None, help="Provider name (defaults to configured provider)"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model id or config model to select"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    refresh: bool = typer.Option(False, "--refresh", help="Fetch before selecting"),
+):
+    """Select a cached model and write it to config.json."""
+    from mira_engine.config.loader import save_config
+    from mira_engine.providers.model_fetch import fetch_models_to_cache, read_model_cache
+
+    cfg, config_path = _load_models_command_config(config)
+    provider_name = _resolve_models_provider(cfg, provider)
+    if refresh:
+        try:
+            cache, _ = asyncio.run(fetch_models_to_cache(cfg, provider_name, config_path))
+        except Exception as e:
+            console.print(f"[red]Model fetch failed:[/red] {e}")
+            raise typer.Exit(1)
+    else:
+        cache = read_model_cache(provider_name, config_path)
+        if cache is None:
+            console.print("[yellow]No cached models found. Run `mira models fetch` first.[/yellow]")
+            raise typer.Exit(1)
+
+    selected = _find_cached_model(cache, model) if model else _prompt_cached_model(cache)
+    if selected is None:
+        console.print("[red]Model not found in cache.[/red]" if model else "[yellow]No model selected.[/yellow]")
+        raise typer.Exit(1)
+
+    cfg.agents.defaults.provider = cache.provider
+    cfg.agents.defaults.model = selected.config_model
+    save_config(cfg, config_path)
+    console.print(f"[green]✓[/green] Set default model to {selected.config_model}")
+
+
+@models_app.command("clear")
+def models_clear(
+    provider: str | None = typer.Argument(None, help="Provider name (omit to clear all model caches)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Clear cached model lists."""
+    from mira_engine.providers.model_fetch import clear_model_cache
+
+    _cfg, config_path = _load_models_command_config(config)
+    removed = clear_model_cache(provider, config_path)
+    if not removed:
+        console.print("[yellow]No model cache files removed.[/yellow]")
+        return
+    console.print(f"[green]✓[/green] Removed {len(removed)} model cache file(s).")
+
+
+def _prompt_cached_model(cache):
+    """Prompt for a model from a cache in interactive terminals."""
+    if not cache.models:
+        return None
+    if not sys.stdin.isatty():
+        return None
+
+    console.print(f"\nModels for {cache.provider}:")
+    for idx, item in enumerate(cache.models, 1):
+        console.print(f"  {idx}. {item.config_model}")
+    raw = typer.prompt("Select model number", default="", show_default=False).strip()
+    if not raw:
+        return None
+    if not raw.isdigit():
+        return None
+    idx = int(raw)
+    if not 1 <= idx <= len(cache.models):
+        return None
+    return cache.models[idx - 1]
 
 
 # ============================================================================
@@ -2091,6 +3006,29 @@ def channels_login(
 # ============================================================================
 
 
+def _oauth_login_status(provider_name: str) -> tuple[bool, str | None]:
+    """Return local OAuth login state without doing any network calls."""
+    try:
+        if provider_name == "openai_codex":
+            ensure_oauth_state_dirs_for_runtime()
+            from oauth_cli_kit import get_token
+
+            token = get_token()
+        elif provider_name == "github_copilot":
+            from mira_engine.providers.github_copilot_provider import get_github_copilot_login_status
+
+            token = get_github_copilot_login_status()
+        else:
+            return False, None
+    except Exception:
+        return False, None
+
+    if not (token and getattr(token, "access", None)):
+        return False, None
+    account_id = getattr(token, "account_id", None)
+    return True, str(account_id) if account_id else None
+
+
 @app.command()
 def status():
     """Show mira status."""
@@ -2107,15 +3045,16 @@ def status():
 
     if config_path.exists():
         from mira_engine.providers.registry import PROVIDERS
+        from mira_engine.providers.model_fetch import is_cache_stale, read_model_cache
 
         console.print(f"Model: {_format_model_selection(config.agents.defaults.model)}")
-        if config.agents.defaults.route_by_complexity:
-            console.print("Routing: [green]enabled[/green]")
-            console.print(f"  small: {_format_model_selection(config.agents.defaults.small_model)}")
-            console.print(f"  medium: {_format_model_selection(config.agents.defaults.medium_model)}")
-            console.print(f"  large: {_format_model_selection(config.agents.defaults.large_model)}")
-        else:
-            console.print("Routing: [dim]disabled[/dim]")
+        active_provider = (
+            config.get_provider_name(config.agents.defaults.model) or config.agents.defaults.provider
+        ).replace("-", "_")
+        for _role in ("supervisor", "student", "critic"):
+            _role_model = getattr(config.agents.defaults, f"{_role}_model", None)
+            if _role_model:
+                console.print(f"Team {_role}: {_format_model_selection(_role_model)}")
 
         # Check API keys from registry
         for spec in PROVIDERS:
@@ -2123,7 +3062,12 @@ def status():
             if p is None:
                 continue
             if spec.is_oauth:
-                console.print(f"{spec.label}: [green]✓ (OAuth)[/green]")
+                authenticated, account_id = _oauth_login_status(spec.name)
+                if authenticated:
+                    account_part = f" [dim]{account_id}[/dim]" if account_id else ""
+                    console.print(f"{spec.label}: [green]✓ OAuth[/green]{account_part}")
+                else:
+                    console.print(f"{spec.label}: [dim]not logged in[/dim]")
             elif spec.is_local:
                 # Local deployments show api_base instead of api_key
                 if p.api_base:
@@ -2133,6 +3077,20 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+            if spec.name == active_provider:
+                cache = read_model_cache(spec.name, config_path)
+                if cache:
+                    state = "stale" if is_cache_stale(cache) else "fresh"
+                    console.print(
+                        f"  Models: [green]{len(cache.models)} cached[/green] "
+                        f"({state}, fetched {cache.fetched_at})"
+                    )
+                    cached_models = {model.config_model for model in cache.models}
+                    if config.agents.defaults.model not in cached_models:
+                        console.print(
+                            "  [yellow]! Current model is not in the cached model list. "
+                            "Run `mira models fetch` to refresh.[/yellow]"
+                        )
 
 
 # ============================================================================

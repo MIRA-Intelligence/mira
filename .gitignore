@@ -1,5 +1,9 @@
 __pycache__/
 .*
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+!.cnb.yml
 .coverage
 coverage.xml
 htmlcov/
@@ -8,3 +12,4 @@ dist/
 *.spec
 !mira-engine.spec
 bundled/
+.gstack/

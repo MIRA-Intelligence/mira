@@ -96,6 +96,27 @@ def test_make_provider_falls_back_to_web_proxy_for_openai_codex() -> None:
     assert provider.proxy == "http://127.0.0.1:7890"
 
 
+def test_make_provider_passes_provider_proxy_to_github_copilot() -> None:
+    """GitHub Copilot provider uses providers.proxy for token exchange calls."""
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "github_copilot",
+                    "model": "github_copilot/gemini-3.1-pro-preview",
+                }
+            },
+            "providers": {"proxy": "http://127.0.0.1:7890"},
+            "tools": {"web": {"proxy": "http://127.0.0.1:9999"}},
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "GitHubCopilotProvider"
+    assert provider.proxy == "http://127.0.0.1:7890"
+
+
 def test_make_provider_routes_deepseek_through_openai_compat() -> None:
     """DeepSeek bypasses LiteLLM to dodge the thinking-mode reasoning_content bug."""
     config = Config.model_validate(
@@ -140,3 +161,47 @@ def test_make_provider_routes_deepseek_with_custom_api_base() -> None:
 
     assert provider.__class__.__name__ == "OpenAICompatProvider"
     assert provider._effective_base == "https://deepseek.proxy.example/v1"
+
+
+def test_make_provider_routes_nvidia_through_direct_provider() -> None:
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "nvidia",
+                    "model": "nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5",
+                }
+            },
+            "providers": {"nvidia": {"apiKey": "nvapi-test-key"}},
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "NvidiaProvider"
+    assert provider.get_default_model() == "nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5"
+    assert provider.api_base == "https://inference-api.nvidia.com/v1"
+
+
+def test_make_provider_routes_nvidia_with_custom_api_base() -> None:
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "nvidia",
+                    "model": "nvidia/deepseek-ai/deepseek-v4-pro",
+                }
+            },
+            "providers": {
+                "nvidia": {
+                    "apiKey": "nvapi-test-key",
+                    "apiBase": "https://proxy.example/v1/chat/completions",
+                }
+            },
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "NvidiaProvider"
+    assert provider.api_base == "https://proxy.example/v1"

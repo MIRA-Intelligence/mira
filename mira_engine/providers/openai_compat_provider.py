@@ -26,6 +26,7 @@ else:
     from openai import AsyncOpenAI
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.registry import model_overrides_for
 from mira_engine.providers.openai_responses import (
     consume_sdk_stream,
     convert_messages,
@@ -169,6 +170,7 @@ class OpenAICompatProvider(LLMProvider):
         default_model: str = "gpt-4o",
         extra_headers: dict[str, str] | None = None,
         spec: ProviderSpec | None = None,
+        http_client: Any | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
@@ -192,13 +194,17 @@ class OpenAICompatProvider(LLMProvider):
         if extra_headers:
             default_headers.update(extra_headers)
 
-        self._client = AsyncOpenAI(
-            api_key=api_key or "no-key",
-            base_url=effective_base,
-            default_headers=default_headers,
-            max_retries=0,
-            timeout=_resolve_timeout(),
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key or "no-key",
+            "base_url": effective_base,
+            "default_headers": default_headers,
+            "max_retries": 0,
+            "timeout": _resolve_timeout(),
+        }
+        if http_client is not None:
+            client_kwargs["http_client"] = http_client
+
+        self._client = AsyncOpenAI(**client_kwargs)
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:
         """Set environment variables based on provider spec."""
@@ -328,8 +334,9 @@ class OpenAICompatProvider(LLMProvider):
         }
 
         # GPT-5 and reasoning models (o1/o3/o4) reject temperature when
-        # reasoning_effort is active.  Only include it when safe.
-        if self._supports_temperature(model_name, reasoning_effort):
+        # reasoning_effort is active.  Only include it when safe and when the
+        # caller actually wants a temperature (None => omit the parameter).
+        if temperature is not None and self._supports_temperature(model_name, reasoning_effort):
             kwargs["temperature"] = temperature
 
         prefers_max_completion_tokens = any(token in model_name.lower() for token in ("gpt-5", "o1", "o3", "o4"))
@@ -338,12 +345,7 @@ class OpenAICompatProvider(LLMProvider):
         else:
             kwargs["max_tokens"] = max(1, max_tokens)
 
-        if spec:
-            model_lower = model_name.lower()
-            for pattern, overrides in spec.model_overrides:
-                if pattern in model_lower:
-                    kwargs.update(overrides)
-                    break
+        self._apply_param_overrides(kwargs, model_overrides_for(model_name, spec))
 
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
@@ -480,7 +482,7 @@ class OpenAICompatProvider(LLMProvider):
             "stream": False,
         }
 
-        if self._supports_temperature(model_name, reasoning_effort):
+        if temperature is not None and self._supports_temperature(model_name, reasoning_effort):
             body["temperature"] = temperature
 
         if reasoning_effort and reasoning_effort.lower() != "none":

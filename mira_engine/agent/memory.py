@@ -3,23 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import weakref
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
-from mira_engine.agent.runner import AgentRunSpec, AgentRunner
+from mira_engine.agent.runner import AgentRunner, AgentRunSpec
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.utils.gitstore import GitStore
-from mira_engine.utils.helpers import ensure_dir
 from mira_engine.utils.helpers import (
+    ensure_dir,
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
     strip_think,
+)
+from mira_engine.utils.locks import (
+    atomic_write_text,
+    interprocess_lock,
+    locked_write_text,
 )
 from mira_engine.utils.prompt_templates import render_template
 
@@ -73,7 +80,6 @@ class MemoryStore:
 
     def __init__(self, workspace: Path, max_history_entries: int = 1000):
         from mira_engine.config.paths import get_workspace_path
-        import hashlib
 
         self.workspace = workspace
         self.project_workspace = workspace
@@ -130,20 +136,28 @@ class MemoryStore:
         return ""
 
     def read_global_term(self) -> str:
+        # Global long-term memory is SHARED across all projects/instances (per
+        # user). Always overlay it on top of per-project memory so knowledge
+        # learned in one project is available everywhere, matching the
+        # "global shared + per-project overlay" model. Writes to the global
+        # store remain gated (see ``write_global_term``); only reads are open.
         if (
-            (self._allow_global_memory or self._explicit_global_write)
-            and self.memory_file != self.global_memory_file
+            self.memory_file.resolve() != self.global_memory_file.resolve()
             and self.global_memory_file.exists()
         ):
             return self.global_memory_file.read_text(encoding="utf-8")
         return ""
 
     def write_long_term(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+        locked_write_text(self.memory_file, content)
         self._legacy_project_memory_file.parent.mkdir(parents=True, exist_ok=True)
-        self._legacy_project_memory_file.write_text(content, encoding="utf-8")
+        if (
+            self._legacy_project_memory_file.resolve(strict=False)
+            != self.global_memory_file.resolve(strict=False)
+        ):
+            locked_write_text(self._legacy_project_memory_file, content)
         if self.backup_dir:
-            self.memory_backup_file.write_text(content, encoding="utf-8")
+            locked_write_text(self.memory_backup_file, content)
 
     @staticmethod
     def read_file(path: Path) -> str:
@@ -171,26 +185,30 @@ class MemoryStore:
         return self.read_file(self.soul_file)
 
     def write_soul(self, content: str) -> None:
-        self.soul_file.write_text(content, encoding="utf-8")
+        locked_write_text(self.soul_file, content)
 
     def read_user(self) -> str:
         return self.read_file(self.user_file)
 
     def write_user(self, content: str) -> None:
-        self.user_file.write_text(content, encoding="utf-8")
+        locked_write_text(self.user_file, content)
 
     def append_history(self, entry: str) -> int:
-        cursor = self._next_cursor()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         cleaned = strip_think(entry.rstrip()) or entry.rstrip()
-        with open(self.history_jsonl_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"cursor": cursor, "timestamp": ts, "content": cleaned}, ensure_ascii=False) + "\n")
-        with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(f"{cleaned}\n\n")
-        self._cursor_file.write_text(str(cursor), encoding="utf-8")
-        if self.backup_dir:
-            with open(self.history_backup_file, "a", encoding="utf-8") as f:
+        # The cursor read-modify-write plus the appends must be atomic across
+        # processes: concurrent instances sharing this workspace would otherwise
+        # mint duplicate cursors and interleave partial lines.
+        with interprocess_lock(self.history_jsonl_file):
+            cursor = self._next_cursor()
+            with open(self.history_jsonl_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"cursor": cursor, "timestamp": ts, "content": cleaned}, ensure_ascii=False) + "\n")
+            with open(self.history_file, "a", encoding="utf-8") as f:
+                f.write(f"{cleaned}\n\n")
+            self._cursor_file.write_text(str(cursor), encoding="utf-8")
+            if self.backup_dir:
+                with open(self.history_backup_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"cursor": cursor, "timestamp": ts, "content": cleaned}, ensure_ascii=False) + "\n")
         return cursor
 
     def _next_cursor(self) -> int:
@@ -212,7 +230,7 @@ class MemoryStore:
                 read_size = min(size, 4096)
                 f.seek(size - read_size)
                 data = f.read().decode("utf-8")
-                lines = [l for l in data.split("\n") if l.strip()]
+                lines = [line for line in data.split("\n") if line.strip()]
                 if not lines:
                     return None
                 return json.loads(lines[-1])
@@ -384,12 +402,63 @@ class MemoryStore:
     def write_global_term(self, content: str) -> None:
         self._explicit_global_write = True
         if self.memory_file.resolve() != self.global_memory_file.resolve():
-            from mira_engine.utils.helpers import ensure_dir
             ensure_dir(self.global_memory_file.parent)
-            self.global_memory_file.write_text(content, encoding="utf-8")
+            # Global memory is shared across all projects/instances; guard the
+            # write with a cross-process lock + atomic replace.
+            locked_write_text(self.global_memory_file, content)
         else:
             # If they are exactly the same, writing to long_term is enough
             pass
+
+    def commit_consolidated_memories(
+        self,
+        *,
+        expected_local: str,
+        local_update: str | None,
+        expected_global: str,
+        global_update: str | None,
+    ) -> bool:
+        """Commit memory snapshots only if neither source changed concurrently."""
+        local_changed = local_update is not None and local_update != expected_local
+        global_changed = global_update is not None and global_update != expected_global
+        if not local_changed and not global_changed:
+            return True
+
+        local_targets: list[Path] = []
+        if local_changed:
+            local_targets.append(self.memory_file)
+            if (
+                self._legacy_project_memory_file.resolve(strict=False)
+                != self.global_memory_file.resolve(strict=False)
+            ):
+                local_targets.append(self._legacy_project_memory_file)
+            if self.backup_dir:
+                local_targets.append(self.memory_backup_file)
+
+        global_targets = [self.global_memory_file] if global_changed else []
+        lock_targets = sorted(
+            {
+                target.resolve(strict=False)
+                for target in local_targets + global_targets + [self.global_memory_file]
+            },
+            key=str,
+        )
+
+        with ExitStack() as stack:
+            for target in lock_targets:
+                stack.enter_context(interprocess_lock(target))
+            if self.read_long_term() != expected_local or self.read_global_term() != expected_global:
+                logger.warning(
+                    "Memory consolidation skipped because another instance updated memory"
+                )
+                return False
+            if local_changed and local_update is not None:
+                for target in local_targets:
+                    atomic_write_text(target, local_update)
+            if global_changed and global_update is not None:
+                atomic_write_text(self.global_memory_file, global_update)
+                self._explicit_global_write = True
+        return True
 
     def get_memory_context(self) -> str:
         global_term = self.read_global_term()
@@ -593,29 +662,29 @@ You MUST analyze the knowledge and separate it:
                 )
                 return False
 
-            wrote_history = False
-            wrote_project = False
-            wrote_workspace = False
+            project_update = args.get("project_memory_update")
+            if project_update is not None and not isinstance(project_update, str):
+                project_update = json.dumps(project_update, ensure_ascii=False)
+            workspace_update = args.get("workspace_memory_update")
+            if workspace_update is not None and not isinstance(workspace_update, str):
+                workspace_update = json.dumps(workspace_update, ensure_ascii=False)
 
+            if not self.commit_consolidated_memories(
+                expected_local=current_local,
+                local_update=project_update,
+                expected_global=current_global,
+                global_update=workspace_update,
+            ):
+                return False
+
+            wrote_project = project_update is not None and project_update != current_local
+            wrote_workspace = workspace_update is not None and workspace_update != current_global
+            wrote_history = False
             if entry := args.get("history_entry"):
                 if not isinstance(entry, str):
                     entry = json.dumps(entry, ensure_ascii=False)
                 self.append_history(entry)
                 wrote_history = True
-            
-            if proj_update := args.get("project_memory_update"):
-                if not isinstance(proj_update, str):
-                    proj_update = json.dumps(proj_update, ensure_ascii=False)
-                if proj_update != current_local:
-                    self.write_long_term(proj_update)
-                    wrote_project = True
-                    
-            if work_update := args.get("workspace_memory_update"):
-                if not isinstance(work_update, str):
-                    work_update = json.dumps(work_update, ensure_ascii=False)
-                if work_update != current_global:
-                    self.write_global_term(work_update)
-                    wrote_workspace = True
 
             if archive_all:
                 session.last_consolidated = 0
@@ -739,7 +808,9 @@ class Consolidator:
                 self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
             )
             target = budget // 2
-            estimated, source = self.estimate_session_prompt_tokens(session)
+            estimated, source = await asyncio.to_thread(
+                self.estimate_session_prompt_tokens, session
+            )
             if estimated <= 0 or estimated < budget:
                 return
 
@@ -771,7 +842,9 @@ class Consolidator:
                     return
                 session.last_consolidated = end_idx
                 self.sessions.save(session)
-                estimated, source = self.estimate_session_prompt_tokens(session)
+                estimated, source = await asyncio.to_thread(
+                    self.estimate_session_prompt_tokens, session
+                )
                 if estimated <= 0:
                     return
 
