@@ -12,7 +12,7 @@ from loguru import logger
 
 try:
     import nh3
-    from mistune import create_markdown
+    from mistune import HTMLRenderer, create_markdown
     from nio import (
         AsyncClient,
         AsyncClientConfig,
@@ -58,7 +58,7 @@ MATRIX_MEDIA_EVENT_FILTER = (RoomMessageMedia, RoomEncryptedMedia)
 MatrixMediaEvent: TypeAlias = RoomMessageMedia | RoomEncryptedMedia
 
 MATRIX_MARKDOWN = create_markdown(
-    escape=True,
+    renderer=HTMLRenderer(escape=True, allow_harmful_protocols={"mxc"}),
     plugins=["table", "strikethrough", "url", "superscript", "subscript"],
 )
 

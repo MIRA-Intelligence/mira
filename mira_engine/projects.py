@@ -268,9 +268,14 @@ class ProjectRegistry:
                 if project_dir is None:
                     continue
                 existing = merged_dirs.get(project_id)
+                project_dir_resolved = project_dir.resolve(strict=False)
+                current_root_candidate = (
+                    self.projects_root / project_id
+                ).resolve(strict=False)
                 if (
                     existing is not None
-                    and existing.resolve(strict=False) != project_dir.resolve(strict=False)
+                    and existing.resolve(strict=False) != project_dir_resolved
+                    and current_root_candidate != project_dir_resolved
                 ):
                     raise ValueError(
                         f"project_id {project_id!r} is already bound to {existing}"
