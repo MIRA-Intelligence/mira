@@ -198,8 +198,30 @@ async def test_dispatch_outbound_filters_progress_messages() -> None:
     task.cancel()
     await task
 
-    assert [m.content for m in ui_ch.sent] == ["normal", "activity"]
+    # The UI always needs the current tool step for its live working indicator,
+    # even when verbose tool hints are disabled for external chat channels.
+    assert [m.content for m in ui_ch.sent] == ["normal", "activity", "hint"]
     assert matrix_ch.sent == []
+
+
+async def test_dispatch_outbound_allows_enabled_tool_hints_for_external_channels() -> None:
+    cfg = Config()
+    cfg.channels.send_progress = False
+    cfg.channels.send_tool_hints = True
+    bus = MessageBus()
+    mgr = ChannelManager(cfg, bus)
+    matrix_ch = _DummyChannel(SimpleNamespace(allow_from=["*"]), bus)
+    mgr.channels = {"matrix": matrix_ch}
+
+    task = asyncio.create_task(mgr._dispatch_outbound())
+    await bus.publish_outbound(
+        OutboundMessage("matrix", "x", "hint", metadata={"_progress": True, "_tool_hint": True})
+    )
+    await asyncio.sleep(0.1)
+    task.cancel()
+    await task
+
+    assert [m.content for m in matrix_ch.sent] == ["hint"]
 
 
 async def test_dispatch_outbound_handles_unknown_channel_and_send_errors() -> None:

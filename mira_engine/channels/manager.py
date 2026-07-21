@@ -264,7 +264,11 @@ class ChannelManager:
                     if msg.metadata.get("_activity_ping"):
                         if msg.channel != "ui":
                             continue
-                    elif msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
+                    elif (
+                        msg.metadata.get("_tool_hint")
+                        and msg.channel != "ui"
+                        and not self.config.channels.send_tool_hints
+                    ):
                         continue
                     elif not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
                         continue
