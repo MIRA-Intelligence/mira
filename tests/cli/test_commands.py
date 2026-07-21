@@ -1014,9 +1014,14 @@ def _patch_cli_command_runtime(
         "mira_engine.cli.commands.sync_workspace_templates",
         sync_templates or (lambda _path: None),
     )
+    provider_factory = make_provider or (lambda _config: object())
     monkeypatch.setattr(
         "mira_engine.cli.commands._make_provider",
-        make_provider or (lambda _config: object()),
+        provider_factory,
+    )
+    monkeypatch.setattr(
+        "mira_engine.cli.commands._make_gateway_provider",
+        provider_factory,
     )
 
     if message_bus is not None:
@@ -1182,6 +1187,10 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     monkeypatch.setattr("mira_engine.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("mira_engine.cli.commands.sync_workspace_templates", lambda _path: None)
     monkeypatch.setattr("mira_engine.cli.commands._make_provider", lambda _config: provider)
+    monkeypatch.setattr(
+        "mira_engine.cli.commands._make_gateway_provider",
+        lambda _config, _model=None: provider,
+    )
     monkeypatch.setattr("mira_engine.bus.queue.MessageBus", lambda: bus)
     monkeypatch.setattr("mira_engine.session.manager.SessionManager", lambda _workspace: object())
 
