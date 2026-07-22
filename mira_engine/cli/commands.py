@@ -40,6 +40,7 @@ from rich.text import Text
 from loguru import logger
 
 from mira_engine import __logo__, __version__
+from mira_engine.cli.workflow import workflow_app
 from mira_engine.config.paths import get_workspace_path
 from mira_engine.config.schema import Config
 from mira_engine.providers.factory import make_provider, make_role_provider
@@ -51,6 +52,7 @@ app = typer.Typer(
     help=f"{__logo__} mira - Personal AI Assistant",
     no_args_is_help=True,
 )
+app.add_typer(workflow_app, name="workflow")
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}

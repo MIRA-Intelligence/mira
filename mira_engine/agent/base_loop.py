@@ -53,6 +53,7 @@ from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.command.router import CommandContext, CommandRouter
+from mira_engine.modules.tools import WorkflowInteractionTool
 from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
@@ -373,6 +374,7 @@ class BaseAgentLoop:
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SetPlanTool())
+        self.tools.register(WorkflowInteractionTool())
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(ConsultRoleTool(manager=self.subagents))
         if self.cron_service:
@@ -517,6 +519,7 @@ class BaseAgentLoop:
         message_id: str | None = None,
         project_ref: ProjectRef | None = None,
         session_key: str | None = None,
+        workflow_run_id: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         if project_ref is not None:
@@ -531,6 +534,8 @@ class BaseAgentLoop:
                     )
                 if hasattr(tool, "set_project_context"):
                     tool.set_project_context(project_ref.project_id, str(project_ref.project_dir))
+                if hasattr(tool, "set_workflow_run_context"):
+                    tool.set_workflow_run_context(workflow_run_id)
         else:
             for tool in getattr(self.tools, "_tools", {}).values():
                 if hasattr(tool, "clear_runtime_context"):
@@ -1378,6 +1383,9 @@ class BaseAgentLoop:
             meta.get("turn_id") or meta.get("message_id"),
             project_ref=project_ref,
             session_key=key,
+            workflow_run_id=meta.get("workflow_run_id")
+            if isinstance(meta.get("workflow_run_id"), str)
+            else None,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
