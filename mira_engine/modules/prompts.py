@@ -1,4 +1,4 @@
-"""Module-local behavior contracts used during the strangler migration."""
+"""Module-local behavior contracts for the four native executors."""
 
 from __future__ import annotations
 
@@ -13,6 +13,9 @@ traceable to evidence and clearly distinguish evidence, inference, and suggestio
 When the Run reaches a real choice or approval gate, call
 request_workflow_interaction to create a structured UI decision. Do not merely ask
 the same gating question in prose. After calling the tool, end the turn and wait.
+When the requested module outcome is genuinely finished, publish any output files
+with publish_workflow_artifact and then call complete_workflow_run exactly once.
+Do not mark a Run complete merely because one conversational turn ended.
 """.strip()
 
 _MODULE_PROMPTS: dict[ModuleType, str] = {

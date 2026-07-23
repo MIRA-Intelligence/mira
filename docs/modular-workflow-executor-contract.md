@@ -4,10 +4,10 @@ Generated on 2026-07-22
 Parent design: `docs/modular-research-workflow-design.md`  
 Storage contract: `docs/modular-workflow-storage-contract.md`  
 API contract: `docs/modular-workflow-api-contract.md`  
-Status: PROPOSED  
+Status: IMPLEMENTED V1 — hardening items remain
 Scope: module execution, pause/resume, interaction, checkpointing, and output publication
 
-Implementation status: the shared protocol, module-local behavior contracts, append-only attempts, durable checkpoint transitions, restart-safe recovery pauses, AI-triggered structured interaction widgets, Run-scoped conversations, pause/cancel/complete controls, Artifact publication, and manual/automatic downstream branching are implemented in the current worktree. Full native canonical executors, staged-output manifests, heartbeats, and forced-control workers remain follow-up extraction work.
+Implementation status: four concrete native executors (`mira.initiation`, `mira.planning`, `mira.experiment`, and `mira.delivery`) now own validation, prompts, and tool capabilities independently. ModuleRun messages bypass the legacy `ResearchAgentLoop` orchestration and use only the shared conversation engine. Attempts and checkpoints persist executor identity/version; structured interaction, Artifact publication, completion, and cooperative pause/cancel are wired end to end. Atomic staged-output manifests, heartbeats, forced-control workers, and checkpoint-version migration remain hardening work.
 
 ## Decision
 
@@ -259,15 +259,16 @@ Every executor must pass the same fake-service tests:
 11. no executor can write outside its staging directory; and
 12. no earlier canonical module is required when equivalent direct-entry input is valid.
 
-The first vertical slice proves lifecycle, storage, REST, replay, UI behavior, and Run-scoped conversation isolation while adapting the current research loop behind module-local behavior contracts. Native checkpoint-producing executors replace this migration adapter incrementally.
+The first vertical slice proves lifecycle, storage, REST, replay, UI behavior, and Run-scoped conversation isolation. The four canonical ModuleRuns now route through concrete native executors and no longer enter the legacy research/task-plan orchestration. They deliberately reuse `BaseAgentLoop` as a conversation/provider engine; that shared engine is infrastructure, not workflow coordination.
 
 ## Extraction order
 
-1. Implement the protocol, fake executor, scheduler lease, and conformance harness.
-2. Extract Initiation because it exercises literature work, direction choices, research-only completion, and optional handoff without experiment risk.
-3. Extract Planning and prove repeated revision/approval interactions.
-4. Extract Delivery and prove direct entry from an uploaded manuscript or selected Artifact set.
-5. Extract Experiment last, retaining current guardrails and adding ambiguous-side-effect recovery tests before enabling automatic handoff into it.
+1. Implement the protocol, registry, scheduler lease, and common executor tests. — Done
+2. Extract Initiation with literature work, direction choices, research-only completion, and optional handoff. — Done
+3. Extract Planning and structured revision/approval interactions. — Done
+4. Extract Delivery with direct entry from user input or selected Artifacts. — Done
+5. Extract Experiment with an independent execution-capable tool surface and safe-boundary controls. — Done
+6. Add atomic staging manifests, heartbeat/lease expiry, forced-control workers, and ambiguous-side-effect recovery before enabling unattended experiment automation. — Deferred hardening
 
 Prompt redesign is a separate change after behavioral parity. Extraction changes ownership and persistence first; it must not simultaneously rewrite scientific behavior.
 

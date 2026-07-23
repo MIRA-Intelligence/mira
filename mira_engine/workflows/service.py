@@ -282,7 +282,14 @@ class WorkflowService:
             event=event,
         )
 
-    def claim_run(self, run_id: str, *, lease_owner: str) -> CommandReceipt | None:
+    def claim_run(
+        self,
+        run_id: str,
+        *,
+        lease_owner: str,
+        executor_name: str | None = None,
+        executor_version: str = "1.0.0",
+    ) -> CommandReceipt | None:
         """Claim a queued Run for an engine-owned execution adapter."""
         with self.repository.transaction():
             workflow = self._load_active_workflow()
@@ -315,6 +322,7 @@ class WorkflowService:
             now = utc_now()
             event_id = new_id()
             previous_attempt_id = run.attempt.current_attempt_id
+            resolved_executor_name = executor_name or f"mira.{run.module_type}"
             workflow.revision += 1
             workflow.last_project_sequence += 1
             run.revision += 1
@@ -334,6 +342,16 @@ class WorkflowService:
                     attempt_id=previous_attempt_id,
                     reason="recovery",
                     created_at=now,
+                    executor_name=(
+                        run.attempts[-1].executor_name
+                        if run.attempts
+                        else resolved_executor_name
+                    ),
+                    executor_version=(
+                        run.attempts[-1].executor_version
+                        if run.attempts
+                        else executor_version
+                    ),
                     state={
                         "recovery_required": True,
                         "previous_lease_owner": run.attempt.lease_owner,
@@ -389,6 +407,8 @@ class WorkflowService:
                         number=run.attempt.number,
                         lease_owner=lease_owner,
                         started_at=now,
+                        executor_name=resolved_executor_name,
+                        executor_version=executor_version,
                         resumed_from_checkpoint_id=run.checkpoint_ref,
                     )
                 )
@@ -437,6 +457,8 @@ class WorkflowService:
         checkpoint_state: dict[str, Any] | None = None,
         conversation_cursor: str | int | None = None,
         attempt_id: str | None = None,
+        executor_name: str | None = None,
+        executor_version: str | None = None,
     ) -> CommandReceipt:
         """Commit a resumable boundary and wait for one typed user response."""
         try:
@@ -452,6 +474,8 @@ class WorkflowService:
             checkpoint_state=checkpoint_state,
             conversation_cursor=conversation_cursor,
             attempt_id=attempt_id,
+            executor_name=executor_name,
+            executor_version=executor_version,
             payload={"interaction": request.model_dump(mode="json")},
         )
 
@@ -464,6 +488,8 @@ class WorkflowService:
         checkpoint_state: dict[str, Any] | None = None,
         conversation_cursor: str | int | None = None,
         attempt_id: str | None = None,
+        executor_name: str | None = None,
+        executor_version: str | None = None,
     ) -> CommandReceipt:
         if control not in {"pause", "cancel"}:
             raise WorkflowError("invalid_control", "control must be pause or cancel", status=422)
@@ -476,6 +502,8 @@ class WorkflowService:
             checkpoint_state=checkpoint_state,
             conversation_cursor=conversation_cursor,
             attempt_id=attempt_id,
+            executor_name=executor_name,
+            executor_version=executor_version,
             require_pending_control=control,
         )
 
@@ -557,6 +585,8 @@ class WorkflowService:
         checkpoint_state: dict[str, Any] | None,
         conversation_cursor: str | int | None,
         attempt_id: str | None,
+        executor_name: str | None,
+        executor_version: str | None,
         payload: dict[str, Any] | None = None,
         require_pending_control: str | None = None,
     ) -> CommandReceipt:
@@ -583,6 +613,14 @@ class WorkflowService:
                     "control_not_pending", f"{require_pending_control} is not pending", status=409
                 )
             now = utc_now()
+            attempt_record = next(
+                (
+                    candidate
+                    for candidate in reversed(run.attempts)
+                    if candidate.attempt_id == active_attempt_id
+                ),
+                None,
+            )
             checkpoint = Checkpoint(
                 checkpoint_id=new_id(),
                 project_id=self.repository.project_id,
@@ -590,6 +628,18 @@ class WorkflowService:
                 attempt_id=active_attempt_id,
                 reason=reason,
                 created_at=now,
+                executor_name=(
+                    executor_name
+                    or (
+                        attempt_record.executor_name
+                        if attempt_record
+                        else f"mira.{run.module_type}"
+                    )
+                ),
+                executor_version=(
+                    executor_version
+                    or (attempt_record.executor_version if attempt_record else "1.0.0")
+                ),
                 conversation_cursor=conversation_cursor,
                 state=checkpoint_state or {},
             )
@@ -673,7 +723,23 @@ class WorkflowService:
             return "cancelled", "run.cancelled", "applied"
         if command == "retry" and status == "failed":
             run.pending_control = None
+            run.module_data.pop("failure", None)
             return "queued", "run.queued", "accepted"
+        if command == "fail" and status in {"queued", "running", "waiting_input"}:
+            code = payload.get("code")
+            message = payload.get("message")
+            run.module_data["failure"] = {
+                "code": code if isinstance(code, str) and code else "execution_failed",
+                "message": message
+                if isinstance(message, str) and message
+                else "Module execution failed",
+                "retryable": bool(payload.get("retryable", True)),
+            }
+            run.pending_control = None
+            run.attempt.lease_owner = None
+            run.attempt.lease_expires_at = None
+            self._close_attempt(run, "failed", utc_now())
+            return "failed", "run.failed", "applied"
         if command == "complete" and status in {"running", "waiting_input", "paused"}:
             outputs = payload.get("outputs", [])
             if not isinstance(outputs, list) or not all(isinstance(item, str) for item in outputs):
