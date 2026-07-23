@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
-from mira_engine.workflows.models import ModuleType
+from mira_engine.workflows.models import Artifact, ModuleRun, ModuleType
 
 
 @dataclass(frozen=True)
@@ -26,14 +27,30 @@ class ValidationResult:
 
 
 @dataclass(frozen=True)
-class ExecutorSignal:
-    signal_type: str
-    payload: dict[str, Any]
+class ModuleExecutionContext:
+    run: ModuleRun
+    artifacts: tuple[Artifact, ...]
+    project_dir: Path
+    user_content: str
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ModuleInvocation:
+    system_instructions: str
+    blocked_tools: frozenset[str]
+
+
+ModuleInvoker = Callable[[ModuleInvocation], Awaitable[Any]]
 
 
 class ModuleExecutor(Protocol):
     descriptor: ExecutorDescriptor
 
-    async def validate_inputs(self, context: dict[str, Any]) -> ValidationResult: ...
+    async def validate_inputs(self, context: ModuleExecutionContext) -> ValidationResult: ...
 
-    def execute(self, context: dict[str, Any]) -> AsyncIterator[ExecutorSignal]: ...
+    async def execute(
+        self,
+        context: ModuleExecutionContext,
+        invoke: ModuleInvoker,
+    ) -> Any: ...

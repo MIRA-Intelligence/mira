@@ -3,7 +3,7 @@
 Generated on 2026-07-22
 Repos: `mira` + `mira-ui`
 Target branches: `dev`
-Status: APPROVED — initial end-to-end v1 implemented; native executor extraction continues
+Status: APPROVED — end-to-end v1 and four native executors implemented; runtime hardening continues
 Mode: Builder
 
 ## Problem Statement

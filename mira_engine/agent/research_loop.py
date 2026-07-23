@@ -1232,6 +1232,25 @@ class ResearchAgentLoop(BaseAgentLoop):
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = msg.metadata or {}
+        workflow_run_id = meta.get("workflow_run_id")
+        if isinstance(workflow_run_id, str) and workflow_run_id:
+            # ModuleRuns use concrete native executors over the workflow-neutral
+            # BaseAgentLoop. They must never enter legacy task_plan orchestration.
+            from mira_engine.modules.runtime import NativeModuleRuntime
+
+            runtime = getattr(self, "_native_module_runtime", None)
+            if runtime is None:
+                runtime = NativeModuleRuntime()
+                self._native_module_runtime = runtime
+            return await runtime.process(
+                self,
+                msg,
+                session_key=session_key,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                audit_hook=audit_hook,
+            )
         if meta.get("loop_mode") == "normal":
             base_meta = dict(meta)
             base_meta.pop("project_dir", None)

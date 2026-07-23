@@ -59,8 +59,12 @@ class AttemptRecord(WorkflowModel):
     number: int
     lease_owner: str
     started_at: str
+    executor_name: str = "mira.conversation"
+    executor_version: str = "1"
     ended_at: str | None = None
-    outcome: Literal["running", "waiting_input", "paused", "completed", "failed", "cancelled"] = "running"
+    outcome: Literal["running", "waiting_input", "paused", "completed", "failed", "cancelled"] = (
+        "running"
+    )
     resumed_from_checkpoint_id: str | None = None
 
 
