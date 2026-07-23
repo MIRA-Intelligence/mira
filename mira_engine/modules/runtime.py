@@ -11,6 +11,7 @@ from mira_engine.workflows.models import new_id
 
 from .base import ModuleExecutionContext, ModuleInvocation
 from .executors import ModuleExecutorRegistry
+from .profiles import normalize_agent_profile
 
 if TYPE_CHECKING:
     from mira_engine.agent.research_loop import ResearchAgentLoop
@@ -42,6 +43,20 @@ class NativeModuleRuntime:
         repository = JsonWorkflowRepository(project_ref.project_dir, project_ref.project_id)
         service = WorkflowService(repository)
         run = repository.load_run(run_id)
+        active_attempt = next(
+            (
+                candidate
+                for candidate in reversed(run.attempts)
+                if candidate.attempt_id == run.attempt.current_attempt_id
+            ),
+            None,
+        )
+        project_document = repository.load_project_document()
+        agent_profile = normalize_agent_profile(
+            active_attempt.agent_profile
+            if active_attempt is not None
+            else metadata.get("agent_profile", project_document.get("agent_profile"))
+        )
         artifacts = tuple(repository.load_artifact(selected.artifact_id) for selected in run.inputs)
         executor = self.registry.get(run.module_type)
         context = ModuleExecutionContext(
@@ -50,6 +65,7 @@ class NativeModuleRuntime:
             project_dir=project_ref.project_dir,
             user_content=msg.content,
             metadata=metadata,
+            agent_profile=agent_profile,
         )
 
         async def invoke(invocation: ModuleInvocation):
@@ -67,6 +83,14 @@ class NativeModuleRuntime:
             }
             clean_metadata["run_mode"] = "manual"
             clean_metadata["_ui_system_instructions"] = invocation.system_instructions
+            clean_metadata["_audit_context"] = {
+                "project_id": project_ref.project_id,
+                "run_id": run_id,
+                "module_type": run.module_type,
+                "executor_name": executor.descriptor.executor_name,
+                "executor_version": executor.descriptor.executor_version,
+                "agent_profile": agent_profile,
+            }
             prepared = InboundMessage(
                 channel=msg.channel,
                 sender_id=msg.sender_id,

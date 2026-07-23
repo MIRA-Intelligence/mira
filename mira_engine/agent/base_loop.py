@@ -1490,11 +1490,16 @@ class BaseAgentLoop:
         emit_audit_to_channel = msg.channel == "ui" or bool(meta.get("_emit_skill_audit"))
         if emit_audit_to_channel or audit_hook:
             async def _audit(details: dict[str, Any]) -> None:
-                skill_name = details.get("skill_name")
+                audit_context = meta.get("_audit_context")
+                enriched_details = {
+                    **(audit_context if isinstance(audit_context, dict) else {}),
+                    **details,
+                }
+                skill_name = enriched_details.get("skill_name")
                 if isinstance(skill_name, str) and skill_name.strip():
                     current_turn_skills.add(skill_name.strip())
                 if audit_hook:
-                    await audit_hook(details)
+                    await audit_hook(enriched_details)
                 if not emit_audit_to_channel:
                     return
                 metadata = dict(msg.metadata or {})
@@ -1502,7 +1507,7 @@ class BaseAgentLoop:
                 metadata["_audit_event"] = (
                     "skill_selected" if details.get("selected") else "skill_invoked"
                 )
-                metadata["_audit_details"] = details
+                metadata["_audit_details"] = enriched_details
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,

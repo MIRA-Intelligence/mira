@@ -289,6 +289,7 @@ class WorkflowService:
         lease_owner: str,
         executor_name: str | None = None,
         executor_version: str = "1.0.0",
+        agent_profile: str = "research",
     ) -> CommandReceipt | None:
         """Claim a queued Run for an engine-owned execution adapter."""
         with self.repository.transaction():
@@ -323,6 +324,9 @@ class WorkflowService:
             event_id = new_id()
             previous_attempt_id = run.attempt.current_attempt_id
             resolved_executor_name = executor_name or f"mira.{run.module_type}"
+            resolved_agent_profile = (
+                agent_profile if agent_profile in {"research", "engineer", "team"} else "research"
+            )
             workflow.revision += 1
             workflow.last_project_sequence += 1
             run.revision += 1
@@ -409,6 +413,7 @@ class WorkflowService:
                         started_at=now,
                         executor_name=resolved_executor_name,
                         executor_version=executor_version,
+                        agent_profile=resolved_agent_profile,
                         resumed_from_checkpoint_id=run.checkpoint_ref,
                     )
                 )

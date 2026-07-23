@@ -96,6 +96,7 @@ async def test_executor_validates_selected_artifact_contract(tmp_path: Path) -> 
         project_dir=service.repository.project_dir,
         user_content="Plan this direction",
         metadata={},
+        agent_profile="research",
     )
     validation = await PlanningExecutor().validate_inputs(context)
     assert validation.valid is False
@@ -355,3 +356,148 @@ async def test_native_executor_acknowledges_pause_before_next_tool_call(
     assert checkpoint.executor_name == "mira.experiment"
     assert checkpoint.executor_version == "1.0.0"
     assert getattr(response, "metadata", {}).get("_workflow_control_ack") == "paused"
+
+
+@pytest.mark.parametrize(
+    ("agent_profile", "prompt_marker", "team_tools_visible"),
+    [
+        ("research", "Scientific Tenacity", False),
+        ("engineer", "results-oriented Machine Learning Engineering Assistant", False),
+        ("team", "Bounded Debate Protocol", True),
+    ],
+)
+async def test_native_executor_composes_profile_policy_and_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_profile: str,
+    prompt_marker: str,
+    team_tools_visible: bool,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    service = _service(tmp_path, project_id=f"PRJ-profile-{agent_profile}")
+    receipt = service.create_run(
+        command_id=f"create-profile-{agent_profile}",
+        module_type="planning",
+        module_data={"intent": "create an approved plan"},
+        enqueue=True,
+    )
+    run_id = receipt.run_id or ""
+    service.claim_run(
+        run_id,
+        lease_owner="test:native",
+        agent_profile=agent_profile,
+    )
+    provider = _CapturingProvider()
+    loop = ResearchAgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="dummy/native",
+        channels_config=ChannelsConfig(),
+        exec_config=ExecToolConfig(enable=True, timeout=5),
+        session_manager=SessionManager(tmp_path),
+    )
+
+    await loop.process_direct(
+        "Prepare this planning module.",
+        session_key=f"ui:{service.repository.project_id}:run:{run_id}",
+        channel="ui",
+        chat_id=service.repository.project_id,
+        metadata={
+            "loop_mode": "project",
+            "project_id": service.repository.project_id,
+            "project_dir": str(service.repository.project_dir),
+            "workflow_run_id": run_id,
+            "agent_profile": agent_profile,
+        },
+    )
+
+    definitions = {
+        item["function"]["name"] for item in provider.calls[0]["tools"]
+    }
+    assert ("consult" in definitions) is team_tools_visible
+    assert ("spawn" in definitions) is team_tools_visible
+    assert "exec" not in definitions
+    system_prompt = provider.calls[0]["messages"][0]["content"]
+    assert prompt_marker in system_prompt
+    assert "Interactive Plan Mode" not in system_prompt
+    assert "task_plan.json under plan.answers" not in system_prompt
+
+
+async def test_native_executor_enriches_skill_audit_with_run_policy_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    service = _service(tmp_path, project_id="PRJ-native-audit")
+    skill_path = service.repository.project_dir / "skills" / "audit-policy" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("# Audit policy\n", encoding="utf-8")
+    receipt = service.create_run(
+        command_id="create-audited-run",
+        module_type="experiment",
+        module_data={"intent": "inspect the audit policy"},
+        enqueue=True,
+    )
+    run_id = receipt.run_id or ""
+    service.claim_run(
+        run_id,
+        lease_owner="test:native",
+        agent_profile="engineer",
+    )
+    provider = _ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="audit-read",
+                        name="read_file",
+                        arguments={"path": "skills/audit-policy/SKILL.md"},
+                    )
+                ],
+            ),
+            LLMResponse(content="Policy inspected."),
+        ]
+    )
+    loop = ResearchAgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="dummy/native",
+        channels_config=ChannelsConfig(),
+        exec_config=ExecToolConfig(enable=True, timeout=5),
+        session_manager=SessionManager(tmp_path),
+    )
+    audit_events: list[dict[str, Any]] = []
+
+    async def audit_hook(details: dict[str, Any]) -> None:
+        audit_events.append(details)
+
+    await loop.process_direct(
+        "Inspect the policy.",
+        session_key=f"ui:{service.repository.project_id}:run:{run_id}",
+        channel="ui",
+        chat_id=service.repository.project_id,
+        metadata={
+            "loop_mode": "project",
+            "project_id": service.repository.project_id,
+            "project_dir": str(service.repository.project_dir),
+            "workflow_run_id": run_id,
+            "agent_profile": "engineer",
+        },
+        audit_hook=audit_hook,
+    )
+
+    assert audit_events == [
+        {
+            "project_id": service.repository.project_id,
+            "run_id": run_id,
+            "module_type": "experiment",
+            "executor_name": "mira.experiment",
+            "executor_version": "1.0.0",
+            "agent_profile": "engineer",
+            "tool": "read_file",
+            "skill_name": "audit-policy",
+            "path": "skills/audit-policy/SKILL.md",
+        }
+    ]
