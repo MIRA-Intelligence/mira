@@ -15,9 +15,12 @@ from .base import (
     ModuleInvoker,
     ValidationResult,
 )
+from .profiles import profile_allows_team_tools, profile_system_instructions
 from .prompts import module_system_instructions
 
-_LEGACY_OR_OUT_OF_BAND_TOOLS = frozenset({"set_plan", "cron", "message"})
+_LEGACY_OR_OUT_OF_BAND_TOOLS = frozenset(
+    {"set_plan", "cron", "message", "consult", "spawn"}
+)
 
 
 class NativeModuleExecutor(ABC):
@@ -75,6 +78,7 @@ class NativeModuleExecutor(ABC):
         run_context = {
             "run_id": context.run.run_id,
             "module_type": context.run.module_type,
+            "agent_profile": context.agent_profile,
             "intent": context.run.module_data.get("intent"),
             "parent_run_id": context.run.module_data.get("parent_run_id"),
             "handoff_summary": context.run.module_data.get("handoff_summary"),
@@ -93,8 +97,15 @@ class NativeModuleExecutor(ABC):
             f"{self.operating_contract}\n\n"
             "The following JSON is the authoritative Run input. Do not infer hidden "
             "inputs from another Run or from task_plan.json:\n"
-            f"{json.dumps(run_context, ensure_ascii=False, indent=2)}"
+            f"{json.dumps(run_context, ensure_ascii=False, indent=2)}\n\n"
+            f"{profile_system_instructions(context.agent_profile)}"
         )
+
+    def blocked_tools_for(self, context: ModuleExecutionContext) -> frozenset[str]:
+        blocked = self.blocked_tools
+        if profile_allows_team_tools(context.agent_profile):
+            blocked = blocked - {"consult", "spawn"}
+        return blocked
 
     async def execute(
         self,
@@ -107,7 +118,7 @@ class NativeModuleExecutor(ABC):
         return await invoke(
             ModuleInvocation(
                 system_instructions=self.system_instructions(context),
-                blocked_tools=self.blocked_tools,
+                blocked_tools=self.blocked_tools_for(context),
             )
         )
 
@@ -118,9 +129,7 @@ class InitiationExecutor(NativeModuleExecutor):
         executor_name="mira.initiation",
         executor_version="1.0.0",
     )
-    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS | frozenset(
-        {"exec", "bg", "spawn", "consult_role"}
-    )
+    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS | frozenset({"exec", "bg"})
     operating_contract = (
         "Own only question clarification, evidence/literature investigation, gap "
         "analysis, and research-direction choices. Never create a legacy plan or "
@@ -134,9 +143,7 @@ class PlanningExecutor(NativeModuleExecutor):
         executor_name="mira.planning",
         executor_version="1.0.0",
     )
-    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS | frozenset(
-        {"exec", "bg", "spawn", "consult_role"}
-    )
+    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS | frozenset({"exec", "bg"})
     operating_contract = (
         "Own only requirements, hypotheses, risks, acceptance criteria, and an "
         "explicitly approved executable plan. Never call set_plan or mutate "
@@ -165,7 +172,7 @@ class DeliveryExecutor(NativeModuleExecutor):
         executor_name="mira.delivery",
         executor_version="1.0.0",
     )
-    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS | frozenset({"spawn", "consult_role"})
+    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS
     operating_contract = (
         "Own only analysis, writing, polishing, visualization, packaging, and "
         "export of the explicitly selected material. Do not launch upstream "

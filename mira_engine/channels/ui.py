@@ -1823,6 +1823,7 @@ class UiChannel(BaseChannel):
                             claim_receipt = workflow_service.claim_run(
                                 workflow_run_id,
                                 lease_owner=f"ui:{self._workflow_executor_id}:{user_id}",
+                                agent_profile=agent_profile,
                             )
                             workflow_run = workflow_service.repository.load_run(
                                 workflow_run_id

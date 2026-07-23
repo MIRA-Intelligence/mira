@@ -7,7 +7,7 @@ API contract: `docs/modular-workflow-api-contract.md`
 Status: IMPLEMENTED V1 — hardening items remain
 Scope: module execution, pause/resume, interaction, checkpointing, and output publication
 
-Implementation status: four concrete native executors (`mira.initiation`, `mira.planning`, `mira.experiment`, and `mira.delivery`) now own validation, prompts, and tool capabilities independently. ModuleRun messages bypass the legacy `ResearchAgentLoop` orchestration and use only the shared conversation engine. Attempts and checkpoints persist executor identity/version; structured interaction, Artifact publication, completion, and cooperative pause/cancel are wired end to end. Atomic staged-output manifests, heartbeats, forced-control workers, and checkpoint-version migration remain hardening work.
+Implementation status: four concrete native executors (`mira.initiation`, `mira.planning`, `mira.experiment`, and `mira.delivery`) now own validation, prompts, and tool capabilities independently. ModuleRun messages bypass the legacy `ResearchAgentLoop` orchestration and use only the shared conversation engine. Research, engineer, and team profile policies are composed into each executor without their legacy `set_plan`/`task_plan` ordering; the effective profile is snapshotted on every attempt, team-only tools are capability-gated, and skill audit events carry Project/Run/executor/profile identity. Attempts and checkpoints persist executor identity/version; structured interaction, Artifact publication, completion, and cooperative pause/cancel are wired end to end. Atomic staged-output manifests, heartbeats, forced-control workers, and checkpoint-version migration remain hardening work.
 
 ## Decision
 

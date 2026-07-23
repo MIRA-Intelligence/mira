@@ -9,6 +9,8 @@ from typing import Any, Protocol
 
 from mira_engine.workflows.models import Artifact, ModuleRun, ModuleType
 
+from .profiles import AgentProfile
+
 
 @dataclass(frozen=True)
 class ExecutorDescriptor:
@@ -33,6 +35,7 @@ class ModuleExecutionContext:
     project_dir: Path
     user_content: str
     metadata: dict[str, Any]
+    agent_profile: AgentProfile
 
 
 @dataclass(frozen=True)

@@ -61,6 +61,7 @@ class AttemptRecord(WorkflowModel):
     started_at: str
     executor_name: str = "mira.conversation"
     executor_version: str = "1"
+    agent_profile: Literal["research", "engineer", "team"] = "research"
     ended_at: str | None = None
     outcome: Literal["running", "waiting_input", "paused", "completed", "failed", "cancelled"] = (
         "running"
