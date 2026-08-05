@@ -103,6 +103,41 @@ async def test_executor_validates_selected_artifact_contract(tmp_path: Path) -> 
     assert "expected experiment_result" in validation.errors[0]
 
 
+def test_executor_instructions_include_user_module_configuration(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    receipt = service.create_run(
+        command_id="run-initiation-config",
+        module_type="initiation",
+        module_data={
+            "intent": "Review the field",
+            "literature_review": {
+                "enabled": True,
+                "sources": ["pubmed", "arxiv"],
+            },
+            "references": "doi:10.1000/example",
+        },
+    )
+    run = service.repository.load_run(receipt.run_id or "")
+    context = ModuleExecutionContext(
+        run=run,
+        artifacts=(),
+        project_dir=service.repository.project_dir,
+        user_content="Review the field",
+        metadata={},
+        agent_profile="research",
+    )
+
+    instructions = InitiationExecutor().system_instructions(context)
+
+    assert '"configuration"' in instructions
+    assert '"sources": [' in instructions
+    assert '"pubmed"' in instructions
+    assert '"references": "doi:10.1000/example"' in instructions
+    assert '"intent": "Review the field"' in instructions
+    assert "call record_initiation_research_result" in instructions
+    assert "complete paper metadata, notes, gaps, and candidate directions" in instructions
+
+
 @pytest.mark.parametrize(
     ("module_type", "tool_name", "visible"),
     [
@@ -161,6 +196,7 @@ async def test_research_loop_routes_module_run_through_native_executor_capabilit
     assert (tool_name in definitions) is visible
     assert "request_workflow_interaction" in definitions
     assert "complete_workflow_run" in definitions
+    assert ("record_initiation_research_result" in definitions) is (module_type == "initiation")
     assert "set_plan" not in definitions
     system_prompt = provider.calls[0]["messages"][0]["content"]
     assert f'"module_type": "{module_type}"' in system_prompt
@@ -235,6 +271,105 @@ async def test_native_planning_executor_requests_durable_interaction_end_to_end(
     assert attempt.executor_version == "1.0.0"
     assert checkpoint.executor_name == attempt.executor_name
     assert checkpoint.executor_version == attempt.executor_version
+
+
+async def test_native_initiation_records_research_before_direction_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    service = _service(tmp_path, project_id="PRJ-initiation-structured")
+    receipt = service.create_run(
+        command_id="create-initiation-structured",
+        module_type="initiation",
+        module_data={"intent": "survey the evidence"},
+        enqueue=True,
+    )
+    run_id = receipt.run_id or ""
+    service.claim_run(run_id, lease_owner="test:native")
+    provider = _ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="research-result-call",
+                        name="record_initiation_research_result",
+                        arguments={
+                            "survey": "Evidence synthesis.",
+                            "references": [
+                                {
+                                    "id": "ref-1",
+                                    "title": "Structured evidence",
+                                    "year": "2026",
+                                    "url": "https://doi.org/10.1000/structured",
+                                    "summary": "Multicenter evidence.",
+                                    "relevance": "Directly relevant.",
+                                }
+                            ],
+                            "notes": ["One limitation."],
+                            "gaps": ["One gap."],
+                            "directions": [
+                                {
+                                    "id": "direction-1",
+                                    "title": "Validate prospectively",
+                                    "rationale": "Closes the gap.",
+                                }
+                            ],
+                        },
+                    )
+                ],
+            ),
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="direction-choice-call",
+                        name="request_workflow_interaction",
+                        arguments={
+                            "interaction_type": "choose_direction",
+                            "title": "Choose a direction",
+                            "prompt": "Which direction should continue?",
+                            "choices": [
+                                {"id": "direction-1", "label": "Validate prospectively"}
+                            ],
+                            "allow_freeform": True,
+                        },
+                    )
+                ],
+            ),
+            LLMResponse(content="The structured survey is ready for review."),
+        ]
+    )
+    loop = ResearchAgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="dummy/native",
+        channels_config=ChannelsConfig(),
+        exec_config=ExecToolConfig(enable=True, timeout=5),
+        session_manager=SessionManager(tmp_path),
+    )
+
+    await loop.process_direct(
+        "Survey this field.",
+        session_key=f"ui:{service.repository.project_id}:run:{run_id}",
+        channel="ui",
+        chat_id=service.repository.project_id,
+        metadata={
+            "loop_mode": "project",
+            "project_id": service.repository.project_id,
+            "project_dir": str(service.repository.project_dir),
+            "workflow_run_id": run_id,
+            "workflow_module_type": "initiation",
+            "run_mode": "manual",
+        },
+    )
+
+    run = service.repository.load_run(run_id)
+    assert run.status == "waiting_input"
+    assert run.module_data["research_result"]["survey"] == "Evidence synthesis."
+    assert run.module_data["research_result"]["references"][0]["title"] == "Structured evidence"
+    assert run.module_data["interaction"]["interaction_type"] == "choose_direction"
 
 
 async def test_native_delivery_executor_can_complete_its_own_run(

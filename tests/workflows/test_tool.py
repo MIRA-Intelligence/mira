@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from mira_engine.modules.tools import (
+    InitiationResearchResultTool,
     WorkflowArtifactTool,
     WorkflowCompletionTool,
     WorkflowInteractionTool,
 )
-from mira_engine.workflows import JsonWorkflowRepository, WorkflowService
+from mira_engine.workflows import JsonWorkflowRepository, WorkflowError, WorkflowService
 
 
 async def test_agent_interaction_tool_commits_a_waiting_checkpoint(tmp_path: Path) -> None:
@@ -39,6 +42,83 @@ async def test_agent_interaction_tool_commits_a_waiting_checkpoint(tmp_path: Pat
     assert run.status == "waiting_input"
     assert run.checkpoint_ref == payload["checkpoint_id"]
     assert run.module_data["interaction"]["interaction_type"] == "approve_plan"
+
+
+async def test_initiation_research_result_tool_persists_validated_structured_output(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "PRJ-research-result"
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
+        json.dumps({"schema_version": 1, "id": "PRJ-research-result"}),
+        encoding="utf-8",
+    )
+    service = WorkflowService(JsonWorkflowRepository(project_dir, "PRJ-research-result"))
+    created = service.create_run(
+        command_id="cmd-create-research-result",
+        module_type="initiation",
+        enqueue=True,
+    )
+    run_id = created.run_id or ""
+    service.claim_run(run_id, lease_owner="agent:test")
+
+    tool = InitiationResearchResultTool()
+    tool.set_project_context("PRJ-research-result", str(project_dir))
+    tool.set_workflow_run_context(run_id)
+    response = json.loads(
+        await tool.execute(
+            survey="Current evidence is promising but heterogeneous.",
+            references=[
+                {
+                    "id": "ref-1",
+                    "title": "AI fibrosis staging",
+                    "authors": "Example et al.",
+                    "year": "2025",
+                    "venue": "Radiology",
+                    "url": "https://doi.org/10.1000/example",
+                    "summary": "A multicenter validation study.",
+                    "relevance": "Directly evaluates the target task.",
+                }
+            ],
+            notes=["External validation remains limited."],
+            gaps=["No prospective head-to-head comparison."],
+            directions=[
+                {
+                    "id": "direction-1",
+                    "title": "Prospective multimodal validation",
+                    "rationale": "Addresses external validity.",
+                    "tradeoffs": "Higher recruitment cost.",
+                    "next_step": "Define sites and endpoints.",
+                }
+            ],
+        )
+    )
+
+    run = service.repository.load_run(run_id)
+    result = run.module_data["research_result"]
+    assert response["status"] == "recorded"
+    assert result["schema_version"] == 1
+    assert result["references"][0]["title"] == "AI fibrosis staging"
+    assert result["gaps"] == ["No prospective head-to-head comparison."]
+    assert result["directions"][0]["id"] == "direction-1"
+
+    with pytest.raises(WorkflowError, match="research_result does not match"):
+        service.command_run(
+            run_id,
+            command_id="invalid-research-result",
+            command_type="record_research_result",
+            expected_revision=run.revision,
+            payload={
+                "research_result": {
+                    "schema_version": 1,
+                    "survey": "Invalid because the reference has no title.",
+                    "references": [{"id": "broken"}],
+                    "notes": [],
+                    "gaps": [],
+                    "directions": [],
+                }
+            },
+        )
 
 
 async def test_native_artifact_and_completion_tools_publish_run_outputs(

@@ -132,6 +132,28 @@ class NativeModuleRuntime:
                     )
                 return None
 
+            async def completion_guard(_content: str | None) -> str | None:
+                current = repository.load_run(run_id)
+                if current.status != "running" or current.pending_control is not None:
+                    return None
+                literature = current.module_data.get("literature_review")
+                research_missing = (
+                    current.module_type == "initiation"
+                    and isinstance(literature, dict)
+                    and literature.get("enabled") is True
+                    and not isinstance(current.module_data.get("research_result"), dict)
+                )
+                if research_missing:
+                    return (
+                        "The Initiation Run is still running and has no structured research "
+                        "result. A progress statement is not a stopping point. Continue now: "
+                        "execute the selected-source searches (call pubmed_search when PubMed "
+                        "is selected), inspect the evidence, record the structured result, "
+                        "then request a direction choice or complete the Run. Do not emit "
+                        "another standalone promise to search."
+                    )
+                return None
+
             with loop.tools.restrict_to(visible_tools, execution_guard=control_guard):
                 return await BaseAgentLoop._process_message(
                     loop,
@@ -141,6 +163,7 @@ class NativeModuleRuntime:
                     on_stream=on_stream,
                     on_stream_end=on_stream_end,
                     audit_hook=audit_hook,
+                    completion_guard=completion_guard,
                 )
 
         try:
@@ -205,5 +228,37 @@ class NativeModuleRuntime:
                     else "Module cancelled at a safe tool boundary."
                 ),
                 metadata={**metadata, "_workflow_control_ack": current.status},
+            )
+        literature = current.module_data.get("literature_review")
+        incomplete_enabled_research = (
+            current.status == "running"
+            and current.module_type == "initiation"
+            and isinstance(literature, dict)
+            and literature.get("enabled") is True
+            and not isinstance(current.module_data.get("research_result"), dict)
+        )
+        if incomplete_enabled_research:
+            service.command_run(
+                run_id,
+                command_id=f"executor-incomplete:{new_id()}",
+                command_type="fail",
+                expected_revision=current.revision,
+                payload={
+                    "code": "executor_incomplete",
+                    "message": (
+                        "The native executor ended without recording a workflow "
+                        "interaction or completion."
+                    ),
+                    "retryable": True,
+                },
+            )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Module execution stopped before producing a durable result. "
+                    "Retry the Run to continue."
+                ),
+                metadata={**metadata, "_error": True, "error_code": "executor_incomplete"},
             )
         return response

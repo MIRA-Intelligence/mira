@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 WORKFLOW_CONTRACT_VERSION = 1
 MODULE_TYPES = ("initiation", "planning", "experiment", "delivery")
@@ -45,6 +45,57 @@ class ArtifactInput(WorkflowModel):
     artifact_id: str
     expected_type: str | None = None
     supported_schema: str | None = None
+
+
+class ResearchReference(WorkflowModel):
+    id: str
+    title: str = Field(min_length=1, max_length=1000)
+    authors: str | None = Field(default=None, max_length=2000)
+    year: str | None = Field(default=None, max_length=32)
+    source: str | None = Field(default=None, max_length=200)
+    venue: str | None = Field(default=None, max_length=500)
+    url: str | None = Field(default=None, max_length=4000)
+    doi: str | None = Field(default=None, max_length=500)
+    summary: str | None = Field(default=None, max_length=8000)
+    relevance: str | None = Field(default=None, max_length=4000)
+
+    @model_validator(mode="after")
+    def split_legacy_combined_url_and_doi(self) -> ResearchReference:
+        marker = " (DOI: "
+        if self.url and marker in self.url and self.url.endswith(")"):
+            clean_url, _, doi_suffix = self.url.partition(marker)
+            self.url = clean_url.strip()
+            self.doi = self.doi or doi_suffix[:-1].strip()
+        return self
+
+
+class LiteratureSearchRecord(WorkflowModel):
+    source: str = Field(min_length=1, max_length=100)
+    query: str = Field(min_length=1, max_length=4000)
+    status: Literal["completed", "unavailable", "failed"]
+    result_count: int = Field(default=0, ge=0)
+    evidence_urls: list[str] = Field(default_factory=list, max_length=100)
+    detail: str | None = Field(default=None, max_length=4000)
+    searched_at: str = Field(default_factory=utc_now)
+
+
+class ResearchDirection(WorkflowModel):
+    id: str
+    title: str = Field(min_length=1, max_length=500)
+    rationale: str = Field(min_length=1, max_length=8000)
+    tradeoffs: str | None = Field(default=None, max_length=4000)
+    next_step: str | None = Field(default=None, max_length=4000)
+
+
+class InitiationResearchResult(WorkflowModel):
+    schema_version: Literal[1] = 1
+    survey: str = Field(default="", max_length=50000)
+    references: list[ResearchReference] = Field(default_factory=list, max_length=500)
+    searches: list[LiteratureSearchRecord] = Field(default_factory=list, max_length=500)
+    notes: list[str] = Field(default_factory=list, max_length=500)
+    gaps: list[str] = Field(default_factory=list, max_length=500)
+    directions: list[ResearchDirection] = Field(default_factory=list, max_length=50)
+    updated_at: str = Field(default_factory=utc_now)
 
 
 class AttemptState(WorkflowModel):

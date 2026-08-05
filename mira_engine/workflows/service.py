@@ -18,7 +18,9 @@ from .models import (
     Checkpoint,
     CommandReceipt,
     HandoffPolicy,
+    InitiationResearchResult,
     InteractionRequest,
+    LiteratureSearchRecord,
     ModuleRun,
     ProjectWorkflow,
     Transition,
@@ -712,6 +714,101 @@ class WorkflowService:
             return "created", "run.draft_updated", "applied"
         if command == "enqueue" and status == "created":
             return "queued", "run.queued", "accepted"
+        if command == "record_research_result" and status == "running":
+            if run.module_type != "initiation":
+                raise WorkflowError(
+                    "invalid_module",
+                    "structured research results belong to initiation Runs",
+                    status=409,
+                )
+            try:
+                result = InitiationResearchResult.model_validate(payload.get("research_result"))
+            except ValidationError as exc:
+                raise WorkflowError(
+                    "invalid_research_result",
+                    "research_result does not match the initiation result contract",
+                    status=422,
+                    details={"errors": exc.errors(include_url=False)},
+                ) from exc
+            literature = run.module_data.get("literature_review")
+            literature_enabled = (
+                isinstance(literature, dict) and literature.get("enabled") is True
+            )
+            selected_sources = {
+                str(source).strip().lower()
+                for source in (literature.get("sources") or [])
+                if isinstance(source, str) and source.strip()
+            } if isinstance(literature, dict) else set()
+            recorded_searches = run.module_data.get("research_searches")
+            searches = recorded_searches if isinstance(recorded_searches, list) else []
+            if literature_enabled and "pubmed" in selected_sources:
+                completed_pubmed = [
+                    search
+                    for search in searches
+                    if isinstance(search, dict)
+                    and search.get("source") == "pubmed"
+                    and search.get("status") == "completed"
+                    and int(search.get("result_count") or 0) > 0
+                ]
+                if not completed_pubmed:
+                    raise WorkflowError(
+                        "literature_search_required",
+                        "PubMed was selected but no successful PubMed search is recorded",
+                        status=409,
+                    )
+                evidence_urls = {
+                    url
+                    for search in completed_pubmed
+                    for url in (search.get("evidence_urls") or [])
+                    if isinstance(url, str)
+                }
+                unverified_references = [
+                    reference.id
+                    for reference in result.references
+                    if not reference.url or reference.url not in evidence_urls
+                ]
+                if unverified_references:
+                    raise WorkflowError(
+                        "unverified_literature_references",
+                        "PubMed references must use URLs returned by this Run's searches",
+                        status=409,
+                        details={"reference_ids": unverified_references},
+                    )
+            if literature_enabled and not result.references:
+                raise WorkflowError(
+                    "literature_references_required",
+                    "enabled literature research must record at least one verifiable reference",
+                    status=409,
+                )
+            result.searches = [
+                LiteratureSearchRecord.model_validate(search)
+                for search in searches
+                if isinstance(search, dict)
+            ]
+            run.module_data["research_result"] = result.model_dump(mode="json")
+            return "running", "run.research_result_updated", "applied"
+        if command == "record_literature_search" and status == "running":
+            if run.module_type != "initiation":
+                raise WorkflowError(
+                    "invalid_module",
+                    "literature search records belong to initiation Runs",
+                    status=409,
+                )
+            try:
+                search = LiteratureSearchRecord.model_validate(payload.get("search"))
+            except ValidationError as exc:
+                raise WorkflowError(
+                    "invalid_literature_search",
+                    "search does not match the literature-search record contract",
+                    status=422,
+                    details={"errors": exc.errors(include_url=False)},
+                ) from exc
+            searches = run.module_data.setdefault("research_searches", [])
+            if not isinstance(searches, list):
+                searches = []
+                run.module_data["research_searches"] = searches
+            searches.append(search.model_dump(mode="json"))
+            return "running", "run.literature_search_recorded", "applied"
         if command == "pause" and status in {"queued", "waiting_input"}:
             return "paused", "run.paused", "applied"
         if command == "pause" and status == "running":
