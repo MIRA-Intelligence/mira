@@ -159,6 +159,39 @@ class TestDispatch:
         assert second.metadata["_stream_end"] is True
 
     @pytest.mark.asyncio
+    async def test_dispatch_buffers_streamed_skill_fallback_marker(self):
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui",
+            sender_id="u1",
+            chat_id="c1",
+            content="hello",
+            metadata={"_wants_stream": True, "selected_skill_ids": ["mrstation"]},
+        )
+
+        async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
+            await on_stream("MIRA_SKILL_")
+            await on_stream("FALLBACK_REQUIRED: command failed")
+            await on_stream_end(resuming=False)
+            return OutboundMessage(
+                channel="ui",
+                chat_id="c1",
+                content="command failed",
+                metadata={"_skill_fallback_required": True},
+            )
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        first = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        second = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        assert first.metadata["_stream_end"] is True
+        assert second.metadata["_skill_fallback_required"] is True
+        assert bus.outbound.empty()
+
+    @pytest.mark.asyncio
     async def test_processing_lock_serializes(self):
         from mira_engine.bus.events import InboundMessage, OutboundMessage
 

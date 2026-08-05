@@ -44,15 +44,7 @@ from mira_engine.config.ui_runtime import (
     build_ui_runtime_payload,
     save_ui_runtime_update,
 )
-from mira_engine.providers.model_fetch import (
-    ModelCache,
-    ModelFetchError,
-    fetch_models_to_cache,
-    fetch_provider_models,
-    is_cache_stale,
-    read_model_cache,
-)
-from mira_engine.providers.registry import find_by_name
+from mira_engine.organization import ORGANIZATION_FILENAME, OrganizationStore
 from mira_engine.projects import (
     PROJECT_DIR_INDEX_FILENAME,
     PROJECT_META_DEFAULT_AGENT_PROFILE,
@@ -65,6 +57,15 @@ from mira_engine.projects import (
     slugify_project_id,
     validate_project_id,
 )
+from mira_engine.providers.model_fetch import (
+    ModelCache,
+    ModelFetchError,
+    fetch_models_to_cache,
+    fetch_provider_models,
+    is_cache_stale,
+    read_model_cache,
+)
+from mira_engine.providers.registry import find_by_name
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
     get_task_plan_contract,
@@ -354,6 +355,10 @@ def _resolve_project_dir_index_path() -> Path:
 
 def _resolve_project_workspace_path() -> Path:
     return get_runtime_subdir("ui").parent / PROJECT_WORKSPACE_FILENAME
+
+
+def _resolve_organization_path() -> Path:
+    return _resolve_project_workspace_path().with_name(ORGANIZATION_FILENAME)
 
 
 def _load_ui_instructions() -> str:
@@ -854,6 +859,7 @@ class UiChannel(BaseChannel):
         )
         self._project_workspace_path: Path = self.project_registry.workspace_path
         self._project_dir_index_path: Path = self.project_registry.legacy_index_path
+        self.organization_store = OrganizationStore(_resolve_organization_path())
         # Compatibility attributes used by existing tests and helper methods.
         # The registry owns the underlying mutable objects.
         self._project_dirs: dict[str, Path] = self.project_registry.project_dirs
@@ -1154,6 +1160,17 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/feedback", self._handle_feedback)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_post("/api/projects", self._handle_create_project)
+        self._app.router.add_get("/api/organization", self._handle_organization)
+        self._app.router.add_post("/api/organization/folders", self._handle_create_folder)
+        self._app.router.add_patch("/api/organization/folders/{folder_id}", self._handle_rename_folder)
+        self._app.router.add_delete("/api/organization/folders/{folder_id}", self._handle_delete_folder)
+        self._app.router.add_patch(
+            "/api/organization/items/{kind}/{item_id}/folder",
+            self._handle_assign_folder,
+        )
+        self._app.router.add_post("/api/organization/chats/import", self._handle_import_chats)
+        self._app.router.add_patch("/api/organization/chats/{chat_id}", self._handle_update_chat)
+        self._app.router.add_delete("/api/organization/chats/{chat_id}", self._handle_delete_chat)
         self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
         self._app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
         self._app.router.add_post("/api/projects/{session_id}/remove", self._handle_remove_project)
@@ -1294,7 +1311,17 @@ class UiChannel(BaseChannel):
         is_progress = metadata.get("_progress", False)
         is_activity_ping = bool(metadata.get("_activity_ping", False))
         is_error = bool(metadata.get("_error", False))
-        msg_type = "error" if is_error else ("progress" if is_progress else "response")
+        is_stop_ack = bool(metadata.get("_stop_ack", False))
+        is_skill_fallback = bool(metadata.get("_skill_fallback_required", False))
+        msg_type = (
+            "stop_ack" if is_stop_ack
+            else "skill_fallback_required" if is_skill_fallback
+            else "error" if is_error
+            else "progress" if is_progress
+            else "response"
+        )
+        if is_stop_ack and msg.chat_id:
+            self._stream_buffers.pop(msg.chat_id, None)
         common_details = {
             "type": msg_type,
             "tool_hint": bool(metadata.get("_tool_hint", False)),
@@ -1307,7 +1334,7 @@ class UiChannel(BaseChannel):
             # Quick-chat (no project): persist assistant turns under the
             # workspace-level session log so the chat history reloads.
             history_dir = self.workspace
-        if history_dir is not None and not is_activity_ping:
+        if history_dir is not None and not is_activity_ping and not is_stop_ack:
             SessionManager(history_dir).append_ui_event(
                 key=f"ui:{msg.chat_id}",
                 role="assistant",
@@ -1594,7 +1621,103 @@ class UiChannel(BaseChannel):
 
             msg_type = data.get("type")
 
-            if msg_type == "message":
+            if msg_type == "stop":
+                session_id = data.get("session_id", session_id)
+                if session_id is None:
+                    await ws.send_json({"type": "error", "content": "session_id required"})
+                    continue
+                loop_mode = _normalize_loop_mode(data.get("loop_mode"))
+                project_dir_path = (
+                    self._resolve_project_dir(session_id, create=False)
+                    if loop_mode == "project"
+                    else None
+                )
+                self._clients[session_id] = ws
+                self._client_project_dirs[session_id] = project_dir_path
+                metadata: dict[str, Any] = {
+                    "source": "ui",
+                    "loop_mode": loop_mode,
+                    "_stop_request_id": data.get("request_id"),
+                    "turn_id": data.get("turn_id"),
+                }
+                if project_dir_path is not None:
+                    metadata.update({
+                        "project_id": session_id,
+                        "project_dir": str(project_dir_path),
+                    })
+                await self._handle_message(
+                    sender_id=data.get("user_id", "ui_user"),
+                    chat_id=session_id,
+                    content="/stop",
+                    media=[],
+                    metadata=metadata,
+                    session_key=f"ui:{session_id}",
+                )
+            elif msg_type == "skill_fallback_response":
+                session_id = data.get("session_id", session_id)
+                if session_id is None:
+                    await ws.send_json({"type": "error", "content": "session_id required"})
+                    continue
+                approved = bool(data.get("approved"))
+                selected_skill_ids = data.get("selected_skill_ids")
+                if not isinstance(selected_skill_ids, list):
+                    selected_skill_ids = []
+                selected_skill_ids = [
+                    str(item).strip() for item in selected_skill_ids
+                    if isinstance(item, str) and str(item).strip()
+                ][:8]
+                if not approved:
+                    self._audit(
+                        source="ui",
+                        action="skill_fallback_rejected",
+                        session_id=session_id,
+                        project_dir=self._resolve_project_dir(session_id),
+                        details={"selected_skill_ids": selected_skill_ids},
+                    )
+                    await ws.send_json({
+                        "type": "response",
+                        "session_id": session_id,
+                        "content": "Skill fallback cancelled.",
+                        "metadata": {"_skill_fallback_cancelled": True},
+                    })
+                    continue
+                loop_mode = _normalize_loop_mode(data.get("loop_mode"))
+                project_dir_path = (
+                    self._resolve_project_dir(session_id, create=False)
+                    if loop_mode == "project"
+                    else None
+                )
+                self._clients[session_id] = ws
+                self._client_project_dirs[session_id] = project_dir_path
+                self._audit(
+                    source="ui",
+                    action="skill_fallback_approved",
+                    session_id=session_id,
+                    project_dir=project_dir_path,
+                    details={"selected_skill_ids": selected_skill_ids},
+                )
+                metadata = {
+                    "source": "ui",
+                    "loop_mode": loop_mode,
+                    "turn_id": data.get("turn_id"),
+                    "selected_skill_ids": selected_skill_ids,
+                    "_skill_fallback_approved": True,
+                    "_wants_stream": True,
+                }
+                if project_dir_path is not None:
+                    metadata.update({
+                        "project_id": session_id,
+                        "project_dir": str(project_dir_path),
+                    })
+                await self._handle_message(
+                    sender_id=data.get("user_id", "ui_user"),
+                    chat_id=session_id,
+                    content="The user approved the proposed Skill fallback. Continue only with that fallback.",
+                    media=[],
+                    metadata=metadata,
+                    session_key=f"ui:{session_id}",
+                )
+            elif msg_type == "message":
                 session_id = data.get("session_id", session_id)
                 user_id = data.get("user_id", session_id or "anonymous")
                 content = data.get("content", "")
@@ -1609,6 +1732,14 @@ class UiChannel(BaseChannel):
                 )
                 incoming_policy = _normalize_automation_policy(data.get("automation_policy"))
                 allow_result_write = bool(data.get("allow_result_write"))
+                turn_id = data.get("turn_id")
+                selected_skill_ids = data.get("selected_skill_ids")
+                if not isinstance(selected_skill_ids, list):
+                    selected_skill_ids = []
+                selected_skill_ids = [
+                    str(item).strip() for item in selected_skill_ids
+                    if isinstance(item, str) and str(item).strip()
+                ][:8]
                 # Token streaming is opt-in per message. Default on so clients
                 # that omit the flag still get a responsive experience.
                 stream_pref = data.get("stream")
@@ -1728,6 +1859,8 @@ class UiChannel(BaseChannel):
                         meta.get("contract_version")
                     ),
                     "_allow_result_write": allow_result_write,
+                    "turn_id": turn_id,
+                    "selected_skill_ids": selected_skill_ids,
                 }
                 if wants_stream:
                     metadata["_wants_stream"] = True
@@ -2761,6 +2894,119 @@ class UiChannel(BaseChannel):
         projects = [self._project_info(ref) for ref in refs]
         return web.json_response({"projects": projects})
 
+    async def _organization_json_body(self, request: web.Request) -> dict[str, Any] | None:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return body if isinstance(body, dict) else None
+
+    async def _handle_organization(self, _request: web.Request) -> web.Response:
+        return web.json_response(self.organization_store.snapshot())
+
+    async def _handle_create_folder(self, request: web.Request) -> web.Response:
+        body = await self._organization_json_body(request)
+        if body is None:
+            return web.json_response({"error": "invalid JSON object"}, status=400)
+        try:
+            folder = self.organization_store.create_folder(body.get("name"))
+        except FileExistsError as exc:
+            return web.json_response({"error": str(exc)}, status=409)
+        except (OSError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(folder, status=201)
+
+    async def _handle_rename_folder(self, request: web.Request) -> web.Response:
+        body = await self._organization_json_body(request)
+        if body is None:
+            return web.json_response({"error": "invalid JSON object"}, status=400)
+        folder_id = request.match_info.get("folder_id", "")
+        try:
+            folder = self.organization_store.rename_folder(folder_id, body.get("name"))
+        except KeyError:
+            return web.json_response({"error": "folder not found"}, status=404)
+        except FileExistsError as exc:
+            return web.json_response({"error": str(exc)}, status=409)
+        except (OSError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(folder)
+
+    async def _handle_delete_folder(self, request: web.Request) -> web.Response:
+        folder_id = request.match_info.get("folder_id", "")
+        try:
+            self.organization_store.delete_folder(folder_id)
+        except KeyError:
+            return web.json_response({"error": "folder not found"}, status=404)
+        except (OSError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"deleted": True, "folder_id": folder_id})
+
+    async def _handle_assign_folder(self, request: web.Request) -> web.Response:
+        body = await self._organization_json_body(request)
+        if body is None:
+            return web.json_response({"error": "invalid JSON object"}, status=400)
+        kind = request.match_info.get("kind", "")
+        item_id = request.match_info.get("item_id", "")
+        snapshot = self.organization_store.snapshot()
+        if kind == "chat":
+            exists = any(chat.get("id") == item_id for chat in snapshot["chats"])
+            if not exists:
+                try:
+                    self.organization_store.upsert_chats([{"id": item_id, "title": ""}])
+                    exists = True
+                except (OSError, ValueError):
+                    exists = False
+        elif kind == "project":
+            exists = self._resolve_project_dir(item_id) is not None
+        else:
+            return web.json_response({"error": "kind must be chat or project"}, status=400)
+        if not exists:
+            return web.json_response({"error": f"{kind} not found"}, status=404)
+        try:
+            self.organization_store.assign(kind, item_id, body.get("folder_id"))
+        except KeyError:
+            return web.json_response({"error": "folder not found"}, status=404)
+        except (OSError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"kind": kind, "item_id": item_id, "folder_id": body.get("folder_id")})
+
+    async def _handle_import_chats(self, request: web.Request) -> web.Response:
+        body = await self._organization_json_body(request)
+        if body is None:
+            return web.json_response({"error": "invalid JSON object"}, status=400)
+        try:
+            chats = self.organization_store.upsert_chats(body.get("chats"))
+        except (OSError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"chats": chats})
+
+    async def _handle_update_chat(self, request: web.Request) -> web.Response:
+        body = await self._organization_json_body(request)
+        if body is None:
+            return web.json_response({"error": "invalid JSON object"}, status=400)
+        chat_id = request.match_info.get("chat_id", "")
+        try:
+            chat = self.organization_store.update_chat(
+                chat_id,
+                title=body.get("title") if "title" in body else None,
+                touch=body.get("touch") is True,
+            )
+        except KeyError:
+            return web.json_response({"error": "chat not found"}, status=404)
+        except (OSError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(chat)
+
+    async def _handle_delete_chat(self, request: web.Request) -> web.Response:
+        chat_id = request.match_info.get("chat_id", "")
+        try:
+            self.organization_store.delete_chat(chat_id)
+        except KeyError:
+            return web.json_response({"error": "chat not found"}, status=404)
+        except (OSError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"deleted": True, "chat_id": chat_id})
+
     async def _handle_create_project(self, request: web.Request) -> web.Response:
         """Create/register a project in the workspace file."""
         try:
@@ -2971,6 +3217,10 @@ class UiChannel(BaseChannel):
             )
             shutil.rmtree(project_dir)
             self._drop_project_dir_registration(session_id)
+            try:
+                self.organization_store.remove_project(session_id)
+            except OSError as exc:
+                logger.warning("Failed to clean organization mapping for {}: {}", session_id, exc)
             self._client_project_dirs.pop(session_id, None)
             self._audit(
                 source="ui",
@@ -3008,6 +3258,10 @@ class UiChannel(BaseChannel):
         )
         try:
             self._drop_project_dir_registration(session_id, hide=True)
+            try:
+                self.organization_store.remove_project(session_id)
+            except OSError as exc:
+                logger.warning("Failed to clean organization mapping for {}: {}", session_id, exc)
             self._client_project_dirs.pop(session_id, None)
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
