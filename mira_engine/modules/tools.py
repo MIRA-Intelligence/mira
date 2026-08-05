@@ -6,10 +6,235 @@ import json
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
+
+import httpx
 
 from mira_engine.agent.tools.base import Tool
 from mira_engine.workflows import JsonWorkflowRepository, WorkflowService
 from mira_engine.workflows.models import new_id
+
+
+class PubMedSearchTool(Tool):
+    """Search PubMed directly and persist a non-hallucinable search audit."""
+
+    _EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    _MAX_SEARCHES_PER_RUN = 6
+    _MAX_ABSTRACT_CHARS = 2000
+
+    def __init__(self, *, proxy: str | None = None) -> None:
+        self.proxy = proxy
+        self._context: ContextVar[tuple[str, Path, str | None] | None] = ContextVar(
+            f"pubmed_search_context_{id(self)}", default=None
+        )
+
+    @property
+    def name(self) -> str:
+        return "pubmed_search"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Search NCBI PubMed and return verifiable article metadata and abstracts. "
+            "Inside an Initiation Run this also records the actual query and PubMed URLs "
+            "for the research audit. Use this whenever PubMed is selected."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "PubMed query, including date or field filters when needed.",
+                },
+                "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Maximum articles to fetch.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+
+    def set_project_context(self, project_id: str, project_dir: str) -> None:
+        current = self._context.get()
+        self._context.set((project_id, Path(project_dir), current[2] if current else None))
+
+    def clear_project_context(self) -> None:
+        self._context.set(None)
+
+    def set_workflow_run_context(self, run_id: str | None) -> None:
+        current = self._context.get()
+        if current:
+            self._context.set((current[0], current[1], run_id))
+
+    @staticmethod
+    def _text(node: ElementTree.Element | None) -> str:
+        return "".join(node.itertext()).strip() if node is not None else ""
+
+    @classmethod
+    def _parse_articles(cls, xml_text: str) -> list[dict[str, Any]]:
+        root = ElementTree.fromstring(xml_text)
+        articles: list[dict[str, Any]] = []
+        for item in root.findall(".//PubmedArticle"):
+            citation = item.find("./MedlineCitation")
+            article = citation.find("./Article") if citation is not None else None
+            pmid = cls._text(citation.find("./PMID") if citation is not None else None)
+            if article is None or not pmid:
+                continue
+            author_names: list[str] = []
+            for author in article.findall("./AuthorList/Author"):
+                collective = cls._text(author.find("./CollectiveName"))
+                if collective:
+                    author_names.append(collective)
+                    continue
+                last = cls._text(author.find("./LastName"))
+                initials = cls._text(author.find("./Initials"))
+                name = " ".join(part for part in (last, initials) if part)
+                if name:
+                    author_names.append(name)
+            pub_date = article.find("./Journal/JournalIssue/PubDate")
+            year = cls._text(pub_date.find("./Year") if pub_date is not None else None)
+            if not year and pub_date is not None:
+                year = cls._text(pub_date.find("./MedlineDate")).split(" ", 1)[0]
+            abstract = "\n".join(
+                cls._text(part)
+                for part in article.findall("./Abstract/AbstractText")
+                if cls._text(part)
+            )[: cls._MAX_ABSTRACT_CHARS]
+            doi = ""
+            for article_id in item.findall("./PubmedData/ArticleIdList/ArticleId"):
+                if article_id.attrib.get("IdType") == "doi":
+                    doi = cls._text(article_id)
+                    break
+            articles.append(
+                {
+                    "pmid": pmid,
+                    "title": cls._text(article.find("./ArticleTitle")),
+                    "authors": ", ".join(author_names),
+                    "year": year,
+                    "venue": cls._text(article.find("./Journal/Title")),
+                    "doi": doi or None,
+                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                    "abstract": abstract,
+                    "source": "PubMed",
+                }
+            )
+        return articles
+
+    def _record_search(
+        self,
+        *,
+        query: str,
+        status: str,
+        articles: list[dict[str, Any]],
+        detail: str | None = None,
+    ) -> None:
+        context = self._context.get()
+        if context is None or not context[2]:
+            return
+        project_id, project_dir, run_id = context
+        service = WorkflowService(JsonWorkflowRepository(project_dir, project_id))
+        run = service.repository.load_run(run_id)
+        if run.module_type != "initiation" or run.status != "running":
+            return
+        service.command_run(
+            run_id,
+            command_id=f"executor-literature-search:{new_id()}",
+            command_type="record_literature_search",
+            expected_revision=run.revision,
+            payload={
+                "search": {
+                    "source": "pubmed",
+                    "query": query,
+                    "status": status,
+                    "result_count": len(articles),
+                    "evidence_urls": [article["url"] for article in articles],
+                    "detail": detail,
+                }
+            },
+        )
+
+    def _run_search_count(self) -> int:
+        context = self._context.get()
+        if context is None or not context[2]:
+            return 0
+        project_id, project_dir, run_id = context
+        service = WorkflowService(JsonWorkflowRepository(project_dir, project_id))
+        run = service.repository.load_run(run_id)
+        searches = run.module_data.get("research_searches")
+        return len(searches) if isinstance(searches, list) else 0
+
+    async def execute(self, *, query: str, count: int = 10) -> str:
+        query = query.strip()
+        count = min(max(int(count), 1), 10)
+        if not query:
+            return "Error: PubMed query must not be empty"
+        if self._run_search_count() >= self._MAX_SEARCHES_PER_RUN:
+            return (
+                "Error: PubMed search budget reached (6 queries). Synthesize the "
+                "evidence already returned and record the structured research result."
+            )
+        try:
+            async with httpx.AsyncClient(proxy=self.proxy, timeout=30.0) as client:
+                search_response = await client.get(
+                    f"{self._EUTILS}/esearch.fcgi",
+                    params={
+                        "db": "pubmed",
+                        "retmode": "json",
+                        "sort": "date",
+                        "retmax": count,
+                        "term": query,
+                        "tool": "mira",
+                        "email": "support@mira-intelligence.com",
+                    },
+                )
+                search_response.raise_for_status()
+                search_result = search_response.json().get("esearchresult") or {}
+                pmids = [
+                    str(pmid)
+                    for pmid in (search_result.get("idlist") or [])
+                    if str(pmid).strip()
+                ]
+                articles: list[dict[str, Any]] = []
+                if pmids:
+                    fetch_response = await client.get(
+                        f"{self._EUTILS}/efetch.fcgi",
+                        params={
+                            "db": "pubmed",
+                            "retmode": "xml",
+                            "rettype": "abstract",
+                            "id": ",".join(pmids),
+                            "tool": "mira",
+                            "email": "support@mira-intelligence.com",
+                        },
+                    )
+                    fetch_response.raise_for_status()
+                    articles = self._parse_articles(fetch_response.text)
+            self._record_search(query=query, status="completed", articles=articles)
+            return json.dumps(
+                {
+                    "source": "PubMed",
+                    "query": query,
+                    "total_matches": int(search_result.get("count") or 0),
+                    "returned": len(articles),
+                    "articles": articles,
+                },
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            self._record_search(
+                query=query,
+                status="failed",
+                articles=[],
+                detail=detail,
+            )
+            return f"Error: PubMed search failed: {detail}"
 
 
 class WorkflowInteractionTool(Tool):
@@ -92,6 +317,15 @@ class WorkflowInteractionTool(Tool):
         run = service.repository.load_run(run_id)
         if run.status != "running" or not run.attempt.current_attempt_id:
             return f"Error: ModuleRun is not actively running (status={run.status})"
+        if (
+            run.module_type == "initiation"
+            and interaction_type == "choose_direction"
+            and not isinstance(run.module_data.get("research_result"), dict)
+        ):
+            return (
+                "Error: record_initiation_research_result must succeed before "
+                "requesting a research-direction choice"
+            )
         normalized_choices = []
         for choice in choices:
             normalized_choices.append(
@@ -222,6 +456,136 @@ class WorkflowArtifactTool(Tool):
         )
 
 
+class InitiationResearchResultTool(Tool):
+    """Persist a validated, UI-renderable literature research result."""
+
+    def __init__(self) -> None:
+        self._context: ContextVar[tuple[str, Path, str | None] | None] = ContextVar(
+            f"initiation_research_result_context_{id(self)}", default=None
+        )
+
+    @property
+    def name(self) -> str:
+        return "record_initiation_research_result"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Record the current Initiation Run's structured literature survey, "
+            "references, notes, research gaps, and candidate directions so the UI "
+            "can render an auditable research result. Call this after evidence "
+            "synthesis and before asking the user to choose a direction."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        reference_properties = {
+            "id": {"type": "string"},
+            "title": {"type": "string"},
+            "authors": {"type": "string"},
+            "year": {"type": "string"},
+            "source": {"type": "string"},
+            "venue": {"type": "string"},
+            "url": {"type": "string"},
+            "doi": {"type": "string"},
+            "summary": {"type": "string"},
+            "relevance": {"type": "string"},
+        }
+        direction_properties = {
+            "id": {"type": "string"},
+            "title": {"type": "string"},
+            "rationale": {"type": "string"},
+            "tradeoffs": {"type": "string"},
+            "next_step": {"type": "string"},
+        }
+        return {
+            "type": "object",
+            "properties": {
+                "survey": {"type": "string"},
+                "references": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": reference_properties,
+                        "required": ["id", "title"],
+                        "additionalProperties": False,
+                    },
+                },
+                "notes": {"type": "array", "items": {"type": "string"}},
+                "gaps": {"type": "array", "items": {"type": "string"}},
+                "directions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": direction_properties,
+                        "required": ["id", "title", "rationale"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["survey", "references", "notes", "gaps", "directions"],
+            "additionalProperties": False,
+        }
+
+    def set_project_context(self, project_id: str, project_dir: str) -> None:
+        current = self._context.get()
+        self._context.set((project_id, Path(project_dir), current[2] if current else None))
+
+    def clear_project_context(self) -> None:
+        self._context.set(None)
+
+    def set_workflow_run_context(self, run_id: str | None) -> None:
+        current = self._context.get()
+        if current:
+            self._context.set((current[0], current[1], run_id))
+
+    async def execute(
+        self,
+        *,
+        survey: str,
+        references: list[dict[str, Any]],
+        notes: list[str],
+        gaps: list[str],
+        directions: list[dict[str, Any]],
+    ) -> str:
+        context = self._context.get()
+        if context is None or not context[2]:
+            return "Error: record_initiation_research_result is available only inside a ModuleRun"
+        project_id, project_dir, run_id = context
+        service = WorkflowService(JsonWorkflowRepository(project_dir, project_id))
+        run = service.repository.load_run(run_id)
+        if run.module_type != "initiation" or run.status != "running":
+            return (
+                "Error: record_initiation_research_result requires an actively "
+                f"running initiation Run (module={run.module_type}, status={run.status})"
+            )
+        receipt = service.command_run(
+            run_id,
+            command_id=f"executor-research-result:{new_id()}",
+            command_type="record_research_result",
+            expected_revision=run.revision,
+            payload={
+                "research_result": {
+                    "schema_version": 1,
+                    "survey": survey,
+                    "references": references,
+                    "notes": notes,
+                    "gaps": gaps,
+                    "directions": directions,
+                }
+            },
+        )
+        return json.dumps(
+            {
+                "status": "recorded",
+                "run_id": run_id,
+                "run_revision": receipt.run_revision,
+                "project_sequence": receipt.project_sequence,
+            },
+            ensure_ascii=False,
+        )
+
+
 class WorkflowCompletionTool(Tool):
     """Commit a native executor's final outputs and optional handoff."""
 
@@ -311,6 +675,17 @@ class WorkflowCompletionTool(Tool):
         project_id, project_dir, run_id = context
         service = WorkflowService(JsonWorkflowRepository(project_dir, project_id))
         run = service.repository.load_run(run_id)
+        literature = run.module_data.get("literature_review")
+        if (
+            run.module_type == "initiation"
+            and isinstance(literature, dict)
+            and literature.get("enabled") is True
+            and not isinstance(run.module_data.get("research_result"), dict)
+        ):
+            return (
+                "Error: enabled literature research must be recorded with "
+                "record_initiation_research_result before completing the Run"
+            )
         receipt = service.command_run(
             run_id,
             command_id=f"executor-complete:{new_id()}",

@@ -612,7 +612,7 @@ async def test_connect_and_close_mcp_paths(monkeypatch, tmp_path: Path) -> None:
 async def test_process_message_system_help_new_and_normal(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
 
-    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None, **_kwargs):
         return "done", [], messages + [{"role": "assistant", "content": "done"}]
 
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
@@ -647,7 +647,7 @@ async def test_process_message_system_help_new_and_normal(monkeypatch, tmp_path:
 async def test_process_message_updates_recent_skills_metadata(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
 
-    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None, **_kwargs):
         if audit_hook:
             await audit_hook({"tool": "read_file", "skill_name": "medical-image-analysis", "path": "/tmp/SKILL.md"})
         return "done", [], messages + [{"role": "assistant", "content": "done"}]
@@ -672,7 +672,7 @@ async def test_process_message_injects_active_skills_into_context(monkeypatch, t
 
     monkeypatch.setattr(loop.context, "build_messages", _capture_build_messages)
 
-    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None, **_kwargs):
         return "done", [], messages + [{"role": "assistant", "content": "done"}]
 
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
@@ -703,7 +703,7 @@ async def test_process_message_new_failure_and_message_tool_short_circuit(monkey
     )
     assert "Memory archival failed" in failed.content
 
-    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None, **_kwargs):
         message_tool = loop.tools.get("message")
         if isinstance(message_tool, MessageTool):
             message_tool._sent_in_turn = True

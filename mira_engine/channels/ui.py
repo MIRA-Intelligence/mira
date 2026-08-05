@@ -45,8 +45,8 @@ from mira_engine.config.ui_runtime import (
     build_ui_runtime_payload,
     save_ui_runtime_update,
 )
-from mira_engine.organization import ORGANIZATION_FILENAME, OrganizationStore
 from mira_engine.modules import module_system_instructions
+from mira_engine.organization import ORGANIZATION_FILENAME, OrganizationStore
 from mira_engine.projects import (
     PROJECT_DIR_INDEX_FILENAME,
     PROJECT_META_DEFAULT_AGENT_PROFILE,

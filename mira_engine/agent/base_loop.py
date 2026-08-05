@@ -54,6 +54,8 @@ from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.command.router import CommandContext, CommandRouter
 from mira_engine.modules.tools import (
+    InitiationResearchResultTool,
+    PubMedSearchTool,
     WorkflowArtifactTool,
     WorkflowCompletionTool,
     WorkflowInteractionTool,
@@ -376,9 +378,11 @@ class BaseAgentLoop:
             self.tools.register(BgTool(registry=self._bg_registry))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        self.tools.register(PubMedSearchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SetPlanTool())
         self.tools.register(WorkflowInteractionTool())
+        self.tools.register(InitiationResearchResultTool())
         self.tools.register(WorkflowArtifactTool())
         self.tools.register(WorkflowCompletionTool())
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -702,6 +706,7 @@ class BaseAgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        completion_guard: Callable[[str | None], Awaitable[str | None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -906,6 +911,23 @@ class BaseAgentLoop:
                 )
                 if hook:
                     clean = hook.finalize_content(hook_ctx, clean)
+                if completion_guard is not None and iteration < self.max_iterations:
+                    continuation = await completion_guard(clean)
+                    if continuation:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"{self._AUTO_CONTINUE_MARKER}\n"
+                                    f"{continuation}"
+                                ),
+                            }
+                        )
+                        hook_ctx.final_content = None
+                        hook_ctx.stop_reason = "contract_continuation"
+                        if hook:
+                            await hook.after_iteration(hook_ctx)
+                        continue
                 final_content = clean
                 hook_ctx.final_content = final_content
                 hook_ctx.stop_reason = "completed"
@@ -1257,6 +1279,7 @@ class BaseAgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        completion_guard: Callable[[str | None], Awaitable[str | None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response.
 
@@ -1527,6 +1550,7 @@ class BaseAgentLoop:
             "model_runtime": model_runtime,
             "on_progress": progress_cb,
             "audit_hook": audit_cb,
+            "completion_guard": completion_guard,
         }
         if on_stream is not None:
             run_kwargs["on_stream"] = on_stream

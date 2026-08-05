@@ -21,6 +21,23 @@ from .prompts import module_system_instructions
 _LEGACY_OR_OUT_OF_BAND_TOOLS = frozenset(
     {"set_plan", "cron", "message", "consult", "spawn"}
 )
+_INITIATION_ONLY_TOOLS = frozenset(
+    {"record_initiation_research_result", "pubmed_search"}
+)
+_INTERNAL_MODULE_DATA_KEYS = frozenset(
+    {
+        "intent",
+        "parent_run_id",
+        "handoff_summary",
+        "interaction",
+        "recovery",
+        "failure",
+        "completion_summary",
+        "suggested_handoffs",
+        "auto_handoff",
+        "handoff_not_before",
+    }
+)
 
 
 class NativeModuleExecutor(ABC):
@@ -83,6 +100,11 @@ class NativeModuleExecutor(ABC):
             "parent_run_id": context.run.module_data.get("parent_run_id"),
             "handoff_summary": context.run.module_data.get("handoff_summary"),
             "selected_artifacts": artifact_context,
+            "configuration": {
+                key: value
+                for key, value in context.run.module_data.items()
+                if key not in _INTERNAL_MODULE_DATA_KEYS
+            },
         }
         interaction = context.run.module_data.get("interaction")
         if isinstance(interaction, dict) and interaction.get("response") is not None:
@@ -127,13 +149,32 @@ class InitiationExecutor(NativeModuleExecutor):
     descriptor = ExecutorDescriptor(
         module_type="initiation",
         executor_name="mira.initiation",
-        executor_version="1.0.0",
+        executor_version="1.1.0",
     )
     blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS | frozenset({"exec", "bg"})
     operating_contract = (
         "Own only question clarification, evidence/literature investigation, gap "
         "analysis, and research-direction choices. Never create a legacy plan or "
-        "execute experiments. Use request_workflow_interaction for a direction choice."
+        "execute experiments. Use request_workflow_interaction for a direction choice. "
+        "Honor configuration.literature_review: when disabled, do not perform external "
+        "literature search; when enabled, use only its selected sources where available. "
+        "A statement "
+        "such as 'I am starting the search' is only a progress update, never a valid end "
+        "of the turn. Perform the searches in this same execution. When PubMed is selected, "
+        "you MUST call pubmed_search with explicit queries; never substitute model memory "
+        "or a generic summary. For Google Scholar use web_search with site:scholar.google.com "
+        "(falling back to a general query only if blocked); for arXiv, Semantic Scholar, "
+        "Crossref, and Europe PMC use web_search/web_fetch restricted to the selected "
+        "domains. Use 3-6 focused queries with at most 10 results each, then stop searching "
+        "and synthesize; do not exhaust context with repetitive variants. Decompose the "
+        "question into multiple searches, inspect returned metadata "
+        "and abstracts, and keep only verifiable papers. Put the clean PubMed/source URL "
+        "in url and the bare DOI in doi; never concatenate them into one field. "
+        "Treat configuration.references as user-selected priority evidence. After "
+        "synthesizing evidence, call record_initiation_research_result with the survey, "
+        "complete paper metadata, notes, gaps, and candidate directions. Do this before "
+        "request_workflow_interaction asks the user to choose a direction, and update it "
+        "again whenever the research result materially changes."
     )
 
 
@@ -143,7 +184,11 @@ class PlanningExecutor(NativeModuleExecutor):
         executor_name="mira.planning",
         executor_version="1.0.0",
     )
-    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS | frozenset({"exec", "bg"})
+    blocked_tools = (
+        _LEGACY_OR_OUT_OF_BAND_TOOLS
+        | _INITIATION_ONLY_TOOLS
+        | frozenset({"exec", "bg"})
+    )
     operating_contract = (
         "Own only requirements, hypotheses, risks, acceptance criteria, and an "
         "explicitly approved executable plan. Never call set_plan or mutate "
@@ -157,12 +202,14 @@ class ExperimentExecutor(NativeModuleExecutor):
         executor_name="mira.experiment",
         executor_version="1.0.0",
     )
-    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS
+    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS | _INITIATION_ONLY_TOOLS
     operating_contract = (
         "Own validation and execution of the supplied experiment scope. Preserve "
         "existing command, path, resource, and confirmation guardrails. Record "
         "methods and evidence in Run-local files or immutable Artifacts; never "
-        "update the legacy task_plan workflow."
+        "update the legacy task_plan workflow. Honor configuration.automation_policy: "
+        "maxExperiments is a hard cap, maxTokens is a token budget, and goals are "
+        "stopping conditions combined by its AND/OR logic."
     )
 
 
@@ -172,7 +219,7 @@ class DeliveryExecutor(NativeModuleExecutor):
         executor_name="mira.delivery",
         executor_version="1.0.0",
     )
-    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS
+    blocked_tools = _LEGACY_OR_OUT_OF_BAND_TOOLS | _INITIATION_ONLY_TOOLS
     operating_contract = (
         "Own only analysis, writing, polishing, visualization, packaging, and "
         "export of the explicitly selected material. Do not launch upstream "
