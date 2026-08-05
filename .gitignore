@@ -3,6 +3,10 @@ __pycache__/
 !.github/
 !.github/workflows/
 !.github/workflows/*.yml
+!.agents/
+!.agents/skills/
+!.agents/skills/mira-release/
+!.agents/skills/mira-release/**
 !.cnb.yml
 .coverage
 coverage.xml
