@@ -6,6 +6,8 @@ import asyncio
 import logging
 import os
 import re
+import signal
+import subprocess
 import sys
 from contextvars import ContextVar
 from pathlib import Path
@@ -207,6 +209,12 @@ class ExecTool(Tool):
             "exec_runtime_working_dir",
             default=None,
         )
+        self._runtime_session_id: ContextVar[str | None] = ContextVar(
+            "exec_runtime_session_id", default=None
+        )
+        self._runtime_turn_id: ContextVar[str | None] = ContextVar(
+            "exec_runtime_turn_id", default=None
+        )
         # Background execution is opt-in: callers (the loop) wire a shared
         # registry and flip ``enable_background``. Subagents leave it off so
         # the LLM doesn't accidentally spawn fire-and-forget jobs in a
@@ -247,6 +255,11 @@ class ExecTool(Tool):
         """Clear the per-turn working directory."""
 
         self._runtime_working_dir.set(None)
+
+    def set_session_context(self, session_id: str, turn_id: str | None = None) -> None:
+        """Associate spawned processes with the active UI/session turn."""
+        self._runtime_session_id.set(session_id)
+        self._runtime_turn_id.set(turn_id)
 
     @property
     def name(self) -> str:
@@ -371,14 +384,13 @@ class ExecTool(Tool):
                     timeout=timeout
                 )
             except asyncio.TimeoutError:
-                process.kill()
-                # Wait for the process to fully terminate so pipes are
-                # drained and file descriptors are released.
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
+                await self._terminate_process_tree(process)
                 return f"Error: Command timed out after {timeout} seconds"
+            except asyncio.CancelledError:
+                # Cancelling the agent task must not leave its shell or any
+                # scientific worker processes running after the UI says stop.
+                await asyncio.shield(self._terminate_process_tree(process))
+                raise
 
             output_parts = []
 
@@ -435,6 +447,8 @@ class ExecTool(Tool):
                 env=env,
                 description=description,
                 job_dir_root=jobs_root,
+                owner_session_id=self._runtime_session_id.get(),
+                owner_turn_id=self._runtime_turn_id.get(),
             )
         except Exception as e:
             return f"Error launching background job: {e}"
@@ -595,6 +609,7 @@ class ExecTool(Tool):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=env,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             )
         return await asyncio.create_subprocess_exec(
             "bash",
@@ -606,7 +621,41 @@ class ExecTool(Tool):
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             env=env,
+            start_new_session=True,
         )
+
+    @staticmethod
+    async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
+        """Terminate ``process`` and descendants, then reap the shell."""
+        if process.returncode is not None:
+            return
+        try:
+            if _IS_WINDOWS:
+                from mira_engine.agent.tools.bg import _terminate_windows_tree
+
+                await asyncio.to_thread(_terminate_windows_tree, process.pid, False)
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            if _IS_WINDOWS:
+                from mira_engine.agent.tools.bg import _terminate_windows_tree
+
+                await asyncio.to_thread(_terminate_windows_tree, process.pid, True)
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning("Process tree rooted at pid=%s did not exit", process.pid)
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
