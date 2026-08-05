@@ -260,21 +260,6 @@ jobs:
             cp dist/*.tar.gz release-artifacts/
           fi
 
-      - name: Generate SHA256 checksums
-        shell: bash
-        run: |
-          python - <<'PY'
-          from hashlib import sha256
-          from pathlib import Path
-
-          out = []
-          for path in sorted(Path("release-artifacts").glob("*")):
-              if path.is_file():
-                  digest = sha256(path.read_bytes()).hexdigest()
-                  out.append(f"{digest}  {path.name}")
-          Path("release-artifacts/SHA256SUMS.txt").write_text("\n".join(out) + "\n", encoding="utf-8")
-          PY
-
       - name: Upload per-OS artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -323,6 +308,23 @@ jobs:
           pattern: mira-engine-*
           merge-multiple: true
           path: release-assets
+
+      - name: Generate combined SHA256 checksums
+        shell: bash
+        run: |
+          python - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+
+          out = []
+          for path in sorted(Path("release-assets").glob("*")):
+              if path.is_file():
+                  digest = sha256(path.read_bytes()).hexdigest()
+                  out.append(f"{digest}  {path.name}")
+          if not out:
+              raise SystemExit("No release assets found for checksum generation")
+          Path("release-assets/SHA256SUMS.txt").write_text("\n".join(out) + "\n", encoding="utf-8")
+          PY
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
