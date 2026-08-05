@@ -79,7 +79,8 @@ python -m pytest tests -q
 
 # /Users/cwang/Code/mira-ui
 npm test -- --run
-npm run build
+npm run build:web
+npm run build:electron
 ```
 
 Use the exact commands declared by current workflows if they differ. A previous PR run is useful evidence but does not replace release-source verification after preparation changes.
@@ -110,7 +111,7 @@ From the mira-ui repo:
 1. Re-run the compatibility validator against the target UI version.
 2. Create a temporary release branch from `origin/release`.
 3. Merge `origin/dev` with a merge commit.
-4. Re-run tests and the production build on the merged release tree.
+4. Re-run tests plus `build:web` and `build:electron` on the merged release tree.
 5. Push the merge commit to `origin/release` without force.
 6. Create and push annotated tag `v<ui-version>` at that exact commit.
 7. Watch `.github/workflows/desktop-release.yml` to completion.
