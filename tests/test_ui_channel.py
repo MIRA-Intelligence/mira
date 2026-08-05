@@ -1527,6 +1527,56 @@ async def test_handle_validate_data_path_allows_outside_when_unrestricted(ui_cha
     assert body["kind"] == "directory"
 
 
+@pytest.mark.asyncio
+async def test_organization_folder_and_chat_handlers(ui_channel: UiChannel) -> None:
+    create_folder_request = MagicMock(spec=web.Request)
+    create_folder_request.json = AsyncMock(return_value={"name": "Lung cancer"})
+    folder_response = await ui_channel._handle_create_folder(create_folder_request)
+    assert folder_response.status == 201
+    folder = json.loads(folder_response.text)
+
+    import_request = MagicMock(spec=web.Request)
+    import_request.json = AsyncMock(return_value={
+        "chats": [{"id": "chat-1", "title": "Question"}],
+    })
+    import_response = await ui_channel._handle_import_chats(import_request)
+    assert import_response.status == 200
+
+    assign_request = MagicMock(spec=web.Request)
+    assign_request.match_info = {"kind": "chat", "item_id": "chat-1"}
+    assign_request.json = AsyncMock(return_value={"folder_id": folder["id"]})
+    assign_response = await ui_channel._handle_assign_folder(assign_request)
+    assert assign_response.status == 200
+
+    snapshot_response = await ui_channel._handle_organization(MagicMock(spec=web.Request))
+    snapshot = json.loads(snapshot_response.text)
+    assert snapshot["assignments"]["chat"] == {"chat-1": folder["id"]}
+
+    delete_request = MagicMock(spec=web.Request)
+    delete_request.match_info = {"folder_id": folder["id"]}
+    delete_response = await ui_channel._handle_delete_folder(delete_request)
+    assert delete_response.status == 200
+    assert ui_channel.organization_store.snapshot()["assignments"]["chat"] == {}
+
+
+@pytest.mark.asyncio
+async def test_assign_folder_rejects_unknown_project_and_folder(ui_channel: UiChannel) -> None:
+    unknown_item = MagicMock(spec=web.Request)
+    unknown_item.match_info = {"kind": "project", "item_id": "PRJ-missing"}
+    unknown_item.json = AsyncMock(return_value={"folder_id": None})
+    response = await ui_channel._handle_assign_folder(unknown_item)
+    assert response.status == 404
+
+    import_request = MagicMock(spec=web.Request)
+    import_request.json = AsyncMock(return_value={"chats": [{"id": "chat-1", "title": "Q"}]})
+    await ui_channel._handle_import_chats(import_request)
+    unknown_folder = MagicMock(spec=web.Request)
+    unknown_folder.match_info = {"kind": "chat", "item_id": "chat-1"}
+    unknown_folder.json = AsyncMock(return_value={"folder_id": "folder-missing"})
+    response = await ui_channel._handle_assign_folder(unknown_folder)
+    assert response.status == 404
+
+
 async def test_handle_list_projects_only_returns_prj_with_meta(ui_channel: UiChannel) -> None:
     (ui_channel.projects_root / "PRJ-0001").mkdir(parents=True)
     (ui_channel.projects_root / "PRJ-0002").mkdir(parents=True)
@@ -2075,6 +2125,28 @@ async def test_send_progress_type(ui_channel: UiChannel) -> None:
     assert ws.send_json.await_args.args[0]["type"] == "progress"
 
 
+async def test_send_stop_ack_is_control_only(ui_channel: UiChannel) -> None:
+    session_id = "sid-stop"
+    project_dir = ui_channel.projects_root / session_id
+    project_dir.mkdir(parents=True)
+    ws = MagicMock()
+    ws.closed = False
+    ws.send_json = AsyncMock()
+    ui_channel._clients[session_id] = ws
+    ui_channel._stream_buffers[session_id] = "partial"
+
+    await ui_channel.send(OutboundMessage(
+        channel="ui",
+        chat_id=session_id,
+        content="Stopped 1 task(s).",
+        metadata={"_stop_ack": True, "request_id": "stop-1"},
+    ))
+
+    assert ws.send_json.await_args.args[0]["type"] == "stop_ack"
+    assert session_id not in ui_channel._stream_buffers
+    assert SessionManager(project_dir).get_ui_history(f"ui:{session_id}") == []
+
+
 async def test_send_activity_ping_does_not_persist_history(ui_channel: UiChannel) -> None:
     session_id = "sid-activity"
     project_dir = ui_channel.projects_root / session_id
@@ -2277,6 +2349,8 @@ async def test_ws_handler_message_and_set_mode_dispatch(
                     },
                     "content": "hello",
                     "media": ["a.png"],
+                    "turn_id": "turn-1",
+                    "selected_skill_ids": ["mrstation", ""],
                 }
             ),
         ),
@@ -2309,6 +2383,8 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert handled[0]["metadata"]["run_mode"] == "auto"
     assert handled[0]["metadata"]["agent_profile"] == "engineer"
     assert handled[0]["metadata"]["contract_version"] == 2
+    assert handled[0]["metadata"]["turn_id"] == "turn-1"
+    assert handled[0]["metadata"]["selected_skill_ids"] == ["mrstation"]
     assert handled[0]["metadata"]["automation_policy"]["maxExperiments"] == 8
     assert "_ui_system_instructions" in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"
@@ -2317,6 +2393,37 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["contract_version"] == 2
     assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
+
+
+async def test_ws_handler_stop_dispatches_control_message(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps({
+                "type": "stop",
+                "session_id": "chat-1",
+                "loop_mode": "normal",
+                "turn_id": "turn-1",
+                "request_id": "stop-1",
+            }),
+        )
+    ])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    handled = []
+
+    async def _handle_message(**kwargs):
+        handled.append(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+
+    assert len(handled) == 1
+    assert handled[0]["content"] == "/stop"
+    assert handled[0]["session_key"] == "ui:chat-1"
+    assert handled[0]["metadata"]["_stop_request_id"] == "stop-1"
+    assert handled[0]["metadata"]["turn_id"] == "turn-1"
 
 
 async def test_ws_handler_normal_message_skips_project_runtime_state(

@@ -1376,7 +1376,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         self._set_tool_context(
             msg.channel,
             msg.chat_id,
-            meta.get("message_id"),
+            meta.get("turn_id") or meta.get("message_id"),
             project_ref=project_ref,
             session_key=key,
         )
@@ -1395,31 +1395,56 @@ class ResearchAgentLoop(BaseAgentLoop):
             meta.get("_task_plan_guard_notice"),
         )
 
+        raw_selected_skills = meta.get("selected_skill_ids")
+        selected_skills = [
+            name for name in (
+                str(item).strip() for item in raw_selected_skills
+                if isinstance(item, str)
+            )
+            if name and ctx.skills.load_skill(name)
+        ] if isinstance(raw_selected_skills, list) else []
+
         suggested_skills = ctx.skills.suggest_skills(
             msg.content,
             recent=recent_skill_names,
             limit=3,
         )
         active_skills: list[str] = []
-        for name in [*recent_skill_names, *suggested_skills]:
+        for name in [*selected_skills, *suggested_skills, *recent_skill_names]:
             if name not in active_skills:
                 active_skills.append(name)
-        active_skills = active_skills[-4:]
+        active_skills = active_skills[:8]
         skill_hint = ""
-        if suggested_skills:
+        if selected_skills:
+            fallback_instruction = (
+                "The user approved the previously proposed fallback for this turn. "
+                "Deviate only as narrowly as that proposal requires."
+                if meta.get("_skill_fallback_approved")
+                else "If their workflow cannot continue, stop using tools and reply with "
+                     "`MIRA_SKILL_FALLBACK_REQUIRED:` followed by the exact error and proposed "
+                     "fallback. Wait for explicit user approval before deviating."
+            )
             skill_hint = (
-                "Skill routing hint: this request likely matches one or more skills. "
-                "Before answering, use read_file to inspect these SKILL.md files if relevant:\n"
+                "User-selected skills are mandatory system-level instructions for this turn:\n"
+                + "\n".join(f"- {name}" for name in selected_skills)
+                + "\nFollow their documented workflow and recommended calls. Do not bypass them "
+                  "by inspecting implementation source, calling internal functions, or writing a "
+                  "replacement implementation. " + fallback_instruction
+            )
+        elif suggested_skills:
+            skill_hint = (
+                "Skill routing selected these active skills. Their full instructions are included "
+                "in the system prompt; prefer their documented workflow when relevant:\n"
                 + "\n".join(f"- {name}" for name in suggested_skills)
             )
-            if on_progress:
-                try:
-                    await on_progress(
-                        f"skill router -> {', '.join(suggested_skills)}",
-                        tool_hint=True,
-                    )
-                except TypeError:
-                    await on_progress(f"skill router -> {', '.join(suggested_skills)}")
+        if on_progress and (selected_skills or suggested_skills):
+            try:
+                await on_progress(
+                    f"skill -> {', '.join(selected_skills or suggested_skills)}",
+                    tool_hint=True,
+                )
+            except TypeError:
+                await on_progress(f"skill -> {', '.join(selected_skills or suggested_skills)}")
         if extra_system:
             extra_system = skill_hint + "\n\n" + extra_system if skill_hint else extra_system
         else:
@@ -1471,7 +1496,9 @@ class ResearchAgentLoop(BaseAgentLoop):
                     return
                 metadata = dict(msg.metadata or {})
                 metadata["_audit_only"] = True
-                metadata["_audit_event"] = "skill_invoked"
+                metadata["_audit_event"] = (
+                    "skill_selected" if details.get("selected") else "skill_invoked"
+                )
                 metadata["_audit_details"] = details
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
@@ -1481,6 +1508,13 @@ class ResearchAgentLoop(BaseAgentLoop):
                 ))
 
             audit_cb = _audit
+        if audit_cb:
+            for selected_skill in selected_skills:
+                await audit_cb({
+                    "tool": "system_prompt",
+                    "skill_name": selected_skill,
+                    "selected": True,
+                })
         run_kwargs: dict[str, Any] = {
             "model_runtime": model_runtime,
             "on_progress": progress_cb,
@@ -1735,7 +1769,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                 for item in prior:
                     if isinstance(item, str) and item not in merged:
                         merged.append(item)
-            for item in sorted(current_turn_skills):
+            for item in [*selected_skills, *sorted(current_turn_skills)]:
                 if item not in merged:
                     merged.append(item)
             session.metadata["_recent_skills"] = merged[-10:]
@@ -1761,6 +1795,11 @@ class ResearchAgentLoop(BaseAgentLoop):
         current_plan_phase = self._plan_phase(project_dir)
         if current_plan_phase:
             response_metadata["_plan_phase"] = current_plan_phase
+        fallback_prefix = "MIRA_SKILL_FALLBACK_REQUIRED:"
+        if selected_skills and final_content.lstrip().startswith(fallback_prefix):
+            final_content = final_content.lstrip()[len(fallback_prefix):].lstrip()
+            response_metadata["_skill_fallback_required"] = True
+            response_metadata["selected_skill_ids"] = selected_skills
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=response_metadata,

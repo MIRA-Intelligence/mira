@@ -153,6 +153,32 @@ async def test_exec_tool_background_returns_job_id(
         await registry.shutdown()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics")
+async def test_registry_kills_only_jobs_owned_by_session(
+    registry: BackgroundJobRegistry, workspace: Path
+) -> None:
+    first = await spawn_background_job(
+        registry=registry,
+        command=_bash_sleep(60),
+        cwd=str(workspace),
+        env={"PATH": "/usr/bin:/bin"},
+        owner_session_id="ui:first",
+    )
+    second = await spawn_background_job(
+        registry=registry,
+        command=_bash_sleep(60),
+        cwd=str(workspace),
+        env={"PATH": "/usr/bin:/bin"},
+        owner_session_id="ui:second",
+    )
+    try:
+        assert await registry.kill_by_session("ui:first") == 1
+        assert first.running is False
+        assert second.running is True
+    finally:
+        await registry.shutdown()
+
+
 async def test_exec_tool_background_disabled_returns_helpful_error(
     workspace: Path,
 ) -> None:

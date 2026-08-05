@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mira Release"
+  short_description: "Safely release paired Mira engine and desktop versions"
+  default_prompt: "Use $mira-release to publish the next Mira engine and desktop patch release."

@@ -15,6 +15,19 @@ from mira_engine.agent.skills import SkillsLoader
 TAG = ContextBuilder._RUNTIME_CONTEXT_TAG
 
 
+def test_selected_skill_content_is_injected_into_system_prompt(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / "mrstation"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\ndescription: MRStation workflow\n---\n\nUSE_MRSTATION_RECOMMENDED_FLOW",
+        encoding="utf-8",
+    )
+    builder = ContextBuilder(tmp_path)
+    prompt = builder.build_system_prompt(skill_names=["mrstation"])
+    assert "USE_MRSTATION_RECOMMENDED_FLOW" in prompt
+    assert prompt.count("USE_MRSTATION_RECOMMENDED_FLOW") == 1
+
+
 def _tc(cid: str, name: str = "fn") -> dict:
     return {
         "id": cid,
