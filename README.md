@@ -21,13 +21,18 @@ Mira comes pre-loaded with specialized medical skills:
 Mira goes beyond standard AI wrappers by implementing a robust, production-ready agent architecture:
 - **Intelligent Model Routing**: Dynamically routes sub-tasks, agent reasoning, and tool calls to the most appropriate AI models based on task complexity and context, ensuring optimal performance and cost-efficiency.
 - **Strict Workspace Sandboxing (Read/Write Separation)**: The agent operates within a highly secure, confined workspace directory. Built-in filesystem and shell execution guards actively block path traversals (e.g., `cd ..`, `../`) and unauthorized updates to external paths, guaranteeing the safety of the host system. Crucially, it employs a sophisticated Read/Write separation model—allowing the agent securely to read system-level built-in skills without permitting any unauthorized edits to framework source code.
+- **Workspace Organization**: Desktop clients can group projects and quick chats into persistent folders. Folder names, chat metadata, and assignments are stored in the local Mira workspace.
+- **Reliable Stop Controls**: `/stop` cancels the active agent task, subagents, and background shell jobs for the current session, then returns a dedicated acknowledgement to the desktop client.
+- **Explicit Skill Execution**: Desktop-selected skills are loaded as mandatory instructions for the current turn. If a selected workflow cannot continue, Mira requests approval before using a fallback.
+
+For details on long-term conversation context, see [Memory in Mira](docs/MEMORY.md).
 
 ## 🚀 Quick Start
 
 **1. Install**
 ```bash
 git clone https://github.com/MIRA-Intelligence/mira.git
-cd Mira
+cd mira
 pip install -e .
 ```
 
@@ -112,6 +117,8 @@ Mira provides a comprehensive CLI for managing your sessions and configurations:
   `ResearchAgentLoop`) drives `_process_message`. `mira gateway` keeps using
   `ResearchAgentLoop` to match the desktop UI.
 
+  To embed Mira in Python, see the [Python SDK guide](docs/PYTHON_SDK.md).
+
 - **`mira status`**
   Check the current status of your Mira configuration, agent defaults, and workspace environment.
 
@@ -166,6 +173,7 @@ Local engine logs and diagnostics:
 
 - Logs: `~/.mira/logs/agent-service.log` (+ rotated files)
 - Diagnostics bundles: `~/.mira/runtime/diagnostics/`
+- Upgrade and rollback steps: [Local Engine Upgrade Runbook](docs/local-engine-upgrade-runbook.md)
 
 ## 🔗 Release Compatibility Mapping
 
@@ -187,6 +195,9 @@ Tagging `v*` triggers `.github/workflows/agent-release.yml` to:
 Use `.github/workflows/release-train.yml` (`workflow_dispatch`) to validate an
 `agent_tag + ui_tag` pair and run smoke checks before announcing a combined release.
 
+Release operators should also read the [deployment blueprint](DEPLOYMENT_RELEASE_BLUEPRINT.md)
+and [release-day checklist](RELEASE_DAY_CHECKLIST.md).
+
 ## 🏗️ Optional Self-hosted Path
 
 Docker-related files are in `deploy/`:
@@ -207,10 +218,14 @@ Operator guide:
 ## 💬 Multi-Channel Deployment (Coming Soon)
 Features to deploy Mira seamlessly to platforms like Telegram, Discord, Feishu, or Slack to assist your research team in real-time are in active development.
 
+Developers can build external integrations with the [Channel Plugin Guide](docs/CHANNEL_PLUGIN_GUIDE.md).
+
 ## 🤝 Contributing / CLA
 
 All external contributions require acceptance of the Contributor License Agreement.
 See `CLA.md` for details. By submitting a PR, you confirm acceptance of this CLA.
+
+Contributors using the CNB mirror should follow the [GitHub and CNB synchronization guide](docs/cnb-github-sync.md).
 
 ## 🙏 Acknowledgments
 
