@@ -120,6 +120,13 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    # Suppress benign Windows asyncio cleanup noise from CPython's
+    # ProactorEventLoop: subprocess transports finalized after the loop is
+    # closed surface as PytestUnraisableExceptionWarning. Tests pass; this just
+    # avoids GitHub Actions misannotating the warning text as an Error.
+    "ignore:Exception ignored in.*BaseSubprocessTransport.*:pytest.PytestUnraisableExceptionWarning",
+]
 
 [tool.coverage.run]
 source = ["mira_engine"]
