@@ -385,7 +385,12 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     ),
     # Moonshot: Kimi models, needs "moonshot/" prefix.
     # LiteLLM requires MOONSHOT_API_BASE env var to find the endpoint.
-    # Kimi K2.5 API enforces temperature >= 1.0.
+    # Moonshot enforces temperature=1 on the entire Kimi K2 family
+    # (kimi-k2, kimi-k2-turbo, kimi-k2.5, kimi-k2.5-turbo, ...) and on
+    # the thinking/reasoning preview models (kimi-thinking-preview,
+    # kimi-k2-thinking, ...). Catch both prefixes so new releases stay covered.
+    # LiteLLMProvider.chat() also retries once with temperature=1.0 if the
+    # server still rejects the request, as a defense against future variants.
     ProviderSpec(
         name="moonshot",
         keywords=("moonshot", "kimi"),
@@ -400,7 +405,10 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="https://api.moonshot.ai/v1",  # intl; use api.moonshot.cn for China
         strip_model_prefix=False,
-        model_overrides=(("kimi-k2.5", {"temperature": 1.0}),),
+        model_overrides=(
+            ("kimi-k2", {"temperature": 1.0}),
+            ("kimi-thinking", {"temperature": 1.0}),
+        ),
     ),
     # MiniMax: needs "minimax/" prefix for LiteLLM routing.
     # Uses OpenAI-compatible API at api.minimax.io/v1.
