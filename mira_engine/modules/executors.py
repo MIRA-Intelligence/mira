@@ -6,6 +6,7 @@ import json
 from abc import ABC
 from typing import ClassVar
 
+from mira_engine.workflows.confirmations import confirmation_context
 from mira_engine.workflows.models import ModuleType
 
 from .base import (
@@ -16,7 +17,7 @@ from .base import (
     ValidationResult,
 )
 from .profiles import profile_allows_team_tools, profile_system_instructions
-from .prompts import module_system_instructions
+from .prompts import module_confirmation_instructions, module_system_instructions
 
 _LEGACY_OR_OUT_OF_BAND_TOOLS = frozenset(
     {"set_plan", "cron", "message", "consult", "spawn"}
@@ -30,6 +31,8 @@ _INTERNAL_MODULE_DATA_KEYS = frozenset(
         "parent_run_id",
         "handoff_summary",
         "interaction",
+        "interaction_history",
+        "confirmation_policy",
         "recovery",
         "failure",
         "completion_summary",
@@ -81,6 +84,7 @@ class NativeModuleExecutor(ABC):
         return ValidationResult(valid=not errors, errors=tuple(errors))
 
     def system_instructions(self, context: ModuleExecutionContext) -> str:
+        confirmation = confirmation_context(context.run)
         artifact_context = [
             {
                 "artifact_id": artifact.artifact_id,
@@ -99,6 +103,7 @@ class NativeModuleExecutor(ABC):
             "intent": context.run.module_data.get("intent"),
             "parent_run_id": context.run.module_data.get("parent_run_id"),
             "handoff_summary": context.run.module_data.get("handoff_summary"),
+            "confirmation": confirmation,
             "selected_artifacts": artifact_context,
             "configuration": {
                 key: value
@@ -113,8 +118,21 @@ class NativeModuleExecutor(ABC):
                 "interaction_type": interaction.get("interaction_type"),
                 "response": interaction.get("response"),
             }
+        interaction_history = context.run.module_data.get("interaction_history")
+        if isinstance(interaction_history, list):
+            run_context["resolved_interactions"] = [
+                {
+                    "interaction_id": item.get("interaction_id"),
+                    "interaction_type": item.get("interaction_type"),
+                    "response": item.get("response"),
+                    "resolved_at": item.get("resolved_at"),
+                }
+                for item in interaction_history[-20:]
+                if isinstance(item, dict)
+            ]
         return (
             f"{module_system_instructions(context.run.module_type, context.run.run_id)}\n\n"
+            f"{module_confirmation_instructions(context.run.module_type, **confirmation)}\n\n"
             "Native executor contract:\n"
             f"{self.operating_contract}\n\n"
             "The following JSON is the authoritative Run input. Do not infer hidden "

@@ -139,6 +139,47 @@ def test_executor_instructions_include_user_module_configuration(tmp_path: Path)
 
 
 @pytest.mark.parametrize(
+    ("module_type", "interaction_type"),
+    [
+        ("initiation", "approve_research_scope"),
+        ("planning", "approve_plan"),
+        ("experiment", "approve_experiment_plan"),
+        ("delivery", "approve_delivery_brief"),
+    ],
+)
+def test_required_module_instructions_embed_the_local_confirmation_gate(
+    tmp_path: Path,
+    module_type: str,
+    interaction_type: str,
+) -> None:
+    service = _service(tmp_path, project_id=f"PRJ-confirm-{module_type}")
+    receipt = service.create_run(
+        command_id=f"create-confirm-{module_type}",
+        module_type=module_type,
+        module_data={
+            "intent": f"confirm {module_type}",
+            "confirmation_policy": {"mode": "required"},
+        },
+    )
+    run = service.repository.load_run(receipt.run_id or "")
+    context = ModuleExecutionContext(
+        run=run,
+        artifacts=(),
+        project_dir=service.repository.project_dir,
+        user_content=f"Confirm {module_type}",
+        metadata={},
+        agent_profile="research",
+    )
+
+    instructions = ModuleExecutorRegistry().get(module_type).system_instructions(context)
+
+    assert interaction_type in instructions
+    assert '"required": true' in instructions
+    assert "exactly two choices" in instructions
+    assert "latest" in instructions
+
+
+@pytest.mark.parametrize(
     ("module_type", "tool_name", "visible"),
     [
         ("initiation", "set_plan", False),
@@ -271,6 +312,89 @@ async def test_native_planning_executor_requests_durable_interaction_end_to_end(
     assert attempt.executor_version == "1.0.0"
     assert checkpoint.executor_name == attempt.executor_name
     assert checkpoint.executor_version == attempt.executor_version
+
+
+async def test_required_confirmation_blocks_completion_tool_until_interaction_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    service = _service(tmp_path, project_id="PRJ-confirmation-guard")
+    receipt = service.create_run(
+        command_id="create-confirmed-experiment",
+        module_type="experiment",
+        module_data={
+            "intent": "run a controlled check",
+            "confirmation_policy": {"mode": "required"},
+        },
+        enqueue=True,
+    )
+    run_id = receipt.run_id or ""
+    service.claim_run(run_id, lease_owner="test:native")
+    provider = _ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="premature-completion",
+                        name="complete_workflow_run",
+                        arguments={
+                            "summary": "Done too early",
+                            "output_artifact_ids": [],
+                            "suggested_handoffs": [],
+                        },
+                    )
+                ],
+            ),
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="confirmation-call",
+                        name="request_workflow_interaction",
+                        arguments={
+                            "interaction_type": "approve_experiment_plan",
+                            "title": "Approve experiment brief",
+                            "prompt": "Hypothesis, method, budget, metrics, and risks.",
+                            "choices": [
+                                {"id": "approve", "label": "Approve", "value": "approve"},
+                                {"id": "revise", "label": "Revise", "value": "revise"},
+                            ],
+                            "allow_freeform": True,
+                        },
+                    )
+                ],
+            ),
+            LLMResponse(content="The Run is waiting for confirmation."),
+        ]
+    )
+    loop = ResearchAgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="dummy/native",
+        channels_config=ChannelsConfig(),
+        exec_config=ExecToolConfig(enable=True, timeout=5),
+        session_manager=SessionManager(tmp_path),
+    )
+
+    await loop.process_direct(
+        "Execute the experiment.",
+        session_key=f"ui:{service.repository.project_id}:run:{run_id}",
+        channel="ui",
+        chat_id=service.repository.project_id,
+        metadata={
+            "loop_mode": "project",
+            "project_id": service.repository.project_id,
+            "project_dir": str(service.repository.project_dir),
+            "workflow_run_id": run_id,
+        },
+    )
+
+    waiting = service.repository.load_run(run_id)
+    assert waiting.status == "waiting_input"
+    assert waiting.module_data["interaction"]["interaction_type"] == "approve_experiment_plan"
+    assert "workflow_confirmation" in json.dumps(provider.calls[1]["messages"])
 
 
 async def test_native_initiation_records_research_before_direction_choice(

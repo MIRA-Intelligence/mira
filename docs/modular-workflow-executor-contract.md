@@ -184,6 +184,21 @@ The service commits the checkpoint and `interaction.requested` event before chan
 
 Free-form scientific discussion is represented as a conversational interaction schema, not as an untracked mutation. Conversation text may live in the existing session store, while the Run checkpoint stores the conversation cursor and the durable interaction event stores the decision needed for replay.
 
+### Module-local execution confirmation
+
+UI-created Runs and automatic handoffs set `module_data.confirmation_policy.mode` to `required`. Before consequential work, each executor must put a complete execution brief in a structured interaction and wait for one of two decisions: `approve` or `revise`. The stable interaction type is module-specific:
+
+| Module | Confirmation interaction | Brief content |
+|---|---|---|
+| Initiation | `approve_research_scope` | question, sources, inclusion/exclusion boundaries, expected outcome |
+| Planning | `approve_plan` | requirements, hypotheses, risks, acceptance criteria, proposed plan |
+| Experiment | `approve_experiment_plan` | hypothesis, inputs, method, budget, metrics, stopping conditions, risks |
+| Delivery | `approve_delivery_brief` | audience, format, outline, selected Artifacts, claim/citation constraints |
+
+Until the latest module confirmation is approved, the runtime permits only local read-only inspection and `request_workflow_interaction`; external search, execution, file mutation, Artifact publication, and Run completion are rejected. A `revise` response is retained in `interaction_history`, queues a new attempt, and requires a new confirmation. The latest confirmation decision wins, so an older approval cannot authorize a later revised brief.
+
+Runs created by older or non-UI clients without `confirmation_policy` retain the previous behavior for compatibility. This policy is a gate inside each module, not a separate Planning stage.
+
 ## Output staging and atomic publication
 
 Executors write only beneath their attempt-scoped staging directory. `ArtifactStaged` identifies a relative path, Artifact type, schema version, media type, label, content hash, provenance, and source input references. The service verifies the path and hash; the executor cannot point outside staging.

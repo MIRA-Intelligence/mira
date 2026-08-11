@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
 
+from .confirmations import confirmation_approved, confirmation_required
 from .models import (
     MODULE_TYPES,
     Actor,
@@ -843,6 +845,12 @@ class WorkflowService:
             self._close_attempt(run, "failed", utc_now())
             return "failed", "run.failed", "applied"
         if command == "complete" and status in {"running", "waiting_input", "paused"}:
+            if confirmation_required(run) and not confirmation_approved(run):
+                raise WorkflowError(
+                    "confirmation_required",
+                    "the module execution brief must be approved before completion",
+                    status=409,
+                )
             outputs = payload.get("outputs", [])
             if not isinstance(outputs, list) or not all(isinstance(item, str) for item in outputs):
                 raise WorkflowError("invalid_outputs", "outputs must be an array of Artifact IDs", status=422)
@@ -900,6 +908,13 @@ class WorkflowService:
             self._validate_interaction_response(interaction.get("response_schema"), response)
             interaction["response"] = response
             interaction["resolved_at"] = utc_now()
+            history = run.module_data.setdefault("interaction_history", [])
+            if not isinstance(history, list):
+                history = []
+            run.module_data["interaction_history"] = [
+                *history,
+                copy.deepcopy(interaction),
+            ][-100:]
             return "queued", "interaction.resolved", "accepted"
         raise WorkflowError(
             "invalid_transition",
@@ -962,6 +977,7 @@ class WorkflowService:
                     "parent_run_id": source_run.run_id,
                     "handoff_summary": suggestion.get("summary"),
                     "auto_handoff": True,
+                    "confirmation_policy": {"mode": "required"},
                     "handoff_not_before": (
                         datetime.now(UTC)
                         + timedelta(seconds=workflow.handoff_policy.interrupt_grace_seconds)
