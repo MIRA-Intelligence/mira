@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from mira_engine.agent.base_loop import BaseAgentLoop
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.workflows import JsonWorkflowRepository, WorkflowService
+from mira_engine.workflows.confirmations import (
+    confirmation_approved,
+    confirmation_required,
+    expected_confirmation_type,
+)
 from mira_engine.workflows.models import new_id
 
 from .base import ModuleExecutionContext, ModuleInvocation
@@ -102,6 +107,13 @@ class NativeModuleRuntime:
                 session_key_override=msg.session_key_override,
             )
             visible_tools = set(loop.tools.all_tool_names) - set(invocation.blocked_tools)
+            pre_confirmation_tools = {
+                "read_file",
+                "list_dir",
+                "glob",
+                "grep",
+                "request_workflow_interaction",
+            }
 
             async def control_guard(_tool_name: str, _arguments: dict[str, Any]) -> str | None:
                 current = repository.load_run(run_id)
@@ -130,12 +142,33 @@ class NativeModuleRuntime:
                         + current.status
                         + '","instruction":"Stop this turn without more tool calls."}'
                     )
+                if (
+                    confirmation_required(current)
+                    and not confirmation_approved(current)
+                    and _tool_name not in pre_confirmation_tools
+                ):
+                    interaction_type = expected_confirmation_type(current.module_type)
+                    return (
+                        '{"workflow_confirmation":"required","interaction_type":"'
+                        + interaction_type
+                        + '","blocked_tool":"'
+                        + _tool_name
+                        + '","instruction":"Draft the module execution brief and call '
+                        "request_workflow_interaction before consequential work." + '"}'
+                    )
                 return None
 
             async def completion_guard(_content: str | None) -> str | None:
                 current = repository.load_run(run_id)
                 if current.status != "running" or current.pending_control is not None:
                     return None
+                if confirmation_required(current) and not confirmation_approved(current):
+                    interaction_type = expected_confirmation_type(current.module_type)
+                    return (
+                        "This ModuleRun still requires approval of its execution brief. "
+                        f"Draft or revise the brief and call request_workflow_interaction "
+                        f"with interaction_type `{interaction_type}`, then end the turn."
+                    )
                 literature = current.module_data.get("literature_review")
                 research_missing = (
                     current.module_type == "initiation"

@@ -132,6 +132,81 @@ def test_engine_claim_and_manual_completion_close_a_conversation_run(
     assert final.module_data["completion_summary"] == "Plan approved in discussion"
 
 
+def test_required_module_confirmation_blocks_completion_until_approved(
+    service: WorkflowService,
+) -> None:
+    created = service.create_run(
+        command_id="cmd-create-confirmed",
+        module_type="experiment",
+        module_data={
+            "intent": "run a controlled experiment",
+            "confirmation_policy": {"mode": "required"},
+        },
+        enqueue=True,
+    )
+    run_id = created.run_id or ""
+    service.claim_run(run_id, lease_owner="executor:test")
+    running = service.repository.load_run(run_id)
+
+    with pytest.raises(WorkflowError) as exc_info:
+        service.command_run(
+            run_id,
+            command_id="cmd-complete-before-confirmation",
+            command_type="complete",
+            expected_revision=running.revision,
+            payload={"outputs": []},
+        )
+    assert exc_info.value.code == "confirmation_required"
+
+    service.request_interaction(
+        run_id,
+        command_id="signal-confirmation",
+        attempt_id=running.attempt.current_attempt_id,
+        checkpoint_state={"phase": "brief_ready"},
+        interaction={
+            "interaction_id": "experiment-confirmation",
+            "interaction_type": "approve_experiment_plan",
+            "title": "Approve experiment brief",
+            "prompt": "Approve this experiment brief?",
+            "response_schema": {
+                "type": "object",
+                "required": ["selection"],
+                "properties": {
+                    "selection": {"type": "string"},
+                    "notes": {"type": "string"},
+                },
+            },
+            "choices": [
+                {"id": "approve", "label": "Approve", "value": "approve"},
+                {"id": "revise", "label": "Revise", "value": "revise"},
+            ],
+            "allow_freeform": True,
+        },
+    )
+    service.command_run(
+        run_id,
+        command_id="cmd-approve-brief",
+        command_type="submit_interaction",
+        payload={
+            "interaction_id": "experiment-confirmation",
+            "response": {"selection": "approve"},
+        },
+    )
+    queued = service.repository.load_run(run_id)
+    assert queued.module_data["interaction_history"][0]["response"] == {"selection": "approve"}
+
+    service.claim_run(run_id, lease_owner="executor:test-2")
+    resumed = service.repository.load_run(run_id)
+    service.command_run(
+        run_id,
+        command_id="cmd-complete-after-confirmation",
+        command_type="complete",
+        expected_revision=resumed.revision,
+        payload={"outputs": [], "summary": "Experiment finished"},
+    )
+    assert service.repository.load_run(run_id).status == "completed"
+
+
 def test_artifact_import_is_immutable_and_can_be_committed_as_run_output(
     service: WorkflowService,
 ) -> None:
@@ -371,6 +446,7 @@ def test_auto_handoff_creates_a_queued_downstream_run_atomically(
     assert child.module_type == "experiment"
     assert child.status == "queued"
     assert child.module_data["parent_run_id"] == run_id
+    assert child.module_data["confirmation_policy"] == {"mode": "required"}
     assert child.module_data["handoff_not_before"]
     with pytest.raises(WorkflowError) as exc_info:
         service.claim_run(child.run_id, lease_owner="executor:too-early")

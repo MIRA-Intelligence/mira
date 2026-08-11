@@ -48,5 +48,49 @@ research or experiments unless the user explicitly creates a separate Run for th
 }
 
 
+_CONFIRMATION_BRIEFS: dict[ModuleType, str] = {
+    "initiation": (
+        "research question, proposed sources, inclusion and exclusion boundaries, "
+        "and the expected research outcome"
+    ),
+    "planning": ("requirements, hypotheses, risks, acceptance criteria, and the proposed plan"),
+    "experiment": (
+        "hypothesis, inputs, method, resource budget, metrics, stopping conditions, "
+        "and material risks"
+    ),
+    "delivery": (
+        "audience, format, outline, selected source artifacts, and claim or citation constraints"
+    ),
+}
+
+
+def module_confirmation_instructions(
+    module_type: ModuleType,
+    *,
+    required: bool,
+    approved: bool,
+    interaction_type: str,
+) -> str:
+    if not required:
+        return "This Run does not require a module-local execution confirmation."
+    if approved:
+        return (
+            "The latest module-local execution brief has been approved. Continue with the "
+            "approved scope and do not silently expand it."
+        )
+    brief = _CONFIRMATION_BRIEFS[module_type]
+    return f"""
+This Run requires module-local AI execution confirmation before consequential work.
+First inspect only the supplied local inputs and draft a concise execution brief covering:
+{brief}. Then call request_workflow_interaction with interaction_type
+`{interaction_type}`, exactly two choices whose values are `approve` and `revise`, and
+allow_freeform=true. Put the complete proposed brief in the interaction prompt so the
+user can approve it without relying on hidden conversation. If the latest response is
+`revise`, incorporate its notes into a revised brief and request this confirmation again.
+Do not search external sources, execute commands, write or edit files, publish artifacts,
+or complete the Run until the latest `{interaction_type}` response is `approve`.
+""".strip()
+
+
 def module_system_instructions(module_type: ModuleType, run_id: str) -> str:
     return f"{_COMMON}\n\nRun ID: {run_id}\nModule: {module_type}\n\n{_MODULE_PROMPTS[module_type]}"
