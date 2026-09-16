@@ -1667,6 +1667,31 @@ async def test_handle_create_project_managed_mode_ignores_client_path(
     assert ch._project_location_payload()["custom_dir_allowed"] is False
 
 
+async def test_create_project_existing_directory_confirmation(ui_channel: UiChannel, tmp_path: Path) -> None:
+    target = tmp_path / "selected" / "study"
+    target.mkdir(parents=True)
+    data = target / "input.csv"
+    data.write_bytes(b"subject,value\n1,42\n")
+    req = MagicMock(spec=web.Request)
+    body = {"project_id": "study", "display_name": "Study", "project_parent_dir": str(target.parent)}
+    # Truthy strings must not bypass confirmation.
+    for consent in (None, False, "true"):
+        req.json = AsyncMock(return_value={**body, "allow_existing_dir": consent})
+        resp = await ui_channel._handle_create_project(req)
+        payload = json.loads(resp.text)
+        assert resp.status == 409
+        assert payload["code"] == "project_directory_exists"
+        assert payload["project_dir"] == str(target)
+        assert not (target / ".mira").exists()
+
+    req.json = AsyncMock(return_value={**body, "allow_existing_dir": True})
+    resp = await ui_channel._handle_create_project(req)
+    assert resp.status == 201
+    assert json.loads(resp.text)["project_dir"] == str(target)
+    assert data.read_bytes() == b"subject,value\n1,42\n"
+    assert (target / ".mira" / "project.json").is_file()
+
+
 async def test_handle_project_meta_updates_display_name(ui_channel: UiChannel) -> None:
     project_dir = ui_channel.projects_root / "PRJ-0001"
     project_dir.mkdir(parents=True)

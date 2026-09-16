@@ -54,6 +54,7 @@ from mira_engine.projects import (
     PROJECT_META_DEFAULT_RUN_MODE,
     PROJECT_META_STRICT_CONTRACT_VERSION,
     PROJECT_WORKSPACE_FILENAME,
+    ProjectDirectoryExistsError,
     ProjectRef,
     ProjectRegistry,
     slugify_project_id,
@@ -3193,7 +3194,14 @@ class UiChannel(BaseChannel):
                 display_name=display_name or project_id,
                 project_dir=project_dir,
                 project_parent_dir=project_parent_dir,
+                allow_existing_dir=body.get("allow_existing_dir") is True,
             )
+        except ProjectDirectoryExistsError as exc:
+            return web.json_response({
+                "error": str(exc),
+                "code": "project_directory_exists",
+                "project_dir": str(exc.project_dir),
+            }, status=409)
         except FileExistsError as exc:
             return web.json_response({"error": str(exc)}, status=409)
         except (OSError, ValueError) as exc:
