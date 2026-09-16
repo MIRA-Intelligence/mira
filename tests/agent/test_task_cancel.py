@@ -26,8 +26,8 @@ def _make_loop(*, exec_config=None):
 
     with patch("mira_engine.agent.base_loop.ContextBuilder"), \
          patch("mira_engine.agent.base_loop.SessionManager"), \
-         patch("mira_engine.agent.base_loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("mira_engine.agent.base_loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, exec_config=exec_config)
     return loop, bus
 
@@ -435,3 +435,52 @@ class TestSubagentCancellation:
         assert cancelled.is_set()
         assert task.cancelled()
         mgr._announce_result.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_ack_arrives_while_glob_filesystem_io_is_pending(tmp_path, monkeypatch):
+    """Exercise the actual search tool and stop handler, not an async-sleep tool."""
+    import threading
+
+    from mira_engine.agent.tools.search import GlobTool
+    from mira_engine.bus.events import InboundMessage
+
+    loop, bus = _make_loop()
+    event_loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    continued = []
+
+    def slow_walk(root):
+        try:
+            event_loop.call_soon_threadsafe(started.set)
+            release.wait(2)
+            yield str(root), [], []
+            continued.append(True)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr('mira_engine.agent.tools.search.os.walk', slow_walk)
+    loop.tools.register(GlobTool(workspace=tmp_path, allowed_dir=tmp_path))
+    task = asyncio.create_task(loop.tools.execute('glob', {'pattern': '*.nii.gz'}))
+    loop._active_tasks['test:c1'] = [task]
+    msg = InboundMessage(
+        channel='test', sender_id='u1', chat_id='c1', content='/stop',
+        metadata={'_stop_request_id': 'stop-glob-1'},
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.wait_for(loop._handle_stop(msg), 0.5)
+        ack = await asyncio.wait_for(bus.consume_outbound(), 0.5)
+        assert ack.metadata['_stop_ack'] is True
+        assert ack.metadata['request_id'] == 'stop-glob-1'
+        assert ack.metadata['cancelled_agent_tasks'] == 1
+        assert task.cancelled()
+        assert not release.is_set()
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await asyncio.to_thread(finished.wait, 1)
+    assert not continued

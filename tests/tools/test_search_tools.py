@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -13,6 +15,95 @@ from mira_engine.agent.loop import AgentLoop
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.search import GlobTool, GrepTool
 from mira_engine.bus.queue import MessageBus
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_class", [GlobTool, GrepTool])
+async def test_search_keeps_event_loop_responsive_and_stops_walking_on_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_class,
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    finished = threading.Event()
+    release_io = threading.Event()
+    advanced_after_cancel = []
+
+    def slow_walk(root):
+        try:
+            loop.call_soon_threadsafe(started.set)
+            # Simulate a slow filesystem operation with a bounded fallback so
+            # the pre-fix synchronous implementation fails instead of hanging.
+            release_io.wait(1)
+            yield str(root), ["empty-directory"], []
+            advanced_after_cancel.append(True)
+            yield str(root / "empty-directory"), [], []
+        finally:
+            finished.set()
+
+    monkeypatch.setattr("mira_engine.agent.tools.search.os.walk", slow_walk)
+    tool = tool_class(workspace=tmp_path, allowed_dir=tmp_path)
+    task = asyncio.create_task(tool.execute(pattern="needle", path="."))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert not task.done(), "filesystem scan blocked the event loop until completion"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+    finally:
+        release_io.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await asyncio.to_thread(finished.wait, 1)
+    assert not advanced_after_cancel, "cancelled search continued traversing directories"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_class", [GlobTool, GrepTool])
+async def test_search_workers_preserve_workspace_and_isolate_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_class,
+) -> None:
+    blocked = tmp_path / "blocked"
+    other = tmp_path / "other"
+    blocked.mkdir()
+    other.mkdir()
+    (other / "needle.txt").write_text("needle")
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    release = threading.Event()
+    finished = threading.Event()
+    original_walk = os.walk
+
+    def walk(root):
+        if root == blocked:
+            try:
+                loop.call_soon_threadsafe(started.set)
+                release.wait(2)
+                yield str(root), [], []
+            finally:
+                finished.set()
+        else:
+            yield from original_walk(root)
+
+    monkeypatch.setattr("mira_engine.agent.tools.search.os.walk", walk)
+    tool = tool_class(workspace=tmp_path, allowed_dir=tmp_path)
+
+    async def search(workspace):
+        tool.set_runtime_context(workspace=workspace, allowed_dir=workspace)
+        return await tool.execute(pattern="needle*" if tool_class is GlobTool else "needle")
+
+    task = asyncio.create_task(search(blocked))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.wait_for(search(other), 1) == "needle.txt"
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await asyncio.to_thread(finished.wait, 1)
 
 
 @pytest.mark.asyncio
