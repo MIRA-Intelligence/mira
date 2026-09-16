@@ -31,6 +31,14 @@ PROJECT_WORKSPACE_FILENAME = "workspace.json"
 PROJECT_DIR_INDEX_FILENAME = "project-dirs.json"
 
 
+class ProjectDirectoryExistsError(FileExistsError):
+    """An existing directory needs explicit consent before project creation."""
+
+    def __init__(self, project_dir: Path) -> None:
+        self.project_dir = project_dir
+        super().__init__(f"project directory already exists: {project_dir}")
+
+
 @dataclass(frozen=True)
 class ProjectRef:
     """Resolved project identity and local directory."""
@@ -592,26 +600,38 @@ class ProjectRegistry:
         display_name: str | None,
         project_parent_dir: Path | str | None = None,
         project_dir: Path | str | None = None,
+        allow_existing_dir: bool = False,
     ) -> ProjectRef:
         raw_name = (display_name or project_id or "").strip()
         normalized_id = validate_project_id(project_id or slugify_project_id(raw_name))
-        if normalized_id in self._project_dirs and self._project_dirs[normalized_id].is_dir():
-            raise FileExistsError(f"project already exists: {normalized_id}")
-
         if project_dir is not None:
             target_dir = Path(project_dir).expanduser().resolve()
         else:
             parent = Path(project_parent_dir).expanduser() if project_parent_dir else self.projects_root
             target_dir = (parent / normalized_id).expanduser().resolve()
 
+        existing_dir = self._project_dirs.get(normalized_id)
+        if existing_dir is not None and existing_dir.is_dir() and existing_dir != target_dir:
+            raise FileExistsError(f"project already exists: {normalized_id}")
+
         if target_dir.exists() and not target_dir.is_dir():
             raise FileExistsError(f"project path is not a directory: {target_dir}")
-        if target_dir.is_dir() and any(target_dir.iterdir()):
+        if target_dir.is_dir():
+            if not allow_existing_dir:
+                raise ProjectDirectoryExistsError(target_dir)
+            registered_id = self.project_id_for_dir(target_dir)
+            if registered_id is not None and registered_id != normalized_id:
+                raise FileExistsError(f"directory belongs to project {registered_id}: {target_dir}")
             meta = self.load_project_meta(target_dir)
-            if meta.get("id") != normalized_id:
-                raise FileExistsError(f"project directory is not empty: {target_dir}")
+            if self.project_meta_path(target_dir).exists() and meta.get("id") != normalized_id:
+                raise FileExistsError(f"directory contains existing project metadata: {target_dir}")
 
-        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            target_dir.mkdir(parents=True, exist_ok=allow_existing_dir)
+        except FileExistsError:
+            if target_dir.is_dir() and not allow_existing_dir:
+                raise ProjectDirectoryExistsError(target_dir) from None
+            raise
         return self.register_project_dir(
             normalized_id,
             target_dir,
