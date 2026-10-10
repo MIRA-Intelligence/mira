@@ -113,10 +113,21 @@ class NativeModuleRuntime:
                 "glob",
                 "grep",
                 "request_workflow_interaction",
+                # The service permits only pending records before scope approval.
+                "record_workflow_experiment",
             }
 
             async def control_guard(_tool_name: str, _arguments: dict[str, Any]) -> str | None:
                 current = repository.load_run(run_id)
+                if (
+                    current.status != "running"
+                    or current.attempt.current_attempt_id != run.attempt.current_attempt_id
+                ):
+                    return (
+                        '{"workflow_control":"turn_closed","status":"'
+                        + current.status
+                        + '","instruction":"Stop. This attempt has ended; wait for the user response or a new attempt."}'
+                    )
                 if current.status == "running" and current.pending_control in {"pause", "cancel"}:
                     control = current.pending_control
                     service.acknowledge_control(
@@ -136,12 +147,6 @@ class NativeModuleRuntime:
                         + control
                         + '","instruction":"Stop this turn without more tool calls."}'
                     )
-                if current.status in {"paused", "completed", "failed", "cancelled"}:
-                    return (
-                        '{"workflow_control":"already_closed","status":"'
-                        + current.status
-                        + '","instruction":"Stop this turn without more tool calls."}'
-                    )
                 if (
                     confirmation_required(current)
                     and not confirmation_approved(current)
@@ -156,6 +161,22 @@ class NativeModuleRuntime:
                         + '","instruction":"Draft the module execution brief and call '
                         "request_workflow_interaction before consequential work." + '"}'
                     )
+                return None
+
+            async def turn_stop_guard() -> str | None:
+                current = repository.load_run(run_id)
+                if current.status == "waiting_input":
+                    interaction = current.module_data.get("interaction") or {}
+                    title = str(interaction.get("title", ""))
+                    if any("\u3400" <= char <= "\u9fff" for char in title):
+                        return f"等待你在交互表单中确认：{title}"
+                    return f"Waiting for your response in the interaction form: {title}"
+                if current.status == "completed":
+                    return current.module_data.get("completion_summary") or "Module completed."
+                if current.status != "running" or (
+                    current.attempt.current_attempt_id != run.attempt.current_attempt_id
+                ):
+                    return f"This module turn has ended (status: {current.status})."
                 return None
 
             async def completion_guard(_content: str | None) -> str | None:
@@ -197,6 +218,7 @@ class NativeModuleRuntime:
                     on_stream_end=on_stream_end,
                     audit_hook=audit_hook,
                     completion_guard=completion_guard,
+                    turn_stop_guard=turn_stop_guard,
                 )
 
         try:

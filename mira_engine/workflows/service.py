@@ -5,11 +5,13 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
 from .confirmations import confirmation_approved, confirmation_required
+from .experiments import ExperimentRecord
 from .models import (
     MODULE_TYPES,
     Actor,
@@ -711,6 +713,40 @@ class WorkflowService:
 
     def _transition(self, run: ModuleRun, command: str, payload: dict[str, Any]) -> tuple[str, str, str]:
         status = run.status
+        if command == "record_experiment" and status in {"running", "completed"}:
+            if run.module_type != "experiment":
+                raise WorkflowError("invalid_module", "experiment records require an experiment Run", status=409)
+            raw = payload.get("experiment")
+            records = list(run.module_data.get("experiments") or [])
+            previous = next((item for item in records if isinstance(raw, dict) and item["id"] == raw.get("id")), {})
+            try:
+                if not isinstance(raw, dict):
+                    raise ValueError("experiment must be an object")
+                record = ExperimentRecord.model_validate({**previous, **raw}).model_dump(mode="json")
+            except (ValidationError, ValueError) as exc:
+                raise WorkflowError("invalid_experiment", str(exc), status=422) from exc
+            if status == "completed" and record["status"] not in {"completed", "failed", "skipped"}:
+                raise WorkflowError("invalid_experiment", "a completed Run accepts only terminal experiment records", status=409)
+            if record["status"] != "pending" and confirmation_required(run) and not confirmation_approved(run):
+                raise WorkflowError("confirmation_required", "approve the experiment scope first", status=409)
+            policy = run.module_data.get("automation_policy") or {}
+            limit = policy.get("maxExperiments") if isinstance(policy, dict) else None
+            if not previous and isinstance(limit, int) and limit > 0 and len(records) >= limit:
+                raise WorkflowError("experiment_limit", "maxExperiments limit reached", status=409)
+            paths = record["results"].get("artifacts", [])
+            if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+                raise WorkflowError("invalid_experiment", "results.artifacts must be an array of project-relative paths", status=422)
+            paths = [*paths, *(ref[key] for ref in record["evidence_refs"] for key in ("artifact", "path") if key in ref)]
+            for path in paths:
+                if not isinstance(path, str):
+                    raise WorkflowError("invalid_experiment", "artifact paths must be strings", status=422)
+                if Path(path).is_absolute() or not (self.repository.project_dir / path).resolve().is_relative_to(self.repository.project_dir.resolve()):
+                    raise WorkflowError("invalid_experiment", "artifact path escapes Project", status=422)
+            # Replace in place: retries and progress updates do not add duplicates.
+            run.module_data["experiments"] = [
+                record if item["id"] == record["id"] else item for item in records
+            ] if previous else [*records, record]
+            return status, "run.experiment_recorded", "applied"
         if command == "update_draft" and status == "created":
             run.module_data.update(payload.get("module_data") or {})
             return "created", "run.draft_updated", "applied"
@@ -819,6 +855,9 @@ class WorkflowService:
         if command == "resume" and status == "paused":
             run.pending_control = None
             run.module_data.pop("recovery", None)
+            interaction = run.module_data.get("interaction")
+            if isinstance(interaction, dict) and interaction.get("response") is None:
+                return "waiting_input", "run.waiting_input", "applied"
             return "queued", "run.queued", "accepted"
         if command == "cancel" and status not in {"completed", "cancelled"}:
             if status == "running":
@@ -828,6 +867,9 @@ class WorkflowService:
         if command == "retry" and status == "failed":
             run.pending_control = None
             run.module_data.pop("failure", None)
+            interaction = run.module_data.get("interaction")
+            if isinstance(interaction, dict) and interaction.get("response") is None:
+                return "waiting_input", "run.waiting_input", "applied"
             return "queued", "run.queued", "accepted"
         if command == "fail" and status in {"queued", "running", "waiting_input"}:
             code = payload.get("code")
@@ -845,6 +887,13 @@ class WorkflowService:
             self._close_attempt(run, "failed", utc_now())
             return "failed", "run.failed", "applied"
         if command == "complete" and status in {"running", "waiting_input", "paused"}:
+            if any(item.get("status") in {"pending", "running"} for item in run.module_data.get("experiments", [])):
+                raise WorkflowError("experiments_unfinished", "finish or explicitly skip registered experiments before completing the Run", status=409)
+            interaction = run.module_data.get("interaction")
+            if isinstance(interaction, dict) and interaction.get("response") is None:
+                raise WorkflowError(
+                    "interaction_required", "answer the pending interaction before completion", status=409
+                )
             if confirmation_required(run) and not confirmation_approved(run):
                 raise WorkflowError(
                     "confirmation_required",
@@ -906,6 +955,27 @@ class WorkflowService:
                 raise WorkflowError("interaction_already_resolved", "interaction already resolved", status=409)
             response = payload.get("response")
             self._validate_interaction_response(interaction.get("response_schema"), response)
+            if isinstance(response, dict) and "selection" in response:
+                selection = response["selection"]
+                if not isinstance(selection, str) or not selection.strip():
+                    raise WorkflowError(
+                        "interaction_response_invalid", "selection must not be blank", status=422
+                    )
+                approval = str(interaction.get("interaction_type", "")).startswith("approve_")
+                allowed = {
+                    str(choice.get("value") or choice.get("id"))
+                    for choice in interaction.get("choices", [])
+                }
+                if (approval and selection not in {"approve", "revise"}) or (
+                    not interaction.get("allow_freeform", True) and selection not in allowed
+                ):
+                    raise WorkflowError(
+                        "interaction_response_invalid", "select one of the offered choices", status=422
+                    )
+                if approval and selection == "revise" and not str(response.get("notes") or "").strip():
+                    raise WorkflowError(
+                        "interaction_response_invalid", "revision requires explanatory notes", status=422
+                    )
             interaction["response"] = response
             interaction["resolved_at"] = utc_now()
             history = run.module_data.setdefault("interaction_history", [])

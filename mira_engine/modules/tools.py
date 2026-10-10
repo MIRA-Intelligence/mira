@@ -253,7 +253,12 @@ class WorkflowInteractionTool(Tool):
     def description(self) -> str:
         return (
             "Pause the active MIRA ModuleRun at a durable checkpoint and ask the user "
-            "one structured question. Use only when a user decision is required; after "
+            "one structured question at ANY stage, repeatedly as new decisions arise. "
+            "Use clarify_requirements for missing objectives or deliverables, resolve_conflict "
+            "for incompatible user requirements, approve_* for execution approval, and "
+            "choose_direction only for researched candidate directions. Explain why the answer "
+            "matters, offer concise choices with trade-offs and a recommended option, and allow "
+            "free-form input. Reuse saved answers unless new evidence changes the decision. After "
             "calling it, briefly say that the Run is waiting and end the turn."
         )
 
@@ -264,7 +269,7 @@ class WorkflowInteractionTool(Tool):
             "properties": {
                 "interaction_type": {
                     "type": "string",
-                    "description": "Stable semantic type, such as choose_direction or approve_plan.",
+                    "description": "clarify_requirements, resolve_conflict, choose_direction, or a module's approve_* type.",
                 },
                 "title": {"type": "string", "maxLength": 160},
                 "prompt": {"type": "string", "maxLength": 4000},
@@ -341,6 +346,13 @@ class WorkflowInteractionTool(Tool):
                 }
             )
         interaction_id = new_id()
+        selection_schema: dict[str, Any] = {"type": "string", "minLength": 1, "maxLength": 4000}
+        if interaction_type.startswith("approve_"):
+            selection_schema["enum"] = ["approve", "revise"]
+        elif not allow_freeform:
+            if not normalized_choices:
+                return "Error: provide choices or enable allow_freeform so the user can answer"
+            selection_schema["enum"] = [choice["value"] for choice in normalized_choices]
         receipt = service.request_interaction(
             run_id,
             command_id=f"executor-interaction:{interaction_id}",
@@ -355,7 +367,7 @@ class WorkflowInteractionTool(Tool):
                     "type": "object",
                     "required": ["selection"],
                     "properties": {
-                        "selection": {"type": "string"},
+                        "selection": selection_schema,
                         "notes": {"type": "string", "maxLength": 4000},
                     },
                     "additionalProperties": False,
@@ -584,6 +596,53 @@ class InitiationResearchResultTool(Tool):
             },
             ensure_ascii=False,
         )
+
+
+class WorkflowExperimentTool(InitiationResearchResultTool):
+    """Upsert a Run-local experiment without using the legacy plan workflow."""
+
+    @property
+    def name(self) -> str:
+        return "record_workflow_experiment"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Register or update one experiment in the active Experiment Run. "
+            "Use a stable local id (e.g. Exp001). Record pending/running before "
+            "execution, then update the same id with completed/failed/skipped, "
+            "methods, metrics, findings and project-relative artifact paths. "
+            "Omitted fields retain their previous values. The UI experiment list "
+            "and detail panel update from these records."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        from mira_engine.workflows.experiments import ExperimentRecord
+
+        return {
+            "type": "object",
+            "properties": {"experiment": ExperimentRecord.model_json_schema()},
+            "required": ["experiment"], "additionalProperties": False,
+        }
+
+    async def execute(self, *, experiment: dict[str, Any]) -> str:
+        context = self._context.get()
+        if context is None or not context[2]:
+            return "Error: record_workflow_experiment is available only inside a ModuleRun"
+        project_id, project_dir, run_id = context
+        service = WorkflowService(JsonWorkflowRepository(project_dir, project_id))
+        run = service.repository.load_run(run_id)
+        if run.module_type != "experiment" or run.status != "running":
+            return "Error: record_workflow_experiment requires an actively running experiment Run"
+        receipt = service.command_run(
+            run_id, command_id=f"executor-experiment:{new_id()}",
+            command_type="record_experiment", expected_revision=run.revision,
+            payload={"experiment": experiment},
+        )
+        return json.dumps({"status": "recorded", "run_id": run_id,
+                           "experiment_id": experiment["id"], "run_revision": receipt.run_revision,
+                           "project_sequence": receipt.project_sequence})
 
 
 class WorkflowCompletionTool(Tool):

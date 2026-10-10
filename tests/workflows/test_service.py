@@ -359,6 +359,67 @@ def test_interaction_checkpoints_then_resumes_in_a_new_attempt(
     assert resumed.attempts[-1].resumed_from_checkpoint_id == checkpoint.checkpoint_id
 
 
+@pytest.mark.parametrize("interruption", ["pause", "fail"])
+def test_unanswered_interaction_survives_control_and_blocks_completion(
+    service: WorkflowService, interruption: str,
+) -> None:
+    run_id = service.create_run(command_id="create-question", module_type="planning", enqueue=True).run_id or ""
+    service.claim_run(run_id, lease_owner="test")
+    service.request_interaction(run_id, command_id="ask", interaction={
+        "interaction_id": "question-1", "interaction_type": "clarify_requirements",
+        "title": "Output?", "prompt": "What should we produce?",
+        "choices": [], "allow_freeform": True,
+        "response_schema": {"type": "object", "required": ["selection"]},
+    })
+    with pytest.raises(WorkflowError, match="answer the pending interaction"):
+        service.command_run(run_id, command_id="premature-complete", command_type="complete")
+    service.command_run(run_id, command_id="interrupt", command_type=interruption)
+    service.command_run(run_id, command_id="continue", command_type="resume" if interruption == "pause" else "retry")
+    assert service.repository.load_run(run_id).status == "waiting_input"
+    with pytest.raises(WorkflowError):
+        service.claim_run(run_id, lease_owner="bypass")
+    service.command_run(run_id, command_id="answer", command_type="submit_interaction", payload={
+        "interaction_id": "question-1", "response": {"selection": "Please suggest a focus"},
+    })
+    service.claim_run(run_id, lease_owner="next")
+    service.request_interaction(run_id, command_id="ask-again", interaction={
+        "interaction_id": "question-2", "interaction_type": "resolve_conflict",
+        "title": "Resource conflict", "prompt": "Choose an alternative",
+        "response_schema": {"type": "object", "required": ["selection"]},
+    })
+    with pytest.raises(WorkflowError) as exc:
+        service.command_run(run_id, command_id="stale-answer", command_type="submit_interaction", payload={
+            "interaction_id": "question-1", "response": {"selection": "Old answer"},
+        })
+    assert exc.value.code == "interaction_not_found"
+    assert service.repository.load_run(run_id).module_data["interaction_history"][0]["prompt"] == "What should we produce?"
+
+
+@pytest.mark.parametrize(("kind", "freeform", "response"), [
+    ("clarify_requirements", True, {"selection": "   "}),
+    ("clarify_requirements", False, {"selection": "not-offered"}),
+    ("approve_plan", True, {"selection": "looks interesting"}),
+    ("approve_plan", True, {"selection": "revise", "notes": "  "}),
+])
+def test_interaction_rejects_empty_or_ambiguous_answers(
+    service: WorkflowService, kind: str, freeform: bool, response: dict,
+) -> None:
+    run_id = service.create_run(command_id="create", module_type="planning", enqueue=True).run_id or ""
+    service.claim_run(run_id, lease_owner="test")
+    service.request_interaction(run_id, command_id="ask", interaction={
+        "interaction_id": "question", "interaction_type": kind,
+        "title": "Confirm", "prompt": "Confirm a choice", "allow_freeform": freeform,
+        "choices": [{"id": "approve", "label": "Approve"}, {"id": "revise", "label": "Revise"}],
+        "response_schema": {"type": "object", "required": ["selection"]},
+    })
+    with pytest.raises(WorkflowError) as exc:
+        service.command_run(run_id, command_id="invalid", command_type="submit_interaction", payload={
+            "interaction_id": "question", "response": response,
+        })
+    assert exc.value.code == "interaction_response_invalid"
+    assert service.repository.load_run(run_id).status == "waiting_input"
+
+
 def test_pending_pause_is_acknowledged_at_a_durable_checkpoint(
     service: WorkflowService,
 ) -> None:
