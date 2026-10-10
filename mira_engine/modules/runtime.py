@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from mira_engine.agent.base_loop import BaseAgentLoop
+from mira_engine.agent.subagent import DelegationPolicy
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.workflows import JsonWorkflowRepository, WorkflowService
 from mira_engine.workflows.confirmations import (
@@ -87,6 +88,7 @@ class NativeModuleRuntime:
                 }
             }
             clean_metadata["run_mode"] = "manual"
+            clean_metadata["agent_profile"] = agent_profile
             clean_metadata["_ui_system_instructions"] = invocation.system_instructions
             clean_metadata["_audit_context"] = {
                 "project_id": project_ref.project_id,
@@ -208,7 +210,21 @@ class NativeModuleRuntime:
                     )
                 return None
 
-            with loop.tools.restrict_to(visible_tools, execution_guard=control_guard):
+            async def delegation_stop_guard() -> str | None:
+                # Also acknowledge pending pause/cancel before a delegate asks
+                # for its next model response. Tool calls recheck individually.
+                return await control_guard("read_file", {}) or await turn_stop_guard()
+
+            policy = DelegationPolicy(
+                scope_id=f"{project_ref.project_dir}:{run_id}:{run.attempt.current_attempt_id}",
+                allowed_tools=frozenset(visible_tools),
+                system_instructions=invocation.system_instructions,
+                execution_guard=control_guard, stop_guard=delegation_stop_guard, run_id=run_id,
+            )
+            with (
+                loop.tools.restrict_to(visible_tools, execution_guard=control_guard),
+                loop.subagents.delegation_scope(policy),
+            ):
                 return await BaseAgentLoop._process_message(
                     loop,
                     prepared,

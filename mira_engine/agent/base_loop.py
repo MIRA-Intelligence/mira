@@ -687,15 +687,26 @@ class BaseAgentLoop:
         sections = [chunk for chunk in (python_hint, base, notice) if chunk]
         return "\n\n".join(sections) if sections else None
 
-    def _get_model_runtime(self, session_key: str) -> RoutedProviderManager:
+    def _get_model_runtime(self, session_key: str, *, role: str | None = None) -> RoutedProviderManager:
         """Return the session-local model runtime, creating it on demand."""
+        if role and self.role_provider_factory is not None:
+            # Keep role routes separate: switching profile must not reuse the
+            # default route, nor change another concurrent project's provider.
+            session_key = f"{session_key}:role:{role}"
         runtime = self._session_model_runtimes.get(session_key)
         if runtime is None:
+            provider, model, candidates = self.provider, self.model, tuple(self.model_candidates or [self.model])
+            provider_factory = self.provider_factory
+            if role and self.role_provider_factory is not None:
+                provider, model, candidates = self.role_provider_factory(role)
+                # Role candidates belong to the role's explicit provider, not
+                # the possibly different globally forced provider.
+                provider_factory = None
             runtime = RoutedProviderManager(
-                default_provider=self.provider,
-                default_model=self.model,
-                provider_factory=self.provider_factory,
-                default_candidates=tuple(self.model_candidates or [self.model]),
+                default_provider=provider,
+                default_model=model,
+                provider_factory=provider_factory,
+                default_candidates=candidates,
             )
             self._session_model_runtimes[session_key] = runtime
         return runtime
@@ -733,7 +744,9 @@ class BaseAgentLoop:
                 await hook.before_iteration(hook_ctx)
             iteration += 1
 
-            use_routed_runtime = model_runtime is not None and self.provider_factory is not None
+            use_routed_runtime = model_runtime is not None and (
+                self.provider_factory is not None or self.role_provider_factory is not None
+            )
             if not use_routed_runtime:
                 if on_stream is not None and hasattr(self.provider, "chat_stream_with_retry"):
                     streamed_raw = ""
@@ -1291,6 +1304,7 @@ class BaseAgentLoop:
         their own per-session caches (e.g. token totals).
         """
         self._session_model_runtimes.pop(session_key, None)
+        self._session_model_runtimes.pop(f"{session_key}:role:supervisor", None)
 
     async def _process_message(
         self,
@@ -1444,7 +1458,8 @@ class BaseAgentLoop:
 
         await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
-        model_runtime = self._get_model_runtime(key)
+        profile = meta.get("agent_profile") or getattr(self, "_session_agent_profiles", {}).get(key)
+        model_runtime = self._get_model_runtime(key, role="supervisor" if profile == "team" else None)
         extra_system = self._compose_extra_system(
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),

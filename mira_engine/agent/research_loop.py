@@ -1408,7 +1408,9 @@ class ResearchAgentLoop(BaseAgentLoop):
 
         await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
-        model_runtime = self._get_model_runtime(key)
+        model_runtime = self._get_model_runtime(
+            key, role="supervisor" if agent_profile == "team" else None,
+        )
         extra_system = self._compose_extra_system(
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
