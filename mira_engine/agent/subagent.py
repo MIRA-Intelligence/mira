@@ -2,13 +2,17 @@
 
 import asyncio
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
+from mira_engine.agent.hook import AgentHook
 from mira_engine.agent.routing import RoutedProviderManager
-from mira_engine.agent.runner import AgentRunner, AgentRunSpec
+from mira_engine.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
@@ -19,11 +23,10 @@ from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.agent.tools.search import GlobTool, GrepTool
 from mira_engine.agent.tools.shell import ExecTool
 from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
-from mira_engine.bus.events import InboundMessage
+from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.config.schema import ExecToolConfig
 from mira_engine.providers.base import LLMProvider
-
 
 # ``team`` profile role definitions. Each role gets its own focused prompt,
 # sampling settings, and tool allowlist. ``allowed_tools = None`` means the
@@ -49,6 +52,33 @@ ROLE_CONFIGS: dict[str, dict[str, Any]] = {
         "temperature": 0.2,
     },
 }
+
+
+@dataclass(frozen=True)
+class DelegationPolicy:
+    """Attempt-local authority inherited by synchronous and background delegates."""
+
+    scope_id: str
+    allowed_tools: frozenset[str]
+    system_instructions: str
+    execution_guard: Callable[[str, dict[str, Any]], Awaitable[str | None]]
+    stop_guard: Callable[[], Awaitable[str | None]]
+    run_id: str
+
+
+class _DelegationStoppedError(Exception):
+    pass
+
+
+class _DelegationHook(AgentHook):
+    def __init__(self, policy: DelegationPolicy):
+        super().__init__(reraise=True)
+        self.policy = policy
+
+    async def before_iteration(self, context):
+        reason = await self.policy.stop_guard()
+        if reason is not None:
+            raise _DelegationStoppedError(reason)
 
 
 class SubagentManager:
@@ -95,6 +125,30 @@ class SubagentManager:
         # Synchronous consult sessions: consult_id -> accumulated messages.
         # Lets the supervisor hold a multi-turn debate with the same critic.
         self._consult_sessions: dict[str, list[dict[str, Any]]] = {}
+        self._consult_scopes: dict[str, tuple[str, str, str | None]] = {}
+        self._delegation_policy: ContextVar[DelegationPolicy | None] = ContextVar(
+            f"delegation_policy_{id(self)}", default=None
+        )
+
+    @contextmanager
+    def delegation_scope(self, policy: DelegationPolicy):
+        token = self._delegation_policy.set(policy)
+        try:
+            yield
+        finally:
+            self._delegation_policy.reset(token)
+
+    async def _run_delegate(self, runner: AgentRunner, spec: AgentRunSpec) -> AgentRunResult:
+        policy = self._delegation_policy.get()
+        if policy is None:
+            return await runner.run(spec)
+        spec.hook = _DelegationHook(policy)
+        try:
+            with spec.tools.restrict_to(policy.allowed_tools, execution_guard=policy.execution_guard):
+                return await runner.run(spec)
+        except _DelegationStoppedError as exc:
+            return AgentRunResult(final_content=str(exc), messages=spec.initial_messages,
+                                  stop_reason="parent_closed")
 
     def _resolve_role(self, role: str | None) -> tuple[LLMProvider, str, AgentRunner]:
         """Return (provider, model, runner) for a role, falling back to defaults."""
@@ -122,9 +176,12 @@ class SubagentManager:
     def _build_tools(self, run_workspace: Path, role: str | None = None) -> ToolRegistry:
         """Build the subagent toolset, restricted by role allowlist when set."""
         allowed = ROLE_CONFIGS.get(role or "", {}).get("allowed_tools")
+        policy = self._delegation_policy.get()
 
         def _permitted(name: str) -> bool:
-            return allowed is None or name in allowed
+            return (allowed is None or name in allowed) and (
+                policy is None or name in policy.allowed_tools
+            )
 
         tools = ToolRegistry()
         allowed_dir = run_workspace if self.restrict_to_workspace else None
@@ -227,7 +284,7 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
 
-            result = await runner.run(
+            result = await self._run_delegate(runner,
                 AgentRunSpec(
                     initial_messages=messages,
                     tools=tools,
@@ -242,7 +299,7 @@ class SubagentManager:
                 )
             )
             final_result = result.final_content or "Task completed but no final response was generated."
-            status = "ok"
+            status = "ok" if result.stop_reason != "parent_closed" else "stopped"
             if any(e.get("status") == "error" for e in result.tool_events):
                 completed = [e for e in result.tool_events if e.get("status") == "ok"]
                 errors = [e for e in result.tool_events if e.get("status") == "error"]
@@ -301,7 +358,19 @@ class SubagentManager:
         project_id: str | None = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
-        status_text = "completed successfully" if status == "ok" else "failed"
+        status_text = {"ok": "completed successfully", "stopped": "stopped with its parent Run"}.get(status, "failed")
+
+        policy = self._delegation_policy.get()
+        if policy is not None:
+            # A native delegate must not trigger an unscoped legacy system turn.
+            # Notify the owning Run only; its supervisor owns further execution.
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=origin["channel"], chat_id=origin["chat_id"],
+                content=f"[Subagent '{label}' {status_text}]\n{result}",
+                metadata={"project_id": project_id, "workflow_run_id": policy.run_id,
+                          "_progress": True, "_subagent_result": True},
+            ))
+            return
 
         announce_content = f"""[Subagent '{label}' {status_text}]
 
@@ -381,6 +450,14 @@ Stay focused on the assigned task. Your final response will be reported back to 
         role_block = self._ROLE_PROMPTS.get(role or "")
         if role_block:
             parts.append(role_block)
+        policy = self._delegation_policy.get()
+        if policy is not None:
+            parts.append(
+                "# Inherited ModuleRun contract\n" + policy.system_instructions
+                + "\nYou are a delegate, not the supervisor. Perform only the assigned subset. "
+                  "Do not start other stages or delegate further. Return findings to the supervisor; "
+                  "only it may request user approval, publish artifacts, or complete the Run."
+            )
 
         return "\n\n".join(parts)
 
@@ -404,13 +481,18 @@ Stay focused on the assigned task. Your final response will be reported back to 
         tools = self._build_tools(run_workspace, role)
 
         consult_id = session_id or f"consult:{role}:{uuid.uuid4().hex[:8]}"
+        policy = self._delegation_policy.get()
+        scope = (str(run_workspace.resolve()), role, policy.scope_id if policy else None)
+        if session_id and self._consult_scopes.get(session_id) != scope:
+            raise ValueError("consult session does not belong to this project, role, and Run attempt")
+        self._consult_scopes[consult_id] = scope
         history = self._consult_sessions.get(consult_id)
         if history is None:
             history = [{"role": "system", "content": self._build_subagent_prompt(run_workspace, role)}]
         messages = list(history)
         messages.append({"role": "user", "content": task})
 
-        result = await runner.run(
+        result = await self._run_delegate(runner,
             AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
@@ -433,6 +515,7 @@ Stay focused on the assigned task. Your final response will be reported back to 
     def clear_consult_session(self, session_id: str) -> None:
         """Drop a stored consult conversation."""
         self._consult_sessions.pop(session_id, None)
+        self._consult_scopes.pop(session_id, None)
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
