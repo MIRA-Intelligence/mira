@@ -294,8 +294,10 @@ async def test_progress_only_reply_continues_into_real_pubmed_research(
     )
 
     run = service.repository.load_run(run_id)
-    assert getattr(response, "content", "") == "文献调研结果已写入中间工作区，等待你选择方向。"
-    assert len(provider.calls) == 5
+    assert getattr(response, "content", "") == "等待你在交互表单中确认：选择下一步研究方向"
+    # The durable form stops execution without another model turn.
+    assert len(provider.responses) == 1
+    assert len(provider.calls) == 4
     assert run.status == "waiting_input"
     assert run.module_data["research_searches"][0]["source"] == "pubmed"
     assert run.module_data["research_result"]["searches"][0]["query"].startswith(

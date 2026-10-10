@@ -116,6 +116,9 @@ class NativeModuleExecutor(ABC):
             run_context["resolved_interaction"] = {
                 "interaction_id": interaction.get("interaction_id"),
                 "interaction_type": interaction.get("interaction_type"),
+                "title": interaction.get("title"),
+                "prompt": interaction.get("prompt"),
+                "choices": interaction.get("choices", []),
                 "response": interaction.get("response"),
             }
         interaction_history = context.run.module_data.get("interaction_history")
@@ -124,11 +127,14 @@ class NativeModuleExecutor(ABC):
                 {
                     "interaction_id": item.get("interaction_id"),
                     "interaction_type": item.get("interaction_type"),
+                    "title": item.get("title"),
+                    "prompt": item.get("prompt"),
+                    "choices": item.get("choices", []),
                     "response": item.get("response"),
                     "resolved_at": item.get("resolved_at"),
                 }
-                for item in interaction_history[-20:]
-                if isinstance(item, dict)
+                for item in interaction_history
+                if isinstance(item, dict) and item.get("response") is not None
             ]
         return (
             f"{module_system_instructions(context.run.module_type, context.run.run_id)}\n\n"
@@ -143,6 +149,8 @@ class NativeModuleExecutor(ABC):
 
     def blocked_tools_for(self, context: ModuleExecutionContext) -> frozenset[str]:
         blocked = self.blocked_tools
+        if context.run.module_type != "experiment":
+            blocked = blocked | {"record_workflow_experiment"}
         if profile_allows_team_tools(context.agent_profile):
             blocked = blocked - {"consult", "spawn"}
         return blocked
@@ -173,7 +181,10 @@ class InitiationExecutor(NativeModuleExecutor):
     operating_contract = (
         "Own only question clarification, evidence/literature investigation, gap "
         "analysis, and research-direction choices. Never create a legacy plan or "
-        "execute experiments. Use request_workflow_interaction for a direction choice. "
+        "execute experiments. Use request_workflow_interaction for output-direction "
+        "clarification before research when needed, and again for material decisions "
+        "during research or a researched direction choice. A pending clarification "
+        "is a valid stopping boundary even before any search or research result. "
         "Honor configuration.literature_review: when disabled, do not perform external "
         "literature search; when enabled, use only its selected sources where available. "
         "A statement "
@@ -190,7 +201,8 @@ class InitiationExecutor(NativeModuleExecutor):
         "in url and the bare DOI in doi; never concatenate them into one field. "
         "Treat configuration.references as user-selected priority evidence. After "
         "synthesizing evidence, call record_initiation_research_result with the survey, "
-        "complete paper metadata, notes, gaps, and candidate directions. Do this before "
+        "complete paper metadata, notes, gaps, and candidate directions when requested "
+        "(directions may be empty for an overview-only outcome). Do this before "
         "request_workflow_interaction asks the user to choose a direction, and update it "
         "again whenever the research result materially changes."
     )

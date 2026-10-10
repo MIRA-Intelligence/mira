@@ -486,6 +486,38 @@ def _stringify_history_content(content: Any) -> str:
     return str(content)
 
 
+def _render_chat_context_attachment(
+    source_session_id: str,
+    entries: list[dict[str, Any]],
+) -> tuple[str, int]:
+    """Render user-visible chat turns as a project context attachment."""
+    lines = [
+        "# Conversation Context",
+        "",
+        f"Source chat: `{source_session_id}`",
+        "",
+        "This file preserves the conversation that preceded this project. "
+        "Use the user messages and Mira responses as context for identifying the project's objective.",
+    ]
+    message_count = 0
+    for entry in entries:
+        if entry.get("type") != "response":
+            continue
+        content = _stringify_history_content(entry.get("content")).strip()
+        if not content:
+            continue
+        metadata = entry.get("metadata")
+        is_user = isinstance(metadata, dict) and metadata.get("_user") is True
+        role = "User" if is_user else "Mira"
+        timestamp = _string_value(entry.get("timestamp"))
+        heading = f"## {role}"
+        if timestamp:
+            heading += f" — {timestamp}"
+        lines.extend(["", heading, "", content])
+        message_count += 1
+    return "\n".join(lines).rstrip() + "\n", message_count
+
+
 def _format_tool_call(tool_call: dict[str, Any]) -> str:
     """Render a tool call in the same compact form shown in logs."""
     fn = tool_call.get("function") if isinstance(tool_call, dict) else None
@@ -1155,6 +1187,14 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/status", self._handle_status)
         self._app.router.add_get("/api/sessions", self._handle_sessions)
         self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
+        self._app.router.add_get(
+            "/api/sessions/{session_id}/context-preview",
+            self._handle_chat_context_preview,
+        )
+        self._app.router.add_post(
+            "/api/sessions/{session_id}/context-preview",
+            self._handle_chat_context_preview,
+        )
         self._app.router.add_get("/api/plan", self._handle_plan)
         self._app.router.add_get("/api/plan/contract", self._handle_plan_contract)
         self._app.router.add_get("/api/plan/lint", self._handle_plan_lint)
@@ -1182,6 +1222,10 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/projects/{session_id}/remove", self._handle_remove_project)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
         self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
+        self._app.router.add_post(
+            "/api/projects/{session_id}/context/from-chat",
+            self._handle_attach_chat_context,
+        )
         self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
         self._app.router.add_get("/api/projects/{session_id}/skill-plugins", self._handle_skill_plugins_list)
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/install", self._handle_skill_plugins_install)
@@ -1626,7 +1670,13 @@ class UiChannel(BaseChannel):
         if request.method == "OPTIONS":
             resp = web.Response(status=204)
         else:
-            resp = await handler(request)
+            try:
+                resp = await handler(request)
+            except web.HTTPException as exc:
+                # aiohttp raises unmatched-route and method errors before a
+                # handler can build a response. Keep CORS headers on those
+                # responses so browser clients can inspect the HTTP status.
+                resp = exc
 
         origin = request.headers.get("Origin", "*")
         allowed = self.config.cors_origins
@@ -2457,6 +2507,33 @@ class UiChannel(BaseChannel):
             response_payload["workflow_run_id"] = workflow_run_id
         return web.json_response(response_payload)
 
+    async def _handle_chat_context_preview(self, request: web.Request) -> web.Response:
+        """Preview the same conversation text used by project promotion."""
+        source_session_id = request.match_info.get("session_id", "").strip()
+        if not source_session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        entries: list[dict[str, Any]] | None = None
+        if request.method == "POST":
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "expected JSON body"}, status=400)
+            raw_entries = body.get("entries") if isinstance(body, dict) else None
+            if not isinstance(raw_entries, list):
+                return web.json_response({"error": "entries must be a list"}, status=400)
+            entries = [entry for entry in raw_entries if isinstance(entry, dict)]
+        transcript, message_count = _render_chat_context_attachment(
+            source_session_id,
+            entries if entries is not None else self._load_history_entries(source_session_id),
+        )
+        if message_count == 0:
+            return web.json_response({"error": "source chat has no messages"}, status=404)
+        return web.json_response({
+            "source_session_id": source_session_id,
+            "content": transcript,
+            "message_count": message_count,
+        })
+
     async def _handle_get_config(self, _request: web.Request) -> web.Response:
         config_path = config_loader.get_config_path().expanduser().resolve()
         runtime_config = config_loader.load_config(config_path)
@@ -2862,7 +2939,7 @@ class UiChannel(BaseChannel):
         })
 
     async def _handle_plan(self, request: web.Request) -> web.Response:
-        """Serve task_plan.json, scoped to a project when session_id is given."""
+        """Serve a legacy-compatible read model, never write Run records to a plan."""
         session_id = request.query.get("session_id")
         if not session_id:
             return web.json_response(None)
@@ -2872,6 +2949,14 @@ class UiChannel(BaseChannel):
         except ValueError as exc:
             logger.warning(str(exc))
             return web.json_response({"error": str(exc)}, status=500)
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is not None:
+            from mira_engine.workflows import JsonWorkflowRepository
+            from mira_engine.workflows.experiments import project_experiments
+
+            records = project_experiments(JsonWorkflowRepository(project_dir, session_id))
+            if records:
+                data = {**(data or {}), "experiments": [*(data or {}).get("experiments", []), *records]}
         if data is None:
             return web.json_response(None)
         return web.json_response(data)
@@ -3553,6 +3638,74 @@ class UiChannel(BaseChannel):
             "uploaded": uploaded,
             "extracted": extracted,
         })
+
+    async def _handle_attach_chat_context(self, request: web.Request) -> web.Response:
+        """Save a Quick Chat transcript as a readable project context file."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        source_session_id = _string_value(
+            body.get("source_session_id") if isinstance(body, dict) else None
+        )
+        if not source_session_id:
+            return web.json_response({"error": "source_session_id required"}, status=400)
+        if source_session_id == session_id:
+            return web.json_response(
+                {"error": "source session must differ from project session"}, status=400
+            )
+
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not project_dir.is_dir():
+            return web.json_response({"error": "project not found"}, status=404)
+
+        raw_entries = body.get("entries") if isinstance(body, dict) else None
+        if raw_entries is not None and not isinstance(raw_entries, list):
+            return web.json_response({"error": "entries must be a list"}, status=400)
+        entries = (
+            [entry for entry in raw_entries if isinstance(entry, dict)]
+            if isinstance(raw_entries, list)
+            else self._load_history_entries(source_session_id)
+        )
+        transcript, message_count = _render_chat_context_attachment(
+            source_session_id,
+            entries,
+        )
+        if message_count == 0:
+            return web.json_response({"error": "source chat has no messages"}, status=404)
+
+        source_slug = slugify_project_id(source_session_id)[:48]
+        source_hash = hashlib.sha256(source_session_id.encode("utf-8")).hexdigest()[:8]
+        context_dir = project_dir / "context"
+        destination = context_dir / f"quick-chat-{source_slug}-{source_hash}.md"
+        try:
+            context_dir.mkdir(parents=True, exist_ok=True)
+            destination.write_text(transcript, encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Failed to save chat context {}: {}", destination, exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+        relative_path = destination.relative_to(project_dir).as_posix()
+        self._audit(
+            source="ui",
+            action="api_project_chat_context_attached",
+            session_id=session_id,
+            project_dir=project_dir,
+            details={
+                "source_session_id": source_session_id,
+                "path": relative_path,
+                "message_count": message_count,
+            },
+        )
+        return web.json_response({
+            "session_id": session_id,
+            "source_session_id": source_session_id,
+            "path": relative_path,
+            "message_count": message_count,
+        }, status=201)
 
     async def _handle_project_artifact(self, request: web.Request) -> web.Response:
         """Serve a project file under projects_root/<session_id> by relative path."""

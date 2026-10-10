@@ -44,6 +44,91 @@ class _ScriptedProvider(_CapturingProvider):
         return self.responses.pop(0)
 
 
+@pytest.mark.parametrize("module_type", ["initiation", "planning", "experiment", "delivery"])
+async def test_repeatable_clarifications_stop_batches_and_restore_decisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module_type: str,
+) -> None:
+    from mira_engine.workflows.confirmations import expected_confirmation_type
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    service = _service(tmp_path)
+    run_id = service.create_run(
+        command_id="create", module_type=module_type, enqueue=True,
+        module_data={"intent": "Investigate useful options", "confirmation_policy": "required"},
+    ).run_id or ""
+    service.claim_run(run_id, lease_owner="test:initial")
+    service.request_interaction(
+        run_id, command_id="initial-approval", interaction={
+            "interaction_id": "approved-brief", "interaction_type": expected_confirmation_type(module_type),
+            "title": "Original scope", "prompt": "Use existing data only",
+            "choices": [{"id": "approve", "label": "Approve"}],
+            "response_schema": {"type": "object", "required": ["selection"]},
+        },
+    )
+    service.command_run(run_id, command_id="approve", command_type="submit_interaction", payload={
+        "interaction_id": "approved-brief", "response": {"selection": "approve"},
+    })
+
+    def question(kind: str, title: str, label: str) -> LLMResponse:
+        return LLMResponse(content=None, tool_calls=[
+            ToolCallRequest(id=kind, name="request_workflow_interaction", arguments={
+                "interaction_type": kind, "title": title, "prompt": f"Decide: {title}",
+                "choices": [{"id": "option_a", "label": label}], "allow_freeform": True,
+            }),
+            ToolCallRequest(id=f"bad-write-{kind}", name="write_file", arguments={
+                "path": str(service.repository.project_dir / "must-not-exist.txt"),
+                "content": "Must not write while waiting",
+            }),
+            ToolCallRequest(id=f"bad-{kind}", name="complete_workflow_run", arguments={
+                "summary": "Must not complete while waiting", "output_artifact_ids": [],
+                "suggested_handoffs": [],
+            }),
+        ])
+
+    provider = _ScriptedProvider([
+        question("clarify_requirements", "Which outcome?", "Feasible research candidates"),
+        question("resolve_conflict", "Missing external cohort", "Use internal validation with caveats"),
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(
+            id="complete", name="complete_workflow_run", arguments={
+                "summary": "Finished within clarified scope", "output_artifact_ids": [],
+                "suggested_handoffs": [],
+            },
+        )]),
+    ])
+    loop = ResearchAgentLoop(
+        bus=MessageBus(), provider=provider, workspace=tmp_path, model="dummy/native",
+        channels_config=ChannelsConfig(), exec_config=ExecToolConfig(enable=True, timeout=5),
+        session_manager=SessionManager(tmp_path),
+    )
+    for index in range(3):
+        service.claim_run(run_id, lease_owner=f"test:turn-{index}")
+        await loop.process_direct(
+            "Continue", session_key=f"ui:{service.repository.project_id}:run:{run_id}",
+            channel="ui", chat_id=service.repository.project_id, metadata={
+                "loop_mode": "project", "project_id": service.repository.project_id,
+                "project_dir": str(service.repository.project_dir), "workflow_run_id": run_id,
+            },
+        )
+        assert len(provider.calls) == index + 1  # no extra model call after a question
+        run = service.repository.load_run(run_id)
+        assert not (service.repository.project_dir / "must-not-exist.txt").exists()
+        if index < 2:
+            assert run.status == "waiting_input"  # second tool in batch was blocked
+            interaction = run.module_data["interaction"]
+            service.command_run(run_id, command_id=f"answer-{index}", command_type="submit_interaction", payload={
+                "interaction_id": interaction["interaction_id"],
+                "response": {"selection": "option_a", "notes": "Keep the agreed scope"},
+            })
+        else:
+            assert run.status == "completed"
+            assert len(run.module_data["interaction_history"]) == 3
+            prompt = provider.calls[-1]["messages"][0]["content"]
+            assert "Feasible research candidates" in prompt
+            assert "Missing external cohort" in prompt
+            assert "Use internal validation with caveats" in prompt
+            assert "Keep the agreed scope" in prompt
+
+
 def _service(tmp_path: Path, project_id: str = "PRJ-native") -> WorkflowService:
     project_dir = tmp_path / project_id
     (project_dir / ".mira").mkdir(parents=True)
@@ -186,6 +271,10 @@ def test_required_module_instructions_embed_the_local_confirmation_gate(
         ("planning", "exec", False),
         ("experiment", "exec", True),
         ("delivery", "set_plan", False),
+        ("initiation", "record_workflow_experiment", False),
+        ("planning", "record_workflow_experiment", False),
+        ("experiment", "record_workflow_experiment", True),
+        ("delivery", "record_workflow_experiment", False),
     ],
 )
 async def test_research_loop_routes_module_run_through_native_executor_capabilities(
@@ -343,7 +432,14 @@ async def test_required_confirmation_blocks_completion_tool_until_interaction_re
                             "output_artifact_ids": [],
                             "suggested_handoffs": [],
                         },
-                    )
+                    ),
+                    ToolCallRequest(
+                        id="pending-experiment",
+                        name="record_workflow_experiment",
+                        arguments={"experiment": {
+                            "id": "Exp001", "title": "Awaiting scope approval", "status": "pending",
+                        }},
+                    ),
                 ],
             ),
             LLMResponse(
@@ -394,6 +490,7 @@ async def test_required_confirmation_blocks_completion_tool_until_interaction_re
     waiting = service.repository.load_run(run_id)
     assert waiting.status == "waiting_input"
     assert waiting.module_data["interaction"]["interaction_type"] == "approve_experiment_plan"
+    assert waiting.module_data["experiments"][0]["status"] == "pending"
     assert "workflow_confirmation" in json.dumps(provider.calls[1]["messages"])
 
 

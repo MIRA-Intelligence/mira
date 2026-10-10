@@ -58,6 +58,7 @@ from mira_engine.modules.tools import (
     PubMedSearchTool,
     WorkflowArtifactTool,
     WorkflowCompletionTool,
+    WorkflowExperimentTool,
     WorkflowInteractionTool,
 )
 from mira_engine.projects import ProjectRef
@@ -385,6 +386,7 @@ class BaseAgentLoop:
         self.tools.register(InitiationResearchResultTool())
         self.tools.register(WorkflowArtifactTool())
         self.tools.register(WorkflowCompletionTool())
+        self.tools.register(WorkflowExperimentTool())
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(ConsultRoleTool(manager=self.subagents))
         if self.cron_service:
@@ -707,6 +709,7 @@ class BaseAgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         completion_guard: Callable[[str | None], Awaitable[str | None]] | None = None,
+        turn_stop_guard: Callable[[], Awaitable[str | None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -719,6 +722,12 @@ class BaseAgentLoop:
         hook = getattr(self, "_hook", None)
 
         while iteration < self.max_iterations:
+            if turn_stop_guard is not None:
+                stop_message = await turn_stop_guard()
+                if stop_message is not None:
+                    final_content = stop_message
+                    messages = self.context.add_assistant_message(messages, stop_message)
+                    break
             hook_ctx = AgentHookContext(iteration=iteration, messages=messages)
             if hook:
                 await hook.before_iteration(hook_ctx)
@@ -886,6 +895,18 @@ class BaseAgentLoop:
                     hook_ctx.tool_events.append(
                         {"name": tool_call.name, "status": "ok", "detail": str(result)}
                     )
+                # Finish the batch's tool-result protocol, but never ask the model
+                # to continue after a durable user-input/control boundary.
+                if turn_stop_guard is not None:
+                    stop_message = await turn_stop_guard()
+                    if stop_message is not None:
+                        final_content = stop_message
+                        messages = self.context.add_assistant_message(messages, stop_message)
+                        hook_ctx.final_content = stop_message
+                        hook_ctx.stop_reason = "durable_boundary"
+                        if hook:
+                            await hook.after_iteration(hook_ctx)
+                        break
             else:
                 clean = self._strip_think(response.content)
                 if response.finish_reason == "error":
@@ -1280,6 +1301,7 @@ class BaseAgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         completion_guard: Callable[[str | None], Awaitable[str | None]] | None = None,
+        turn_stop_guard: Callable[[], Awaitable[str | None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response.
 
@@ -1552,6 +1574,8 @@ class BaseAgentLoop:
             "audit_hook": audit_cb,
             "completion_guard": completion_guard,
         }
+        if turn_stop_guard is not None:
+            run_kwargs["turn_stop_guard"] = turn_stop_guard
         if on_stream is not None:
             run_kwargs["on_stream"] = on_stream
         if on_stream_end is not None:
