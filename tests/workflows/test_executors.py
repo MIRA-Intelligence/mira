@@ -44,6 +44,77 @@ class _ScriptedProvider(_CapturingProvider):
         return self.responses.pop(0)
 
 
+@pytest.mark.parametrize("mode", ["manual", "auto"])
+async def test_experiment_mode_enforces_repeatable_boundaries(tmp_path: Path, monkeypatch, mode):
+    monkeypatch.setenv("MIRA_HOME", str(tmp_path / "home"))
+    service = _service(tmp_path)
+    run_id = service.create_run(command_id="create", module_type="experiment", enqueue=True,
+                                module_data={"experiment_execution_mode": mode}).run_id
+
+    def experiment_turn(number):
+        return LLMResponse(content=None, tool_calls=[
+            ToolCallRequest(id=f"unregistered-{number}", name="exec", arguments={
+                "command": f"touch '{service.repository.project_dir / f'unregistered-{number}.txt'}'",
+            }),
+            *[ToolCallRequest(id=f"{number}-{state}", name="record_workflow_experiment", arguments={
+                "experiment": {"id": f"Exp00{number}", "title": f"Experiment {number}", "status": state},
+            }) for state in ["pending", "running", "completed"]],
+            ToolCallRequest(id=f"after-{number}", name="write_file", arguments={
+                "path": str(service.repository.project_dir / f"after-{number}.txt"), "content": "continued",
+            }),
+        ])
+
+    provider = _ScriptedProvider([
+        experiment_turn(1),
+        *([LLMResponse(content="First experiment done; I will continue later.")] if mode == "auto" else []),
+        experiment_turn(2),
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(id="complete", name="complete_workflow_run", arguments={
+            "summary": "Finished", "output_artifact_ids": [], "suggested_handoffs": [],
+        })]),
+    ])
+    loop = ResearchAgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="dummy/native",
+                             channels_config=ChannelsConfig(), exec_config=ExecToolConfig(enable=True, timeout=5),
+                             session_manager=SessionManager(tmp_path))
+
+    async def execute():
+        service.claim_run(run_id, lease_owner="test")
+        await loop.process_direct("Continue", session_key=f"ui:PRJ-native:run:{run_id}", channel="ui",
+                                  chat_id="PRJ-native", metadata={"project_id": "PRJ-native",
+                                  "project_dir": str(service.repository.project_dir), "workflow_run_id": run_id,
+                                  "run_mode": "manual" if mode == "auto" else "auto"})
+
+    await execute()
+    if mode == "manual":
+        for number, decision in [(1, "continue"), (2, "finish")]:
+            run = service.repository.load_run(run_id)
+            assert run.status == "waiting_input"
+            assert len(provider.calls) == number
+            assert not (service.repository.project_dir / f"after-{number}.txt").exists()
+            assert not (service.repository.project_dir / f"unregistered-{number}.txt").exists()
+            assert run.module_data["experiments"][-1]["status"] == "completed"
+            interaction = run.module_data["interaction"]
+            assert interaction["interaction_type"] == "confirm_experiment_continuation"
+            service.command_run(run_id, command_id=f"answer-{number}", command_type="submit_interaction", payload={
+                "interaction_id": interaction["interaction_id"], "response": {"selection": decision},
+            })
+            if decision == "finish":
+                service.claim_run(run_id, lease_owner="test")
+                from mira_engine.workflows import WorkflowError
+                with pytest.raises(WorkflowError, match="confirm continuation"):
+                    service.command_run(run_id, command_id="bad-next", command_type="record_experiment", payload={
+                        "experiment": {"id": "Exp003", "title": "Unapproved", "status": "running"},
+                    })
+            await execute()
+    else:
+        assert (service.repository.project_dir / "after-1.txt").exists()
+        assert (service.repository.project_dir / "after-2.txt").exists()
+        assert (service.repository.project_dir / "unregistered-1.txt").exists()
+    run = service.repository.load_run(run_id)
+    assert run.status == "completed"
+    assert len(run.module_data["experiments"]) == 2
+    assert len(provider.calls) == (3 if mode == "manual" else 4)
+
+
 @pytest.mark.parametrize("module_type", ["initiation", "planning", "experiment", "delivery"])
 async def test_repeatable_clarifications_stop_batches_and_restore_decisions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module_type: str,

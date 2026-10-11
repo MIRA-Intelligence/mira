@@ -11,7 +11,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .confirmations import confirmation_approved, confirmation_required
-from .experiments import ExperimentRecord
+from .experiments import ExperimentRecord, experiment_boundary_decision, manual_experiments
 from .models import (
     MODULE_TYPES,
     Actor,
@@ -143,6 +143,11 @@ class WorkflowService:
             raise WorkflowError("invalid_module_type", f"unsupported module_type: {module_type}", status=422)
         if not command_id:
             raise WorkflowError("command_id_required", "command_id is required", status=422)
+        if module_type == "experiment":
+            module_data = dict(module_data or {})
+            module_data.setdefault("experiment_execution_mode", "auto")
+            if module_data["experiment_execution_mode"] not in ("auto", "manual"):
+                raise WorkflowError("invalid_execution_mode", "experiment_execution_mode must be auto or manual", status=422)
         with self.repository.transaction():
             workflow = self._load_active_workflow()
             duplicate = self._duplicate_receipt(command_id, workflow)
@@ -742,12 +747,31 @@ class WorkflowService:
                     raise WorkflowError("invalid_experiment", "artifact paths must be strings", status=422)
                 if Path(path).is_absolute() or not (self.repository.project_dir / path).resolve().is_relative_to(self.repository.project_dir.resolve()):
                     raise WorkflowError("invalid_experiment", "artifact path escapes Project", status=422)
+            if status == "running" and manual_experiments(run):
+                if previous.get("status") == "running" and record["status"] == "pending":
+                    raise WorkflowError("invalid_experiment", "finish or skip the active experiment before resetting it", status=409)
+                if record["status"] == "running" and previous.get("status") != "running":
+                    if any(item["status"] == "running" for item in records):
+                        raise WorkflowError("experiment_in_progress", "manual mode permits only one active experiment", status=409)
+                    if run.module_data.get("_manual_experiment_boundary"):
+                        if experiment_boundary_decision(run) != "continue":
+                            raise WorkflowError("experiment_confirmation_required", "confirm continuation before starting another experiment", status=409)
+                        run.module_data.pop("_manual_experiment_boundary")
+                if record["status"] in {"completed", "failed"} and previous.get("status") not in {"running", "completed", "failed"}:
+                    raise WorkflowError("experiment_not_started", "register running before executing a manual experiment", status=409)
+                if previous.get("status") == "running" and record["status"] in {"completed", "failed", "skipped"}:
+                    run.module_data["_manual_experiment_boundary"] = {
+                        "interaction_id": new_id(), "experiment_id": record["id"], "title": record["title"],
+                    }
             # Replace in place: retries and progress updates do not add duplicates.
             run.module_data["experiments"] = [
                 record if item["id"] == record["id"] else item for item in records
             ] if previous else [*records, record]
             return status, "run.experiment_recorded", "applied"
         if command == "update_draft" and status == "created":
+            mode = (payload.get("module_data") or {}).get("experiment_execution_mode", "auto")
+            if run.module_type == "experiment" and mode not in ("auto", "manual"):
+                raise WorkflowError("invalid_execution_mode", "experiment_execution_mode must be auto or manual", status=422)
             run.module_data.update(payload.get("module_data") or {})
             return "created", "run.draft_updated", "applied"
         if command == "enqueue" and status == "created":
@@ -887,6 +911,8 @@ class WorkflowService:
             self._close_attempt(run, "failed", utc_now())
             return "failed", "run.failed", "applied"
         if command == "complete" and status in {"running", "waiting_input", "paused"}:
+            if manual_experiments(run) and run.module_data.get("_manual_experiment_boundary") and experiment_boundary_decision(run) is None:
+                raise WorkflowError("experiment_confirmation_required", "answer the experiment continuation form before completing the Run", status=409)
             if any(item.get("status") in {"pending", "running"} for item in run.module_data.get("experiments", [])):
                 raise WorkflowError("experiments_unfinished", "finish or explicitly skip registered experiments before completing the Run", status=409)
             interaction = run.module_data.get("interaction")

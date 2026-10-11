@@ -91,6 +91,32 @@ class ModuleExecutor(Protocol):
 
 ## Attempt lifecycle
 
+### Experiment execution mode
+
+The experiment launch dialogs (overview and upstream-module handoff) persist
+`module_data.experiment_execution_mode` as `auto` (default) or `manual`. The old
+global sidebar toggle is removed. Research and delivery do not use this setting;
+their existing clarification and scope-approval gates remain in effect. This is
+independent of the Project's inter-module `handoff_policy`.
+
+- Auto: execute the approved experiment scope continuously within configured
+  limits. A model progress message does not complete a still-running experiment Run.
+- Manual: scope approval permits the first experiment. Only one experiment may be
+  running. Saving its completed/failed/skipped record creates a durable boundary;
+  the runtime opens `confirm_experiment_continuation` and stops the current turn,
+  including remaining calls in a tool batch and delegated tool calls. `continue`
+  permits one more experiment; `finish` permits only skipping remaining proposals
+  and publishing/summarizing existing results. Even the final experiment requires
+  this decision, so the user can inspect its result before finalization.
+- Terminal-record edits do not create duplicate boundaries. Boundary identity and
+  the matching response survive reloads. Legacy Runs without this field use auto
+  semantics; the legacy Project `run_mode` cannot override it.
+
+Agents must register experiments before execution and must not hide several
+experiments inside one script/record. The gate operates at registered experiment
+boundaries, not arbitrary operating-system subprocess boundaries. Explicit Stop
+or pause/cancel remains the interruption mechanism during an active experiment.
+
 An attempt is one scheduler claim of a Run, not the whole lifetime of the Run.
 
 ```text

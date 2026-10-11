@@ -94,6 +94,18 @@ Never invent executed experiments for protocol-only work; skipped proposals must
 be labelled as not executed. Do not write task_plan.json. Respect maxExperiments;
 updating an existing experiment is not an additional experiment. Finish or explicitly
 skip every registered pending/running experiment before complete_workflow_run.
+configuration.experiment_execution_mode controls ONLY this Experiment Run; absent
+means auto. In auto mode, execute the approved experiment scope continuously within
+its budget, without asking after each experiment. Clarification, conflict resolution,
+and execution approval still apply. In manual mode, register exactly ONE experiment
+as running before executing it; do not batch multiple experiments into one script,
+parallel delegation, or one record. Initial scope approval permits the first
+experiment. After its completed/failed/skipped record is saved, the runtime opens
+an experiment continuation form and ends the turn. Wait for the user. A continue
+answer permits only one more experiment; finish means mark remaining proposals
+skipped and summarize/publish existing results without executing further experiments.
+These boundaries also apply to delegated agents. Never reinterpret the old global
+run_mode as this Run's experiment execution mode.
 """.strip(),
     "delivery": """
 This is a Delivery Run. Work directly from the selected manuscript, draft, results,
