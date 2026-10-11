@@ -12,6 +12,23 @@ from .models import ModuleRun
 from .repository import JsonWorkflowRepository
 
 
+def manual_experiments(run: ModuleRun) -> bool:
+    return run.module_type == "experiment" and run.module_data.get("experiment_execution_mode") == "manual"
+
+
+def experiment_boundary_decision(run: ModuleRun) -> str | None:
+    """Only the response to this exact experiment boundary authorizes continuation."""
+    boundary = run.module_data.get("_manual_experiment_boundary")
+    if not manual_experiments(run) or not isinstance(boundary, dict):
+        return None
+    interactions = [*(run.module_data.get("interaction_history") or []), run.module_data.get("interaction")]
+    for interaction in reversed(interactions):
+        if isinstance(interaction, dict) and interaction.get("interaction_id") == boundary["interaction_id"]:
+            response = interaction.get("response")
+            return response.get("selection") if isinstance(response, dict) else None
+    return None
+
+
 class ExperimentRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 

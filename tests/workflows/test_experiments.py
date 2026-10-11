@@ -131,3 +131,40 @@ async def test_tool_records_only_in_active_experiment_context(tmp_path):
     result = json.loads(await tool.execute(experiment=item))
     assert result["status"] == "recorded"
     assert service.repository.load_run(run_id).module_data["experiments"][0]["id"] == "Exp001"
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed", "skipped"])
+def test_manual_mode_blocks_parallel_experiments_and_unconfirmed_continuation(tmp_path, terminal):
+    service, run_id = make_service(tmp_path, experiment_execution_mode="manual")
+    record(service, run_id)
+    with pytest.raises(WorkflowError, match="one active"):
+        record(service, run_id, command_id="parallel", id="Exp002")
+    with pytest.raises(WorkflowError, match="resetting"):
+        record(service, run_id, command_id="reset", status="pending")
+    record(service, run_id, command_id="finish", status=terminal)
+    boundary = service.repository.load_run(run_id).module_data["_manual_experiment_boundary"]
+    record(service, run_id, command_id="edit-result", status=terminal, conclusion="Clarified result")
+    assert service.repository.load_run(run_id).module_data["_manual_experiment_boundary"] == boundary
+    # A fresh service instance cannot bypass the persisted boundary.
+    service = WorkflowService(JsonWorkflowRepository(tmp_path, "test"))
+    with pytest.raises(WorkflowError, match="confirm continuation"):
+        record(service, run_id, command_id="next", id="Exp002")
+    with pytest.raises(WorkflowError, match="continuation form"):
+        service.command_run(run_id, command_id="complete", command_type="complete")
+    with pytest.raises(WorkflowError, match="register running"):
+        record(service, run_id, command_id="bypass", id="Exp002", status="completed")
+
+
+@pytest.mark.parametrize("mode", ["auto", None])
+def test_auto_and_legacy_runs_do_not_add_manual_boundaries(tmp_path, mode):
+    service, run_id = make_service(tmp_path, **({"experiment_execution_mode": mode} if mode else {}))
+    record(service, run_id)
+    record(service, run_id, command_id="finish", status="completed")
+    record(service, run_id, command_id="next", id="Exp002")
+    assert "_manual_experiment_boundary" not in service.repository.load_run(run_id).module_data
+
+
+@pytest.mark.parametrize("mode", ["invalid", {}, None])
+def test_invalid_experiment_mode_rejected(tmp_path, mode):
+    with pytest.raises(WorkflowError, match="auto or manual"):
+        make_service(tmp_path, experiment_execution_mode=mode)

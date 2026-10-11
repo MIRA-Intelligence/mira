@@ -13,6 +13,7 @@ from mira_engine.workflows.confirmations import (
     confirmation_required,
     expected_confirmation_type,
 )
+from mira_engine.workflows.experiments import experiment_boundary_decision, manual_experiments
 from mira_engine.workflows.models import new_id
 
 from .base import ModuleExecutionContext, ModuleInvocation
@@ -119,8 +120,37 @@ class NativeModuleRuntime:
                 "record_workflow_experiment",
             }
 
+            def request_manual_boundary(current):
+                boundary = current.module_data.get("_manual_experiment_boundary")
+                if (
+                    current.status == "running" and current.pending_control is None
+                    and manual_experiments(current) and boundary
+                    and experiment_boundary_decision(current) is None
+                ):
+                    service.request_interaction(
+                        run_id, command_id=f"experiment-boundary:{boundary['interaction_id']}",
+                        attempt_id=current.attempt.current_attempt_id,
+                        interaction={
+                            "interaction_id": boundary["interaction_id"],
+                            "interaction_type": "confirm_experiment_continuation",
+                            "title": f"实验 {boundary['experiment_id']} 已结束：确认下一步",
+                            "prompt": f"{boundary['title']}\n手动模式已保存本实验记录。继续执行下一个实验，还是结束并汇总？\nManual mode: the experiment record is saved. Continue with one more experiment or finish and summarize?",
+                            "choices": [
+                                {"value": "continue", "label": "继续下一个实验 / Continue one experiment"},
+                                {"value": "finish", "label": "结束并汇总 / Finish and summarize"},
+                            ],
+                            "response_schema": {"type": "object", "required": ["selection"], "properties": {
+                                "selection": {"type": "string", "enum": ["continue", "finish"]},
+                                "notes": {"type": "string"},
+                            }, "additionalProperties": False},
+                            "allow_freeform": True,
+                        },
+                    )
+                    return repository.load_run(run_id)
+                return current
+
             async def control_guard(_tool_name: str, _arguments: dict[str, Any]) -> str | None:
-                current = repository.load_run(run_id)
+                current = request_manual_boundary(repository.load_run(run_id))
                 if (
                     current.status != "running"
                     or current.attempt.current_attempt_id != run.attempt.current_attempt_id
@@ -163,10 +193,20 @@ class NativeModuleRuntime:
                         + '","instruction":"Draft the module execution brief and call '
                         "request_workflow_interaction before consequential work." + '"}'
                     )
+                if manual_experiments(current) and _tool_name not in {
+                    "read_file", "list_dir", "glob", "grep", "write_file", "edit_file",
+                    "request_workflow_interaction", "record_workflow_experiment",
+                    "publish_workflow_artifact", "complete_workflow_run",
+                } and not any(item.get("status") == "running" for item in current.module_data.get("experiments", [])):
+                    return (
+                        "Manual experiment mode: no experiment is active. Register exactly one "
+                        "experiment as running with record_workflow_experiment before execution. "
+                        "If the user chose finish, skip pending experiments and publish the summary instead."
+                    )
                 return None
 
             async def turn_stop_guard() -> str | None:
-                current = repository.load_run(run_id)
+                current = request_manual_boundary(repository.load_run(run_id))
                 if current.status == "waiting_input":
                     interaction = current.module_data.get("interaction") or {}
                     title = str(interaction.get("title", ""))
@@ -191,6 +231,19 @@ class NativeModuleRuntime:
                         "This ModuleRun still requires approval of its execution brief. "
                         f"Draft or revise the brief and call request_workflow_interaction "
                         f"with interaction_type `{interaction_type}`, then end the turn."
+                    )
+                if current.module_type == "experiment" and current.module_data.get("experiments"):
+                    if experiment_boundary_decision(current) == "finish":
+                        return (
+                            "The user chose finish. Do not execute more experiments. Mark remaining "
+                            "pending proposals skipped, publish existing results, and complete_workflow_run."
+                        )
+                    return (
+                        "This Experiment Run is still running. A progress statement is not completion. "
+                        "Continue the approved registered experiments within the configured limits; "
+                        "record their outcomes. In manual mode the runtime will stop at each experiment "
+                        "boundary. If scope is finished, skip remaining proposals as appropriate, publish "
+                        "results and call complete_workflow_run. If blocked, request_workflow_interaction."
                     )
                 literature = current.module_data.get("literature_review")
                 research_missing = (
