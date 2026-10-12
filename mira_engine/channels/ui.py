@@ -76,6 +76,7 @@ from mira_engine.task_plan.guardrails import (
     reconcile_task_plan_data,
 )
 from mira_engine.workflows.http import WorkflowHttpApi
+from mira_engine.workflows.input_paths import resolve_input_path
 
 PLAN_FILENAME = "task_plan.json"
 # Sentinel session id used by the UI to manage globally-scoped skill plugins
@@ -2889,6 +2890,21 @@ class UiChannel(BaseChannel):
         raw_path = body.get("path") if isinstance(body, dict) else None
         if not isinstance(raw_path, str):
             return web.json_response({"ok": False, "error": "path must be a string"})
+
+        if body.get("purpose") == "experiment_input":
+            # A read-only user-facing probe, not an enduring grant. Authority is
+            # recorded only when the user creates the experiment Run.
+            try:
+                resolved = await asyncio.to_thread(resolve_input_path, raw_path)
+            except (OSError, ValueError, RuntimeError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)})
+            return web.json_response({
+                "ok": True,
+                "kind": "directory" if resolved.is_dir() else "file",
+                "resolved_path": str(resolved),
+                "outside_workspace": not resolved.is_relative_to(self._workspace_root_for_access().resolve()),
+                "restrict_to_workspace": self.restrict_to_workspace,
+            })
 
         resolved, err = self._resolve_probe_path(raw_path)
         if err or resolved is None:

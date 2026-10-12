@@ -270,6 +270,10 @@ class GlobTool(_SearchTool):
                 include_dirs=include_dirs,
             ):
                 _check_search_cancelled()
+                try:
+                    self._resolve(str(entry))
+                except PermissionError:
+                    continue
                 rel_path = entry.relative_to(root).as_posix()
                 if _match_glob(rel_path, entry.name, pattern):
                     display = self._display_path(entry, root)
@@ -477,6 +481,10 @@ class GrepTool(_SearchTool):
 
             for file_path in self._iter_files(target):
                 _check_search_cancelled()
+                try:
+                    self._resolve(str(file_path))
+                except PermissionError:
+                    continue
                 rel_path = file_path.relative_to(root).as_posix()
                 if glob and not _match_glob(rel_path, file_path.name, glob):
                     continue
