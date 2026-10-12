@@ -4,101 +4,89 @@ on:
   workflow_dispatch:
     inputs:
       agent_tag:
-        description: "Agent tag in Mira (e.g. v0.2.0)"
+        description: "Published engine tag (e.g. v0.3.5rc1)"
         required: true
         type: string
       ui_tag:
-        description: "UI tag in MiraUI (e.g. v0.2.0)"
+        description: "Published UI tag (e.g. v0.4.5rc1)"
         required: true
         type: string
 
 permissions:
   contents: read
 
+env:
+  AGENT_TAG: ${{ inputs.agent_tag }}
+  UI_TAG: ${{ inputs.ui_tag }}
+  GH_TOKEN: ${{ secrets.RELEASE_TRAIN_GH_TOKEN || github.token }}
+
 jobs:
   verify-tags:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.RELEASE_TRAIN_GH_TOKEN || github.token }}
     steps:
-      - name: Ensure cross-repo token can access MiraUI
-        run: |
-          if ! gh api repos/MIRA-Intelligence/mira-ui >/dev/null 2>&1; then
-            echo "::error::Current GH token cannot access MIRA-Intelligence/mira-ui."
-            echo "Configure RELEASE_TRAIN_GH_TOKEN with repo:read access to both repos, then rerun."
-            exit 1
-          fi
-
-      - name: Verify agent tag exists
-        run: |
-          gh api repos/MIRA-Intelligence/mira/git/ref/tags/${{ inputs.agent_tag }} >/dev/null
-
-      - name: Verify UI tag exists
-        run: |
-          gh api repos/MIRA-Intelligence/mira-ui/git/ref/tags/${{ inputs.ui_tag }} >/dev/null
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify published releases, assets and compatibility mapping
+        run: python scripts/verify_release_pair.py --agent-tag "$AGENT_TAG" --ui-tag "$UI_TAG" --output release-pair.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-pair
+          path: release-pair.json
 
   smoke:
     needs: verify-tags
     runs-on: ubuntu-latest
+    env:
+      MIRA_HOME: ${{ runner.temp }}/mira-release-train
+      MIRA_CONFIG_PATH: ${{ runner.temp }}/mira-release-train/config.json
     steps:
-      - name: Checkout agent tag
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.agent_tag }}
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install Mira
+      - name: Download and verify the published engine
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: Build CI gateway config
+          mkdir engine-assets
+          gh release download "$AGENT_TAG" --repo MIRA-Intelligence/mira \
+            --pattern mira-engine-linux-x86_64 --pattern SHA256SUMS.txt --dir engine-assets
+          (cd engine-assets && sha256sum --ignore-missing --check SHA256SUMS.txt)
+          chmod +x engine-assets/mira-engine-linux-x86_64
+      - name: Build isolated gateway config
         run: |
           python - <<'PY'
           import json
+          import os
           from pathlib import Path
-          from mira_engine.config.schema import Config
-
-          cfg = Config()
-          cfg.agents.defaults.model = "custom/default"
-          cfg.agents.defaults.provider = "custom"
-          cfg.providers.custom.api_key = "no-key"
-          cfg.providers.custom.api_base = "http://127.0.0.1:8000/v1"
-          cfg.channels.ui.enabled = True
-          cfg.channels.ui.allow_from = ["*"]
-          cfg.channels.ui.cors_origins = ["*"]
-
-          out = Path("release-train-config.json")
-          out.write_text(json.dumps(cfg.model_dump(by_alias=True), indent=2), encoding="utf-8")
-          print(f"Wrote {out}")
+          root = Path(os.environ["MIRA_HOME"])
+          root.mkdir(parents=True, exist_ok=True)
+          config = {
+              "agents": {"defaults": {"workspace": str(root / "workspace"), "provider": "custom", "model": "custom/test-model"}},
+              "providers": {"custom": {"apiKey": "no-key", "apiBase": "http://127.0.0.1:9/v1"}},
+              "channels": {"ui": {"enabled": True, "allowFrom": ["*"], "corsOrigins": ["*"]}},
+          }
+          Path(os.environ["MIRA_CONFIG_PATH"]).write_text(json.dumps(config), encoding="utf-8")
           PY
-
-      - name: Start gateway
+      - name: Start published gateway and run smoke checks
         run: |
-          nohup mira gateway --config release-train-config.json --port 18790 > gateway.log 2>&1 &
-
-      - name: Wait for gateway health
-        run: |
-          for i in {1..20}; do
-            if curl -sf http://127.0.0.1:18790/health >/dev/null; then
-              exit 0
-            fi
+          engine-assets/mira-engine-linux-x86_64 run-gateway --host 127.0.0.1 --port 18790 > gateway.log 2>&1 &
+          GATEWAY_PID=$!
+          trap 'kill "$GATEWAY_PID" 2>/dev/null || true' EXIT
+          healthy=false
+          for i in {1..30}; do
+            if curl -sf http://127.0.0.1:18790/health >/dev/null; then healthy=true; break; fi
+            kill -0 "$GATEWAY_PID" || break
             sleep 2
           done
-          echo "Gateway failed to become healthy"
-          echo "------ gateway.log (tail) ------"
-          tail -n 200 gateway.log || true
-          exit 1
-
-      - name: Run release-train smoke checks
-        run: |
-          python scripts/release_train_smoke.py --base-url http://127.0.0.1:18790 > smoke-report.json
-
+          if [ "$healthy" != true ]; then tail -n 200 gateway.log; exit 1; fi
+          python scripts/release_train_smoke.py --base-url http://127.0.0.1:18790 \
+            --expected-agent "${AGENT_TAG#v}" --expected-contract v1 > smoke-report.json
       - name: Upload smoke artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: release-train-smoke-${{ inputs.agent_tag }}-${{ inputs.ui_tag }}
@@ -110,23 +98,29 @@ jobs:
     needs: [verify-tags, smoke]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-pair
       - name: Build release summary
         run: |
-          cat <<EOF > release-train-summary.md
-          ## Release Train Candidate
-
-          - Agent tag: \`${{ inputs.agent_tag }}\`
-          - UI tag: \`${{ inputs.ui_tag }}\`
-          - Smoke: passed
-
-          Smoke validates:
-          - Desktop -> Local engine contract checks (\`/health\`, \`/version\`)
-          - Desktop -> Cloud-style API contract check (\`/api/status\`)
-          - Web -> Cloud-style API contract check (\`/api/status\`)
-          EOF
-
-      - name: Upload summary artifact
-        uses: actions/upload-artifact@v4
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads(Path("release-pair.json").read_text())
+          text = "## Release Train Verified\n\n"
+          text += f"- Engine: {report['agent_tag']} ({report['agent_commit']})\n"
+          text += f"- UI: {report['ui_tag']} ({report['ui_commit']})\n"
+          text += f"- Compatibility: {json.dumps(report['compatibility'])}\n"
+          text += "- Published binary SHA256, exact engine/API version and modular workflow smoke: passed\n"
+          text += "- Both releases, installers and update manifests verified\n"
+          Path("release-train-summary.md").write_text(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(text)
+          PY
+      - uses: actions/upload-artifact@v4
         with:
           name: release-train-summary-${{ inputs.agent_tag }}-${{ inputs.ui_tag }}
-          path: release-train-summary.md
+          path: |
+            release-train-summary.md
+            release-pair.json
