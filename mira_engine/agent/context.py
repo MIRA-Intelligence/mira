@@ -34,6 +34,7 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         agents_filename: str = "AGENTS.md",
         channel: str | None = None,
+        loaded_skills: list[str] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity(channel=channel)]
@@ -51,7 +52,7 @@ class ContextBuilder:
             if name and name not in active_skills:
                 active_skills.append(name)
         if active_skills:
-            active_content = self.skills.load_skills_for_context(active_skills)
+            active_content = self.skills.load_skills_for_context(active_skills, loaded_skills=loaded_skills)
             if active_content:
                 parts.append(f"# Active Skills\n\n{active_content}")
 
@@ -258,6 +259,7 @@ class ContextBuilder:
         agents_filename: str = "AGENTS.md",
         extra_system: str | None = None,
         current_role: str = "user",
+        loaded_skills: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, project_dir, run_mode)
@@ -283,6 +285,7 @@ class ContextBuilder:
             skill_names,
             agents_filename=agents_filename,
             channel=channel,
+            loaded_skills=loaded_skills,
         )
         if extra_system:
             system_prompt += "\n\n---\n\n" + extra_system

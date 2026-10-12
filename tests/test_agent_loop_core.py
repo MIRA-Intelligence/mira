@@ -660,6 +660,61 @@ async def test_process_message_updates_recent_skills_metadata(monkeypatch, tmp_p
     assert session.metadata.get("_recent_skills") == ["medical-image-analysis"]
 
 
+async def test_skill_load_prompt_dedup_and_new_turn(monkeypatch, tmp_path: Path) -> None:
+    from mira_engine.agent.skill_events import skill_loaded
+
+    path = tmp_path / "skills" / "manual-demo" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("# Follow these instructions")
+    loop = _make_real_loop(tmp_path)
+    events = []
+
+    async def fake_run(messages, audit_hook=None, **kwargs):
+        assert "Follow these instructions" in messages[0]["content"]
+        await audit_hook(skill_loaded("manual-demo", "read_file"))
+        await audit_hook(skill_loaded("manual-demo", "read_file"))
+        return "done", [], messages + [{"role": "assistant", "content": "done"}]
+
+    async def audit(event):
+        events.append(event)
+
+    monkeypatch.setattr(loop, "_run_agent_loop", fake_run)
+    message = InboundMessage(channel="ui", sender_id="u", chat_id="chat-demo", content="hello",
+                             metadata={"selected_skill_ids": ["manual-demo"]})
+    await loop._process_message(message, audit_hook=audit)
+    await loop._process_message(message, audit_hook=audit)
+    loaded = [event for event in events if event.get("loaded") and event["skill_name"] == "manual-demo"]
+    assert len(loaded) == 2
+    assert all(event["source"] == "manual" for event in loaded)
+    assert loaded[0]["event_id"] != loaded[1]["event_id"]
+
+
+async def test_actual_skill_read_emits_only_after_success(tmp_path: Path) -> None:
+    from mira_engine.agent.tools.filesystem import ReadFileTool
+
+    loop = _make_loop(tmp_path)
+    loop.tools.register(ReadFileTool(workspace=tmp_path))
+    path = tmp_path / "demo" / "SKILL.md"
+    path.parent.mkdir()
+    path.write_text("# Instructions")
+    runtime = _RuntimeStub([
+        LLMResponse(content=None, tool_calls=[
+            ToolCallRequest(id="ok", name="read_file", arguments={"path": str(path)}),
+            ToolCallRequest(id="bad", name="read_file", arguments={"path": str(tmp_path / "bad" / "SKILL.md")}),
+        ]),
+        LLMResponse(content="done"),
+    ])
+    events = []
+
+    async def audit(event):
+        events.append(event)
+
+    await loop._run_agent_loop([{"role": "user", "content": "read"}], model_runtime=runtime, audit_hook=audit)
+    assert [event["skill_name"] for event in events if event.get("loaded")] == ["demo"]
+    assert events[0].get("loaded") is None
+    assert events[1]["loaded"] is True
+
+
 async def test_process_message_injects_active_skills_into_context(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
     captured: dict[str, Any] = {}

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from scripts.verify_release_pair import validate_pair, version_from_tag
@@ -42,3 +44,11 @@ def test_incomplete_or_mismatched_pair_fails(failure):
 def test_tag_input_is_not_shell_code():
     with pytest.raises(ValueError):
         version_from_tag("v0.3.5rc1; echo bad")
+
+
+def test_release_train_resolves_runner_paths_at_step_runtime():
+    workflow = (Path(__file__).parents[1] / ".github/workflows/release-train.yml").read_text()
+    assert "${{ runner.temp }}" not in workflow
+    assert 'MIRA_HOME=$RUNNER_TEMP/mira-release-train' in workflow
+    assert 'MIRA_CONFIG_PATH=$RUNNER_TEMP/mira-release-train/config.json' in workflow
+    assert '>> "$GITHUB_ENV"' in workflow
