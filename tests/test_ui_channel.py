@@ -1542,6 +1542,23 @@ async def test_handle_validate_data_path_enforces_workspace_boundary(ui_channel:
     assert "outside workspace" in body["error"]
 
 
+async def test_experiment_input_probe_allows_external_read_without_changing_policy(ui_channel: UiChannel, tmp_path: Path) -> None:
+    external = tmp_path / "user-input.txt"
+    external.write_text("data")
+    ui_channel.projects_root = tmp_path / "project-workspace"
+    ui_channel.projects_root.mkdir()
+    ui_channel.restrict_to_workspace = True
+    request = MagicMock(spec=web.Request)
+    request.json = AsyncMock(return_value={"path": str(external), "purpose": "experiment_input"})
+    body = json.loads((await ui_channel._handle_validate_data_path(request)).text)
+    assert body["ok"] and body["outside_workspace"] and body["restrict_to_workspace"]
+    request.json = AsyncMock(return_value={"path": str(external)})
+    denied = json.loads((await ui_channel._handle_validate_data_path(request)).text)
+    assert not denied["ok"]  # probing is not a global grant
+    request.json = AsyncMock(return_value={"path": str(external.parent / "missing"), "purpose": "experiment_input"})
+    assert not json.loads((await ui_channel._handle_validate_data_path(request)).text)["ok"]
+
+
 async def test_handle_validate_data_path_allows_outside_when_unrestricted(ui_channel: UiChannel, tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside-open-datasets"
     outside.mkdir(parents=True, exist_ok=True)

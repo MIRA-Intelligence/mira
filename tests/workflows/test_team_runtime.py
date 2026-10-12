@@ -43,7 +43,7 @@ def isolate_memory(tmp_path, monkeypatch):
 
 
 async def run_native(tmp_path, main, role_factory=None, *, stage="planning", profile="team",
-                     metadata_profile=None, module_data=None, streaming=False):
+                     metadata_profile=None, module_data=None, streaming=False, strict=False):
     project_dir = tmp_path / "project"
     project_dir.mkdir(exist_ok=True)
     service = WorkflowService(JsonWorkflowRepository(project_dir, "QA-team"))
@@ -51,6 +51,7 @@ async def run_native(tmp_path, main, role_factory=None, *, stage="planning", pro
         module_data={"intent": "Verify team scope", **(module_data or {})}, enqueue=True).run_id
     service.claim_run(run_id, lease_owner="test", agent_profile=profile)
     loop = ResearchAgentLoop(bus=MessageBus(), provider=main, workspace=tmp_path,
+        restrict_to_workspace=strict,
         model="test/main", channels_config=ChannelsConfig(),
         exec_config=ExecToolConfig(enable=True, timeout=5),
         session_manager=SessionManager(tmp_path), role_provider_factory=role_factory)
@@ -64,6 +65,34 @@ async def run_native(tmp_path, main, role_factory=None, *, stage="planning", pro
     await loop._process_message(message, session_key=f"ui:QA-team:run:{run_id}",
         on_stream=on_stream if streaming else None)
     return loop, service
+
+
+@pytest.mark.parametrize("profile", ["research", "engineer", "team"])
+async def test_native_external_input_read_grants_are_scoped_and_read_only(tmp_path, profile):
+    source = tmp_path / "user-data.txt"
+    source.write_text("AUTHORIZED EXTERNAL EVIDENCE")
+    main = Provider([call("read_file", path=str(source)),
+                     call("write_file", path=str(source), content="changed"), complete()])
+    loop, _ = await run_native(tmp_path, main, stage="experiment", profile=profile, strict=True,
+        module_data={"external_read_paths": [str(source)]})
+    replies = [m["content"] for m in main.calls[-1]["messages"] if m["role"] == "tool"]
+    assert any("AUTHORIZED EXTERNAL EVIDENCE" in r for r in replies)
+    assert any("outside allowed" in r for r in replies)
+    assert source.read_text() == "AUTHORIZED EXTERNAL EVIDENCE"
+    assert "outside allowed" in await loop.tools.get("read_file").execute(path=str(source))
+    assert "external_read_paths" in main.calls[0]["messages"][0]["content"]
+
+
+async def test_team_delegates_inherit_external_input_grants(tmp_path):
+    source = tmp_path / "user-data.txt"
+    source.write_text("DELEGATE EVIDENCE")
+    supervisor = Provider([call("consult", role="student", task="Read supplied file"), complete()])
+    student = Provider([call("read_file", path=str(source)), LLMResponse(content="Read it")])
+    def factory(role):
+        return (supervisor if role == "supervisor" else student), f"test/{role}", (f"test/{role}",)
+    await run_native(tmp_path, supervisor, factory, stage="experiment", strict=True,
+        module_data={"external_read_paths": [str(source)]})
+    assert any("DELEGATE EVIDENCE" in m["content"] for m in student.calls[-1]["messages"] if m["role"] == "tool")
 
 
 @pytest.mark.parametrize("profile", ["research", "engineer", "team"])

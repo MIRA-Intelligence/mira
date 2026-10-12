@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from mira_engine.agent.base_loop import BaseAgentLoop
@@ -14,6 +15,7 @@ from mira_engine.workflows.confirmations import (
     expected_confirmation_type,
 )
 from mira_engine.workflows.experiments import experiment_boundary_decision, manual_experiments
+from mira_engine.workflows.input_paths import run_read_paths
 from mira_engine.workflows.models import new_id
 
 from .base import ModuleExecutionContext, ModuleInvocation
@@ -273,11 +275,17 @@ class NativeModuleRuntime:
                 allowed_tools=frozenset(visible_tools),
                 system_instructions=invocation.system_instructions,
                 execution_guard=control_guard, stop_guard=delegation_stop_guard, run_id=run_id,
+                read_paths=run_read_paths(run),
             )
             with (
                 loop.tools.restrict_to(visible_tools, execution_guard=control_guard),
                 loop.subagents.delegation_scope(policy),
+                ExitStack() as read_access,
             ):
+                for name in ("read_file", "list_dir", "grep", "glob"):
+                    tool = loop.tools.get(name)
+                    if tool is not None and hasattr(tool, "allow_read_paths"):
+                        read_access.enter_context(tool.allow_read_paths(policy.read_paths))
                 return await BaseAgentLoop._process_message(
                     loop,
                     prepared,

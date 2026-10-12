@@ -64,6 +64,7 @@ class DelegationPolicy:
     execution_guard: Callable[[str, dict[str, Any]], Awaitable[str | None]]
     stop_guard: Callable[[], Awaitable[str | None]]
     run_id: str
+    read_paths: tuple[Path, ...] = ()
 
 
 class _DelegationStoppedError(Exception):
@@ -185,19 +186,20 @@ class SubagentManager:
 
         tools = ToolRegistry()
         allowed_dir = run_workspace if self.restrict_to_workspace else None
+        read_paths = policy.read_paths if policy else ()
         supports_vision = self.provider.supports_vision(self.model)
         if _permitted("read_file"):
-            tools.register(ReadFileTool(workspace=run_workspace, allowed_dir=allowed_dir, supports_vision=supports_vision))
+            tools.register(ReadFileTool(workspace=run_workspace, allowed_dir=allowed_dir, supports_vision=supports_vision, read_paths=read_paths))
         if _permitted("write_file"):
             tools.register(WriteFileTool(workspace=run_workspace, allowed_dir=allowed_dir))
         if _permitted("edit_file"):
             tools.register(EditFileTool(workspace=run_workspace, allowed_dir=allowed_dir))
         if _permitted("list_dir"):
-            tools.register(ListDirTool(workspace=run_workspace, allowed_dir=allowed_dir))
+            tools.register(ListDirTool(workspace=run_workspace, allowed_dir=allowed_dir, read_paths=read_paths))
         if _permitted("grep"):
-            tools.register(GrepTool(workspace=run_workspace, allowed_dir=allowed_dir))
+            tools.register(GrepTool(workspace=run_workspace, allowed_dir=allowed_dir, read_paths=read_paths))
         if _permitted("glob"):
-            tools.register(GlobTool(workspace=run_workspace, allowed_dir=allowed_dir))
+            tools.register(GlobTool(workspace=run_workspace, allowed_dir=allowed_dir, read_paths=read_paths))
         if self.exec_config.enable and _permitted("exec"):
             tools.register(ExecTool(
                 working_dir=str(run_workspace),
