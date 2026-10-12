@@ -38,14 +38,15 @@ jobs:
   smoke:
     needs: verify-tags
     runs-on: ubuntu-latest
-    env:
-      MIRA_HOME: ${{ runner.temp }}/mira-release-train
-      MIRA_CONFIG_PATH: ${{ runner.temp }}/mira-release-train/config.json
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.agent_tag }}
           fetch-depth: 0
+      - name: Set isolated gateway paths on the runner
+        run: |
+          echo "MIRA_HOME=$RUNNER_TEMP/mira-release-train" >> "$GITHUB_ENV"
+          echo "MIRA_CONFIG_PATH=$RUNNER_TEMP/mira-release-train/config.json" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
