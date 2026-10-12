@@ -40,6 +40,7 @@ from rich.text import Text
 from loguru import logger
 
 from mira_engine import __logo__, __version__
+from mira_engine.cli.workflow import workflow_app
 from mira_engine.config.paths import get_workspace_path
 from mira_engine.config.schema import Config
 from mira_engine.providers.factory import make_provider, make_role_provider
@@ -51,6 +52,7 @@ app = typer.Typer(
     help=f"{__logo__} mira - Personal AI Assistant",
     no_args_is_help=True,
 )
+app.add_typer(workflow_app, name="workflow")
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
@@ -1250,6 +1252,15 @@ def _sync_workspace_templates_or_exit(workspace: Path) -> None:
 
 
 def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool = False) -> None:
+    from mira_engine.config.loader import get_home_dir
+    from mira_engine.utils.locks import interprocess_lock
+
+    # Serialize check + publish, not just each individual file write.
+    with interprocess_lock(get_home_dir() / "runtime" / "gateway-reservation"):
+        _reserve_gateway_endpoint(gateway_host, gateway_port, verbose)
+
+
+def _reserve_gateway_endpoint(gateway_host: str, gateway_port: int, verbose: bool = False) -> None:
     """Reserve one gateway endpoint without blocking gateways on other ports."""
     import atexit
     import hashlib
@@ -1261,7 +1272,8 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
     if os.environ.get("MIRA_SKIP_GATEWAY_FAILSAVE"):
         return
 
-    from mira_engine.config.loader import get_home_dir
+    from mira_engine.cli.gateway_lifecycle import is_gateway_command
+    from mira_engine.config.loader import get_config_path, get_home_dir
     from mira_engine.utils.locks import locked_update_text, locked_write_text
 
     runtime_dir = get_home_dir() / "runtime"
@@ -1277,14 +1289,27 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
             old_pid = int(pid_file.read_text().strip())
             if psutil.pid_exists(old_pid):
                 proc = psutil.Process(old_pid)
-                if "mira" in " ".join(proc.cmdline()):
+                record = None
+                if discovery_file.exists():
+                    try:
+                        discovery = json.loads(discovery_file.read_text(encoding="utf-8"))
+                        record = discovery.get("instances", {}).get(endpoint_key)
+                    except (ValueError, AttributeError):
+                        pass
+                same_process = not isinstance(record, dict) or record.get("create_time") is None or (
+                    record.get("pid") == old_pid and abs(proc.create_time() - record["create_time"]) < 0.01
+                )
+                if same_process and is_gateway_command(proc.cmdline()):
                     # Note: Using basic print here as it is before main gateway loop setup
                     print(f"错误: Mira 已经在运行中 (PID: {old_pid})。")
-                    print("提示: 请先停止旧进程，或使用 `mira-engine stop`。")
+                    print("提示: 系统服务请使用 `mira-engine stop`；独立 gateway 请在相同 MIRA_HOME 下使用 `mira-engine stop --gateway`。")
                     raise typer.Exit(1)
         except typer.Exit:
             raise
-        except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
+        except psutil.AccessDenied:
+            print("无法确认已有 PID 的归属；请检查权限，不会删除其运行记录。")
+            raise typer.Exit(1)
+        except (ValueError, psutil.NoSuchProcess):
             pid_file.unlink(missing_ok=True)
 
     # 2. Check the actual endpoint in case its owner did not create a PID file.
@@ -1319,6 +1344,10 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
             "port": gateway_port,
             "pid": current_pid,
             "endpoint": endpoint,
+            "create_time": psutil.Process(current_pid).create_time(),
+            "config_path": str(get_config_path().resolve()),
+            "mira_home": str(get_home_dir().resolve()),
+            "launch_mode": os.environ.get("MIRA_SERVICE_MODE", "standalone"),
         }
         return json.dumps({"instances": instances}, indent=2, ensure_ascii=False) + "\n"
 

@@ -29,6 +29,7 @@ from mira_engine.channels.ui import (
     _normalize_contract_version,
     _normalize_loop_mode,
     _normalize_run_mode,
+    _render_chat_context_attachment,
     _safe_upload_name,
     _stringify_history_content,
 )
@@ -322,6 +323,34 @@ async def test_handle_plan_returns_json(ui_channel: UiChannel) -> None:
     resp = await ui_channel._handle_plan(req)
     assert resp.status == 200
     assert json.loads(resp.text) == data
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_plan_projects_workflow_experiments_without_writing_legacy_plan(ui_channel: UiChannel, legacy: bool) -> None:
+    from mira_engine.workflows import JsonWorkflowRepository, WorkflowService
+
+    session = "workflow-experiments"
+    project_dir = ui_channel.projects_root / session
+    project_dir.mkdir(parents=True)
+    plan_path = project_dir / PLAN_FILENAME
+    if legacy:
+        plan_path.write_text(json.dumps({"experiments": [{"id": "Exp001", "title": "Legacy", "status": "pending"}]}))
+    service = WorkflowService(JsonWorkflowRepository(project_dir, session))
+    for index in range(2):
+        run_id = service.create_run(command_id=f"create-{index}", module_type="experiment", enqueue=True).run_id
+        service.claim_run(run_id, lease_owner="test")
+        service.command_run(run_id, command_id=f"record-{index}", command_type="record_experiment", payload={
+            "experiment": {"id": "Exp001", "title": f"Branch {index}", "status": "running"},
+        })
+    req = MagicMock(spec=web.Request)
+    req.query = {"session_id": session}
+    body = json.loads((await ui_channel._handle_plan(req)).text)
+    assert len(body["experiments"]) == (3 if legacy else 2)
+    assert len({item["id"] for item in body["experiments"]}) == len(body["experiments"])
+    if legacy:
+        assert len(json.loads(plan_path.read_text())["experiments"]) == 1
+    else:
+        assert not plan_path.exists()
 
 
 async def test_handle_plan_invalid_json_returns_500(ui_channel: UiChannel) -> None:
@@ -1513,6 +1542,23 @@ async def test_handle_validate_data_path_enforces_workspace_boundary(ui_channel:
     assert "outside workspace" in body["error"]
 
 
+async def test_experiment_input_probe_allows_external_read_without_changing_policy(ui_channel: UiChannel, tmp_path: Path) -> None:
+    external = tmp_path / "user-input.txt"
+    external.write_text("data")
+    ui_channel.projects_root = tmp_path / "project-workspace"
+    ui_channel.projects_root.mkdir()
+    ui_channel.restrict_to_workspace = True
+    request = MagicMock(spec=web.Request)
+    request.json = AsyncMock(return_value={"path": str(external), "purpose": "experiment_input"})
+    body = json.loads((await ui_channel._handle_validate_data_path(request)).text)
+    assert body["ok"] and body["outside_workspace"] and body["restrict_to_workspace"]
+    request.json = AsyncMock(return_value={"path": str(external)})
+    denied = json.loads((await ui_channel._handle_validate_data_path(request)).text)
+    assert not denied["ok"]  # probing is not a global grant
+    request.json = AsyncMock(return_value={"path": str(external.parent / "missing"), "purpose": "experiment_input"})
+    assert not json.loads((await ui_channel._handle_validate_data_path(request)).text)["ok"]
+
+
 async def test_handle_validate_data_path_allows_outside_when_unrestricted(ui_channel: UiChannel, tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside-open-datasets"
     outside.mkdir(parents=True, exist_ok=True)
@@ -1667,6 +1713,31 @@ async def test_handle_create_project_managed_mode_ignores_client_path(
     assert ch._project_location_payload()["custom_dir_allowed"] is False
 
 
+async def test_create_project_existing_directory_confirmation(ui_channel: UiChannel, tmp_path: Path) -> None:
+    target = tmp_path / "selected" / "study"
+    target.mkdir(parents=True)
+    data = target / "input.csv"
+    data.write_bytes(b"subject,value\n1,42\n")
+    req = MagicMock(spec=web.Request)
+    body = {"project_id": "study", "display_name": "Study", "project_parent_dir": str(target.parent)}
+    # Truthy strings must not bypass confirmation.
+    for consent in (None, False, "true"):
+        req.json = AsyncMock(return_value={**body, "allow_existing_dir": consent})
+        resp = await ui_channel._handle_create_project(req)
+        payload = json.loads(resp.text)
+        assert resp.status == 409
+        assert payload["code"] == "project_directory_exists"
+        assert payload["project_dir"] == str(target)
+        assert not (target / ".mira").exists()
+
+    req.json = AsyncMock(return_value={**body, "allow_existing_dir": True})
+    resp = await ui_channel._handle_create_project(req)
+    assert resp.status == 201
+    assert json.loads(resp.text)["project_dir"] == str(target)
+    assert data.read_bytes() == b"subject,value\n1,42\n"
+    assert (target / ".mira" / "project.json").is_file()
+
+
 async def test_handle_project_meta_updates_display_name(ui_channel: UiChannel) -> None:
     project_dir = ui_channel.projects_root / "PRJ-0001"
     project_dir.mkdir(parents=True)
@@ -1776,6 +1847,19 @@ async def test_cors_allows_patch_method(ui_channel: UiChannel) -> None:
     resp = await ui_channel._cors_middleware(req, AsyncMock())
     assert resp.status == 204
     assert resp.headers["Access-Control-Allow-Methods"] == "GET, POST, PATCH, DELETE, OPTIONS"
+    assert resp.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+
+
+async def test_cors_is_preserved_for_http_errors(ui_channel: UiChannel) -> None:
+    ui_channel.config.cors_origins = ["*"]
+    req = MagicMock(spec=web.Request)
+    req.method = "GET"
+    req.headers = {"Origin": "http://localhost:5173"}
+    handler = AsyncMock(side_effect=web.HTTPNotFound())
+
+    resp = await ui_channel._cors_middleware(req, handler)
+
+    assert resp.status == 404
     assert resp.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
 
 
@@ -1953,6 +2037,170 @@ async def test_handle_upload_project_files_references_rejects_zip_slip(
     assert resp.status == 400
     assert "unsafe zip entry" in json.loads(resp.text)["error"]
     assert not (ui_channel.projects_root / "escape.txt").exists()
+
+
+def test_render_chat_context_attachment_keeps_conversation_separate_from_objective() -> None:
+    transcript, count = _render_chat_context_attachment("chat-1", [
+        {
+            "type": "response",
+            "timestamp": "2026-09-16T10:00:00",
+            "content": "Build a leakage-safe MRI study.",
+            "metadata": {"_user": True},
+        },
+        {
+            "type": "response",
+            "timestamp": "2026-09-16T10:01:00",
+            "content": "I recommend patient-level splitting.",
+            "metadata": {},
+        },
+        {"type": "tool_call", "content": "read_file(data.csv)", "metadata": {}},
+    ])
+
+    assert count == 2
+    assert "## User — 2026-09-16T10:00:00" in transcript
+    assert "Build a leakage-safe MRI study." in transcript
+    assert "## Mira — 2026-09-16T10:01:00" in transcript
+    assert "read_file(data.csv)" not in transcript
+    assert "identifying the project's objective" in transcript
+
+
+async def test_handle_chat_context_preview_returns_attachment_content(
+    ui_channel: UiChannel,
+) -> None:
+    source = SessionManager(ui_channel.workspace)
+    source.append_ui_event(
+        key="ui:chat-preview",
+        role="user",
+        content="Preview this requirement.",
+        msg_type="response",
+        timestamp="2026-09-16T10:00:00",
+    )
+    source.append_ui_event(
+        key="ui:chat-preview",
+        role="assistant",
+        content="Preview this response.",
+        msg_type="response",
+        timestamp="2026-09-16T10:01:00",
+    )
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "chat-preview"}
+
+    resp = await ui_channel._handle_chat_context_preview(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["source_session_id"] == "chat-preview"
+    assert body["message_count"] == 2
+    assert "Preview this requirement." in body["content"]
+    assert "Preview this response." in body["content"]
+
+
+async def test_handle_chat_context_preview_uses_supplied_live_entries(
+    ui_channel: UiChannel,
+) -> None:
+    req = MagicMock(spec=web.Request)
+    req.method = "POST"
+    req.match_info = {"session_id": "chat-live"}
+    req.json = AsyncMock(return_value={
+        "entries": [
+            {
+                "type": "response",
+                "content": "Live requirement not persisted yet.",
+                "timestamp": "2026-09-16T12:00:00",
+                "metadata": {"_user": True},
+            },
+            {
+                "type": "response",
+                "content": "Live Mira response.",
+                "timestamp": "2026-09-16T12:01:00",
+                "metadata": {},
+            },
+        ],
+    })
+
+    resp = await ui_channel._handle_chat_context_preview(req)
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["message_count"] == 2
+    assert "Live requirement not persisted yet." in body["content"]
+    assert "Live Mira response." in body["content"]
+
+
+async def test_handle_attach_chat_context_writes_project_attachment(
+    ui_channel: UiChannel,
+) -> None:
+    ref = ui_channel.project_registry.create_project(
+        project_id="promoted-study",
+        display_name="Promoted Study",
+    )
+    source = SessionManager(ui_channel.workspace)
+    source.append_ui_event(
+        key="ui:chat-source",
+        role="user",
+        content="Compare two reconstruction methods.",
+        msg_type="response",
+        timestamp="2026-09-16T11:00:00",
+    )
+    source.append_ui_event(
+        key="ui:chat-source",
+        role="assistant",
+        content="Which metric matters most?",
+        msg_type="response",
+        timestamp="2026-09-16T11:01:00",
+    )
+    source.append_ui_event(
+        key="ui:chat-source",
+        role="assistant",
+        content="search -> running",
+        msg_type="progress",
+        timestamp="2026-09-16T11:01:30",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "promoted-study"}
+    req.json = AsyncMock(return_value={"source_session_id": "chat-source"})
+    resp = await ui_channel._handle_attach_chat_context(req)
+
+    assert resp.status == 201
+    body = json.loads(resp.text)
+    assert body["source_session_id"] == "chat-source"
+    assert body["message_count"] == 2
+    assert body["path"].startswith("context/quick-chat-chat-source-")
+    attachment = ref.project_dir / body["path"]
+    assert attachment.is_file()
+    text = attachment.read_text(encoding="utf-8")
+    assert "Compare two reconstruction methods." in text
+    assert "Which metric matters most?" in text
+    assert "search -> running" not in text
+
+
+async def test_handle_attach_chat_context_uses_supplied_live_entries(
+    ui_channel: UiChannel,
+) -> None:
+    ref = ui_channel.project_registry.create_project(
+        project_id="promoted-live",
+        display_name="Promoted Live",
+    )
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "promoted-live"}
+    req.json = AsyncMock(return_value={
+        "source_session_id": "chat-live",
+        "entries": [{
+            "type": "response",
+            "content": "Use the live UI conversation.",
+            "timestamp": "2026-09-16T12:00:00",
+            "metadata": {"_user": True},
+        }],
+    })
+
+    resp = await ui_channel._handle_attach_chat_context(req)
+
+    assert resp.status == 201
+    body = json.loads(resp.text)
+    attachment = ref.project_dir / body["path"]
+    assert body["message_count"] == 1
+    assert "Use the live UI conversation." in attachment.read_text(encoding="utf-8")
 
 
 async def test_handle_project_artifact_serves_file(ui_channel: UiChannel) -> None:

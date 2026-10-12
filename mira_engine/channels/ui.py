@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from loguru import logger
@@ -44,6 +45,7 @@ from mira_engine.config.ui_runtime import (
     build_ui_runtime_payload,
     save_ui_runtime_update,
 )
+from mira_engine.modules import module_system_instructions
 from mira_engine.organization import ORGANIZATION_FILENAME, OrganizationStore
 from mira_engine.projects import (
     PROJECT_DIR_INDEX_FILENAME,
@@ -52,6 +54,7 @@ from mira_engine.projects import (
     PROJECT_META_DEFAULT_RUN_MODE,
     PROJECT_META_STRICT_CONTRACT_VERSION,
     PROJECT_WORKSPACE_FILENAME,
+    ProjectDirectoryExistsError,
     ProjectRef,
     ProjectRegistry,
     slugify_project_id,
@@ -72,6 +75,8 @@ from mira_engine.task_plan.guardrails import (
     guard_task_plan_file,
     reconcile_task_plan_data,
 )
+from mira_engine.workflows.http import WorkflowHttpApi
+from mira_engine.workflows.input_paths import resolve_input_path
 
 PLAN_FILENAME = "task_plan.json"
 # Sentinel session id used by the UI to manage globally-scoped skill plugins
@@ -482,6 +487,38 @@ def _stringify_history_content(content: Any) -> str:
     return str(content)
 
 
+def _render_chat_context_attachment(
+    source_session_id: str,
+    entries: list[dict[str, Any]],
+) -> tuple[str, int]:
+    """Render user-visible chat turns as a project context attachment."""
+    lines = [
+        "# Conversation Context",
+        "",
+        f"Source chat: `{source_session_id}`",
+        "",
+        "This file preserves the conversation that preceded this project. "
+        "Use the user messages and Mira responses as context for identifying the project's objective.",
+    ]
+    message_count = 0
+    for entry in entries:
+        if entry.get("type") != "response":
+            continue
+        content = _stringify_history_content(entry.get("content")).strip()
+        if not content:
+            continue
+        metadata = entry.get("metadata")
+        is_user = isinstance(metadata, dict) and metadata.get("_user") is True
+        role = "User" if is_user else "Mira"
+        timestamp = _string_value(entry.get("timestamp"))
+        heading = f"## {role}"
+        if timestamp:
+            heading += f" — {timestamp}"
+        lines.extend(["", heading, "", content])
+        message_count += 1
+    return "\n".join(lines).rstrip() + "\n", message_count
+
+
 def _format_tool_call(tool_call: dict[str, Any]) -> str:
     """Render a tool call in the same compact form shown in logs."""
     fn = tool_call.get("function") if isinstance(tool_call, dict) else None
@@ -879,6 +916,8 @@ class UiChannel(BaseChannel):
         # be persisted to the UI history log on stream end.
         self._stream_buffers: dict[str, str] = {}
         self._app: web.Application | None = None
+        self._workflow_api = WorkflowHttpApi(self.project_registry)
+        self._workflow_executor_id = uuid4().hex
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
         self._migrate_global_to_project()
@@ -1149,6 +1188,14 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/status", self._handle_status)
         self._app.router.add_get("/api/sessions", self._handle_sessions)
         self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
+        self._app.router.add_get(
+            "/api/sessions/{session_id}/context-preview",
+            self._handle_chat_context_preview,
+        )
+        self._app.router.add_post(
+            "/api/sessions/{session_id}/context-preview",
+            self._handle_chat_context_preview,
+        )
         self._app.router.add_get("/api/plan", self._handle_plan)
         self._app.router.add_get("/api/plan/contract", self._handle_plan_contract)
         self._app.router.add_get("/api/plan/lint", self._handle_plan_lint)
@@ -1176,11 +1223,16 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/projects/{session_id}/remove", self._handle_remove_project)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
         self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
+        self._app.router.add_post(
+            "/api/projects/{session_id}/context/from-chat",
+            self._handle_attach_chat_context,
+        )
         self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
         self._app.router.add_get("/api/projects/{session_id}/skill-plugins", self._handle_skill_plugins_list)
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/install", self._handle_skill_plugins_install)
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
         self._app.router.add_delete("/api/projects/{session_id}/skill-plugins/{plugin_id}", self._handle_skill_plugins_uninstall)
+        self._workflow_api.add_routes(self._app)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -1207,6 +1259,7 @@ class UiChannel(BaseChannel):
         self._running = False
 
         await self._close_active_clients()
+        await self._workflow_api.close()
 
         if self._site:
             await self._site.stop()
@@ -1237,8 +1290,38 @@ class UiChannel(BaseChannel):
             return self.workspace
         return None
 
+    @staticmethod
+    def _ui_history_key(chat_id: str, metadata: dict[str, Any]) -> str:
+        run_id = metadata.get("workflow_run_id")
+        if isinstance(run_id, str) and run_id:
+            return f"ui:{chat_id}:run:{run_id}"
+        return f"ui:{chat_id}"
+
     async def send(self, msg: OutboundMessage) -> None:
         metadata = msg.metadata or {}
+
+        workflow_run_id = metadata.get("workflow_run_id")
+        workflow_project_id = metadata.get("project_id")
+        if (
+            isinstance(workflow_run_id, str)
+            and isinstance(workflow_project_id, str)
+        ):
+            if (
+                metadata.get("_activity_ping")
+                or metadata.get("_tool_hint")
+                or metadata.get("_progress")
+            ):
+                await self._workflow_api.broadcast_activity(
+                    workflow_project_id,
+                    workflow_run_id,
+                    msg.content,
+                )
+            elif metadata.get("_stream_end") or not metadata.get("_stream_delta"):
+                await self._workflow_api.broadcast_activity(
+                    workflow_project_id,
+                    workflow_run_id,
+                    "",
+                )
         if metadata.get("_audit_only"):
             action = metadata.get("_audit_event")
             details = metadata.get("_audit_details")
@@ -1282,7 +1365,7 @@ class UiChannel(BaseChannel):
                 history_dir = self._stream_history_dir(msg.chat_id, metadata)
                 if history_dir is not None:
                     SessionManager(history_dir).append_ui_event(
-                        key=f"ui:{msg.chat_id}",
+                        key=self._ui_history_key(msg.chat_id, metadata),
                         role="assistant",
                         content=joined,
                         msg_type="response",
@@ -1336,7 +1419,7 @@ class UiChannel(BaseChannel):
             history_dir = self.workspace
         if history_dir is not None and not is_activity_ping and not is_stop_ack:
             SessionManager(history_dir).append_ui_event(
-                key=f"ui:{msg.chat_id}",
+                key=self._ui_history_key(msg.chat_id, metadata),
                 role="assistant",
                 content=msg.content,
                 msg_type=msg_type,
@@ -1588,7 +1671,13 @@ class UiChannel(BaseChannel):
         if request.method == "OPTIONS":
             resp = web.Response(status=204)
         else:
-            resp = await handler(request)
+            try:
+                resp = await handler(request)
+            except web.HTTPException as exc:
+                # aiohttp raises unmatched-route and method errors before a
+                # handler can build a response. Keep CORS headers on those
+                # responses so browser clients can inspect the HTTP status.
+                resp = exc
 
         origin = request.headers.get("Origin", "*")
         allowed = self.config.cors_origins
@@ -1731,6 +1820,8 @@ class UiChannel(BaseChannel):
                     else None
                 )
                 incoming_policy = _normalize_automation_policy(data.get("automation_policy"))
+                workflow_run_id = data.get("workflow_run_id")
+                workflow_run = None
                 allow_result_write = bool(data.get("allow_result_write"))
                 turn_id = data.get("turn_id")
                 selected_skill_ids = data.get("selected_skill_ids")
@@ -1774,13 +1865,56 @@ class UiChannel(BaseChannel):
                         contract_version=contract_version,
                         automation_policy=incoming_policy,
                     )
+                    if workflow_run_id is not None:
+                        if not isinstance(workflow_run_id, str) or not workflow_run_id:
+                            await ws.send_json({"type": "error", "content": "invalid workflow_run_id"})
+                            continue
+                        try:
+                            workflow_service = self._workflow_api._service(session_id)
+                            workflow_run = workflow_service.repository.load_run(workflow_run_id)
+                            claim_receipt = workflow_service.claim_run(
+                                workflow_run_id,
+                                lease_owner=f"ui:{self._workflow_executor_id}:{user_id}",
+                                agent_profile=agent_profile,
+                            )
+                            workflow_run = workflow_service.repository.load_run(
+                                workflow_run_id
+                            )
+                            if (
+                                claim_receipt
+                                and claim_receipt.event
+                                and claim_receipt.event.event_type
+                                == "run.recovery_required"
+                            ):
+                                await ws.send_json({
+                                    "type": "error",
+                                    "content": (
+                                        "MIRA restarted while this module was running. "
+                                        "The Run is paused to avoid repeating uncertain work; "
+                                        "review it and choose Resume to continue."
+                                    ),
+                                })
+                                continue
+                        except Exception as exc:
+                            await ws.send_json({"type": "error", "content": str(exc)})
+                            continue
+                elif workflow_run_id is not None:
+                    await ws.send_json({
+                        "type": "error",
+                        "content": "workflow_run_id is valid only in project mode",
+                    })
+                    continue
                 self._clients[session_id] = ws
                 self._client_project_dirs[session_id] = project_dir_path
                 effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
-                plan_ids_before = _extract_plan_experiment_ids(project_dir_path) if project_dir_path else []
+                plan_ids_before = (
+                    _extract_plan_experiment_ids(project_dir_path)
+                    if project_dir_path and workflow_run is None
+                    else []
+                )
                 guard = (
                     guard_task_plan_file(project_dir_path, auto_fix=True)
-                    if project_dir_path
+                    if project_dir_path and workflow_run is None
                     else {"fixed": False, "blocking": False}
                 )
                 guard_notice: str | None = None
@@ -1834,7 +1968,11 @@ class UiChannel(BaseChannel):
                 )
                 if project_dir_path:
                     SessionManager(project_dir_path).append_ui_event(
-                        key=f"ui:{session_id}",
+                        key=(
+                            f"ui:{session_id}:run:{workflow_run_id}"
+                            if workflow_run is not None
+                            else f"ui:{session_id}"
+                        ),
                         role="user",
                         content=content,
                         msg_type="response",
@@ -1867,10 +2005,44 @@ class UiChannel(BaseChannel):
                 if project_dir is not None:
                     metadata["project_id"] = session_id
                     metadata["project_dir"] = project_dir
+                if workflow_run is not None:
+                    metadata["workflow_run_id"] = workflow_run_id
+                    metadata["workflow_module_type"] = workflow_run.module_type
+                    # The legacy research loop's auto mode assumes one mandatory
+                    # four-stage task_plan. ModuleRuns control their own lifecycle.
+                    metadata["run_mode"] = "manual"
                 if effective_policy:
                     metadata["automation_policy"] = effective_policy
-                if loop_mode == "project" and self._ui_instructions:
-                    metadata["_ui_system_instructions"] = self._ui_instructions
+                if loop_mode == "project":
+                    if workflow_run is not None:
+                        instruction_parts = [
+                            module_system_instructions(
+                                workflow_run.module_type, workflow_run_id
+                            )
+                        ]
+                        interaction = workflow_run.module_data.get("interaction")
+                        if (
+                            isinstance(interaction, dict)
+                            and interaction.get("response") is not None
+                        ):
+                            instruction_parts.append(
+                                "The latest structured interaction has been resolved. "
+                                "Continue from this authoritative response:\n"
+                                + json.dumps(
+                                    {
+                                        "interaction_id": interaction.get("interaction_id"),
+                                        "interaction_type": interaction.get("interaction_type"),
+                                        "response": interaction.get("response"),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            )
+                    else:
+                        instruction_parts = (
+                            [self._ui_instructions] if self._ui_instructions else []
+                        )
+                    if instruction_parts:
+                        metadata["_ui_system_instructions"] = "\n\n".join(instruction_parts)
                 if guard_notice:
                     metadata["_task_plan_guard_notice"] = guard_notice
                 await self._handle_message(
@@ -1879,7 +2051,11 @@ class UiChannel(BaseChannel):
                     content=content,
                     media=media,
                     metadata=metadata,
-                    session_key=f"ui:{session_id}",
+                    session_key=(
+                        f"ui:{session_id}:run:{workflow_run_id}"
+                        if workflow_run is not None
+                        else f"ui:{session_id}"
+                    ),
                 )
             elif msg_type == "set_mode":
                 session_id = data.get("session_id", session_id)
@@ -2209,7 +2385,9 @@ class UiChannel(BaseChannel):
             return []
         return rows
 
-    def _load_history_entries(self, session_id: str) -> list[dict[str, Any]]:
+    def _load_history_entries(
+        self, session_id: str, *, workflow_run_id: str | None = None
+    ) -> list[dict[str, Any]]:
         project_dir = self._resolve_project_dir(session_id)
         if project_dir is not None and project_dir.is_dir():
             manager = SessionManager(project_dir)
@@ -2218,7 +2396,11 @@ class UiChannel(BaseChannel):
             manager = SessionManager(self.workspace)
         else:
             return []
-        session_key = f"ui:{session_id}"
+        session_key = (
+            f"ui:{session_id}:run:{workflow_run_id}"
+            if workflow_run_id
+            else f"ui:{session_id}"
+        )
         session = manager.get_or_create(session_key)
         ui_entries = manager.get_ui_history(session_key)
         merged: list[dict[str, Any]] = list(ui_entries)
@@ -2303,9 +2485,54 @@ class UiChannel(BaseChannel):
         session_id = request.match_info.get("session_id", "").strip()
         if not session_id:
             return web.json_response({"error": "session_id required"}, status=400)
-        return web.json_response({
+        raw_workflow_run_id = request.query.get("workflow_run_id")
+        workflow_run_id = (
+            raw_workflow_run_id.strip()
+            if isinstance(raw_workflow_run_id, str) and raw_workflow_run_id.strip()
+            else None
+        )
+        if workflow_run_id:
+            try:
+                run = self._workflow_api._service(session_id).repository.load_run(workflow_run_id)
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=404)
+            if run.project_id != session_id:
+                return web.json_response({"error": "Run belongs to another Project"}, status=409)
+        response_payload = {
             "session_id": session_id,
-            "entries": self._load_history_entries(session_id),
+            "entries": self._load_history_entries(
+                session_id, workflow_run_id=workflow_run_id
+            ),
+        }
+        if workflow_run_id:
+            response_payload["workflow_run_id"] = workflow_run_id
+        return web.json_response(response_payload)
+
+    async def _handle_chat_context_preview(self, request: web.Request) -> web.Response:
+        """Preview the same conversation text used by project promotion."""
+        source_session_id = request.match_info.get("session_id", "").strip()
+        if not source_session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        entries: list[dict[str, Any]] | None = None
+        if request.method == "POST":
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "expected JSON body"}, status=400)
+            raw_entries = body.get("entries") if isinstance(body, dict) else None
+            if not isinstance(raw_entries, list):
+                return web.json_response({"error": "entries must be a list"}, status=400)
+            entries = [entry for entry in raw_entries if isinstance(entry, dict)]
+        transcript, message_count = _render_chat_context_attachment(
+            source_session_id,
+            entries if entries is not None else self._load_history_entries(source_session_id),
+        )
+        if message_count == 0:
+            return web.json_response({"error": "source chat has no messages"}, status=404)
+        return web.json_response({
+            "source_session_id": source_session_id,
+            "content": transcript,
+            "message_count": message_count,
         })
 
     async def _handle_get_config(self, _request: web.Request) -> web.Response:
@@ -2664,6 +2891,21 @@ class UiChannel(BaseChannel):
         if not isinstance(raw_path, str):
             return web.json_response({"ok": False, "error": "path must be a string"})
 
+        if body.get("purpose") == "experiment_input":
+            # A read-only user-facing probe, not an enduring grant. Authority is
+            # recorded only when the user creates the experiment Run.
+            try:
+                resolved = await asyncio.to_thread(resolve_input_path, raw_path)
+            except (OSError, ValueError, RuntimeError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)})
+            return web.json_response({
+                "ok": True,
+                "kind": "directory" if resolved.is_dir() else "file",
+                "resolved_path": str(resolved),
+                "outside_workspace": not resolved.is_relative_to(self._workspace_root_for_access().resolve()),
+                "restrict_to_workspace": self.restrict_to_workspace,
+            })
+
         resolved, err = self._resolve_probe_path(raw_path)
         if err or resolved is None:
             return web.json_response({"ok": False, "error": err or "invalid path"})
@@ -2713,7 +2955,7 @@ class UiChannel(BaseChannel):
         })
 
     async def _handle_plan(self, request: web.Request) -> web.Response:
-        """Serve task_plan.json, scoped to a project when session_id is given."""
+        """Serve a legacy-compatible read model, never write Run records to a plan."""
         session_id = request.query.get("session_id")
         if not session_id:
             return web.json_response(None)
@@ -2723,6 +2965,14 @@ class UiChannel(BaseChannel):
         except ValueError as exc:
             logger.warning(str(exc))
             return web.json_response({"error": str(exc)}, status=500)
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is not None:
+            from mira_engine.workflows import JsonWorkflowRepository
+            from mira_engine.workflows.experiments import project_experiments
+
+            records = project_experiments(JsonWorkflowRepository(project_dir, session_id))
+            if records:
+                data = {**(data or {}), "experiments": [*(data or {}).get("experiments", []), *records]}
         if data is None:
             return web.json_response(None)
         return web.json_response(data)
@@ -3045,7 +3295,14 @@ class UiChannel(BaseChannel):
                 display_name=display_name or project_id,
                 project_dir=project_dir,
                 project_parent_dir=project_parent_dir,
+                allow_existing_dir=body.get("allow_existing_dir") is True,
             )
+        except ProjectDirectoryExistsError as exc:
+            return web.json_response({
+                "error": str(exc),
+                "code": "project_directory_exists",
+                "project_dir": str(exc.project_dir),
+            }, status=409)
         except FileExistsError as exc:
             return web.json_response({"error": str(exc)}, status=409)
         except (OSError, ValueError) as exc:
@@ -3397,6 +3654,74 @@ class UiChannel(BaseChannel):
             "uploaded": uploaded,
             "extracted": extracted,
         })
+
+    async def _handle_attach_chat_context(self, request: web.Request) -> web.Response:
+        """Save a Quick Chat transcript as a readable project context file."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        source_session_id = _string_value(
+            body.get("source_session_id") if isinstance(body, dict) else None
+        )
+        if not source_session_id:
+            return web.json_response({"error": "source_session_id required"}, status=400)
+        if source_session_id == session_id:
+            return web.json_response(
+                {"error": "source session must differ from project session"}, status=400
+            )
+
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not project_dir.is_dir():
+            return web.json_response({"error": "project not found"}, status=404)
+
+        raw_entries = body.get("entries") if isinstance(body, dict) else None
+        if raw_entries is not None and not isinstance(raw_entries, list):
+            return web.json_response({"error": "entries must be a list"}, status=400)
+        entries = (
+            [entry for entry in raw_entries if isinstance(entry, dict)]
+            if isinstance(raw_entries, list)
+            else self._load_history_entries(source_session_id)
+        )
+        transcript, message_count = _render_chat_context_attachment(
+            source_session_id,
+            entries,
+        )
+        if message_count == 0:
+            return web.json_response({"error": "source chat has no messages"}, status=404)
+
+        source_slug = slugify_project_id(source_session_id)[:48]
+        source_hash = hashlib.sha256(source_session_id.encode("utf-8")).hexdigest()[:8]
+        context_dir = project_dir / "context"
+        destination = context_dir / f"quick-chat-{source_slug}-{source_hash}.md"
+        try:
+            context_dir.mkdir(parents=True, exist_ok=True)
+            destination.write_text(transcript, encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Failed to save chat context {}: {}", destination, exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+        relative_path = destination.relative_to(project_dir).as_posix()
+        self._audit(
+            source="ui",
+            action="api_project_chat_context_attached",
+            session_id=session_id,
+            project_dir=project_dir,
+            details={
+                "source_session_id": source_session_id,
+                "path": relative_path,
+                "message_count": message_count,
+            },
+        )
+        return web.json_response({
+            "session_id": session_id,
+            "source_session_id": source_session_id,
+            "path": relative_path,
+            "message_count": message_count,
+        }, status=201)
 
     async def _handle_project_artifact(self, request: web.Request) -> web.Response:
         """Serve a project file under projects_root/<session_id> by relative path."""

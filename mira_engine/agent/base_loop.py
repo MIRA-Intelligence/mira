@@ -53,6 +53,14 @@ from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.command.router import CommandContext, CommandRouter
+from mira_engine.modules.tools import (
+    InitiationResearchResultTool,
+    PubMedSearchTool,
+    WorkflowArtifactTool,
+    WorkflowCompletionTool,
+    WorkflowExperimentTool,
+    WorkflowInteractionTool,
+)
 from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
@@ -371,8 +379,14 @@ class BaseAgentLoop:
             self.tools.register(BgTool(registry=self._bg_registry))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        self.tools.register(PubMedSearchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SetPlanTool())
+        self.tools.register(WorkflowInteractionTool())
+        self.tools.register(InitiationResearchResultTool())
+        self.tools.register(WorkflowArtifactTool())
+        self.tools.register(WorkflowCompletionTool())
+        self.tools.register(WorkflowExperimentTool())
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(ConsultRoleTool(manager=self.subagents))
         if self.cron_service:
@@ -517,6 +531,7 @@ class BaseAgentLoop:
         message_id: str | None = None,
         project_ref: ProjectRef | None = None,
         session_key: str | None = None,
+        workflow_run_id: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         if project_ref is not None:
@@ -531,6 +546,8 @@ class BaseAgentLoop:
                     )
                 if hasattr(tool, "set_project_context"):
                     tool.set_project_context(project_ref.project_id, str(project_ref.project_dir))
+                if hasattr(tool, "set_workflow_run_context"):
+                    tool.set_workflow_run_context(workflow_run_id)
         else:
             for tool in getattr(self.tools, "_tools", {}).values():
                 if hasattr(tool, "clear_runtime_context"):
@@ -670,15 +687,26 @@ class BaseAgentLoop:
         sections = [chunk for chunk in (python_hint, base, notice) if chunk]
         return "\n\n".join(sections) if sections else None
 
-    def _get_model_runtime(self, session_key: str) -> RoutedProviderManager:
+    def _get_model_runtime(self, session_key: str, *, role: str | None = None) -> RoutedProviderManager:
         """Return the session-local model runtime, creating it on demand."""
+        if role and self.role_provider_factory is not None:
+            # Keep role routes separate: switching profile must not reuse the
+            # default route, nor change another concurrent project's provider.
+            session_key = f"{session_key}:role:{role}"
         runtime = self._session_model_runtimes.get(session_key)
         if runtime is None:
+            provider, model, candidates = self.provider, self.model, tuple(self.model_candidates or [self.model])
+            provider_factory = self.provider_factory
+            if role and self.role_provider_factory is not None:
+                provider, model, candidates = self.role_provider_factory(role)
+                # Role candidates belong to the role's explicit provider, not
+                # the possibly different globally forced provider.
+                provider_factory = None
             runtime = RoutedProviderManager(
-                default_provider=self.provider,
-                default_model=self.model,
-                provider_factory=self.provider_factory,
-                default_candidates=tuple(self.model_candidates or [self.model]),
+                default_provider=provider,
+                default_model=model,
+                provider_factory=provider_factory,
+                default_candidates=candidates,
             )
             self._session_model_runtimes[session_key] = runtime
         return runtime
@@ -691,6 +719,8 @@ class BaseAgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        completion_guard: Callable[[str | None], Awaitable[str | None]] | None = None,
+        turn_stop_guard: Callable[[], Awaitable[str | None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -703,12 +733,20 @@ class BaseAgentLoop:
         hook = getattr(self, "_hook", None)
 
         while iteration < self.max_iterations:
+            if turn_stop_guard is not None:
+                stop_message = await turn_stop_guard()
+                if stop_message is not None:
+                    final_content = stop_message
+                    messages = self.context.add_assistant_message(messages, stop_message)
+                    break
             hook_ctx = AgentHookContext(iteration=iteration, messages=messages)
             if hook:
                 await hook.before_iteration(hook_ctx)
             iteration += 1
 
-            use_routed_runtime = model_runtime is not None and self.provider_factory is not None
+            use_routed_runtime = model_runtime is not None and (
+                self.provider_factory is not None or self.role_provider_factory is not None
+            )
             if not use_routed_runtime:
                 if on_stream is not None and hasattr(self.provider, "chat_stream_with_retry"):
                     streamed_raw = ""
@@ -870,6 +908,18 @@ class BaseAgentLoop:
                     hook_ctx.tool_events.append(
                         {"name": tool_call.name, "status": "ok", "detail": str(result)}
                     )
+                # Finish the batch's tool-result protocol, but never ask the model
+                # to continue after a durable user-input/control boundary.
+                if turn_stop_guard is not None:
+                    stop_message = await turn_stop_guard()
+                    if stop_message is not None:
+                        final_content = stop_message
+                        messages = self.context.add_assistant_message(messages, stop_message)
+                        hook_ctx.final_content = stop_message
+                        hook_ctx.stop_reason = "durable_boundary"
+                        if hook:
+                            await hook.after_iteration(hook_ctx)
+                        break
             else:
                 clean = self._strip_think(response.content)
                 if response.finish_reason == "error":
@@ -895,6 +945,23 @@ class BaseAgentLoop:
                 )
                 if hook:
                     clean = hook.finalize_content(hook_ctx, clean)
+                if completion_guard is not None and iteration < self.max_iterations:
+                    continuation = await completion_guard(clean)
+                    if continuation:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"{self._AUTO_CONTINUE_MARKER}\n"
+                                    f"{continuation}"
+                                ),
+                            }
+                        )
+                        hook_ctx.final_content = None
+                        hook_ctx.stop_reason = "contract_continuation"
+                        if hook:
+                            await hook.after_iteration(hook_ctx)
+                        continue
                 final_content = clean
                 hook_ctx.final_content = final_content
                 hook_ctx.stop_reason = "completed"
@@ -1237,6 +1304,7 @@ class BaseAgentLoop:
         their own per-session caches (e.g. token totals).
         """
         self._session_model_runtimes.pop(session_key, None)
+        self._session_model_runtimes.pop(f"{session_key}:role:supervisor", None)
 
     async def _process_message(
         self,
@@ -1246,6 +1314,8 @@ class BaseAgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        completion_guard: Callable[[str | None], Awaitable[str | None]] | None = None,
+        turn_stop_guard: Callable[[], Awaitable[str | None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response.
 
@@ -1378,6 +1448,9 @@ class BaseAgentLoop:
             meta.get("turn_id") or meta.get("message_id"),
             project_ref=project_ref,
             session_key=key,
+            workflow_run_id=meta.get("workflow_run_id")
+            if isinstance(meta.get("workflow_run_id"), str)
+            else None,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -1385,7 +1458,8 @@ class BaseAgentLoop:
 
         await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
-        model_runtime = self._get_model_runtime(key)
+        profile = meta.get("agent_profile") or getattr(self, "_session_agent_profiles", {}).get(key)
+        model_runtime = self._get_model_runtime(key, role="supervisor" if profile == "team" else None)
         extra_system = self._compose_extra_system(
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
@@ -1476,11 +1550,16 @@ class BaseAgentLoop:
         emit_audit_to_channel = msg.channel == "ui" or bool(meta.get("_emit_skill_audit"))
         if emit_audit_to_channel or audit_hook:
             async def _audit(details: dict[str, Any]) -> None:
-                skill_name = details.get("skill_name")
+                audit_context = meta.get("_audit_context")
+                enriched_details = {
+                    **(audit_context if isinstance(audit_context, dict) else {}),
+                    **details,
+                }
+                skill_name = enriched_details.get("skill_name")
                 if isinstance(skill_name, str) and skill_name.strip():
                     current_turn_skills.add(skill_name.strip())
                 if audit_hook:
-                    await audit_hook(details)
+                    await audit_hook(enriched_details)
                 if not emit_audit_to_channel:
                     return
                 metadata = dict(msg.metadata or {})
@@ -1488,7 +1567,7 @@ class BaseAgentLoop:
                 metadata["_audit_event"] = (
                     "skill_selected" if details.get("selected") else "skill_invoked"
                 )
-                metadata["_audit_details"] = details
+                metadata["_audit_details"] = enriched_details
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
@@ -1508,7 +1587,10 @@ class BaseAgentLoop:
             "model_runtime": model_runtime,
             "on_progress": progress_cb,
             "audit_hook": audit_cb,
+            "completion_guard": completion_guard,
         }
+        if turn_stop_guard is not None:
+            run_kwargs["turn_stop_guard"] = turn_stop_guard
         if on_stream is not None:
             run_kwargs["on_stream"] = on_stream
         if on_stream_end is not None:

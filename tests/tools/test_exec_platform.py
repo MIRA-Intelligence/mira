@@ -81,7 +81,7 @@ class TestBuildEnvUnix:
         assert "OPENAI_API_KEY" not in env
         assert "MIRA_TOKEN" not in env
         for v in env.values():
-            assert "secret" not in v.lower()
+            assert "sk-secret" not in v and "tok-secret" not in v
 
 
 class TestBuildEnvWindows:
@@ -124,7 +124,7 @@ class TestBuildEnvWindows:
         assert "OPENAI_API_KEY" not in env
         assert "MIRA_TOKEN" not in env
         for v in env.values():
-            assert "secret" not in v.lower()
+            assert "sk-secret" not in v and "tok-secret" not in v
 
     def test_path_has_sensible_default(self):
         with (

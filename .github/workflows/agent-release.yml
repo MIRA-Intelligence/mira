@@ -82,10 +82,13 @@ jobs:
         run: |
           python <<'PY'
           from importlib import metadata as importlib_metadata
+          import os
 
           version = importlib_metadata.version("mira-engine")
           if version == "0.0.0":
               raise SystemExit("mira-engine metadata version resolved to 0.0.0")
+          if os.environ.get("GITHUB_REF_TYPE") == "tag" and version != os.environ["GITHUB_REF_NAME"].removeprefix("v"):
+              raise SystemExit(f"Package version {version} does not match release tag")
           print(f"Resolved mira-engine metadata version: {version}")
           PY
 
@@ -188,6 +191,8 @@ jobs:
               agent_version = version_payload.get("agent_version")
               if not agent_version or agent_version == "0.0.0":
                   raise RuntimeError(f"unexpected standalone version payload: {version_payload}")
+              if os.environ.get("GITHUB_REF_TYPE") == "tag" and agent_version != os.environ["GITHUB_REF_NAME"].removeprefix("v"):
+                  raise RuntimeError(f"standalone version does not match release tag: {version_payload}")
               if version_payload.get("api_contract") != "v1":
                   raise RuntimeError(f"unexpected api contract payload: {version_payload}")
 
@@ -330,6 +335,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, 'rc') }}
+          make_latest: ${{ contains(github.ref_name, 'rc') && 'false' || 'true' }}
           generate_release_notes: true
           files: |
             release-assets/*
