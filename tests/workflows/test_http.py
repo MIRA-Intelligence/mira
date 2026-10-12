@@ -60,6 +60,31 @@ async def test_contract_and_direct_run_creation(workflow_client: TestClient) -> 
     assert snapshot["runs"][0]["module_type"] == "delivery"
 
 
+@pytest.mark.parametrize("journal_id", ["radiology", "media"])
+async def test_journal_catalog_and_selection_round_trip(workflow_client: TestClient, journal_id):
+    response = await workflow_client.get("/api/workflow/v1/journals")
+    assert response.status == 200
+    catalog = await response.json()
+    assert len(catalog["journals"]) == 7
+    selected = next(item for item in catalog["journals"] if item["id"] == journal_id)
+    assert selected["verification_status"] == "verified"
+    response = await workflow_client.post("/api/workflow/v1/projects/PRJ-api/runs", json={
+        "command_id": "journal", "module_type": "delivery",
+        "module_data": {"intent": "write", "delivery_format": "paper_article", "target_journal": journal_id},
+    })
+    assert response.status == 201
+    run_id = (await response.json())["run_id"]
+    snapshot = await (await workflow_client.get("/api/workflow/v1/projects/PRJ-api")).json()
+    run = next(run for run in snapshot["runs"] if run["run_id"] == run_id)
+    assert run["module_data"]["target_journal"] == journal_id
+    assert run["module_data"]["journal_profile_version"] == catalog["profile_version"]
+    invalid = await workflow_client.post("/api/workflow/v1/projects/PRJ-api/runs", json={
+        "command_id": "invalid-journal", "module_type": "delivery",
+        "module_data": {"delivery_format": "paper_article", "target_journal": "unknown"},
+    })
+    assert invalid.status == 422
+
+
 async def test_websocket_replays_and_then_follows_live_events(
     workflow_client: TestClient,
 ) -> None:

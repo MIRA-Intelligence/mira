@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from .confirmations import confirmation_approved, confirmation_required
 from .experiments import ExperimentRecord, experiment_boundary_decision, manual_experiments
 from .input_paths import normalize_input_paths
+from .journals import normalize_journal_selection
 from .models import (
     MODULE_TYPES,
     Actor,
@@ -163,6 +164,11 @@ class WorkflowService:
             duplicate = self._duplicate_receipt(command_id, workflow)
             if duplicate:
                 return duplicate
+            if module_data and ("target_journal" in module_data or "journal_profile_version" in module_data):
+                try:
+                    module_data = normalize_journal_selection(module_type, module_data)
+                except ValueError as exc:
+                    raise WorkflowError("invalid_journal_selection", str(exc), status=422) from exc
             if module_data and "external_read_paths" in module_data:
                 module_data = self._validate_input_paths(module_type, module_data)
             self._check_revision(workflow.revision, expected_revision, "project")
@@ -781,6 +787,16 @@ class WorkflowService:
             ] if previous else [*records, record]
             return status, "run.experiment_recorded", "applied"
         if command == "update_draft" and status == "created":
+            proposed = {**run.module_data, **(payload.get("module_data") or {})}
+            try:
+                proposed = normalize_journal_selection(run.module_type, proposed)
+            except ValueError as exc:
+                raise WorkflowError("invalid_journal_selection", str(exc), status=422) from exc
+            if proposed.get("target_journal"):
+                payload = dict(payload, module_data={
+                    **(payload.get("module_data") or {}),
+                    "journal_profile_version": proposed["journal_profile_version"],
+                })
             if "external_read_paths" in (payload.get("module_data") or {}):
                 payload = dict(payload, module_data=self._validate_input_paths(run.module_type, payload["module_data"]))
             mode = (payload.get("module_data") or {}).get("experiment_execution_mode", "auto")
