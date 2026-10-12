@@ -86,7 +86,9 @@ async def test_base_loop_processes_message_without_research_metadata(
     """
     loop = _make_base_loop(tmp_path)
 
-    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None,
+                        completion_guard=None, turn_stop_guard=None):
+        assert completion_guard is None and turn_stop_guard is None
         return "done", [], messages + [{"role": "assistant", "content": "done"}]
 
     monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
