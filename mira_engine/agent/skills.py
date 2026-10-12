@@ -173,7 +173,7 @@ class SkillsLoader:
 
         return None
 
-    def load_skills_for_context(self, skill_names: list[str]) -> str:
+    def load_skills_for_context(self, skill_names: list[str], *, loaded_skills: list[str] | None = None) -> str:
         """
         Load specific skills for inclusion in agent context.
 
@@ -188,7 +188,10 @@ class SkillsLoader:
             content = self.load_skill(name)
             if content:
                 content = self._strip_frontmatter(content)
-                parts.append(f"### Skill: {name}\n\n{content}")
+                if content.strip():
+                    parts.append(f"### Skill: {name}\n\n{content}")
+                    if loaded_skills is not None:
+                        loaded_skills.append(name)
 
         return "\n\n---\n\n".join(parts) if parts else ""
 

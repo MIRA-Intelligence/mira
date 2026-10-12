@@ -915,7 +915,10 @@ async def test_native_executor_enriches_skill_audit_with_run_policy_identity(
         audit_hook=audit_hook,
     )
 
-    assert audit_events == [
+    loaded = [event for event in audit_events if event.get("loaded")]
+    assert any(event["skill_name"] == "audit-policy" and event["source"] == "read_file" for event in loaded)
+    assert all(event["run_id"] == run_id and event["module_type"] == "experiment" for event in loaded)
+    assert [event for event in audit_events if not event.get("loaded")] == [
         {
             "project_id": service.repository.project_id,
             "run_id": run_id,

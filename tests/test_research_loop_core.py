@@ -803,6 +803,8 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     out = await loop._process_message(msg, on_progress=_progress)
     assert out.content == "round-2"
     intermediate = await loop.bus.consume_outbound()
+    while intermediate.metadata.get("_audit_only"):
+        intermediate = await loop.bus.consume_outbound()
     assert intermediate.channel == "ui"
     assert intermediate.chat_id == "PRJ-5"
     assert intermediate.content == "round-1"
