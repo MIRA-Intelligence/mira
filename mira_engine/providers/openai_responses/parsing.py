@@ -11,6 +11,7 @@ import json_repair
 from loguru import logger
 
 from mira_engine.providers.base import LLMResponse, ToolCallRequest
+from mira_engine.providers.usage import extract_usage
 
 FINISH_REASON_MAP = {
     "completed": "stop",
@@ -183,17 +184,7 @@ def parse_response_output(response: Any) -> LLMResponse:
                 arguments=args if isinstance(args, dict) else {},
             ))
 
-    usage_raw = response.get("usage") or {}
-    if not isinstance(usage_raw, dict):
-        dump = getattr(usage_raw, "model_dump", None)
-        usage_raw = dump() if callable(dump) else vars(usage_raw)
-    usage = {}
-    if usage_raw:
-        usage = {
-            "prompt_tokens": int(usage_raw.get("input_tokens") or 0),
-            "completion_tokens": int(usage_raw.get("output_tokens") or 0),
-            "total_tokens": int(usage_raw.get("total_tokens") or 0),
-        }
+    usage = extract_usage(response)
 
     status = response.get("status")
     finish_reason = map_finish_reason(status)
@@ -271,18 +262,12 @@ async def consume_sdk_stream(
                         arguments=args,
                     )
                 )
-        elif event_type == "response.completed":
+        elif event_type in {"response.completed", "response.incomplete"}:
             resp = getattr(event, "response", None)
             status = getattr(resp, "status", None) if resp else None
             finish_reason = map_finish_reason(status)
             if resp:
-                usage_obj = getattr(resp, "usage", None)
-                if usage_obj:
-                    usage = {
-                        "prompt_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
-                        "completion_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
-                        "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
-                    }
+                usage = extract_usage(resp)
                 for out_item in getattr(resp, "output", None) or []:
                     if getattr(out_item, "type", None) == "reasoning":
                         for s in getattr(out_item, "summary", None) or []:

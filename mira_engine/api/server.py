@@ -157,7 +157,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     session_locks: dict[str, asyncio.Lock] = request.app["session_locks"]
     session_lock = session_locks.setdefault(f"{lock_project}:{session_key}", asyncio.Lock())
 
-    logger.info("API request session_key={} content={}", session_key, user_content[:80])
+    logger.info("API request received (content length={})", len(user_content))
 
     fallback = EMPTY_FINAL_RESPONSE_MESSAGE
 
@@ -245,7 +245,9 @@ def create_app(
         model_name: Model name reported in responses.
         request_timeout: Per-request timeout in seconds.
     """
-    app = web.Application()
+    from mira_engine.observability import request_middleware
+
+    app = web.Application(middlewares=[request_middleware()])
     app["agent_loop"] = agent_loop
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout

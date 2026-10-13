@@ -1180,7 +1180,9 @@ class UiChannel(BaseChannel):
     async def start(self) -> None:
         self._kill_stale_listener()
 
-        self._app = web.Application(middlewares=[self._cors_middleware])
+        from mira_engine.observability import request_middleware
+
+        self._app = web.Application(middlewares=[self._cors_middleware, request_middleware()])
         self._app.router.add_get("/ws", self._ws_handler)
         self._app.router.add_get("/health", self._handle_health)
         self._app.router.add_get("/version", self._handle_version)
@@ -1190,6 +1192,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/sessions", self._handle_sessions)
         self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
         self._app.router.add_get("/api/sessions/{session_id}/skills", self._handle_skill_history)
+        self._app.router.add_get("/api/sessions/{session_id}/usage", self._handle_token_usage)
         self._app.router.add_get(
             "/api/sessions/{session_id}/context-preview",
             self._handle_chat_context_preview,
@@ -1301,6 +1304,16 @@ class UiChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         metadata = msg.metadata or {}
+        if metadata.get("_usage_only"):
+            # Do not append a chat message, toggle streaming, or refresh workflow state.
+            ws = self._clients.get(msg.chat_id)
+            if ws is not None and not ws.closed:
+                try:
+                    await ws.send_json({"type": "token_usage", "session_id": msg.chat_id,
+                                        "content": "", "metadata": {"token_usage": metadata.get("token_usage")}})
+                except Exception:
+                    logger.debug("Token usage delivery deferred to snapshot")
+            return
 
         workflow_run_id = metadata.get("workflow_run_id")
         workflow_project_id = metadata.get("project_id")
@@ -1707,14 +1720,19 @@ class UiChannel(BaseChannel):
             resp.headers["Access-Control-Allow-Origin"] = origin
 
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Mira-Request-Id"
+        resp.headers["Access-Control-Expose-Headers"] = "X-Mira-Request-Id"
         return resp
 
     # ── WebSocket handler ────────────────────────────────────────────
 
     async def _ws_handler(self, request: web.Request) -> web.WebSocketResponse:
+        from mira_engine.observability import correlation_id, emit_event
+
+        connection_id = correlation_id()
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        emit_event("websocket.connected", connection_id=connection_id)
 
         session_id: str | None = None
 
@@ -1729,6 +1747,11 @@ class UiChannel(BaseChannel):
                 continue
 
             msg_type = data.get("type")
+            data["request_id"] = correlation_id(data.get("request_id"))
+            emit_event("websocket.received", connection_id=connection_id,
+                       request_id=data["request_id"], operation=msg_type if isinstance(msg_type, str) and msg_type in {
+                           "stop", "skill_fallback_response", "message", "user_input", "chat", "bind", "plan_decision", "plan_answers",
+                       } else "unknown")
 
             if msg_type == "stop":
                 session_id = data.get("session_id", session_id)
@@ -1759,7 +1782,7 @@ class UiChannel(BaseChannel):
                     chat_id=session_id,
                     content="/stop",
                     media=[],
-                    metadata=metadata,
+                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
                     session_key=f"ui:{session_id}",
                 )
             elif msg_type == "skill_fallback_response":
@@ -1823,7 +1846,7 @@ class UiChannel(BaseChannel):
                     chat_id=session_id,
                     content="The user approved the proposed Skill fallback. Continue only with that fallback.",
                     media=[],
-                    metadata=metadata,
+                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
                     session_key=f"ui:{session_id}",
                 )
             elif msg_type == "message":
@@ -2070,7 +2093,7 @@ class UiChannel(BaseChannel):
                     chat_id=session_id,
                     content=content,
                     media=media,
-                    metadata=metadata,
+                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
                     session_key=(
                         f"ui:{session_id}:run:{workflow_run_id}"
                         if workflow_run is not None
@@ -2121,7 +2144,7 @@ class UiChannel(BaseChannel):
                     chat_id=session_id,
                     content="__set_mode__",
                     media=[],
-                    metadata=metadata,
+                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
                     session_key=f"ui:{session_id}",
                 )
             elif msg_type == "plan_answer":
@@ -2185,7 +2208,7 @@ class UiChannel(BaseChannel):
                     chat_id=session_id,
                     content="__plan_answer__",
                     media=[],
-                    metadata=metadata,
+                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
                     session_key=f"ui:{session_id}",
                 )
             elif msg_type == "plan_decision":
@@ -2259,7 +2282,7 @@ class UiChannel(BaseChannel):
                     chat_id=session_id,
                     content="__plan_decision__",
                     media=[],
-                    metadata=metadata,
+                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
                     session_key=f"ui:{session_id}",
                 )
             elif msg_type == "bind":
@@ -2282,6 +2305,7 @@ class UiChannel(BaseChannel):
                 )
 
         # Client disconnected
+        emit_event("websocket.disconnected", connection_id=connection_id, code=getattr(ws, "close_code", None))
         if session_id and self._clients.get(session_id) is ws:
             del self._clients[session_id]
             self._client_project_dirs.pop(session_id, None)
@@ -2317,6 +2341,7 @@ class UiChannel(BaseChannel):
         return web.json_response({
             "service": "mira-gateway",
             "agent_version": __version__,
+            "diagnostics_contract": 1,
             "api_contract": _API_CONTRACT_VERSION,
             "uptime_seconds": int(max(time.monotonic() - self._boot_ts, 0)),
             "engine_sha256": identity.get("engine_sha256"),
@@ -2514,6 +2539,21 @@ class UiChannel(BaseChannel):
             "run_id": details.get("workflow_run_id"), "module_type": details.get("module_type"),
             "turn_id": details.get("turn_id"), "agent": details.get("agent"),
         }
+
+    async def _handle_token_usage(self, request: web.Request) -> web.Response:
+        from mira_engine.agent.token_usage import TokenUsageStore
+
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        directory = self._resolve_project_dir(session_id) or self.workspace
+        if directory is None:
+            return web.json_response({"error": "workspace unavailable"}, status=503)
+        try:
+            snapshot = await asyncio.to_thread(TokenUsageStore(directory).snapshot, session_id)
+        except Exception:
+            return web.json_response({"error": "usage unavailable"}, status=503)
+        return web.json_response(snapshot)
 
     async def _handle_skill_history(self, request: web.Request) -> web.Response:
         """Page backwards through persisted load facts, never infer success from old audits."""

@@ -144,6 +144,28 @@ async def test_skill_load_history_persist_stream_paginate_and_isolate(ui_channel
     assert json.loads((await ui_channel._handle_skill_history(request)).text)["events"] == []
 
 
+async def test_token_usage_snapshot_and_side_effect_free_push(ui_channel):
+    from mira_engine.agent.token_usage import TokenUsageStore
+
+    snapshot = TokenUsageStore(ui_channel.workspace).record("chat-test", "", "model",
+        {"prompt_tokens": 120, "completion_tokens": 3, "total_tokens": 123, "cached_tokens": 100})
+    ws = SimpleNamespace(closed=False, send_json=AsyncMock())
+    ui_channel._clients["chat-test"] = ws
+    ui_channel._workflow_api.broadcast_activity = AsyncMock()
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="chat-test", content="", metadata={
+        "_usage_only": True, "token_usage": snapshot, "workflow_run_id": "run", "project_id": "project",
+    }))
+    assert ws.send_json.call_args.args[0]["type"] == "token_usage"
+    assert ws.send_json.call_args.args[0]["metadata"]["token_usage"] == snapshot
+    assert snapshot["cached_tokens"] == 100
+    assert snapshot["cache_reported_calls"] == 1
+    ui_channel._workflow_api.broadcast_activity.assert_not_called()
+    response = await ui_channel._handle_token_usage(SimpleNamespace(match_info={"session_id": "chat-test"}))
+    assert json.loads(response.text) == snapshot
+    response = await ui_channel._handle_token_usage(SimpleNamespace(match_info={"session_id": "other"}))
+    assert json.loads(response.text)["total_tokens"] == 0
+
+
 def test_load_ui_instructions_skips_missing_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(ui_channel_mod, "_ASSETS_DIR", tmp_path)
     (tmp_path / "AGENTS_UI.md").write_text("only", encoding="utf-8")

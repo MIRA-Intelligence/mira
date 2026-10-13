@@ -20,6 +20,7 @@ from loguru import logger
 from mira_engine.agent.base_loop import UNIFIED_SESSION_KEY, BaseAgentLoop
 from mira_engine.agent.context import ContextBuilder
 from mira_engine.agent.skill_events import skill_loaded
+from mira_engine.agent.token_usage import track_token_usage
 from mira_engine.agent.tools.message import MessageTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.command.router import CommandContext
@@ -1187,6 +1188,7 @@ class ResearchAgentLoop(BaseAgentLoop):
     # _process_message override (research orchestration)
     # ------------------------------------------------------------------
 
+    @track_token_usage
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1432,7 +1434,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             limit=3,
         )
         active_skills: list[str] = []
-        for name in [*selected_skills, *suggested_skills, *recent_skill_names]:
+        for name in [*selected_skills, *suggested_skills]:
             if name not in active_skills:
                 active_skills.append(name)
         active_skills = active_skills[:8]
@@ -1797,13 +1799,9 @@ class ResearchAgentLoop(BaseAgentLoop):
             final_content = "I've completed processing but have no response to give."
 
         if isinstance(session.metadata, dict):
-            prior = session.metadata.get("_recent_skills")
             merged: list[str] = []
-            if isinstance(prior, list):
-                for item in prior:
-                    if isinstance(item, str) and item not in merged:
-                        merged.append(item)
-            for item in [*selected_skills, *sorted(current_turn_skills)]:
+            # Remember this task's skills, not an ever-growing list of old topics.
+            for item in [*(name for name in active_skills if name in loaded_skills), *sorted(current_turn_skills)]:
                 if item not in merged:
                     merged.append(item)
             session.metadata["_recent_skills"] = merged[-10:]

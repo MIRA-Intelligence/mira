@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from loguru import logger
 
 from mira_engine.agent.runner import AgentRunner, AgentRunSpec
+from mira_engine.agent.token_usage import record_token_usage
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.utils.gitstore import GitStore
 from mira_engine.utils.helpers import (
@@ -646,6 +647,7 @@ You MUST analyze the knowledge and separate it:
                     tool_choice=_SAVE_MEMORY_TOOL_CHOICE,
                     model=model,
                 )
+                await record_token_usage(response.usage, model)
                 args = self._extract_save_memory_args(response)
                 if args is not None:
                     break
@@ -792,6 +794,7 @@ class Consolidator:
                 tools=None,
                 tool_choice=None,
             )
+            await record_token_usage(response.usage, self.model)
             self.store.append_history(response.content or "[no summary]")
             return True
         except Exception:
@@ -911,6 +914,7 @@ class Dream:
                 tools=None,
                 tool_choice=None,
             )
+            await record_token_usage(phase1_response.usage, self.model)
             analysis = phase1_response.content or ""
         except Exception:
             logger.exception("Dream Phase 1 failed")

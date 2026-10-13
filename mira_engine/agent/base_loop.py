@@ -27,7 +27,10 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from mira_engine.observability import correlation_id, diagnostic_context, emit_event, opaque_ref
+
 from mira_engine.agent.context import ContextBuilder
+from mira_engine.agent.token_usage import record_token_usage, track_token_usage
 from mira_engine.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from mira_engine.agent.memory import Consolidator, Dream, MemoryStore
 from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
@@ -841,6 +844,7 @@ class BaseAgentLoop:
                         max_tokens=self.max_tokens,
                         reasoning_effort=self.reasoning_effort,
                     )
+            await record_token_usage(response.usage, getattr(active_route, "model", None) or self.model)
             if isinstance(response.usage, dict):
                 self._last_usage = {
                     "prompt_tokens": int(response.usage.get("prompt_tokens", 0) or 0),
@@ -883,8 +887,9 @@ class BaseAgentLoop:
 
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                    logger.info("Tool call: {} (arguments omitted)", tool_call.name)
+                    tool_started = time.monotonic()
+                    emit_event("tool.started", tool=tool_call.name)
                     if audit_hook:
                         skill_event = self._build_skill_invoked_event(
                             tool_name=tool_call.name,
@@ -900,7 +905,12 @@ class BaseAgentLoop:
                         scope = manager.skill_audit_scope(audit_hook) if manager is not None else nullcontext()
                         with scope:
                             result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    except BaseException as exc:
+                        emit_event("tool.failed", level="ERROR", tool=tool_call.name, exception=exc)
+                        raise
                     finally:
+                        emit_event("tool.finished", tool=tool_call.name,
+                                   duration_ms=round((time.monotonic() - tool_started) * 1000, 2))
                         if ping_task is not None:
                             ping_task.cancel()
                             with suppress(asyncio.CancelledError):
@@ -931,7 +941,8 @@ class BaseAgentLoop:
             else:
                 clean = self._strip_think(response.content)
                 if response.finish_reason == "error":
-                    logger.error("LLM returned error: {}", (clean or "")[:200])
+                    logger.error("LLM returned an error (response content omitted)")
+                    emit_event("provider.failed", level="ERROR", reason="error_finish_reason")
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     # Save a neutral placeholder so the session doesn't end
                     # with an orphaned user message (consecutive users cause
@@ -1157,6 +1168,26 @@ class BaseAgentLoop:
         return cancelled, sub_cancelled, background_cancelled
 
     async def _dispatch(self, msg: InboundMessage) -> None:
+        metadata = msg.metadata or {}
+        request_id = correlation_id(metadata.get("_diagnostic_request_id"))
+        started = time.monotonic()
+        with diagnostic_context(request_id=request_id, run_id=correlation_id(),
+                                session_ref=opaque_ref(msg.session_key), channel=msg.channel,
+                                workflow_run_id=metadata.get("workflow_run_id")):
+            emit_event("agent.dispatch.started")
+            try:
+                await self._dispatch_with_context(msg)
+            except asyncio.CancelledError:
+                emit_event("agent.dispatch.cancelled")
+                raise
+            except Exception as exc:
+                emit_event("agent.dispatch.failed", level="ERROR", exception=exc)
+                raise
+            finally:
+                emit_event("agent.dispatch.finished",
+                           duration_ms=round((time.monotonic() - started) * 1000, 2))
+
+    async def _dispatch_with_context(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
         if getattr(self, "_unified_session", False) and not msg.session_key_override:
             msg.session_key_override = UNIFIED_SESSION_KEY
@@ -1247,6 +1278,7 @@ class BaseAgentLoop:
                 raise asyncio.CancelledError() from None
             except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                emit_event("agent.turn.failed", level="ERROR", exception=exc)
                 await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
             return
         async with self._processing_lock:
@@ -1268,6 +1300,7 @@ class BaseAgentLoop:
                 raise asyncio.CancelledError() from None
             except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                emit_event("agent.turn.failed", level="ERROR", exception=exc)
                 await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
 
     async def _warm_skill_scan_cache(self) -> None:
@@ -1314,6 +1347,7 @@ class BaseAgentLoop:
         self._session_model_runtimes.pop(session_key, None)
         self._session_model_runtimes.pop(f"{session_key}:role:supervisor", None)
 
+    @track_token_usage
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1364,8 +1398,7 @@ class BaseAgentLoop:
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Processing message on {} (content length={})", msg.channel, len(msg.content))
 
         meta = msg.metadata or {}
         project_ref = self._project_ref_from_metadata(meta)
@@ -1488,7 +1521,7 @@ class BaseAgentLoop:
             limit=3,
         )
         active_skills: list[str] = []
-        for name in [*selected_skills, *suggested_skills, *recent_skill_names]:
+        for name in [*selected_skills, *suggested_skills]:
             if name not in active_skills:
                 active_skills.append(name)
         active_skills = active_skills[:8]
@@ -1622,13 +1655,9 @@ class BaseAgentLoop:
             final_content = "I've completed processing but have no response to give."
 
         if isinstance(session.metadata, dict):
-            prior = session.metadata.get("_recent_skills")
             merged: list[str] = []
-            if isinstance(prior, list):
-                for item in prior:
-                    if isinstance(item, str) and item not in merged:
-                        merged.append(item)
-            for item in [*selected_skills, *sorted(current_turn_skills)]:
+            # Remember this task's skills, not an ever-growing list of old topics.
+            for item in [*(name for name in active_skills if name in loaded_skills), *sorted(current_turn_skills)]:
                 if item not in merged:
                     merged.append(item)
             session.metadata["_recent_skills"] = merged[-10:]
@@ -1639,8 +1668,7 @@ class BaseAgentLoop:
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Response on {} (content length={})", msg.channel, len(final_content))
         outbound_meta = dict(msg.metadata or {})
         fallback_prefix = "MIRA_SKILL_FALLBACK_REQUIRED:"
         if selected_skills and final_content.lstrip().startswith(fallback_prefix):
@@ -1799,7 +1827,6 @@ class BaseAgentLoop:
         so callers can inject CLI flags (``run_mode``, ``agent_profile``,
         ``automation_policy``, ``project_dir``, …) that subclasses interpret.
         """
-        await self._connect_mcp()
         msg = InboundMessage(
             channel=channel,
             sender_id="user",
@@ -1807,12 +1834,26 @@ class BaseAgentLoop:
             content=content,
             metadata=dict(metadata or {}),
         )
-        response = await self._process_message(
-            msg,
-            session_key=session_key,
-            on_progress=on_progress,
-            audit_hook=audit_hook,
-        )
+        with diagnostic_context(run_id=correlation_id(), session_ref=opaque_ref(session_key), channel=channel):
+            emit_event("agent.direct.started")
+            started = time.monotonic()
+            try:
+                await self._connect_mcp()
+                response = await self._process_message(
+                    msg,
+                    session_key=session_key,
+                    on_progress=on_progress,
+                    audit_hook=audit_hook,
+                )
+            except asyncio.CancelledError:
+                emit_event("agent.direct.cancelled")
+                raise
+            except Exception as exc:
+                emit_event("agent.direct.failed", level="ERROR", exception=exc)
+                raise
+            finally:
+                emit_event("agent.direct.finished",
+                           duration_ms=round((time.monotonic() - started) * 1000, 2))
         if response is None:
             return ""
         if isinstance(response, OutboundMessage) and isinstance(content, str) and content.strip().startswith("/"):
