@@ -8,6 +8,7 @@ from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
 from mira_engine.cron.types import CronSchedule
+from mira_engine.security.gateway_auth import DEFAULT_ALLOWED_ORIGINS
 
 
 def _default_workspace() -> str:
@@ -245,7 +246,8 @@ class UiChannelConfig(Base):
 
     enabled: bool = False
     allow_from: list[str] = Field(default_factory=list)
-    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    # Browser origins allowed to call the gateway; "*" accepts any site (unsafe).
+    cors_origins: list[str] = Field(default_factory=lambda: list(DEFAULT_ALLOWED_ORIGINS))
     feedback: UiFeedbackConfig = Field(default_factory=UiFeedbackConfig)
     project_storage: Literal["user_selectable", "managed"] = "user_selectable"
     managed_project_root: str | None = None
@@ -508,8 +510,10 @@ class ApiConfig(Base):
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"  # Local-only by default; servers opt in to 0.0.0.0.
     port: int = 18790
+    # Overrides the generated <MIRA_HOME>/runtime/gateway-token; env MIRA_GATEWAY_TOKEN wins.
+    auth_token: str = ""
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
