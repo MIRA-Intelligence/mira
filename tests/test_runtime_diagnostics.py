@@ -166,3 +166,158 @@ os.kill(os.getpid(), signal.SIGABRT)
     fault = next(tmp_path.glob("fault-*.log")).read_text()
     assert "Fatal Python error" in fault
     assert '<module>' in fault
+
+
+def test_library_warnings_stay_on_stderr_when_root_has_no_handlers(tmp_path, monkeypatch, capsys):
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    runtime = diagnostics.RuntimeDiagnostics(tmp_path, mode="test", capture_faults=False)
+    try:
+        logging.getLogger("aiohttp.server").error("Error handling request")
+    finally:
+        runtime.close()
+    assert "Error handling request" in capsys.readouterr().err
+    assert root.handlers == []
+    assert any(event["event"] == "runtime.standard_log" for event in rows(runtime))
+
+
+def test_existing_root_handlers_do_not_get_a_second_stderr_handler(runtime):
+    assert runtime._stderr_handler is None
+
+
+@pytest.mark.asyncio
+async def test_asyncio_exception_is_recorded_once(runtime):
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    runtime.install_asyncio_handler(loop)
+    try:
+        loop.call_exception_handler({"message": "Task exception was never retrieved",
+                                     "exception": RuntimeError("private")})
+    finally:
+        loop.set_exception_handler(previous)
+    events = [event["event"] for event in rows(runtime)]
+    assert events.count("asyncio.unhandled_exception") == 1
+    assert "runtime.standard_log" not in events
+
+
+def _service_log(tmp_path, lines):
+    path = tmp_path / "agent-service.log"
+    path.write_text("\n".join(lines) + "\n")
+    return diagnostics.structured_service_tail(path)
+
+
+def test_service_tail_only_exports_service_manager_rows(tmp_path):
+    lifecycle = {"schema_version": 1, "component": "engine-service", "pid": 4, "request_id": "r-1",
+                 "timestamp": "2026-10-13T15:21:03+00:00", "event": "start_service", "running": True}
+    exported = _service_log(tmp_path, [
+        json.dumps(lifecycle),
+        # structlog-style stderr from an MCP server: "event" is free text.
+        json.dumps({"event": "Patient John Doe, dx: HIV", "timestamp": "2026-10-13T15:21:03Z"}),
+        json.dumps({**lifecycle, "event": "Patient John Doe"}),
+        json.dumps({**lifecycle, "timestamp": {"note": "sk-live secret prompt"}}),
+        json.dumps({**lifecycle, "component": "mcp"}),
+        json.dumps({**lifecycle, "schema_version": 2}),
+    ])
+    assert [json.loads(line) for line in exported.splitlines()] == [{
+        "timestamp": "2026-10-13T15:21:03+00:00", "event": "start_service",
+        "request_id": "r-1", "pid": 4, "running": True,
+    }]
+    assert "Patient" not in exported and "sk-live" not in exported
+
+
+def test_service_tail_skips_deeply_nested_json(tmp_path):
+    lifecycle = {"schema_version": 1, "component": "engine-service",
+                 "timestamp": "2026-10-13T15:21:03+00:00", "event": "stop_service"}
+    exported = _service_log(tmp_path, ["[" * 50_000, "{" + '"a":[' * 50_000, json.dumps(lifecycle)])
+    assert [json.loads(line)["event"] for line in exported.splitlines()] == ["stop_service"]
+
+
+def test_opaque_ref_is_keyed_per_install(tmp_path):
+    first = diagnostics.RuntimeDiagnostics(tmp_path / "a", mode="test", capture_faults=False)
+    again = diagnostics.RuntimeDiagnostics(tmp_path / "a", mode="test", capture_faults=False)
+    other = diagnostics.RuntimeDiagnostics(tmp_path / "b", mode="test", capture_faults=False)
+    try:
+        session = "whatsapp:15551234567@s.whatsapp.net"
+        import hashlib
+        unsalted = hashlib.sha256(session.encode()).hexdigest()[:16]
+        ref = diagnostics.opaque_ref(session, key=first.ref_key)
+        assert ref != unsalted
+        assert ref == diagnostics.opaque_ref(session, key=again.ref_key)
+        assert ref != diagnostics.opaque_ref(session, key=other.ref_key)
+        key_file = tmp_path / "a" / diagnostics.REF_KEY_FILE
+        assert key_file.read_bytes() == first.ref_key
+        if os.name != "nt":
+            assert key_file.stat().st_mode & 0o777 == 0o600
+        assert not list((tmp_path / "a").glob(".ref.key.*"))
+    finally:
+        for runtime in (first, again, other):
+            runtime.close()
+
+
+def test_opaque_ref_uses_active_runtime_key(runtime):
+    assert diagnostics.opaque_ref("ui:s-1") == diagnostics.opaque_ref("ui:s-1", key=runtime.ref_key)
+
+
+def test_unreadable_ref_key_falls_back_to_process_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(diagnostics.Path, "read_bytes",
+                        lambda self: (_ for _ in ()).throw(PermissionError("denied")))
+    assert diagnostics.load_ref_key(tmp_path) == diagnostics._process_ref_key
+
+
+def test_corrupt_ref_key_is_replaced(tmp_path):
+    (tmp_path / diagnostics.REF_KEY_FILE).write_bytes(b"short")
+    key = diagnostics.load_ref_key(tmp_path)
+    assert len(key) == 32
+    assert diagnostics.load_ref_key(tmp_path) == key
+
+
+def test_export_tolerates_runtime_file_vanishing_mid_export(tmp_path, monkeypatch):
+    manager = LocalServiceManager(AgentPaths.for_home(tmp_path))
+    manager.install_service()
+    directory = manager.paths.root / "logs" / "runtime"
+    runtime = diagnostics.RuntimeDiagnostics(directory, mode="test", capture_faults=False)
+    runtime.write("export.probe")
+    runtime.close()
+    vanished = directory / f"engine-1-{'a' * 32}.jsonl.1"
+    vanished.write_text("{}\n")
+    real_lstat = diagnostics.Path.lstat
+
+    def lstat(self):
+        if self.name == vanished.name:
+            raise FileNotFoundError(self)
+        return real_lstat(self)
+
+    monkeypatch.setattr(diagnostics.Path, "lstat", lstat)
+    code, bundle = manager.export_diagnostics()
+    assert code == 0
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+    assert {"file": vanished.name, "error_type": "FileNotFoundError"} in manifest["errors"]
+    assert runtime.path.name in manifest["runtime_files"]
+    if os.name != "nt":
+        assert os.stat(bundle).st_mode & 0o777 == 0o600
+
+
+def test_failed_export_leaves_no_bundle(tmp_path, monkeypatch):
+    manager = LocalServiceManager(AgentPaths.for_home(tmp_path))
+    manager.install_service()
+    monkeypatch.setattr(manager, "_write_diagnostics_bundle",
+                        lambda *_args: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError):
+        manager.export_diagnostics()
+    assert not list((manager.paths.runtime_dir / "diagnostics").glob("*.zip"))
+
+
+def test_lifecycle_events_from_one_command_share_a_request_id(tmp_path, monkeypatch):
+    import mira_engine.cli.agent_service as agent_service
+
+    monkeypatch.delenv("MIRA_DIAGNOSTIC_REQUEST_ID", raising=False)
+    monkeypatch.setattr(agent_service, "_lifecycle_request_id", None)
+    manager = LocalServiceManager(AgentPaths.for_home(tmp_path))
+    manager._append_log("install_service")
+    manager._append_log("start_service")
+    monkeypatch.setenv("MIRA_DIAGNOSTIC_REQUEST_ID", "desktop-req-9")
+    manager._append_log("stop_service")
+    ids = [json.loads(line)["request_id"] for line in manager.paths.log_file.read_text().splitlines()]
+    assert ids[0] == ids[1] != "desktop-req-9"
+    assert ids[2] == "desktop-req-9"

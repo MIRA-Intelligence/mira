@@ -7,6 +7,7 @@ import atexit
 import contextvars
 import faulthandler
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -28,9 +29,16 @@ MAX_LOG_BYTES = 2 * 1024 * 1024
 LOG_BACKUPS = 3
 MAX_RUNTIME_FILES = 32
 MAX_TAIL_BYTES = 128 * 1024
+REF_KEY_FILE = "ref.key"
 _context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("mira_diagnostics", default={})
+# Set while asyncio's default handler logs an exception already recorded as an event.
+_mirrored: contextvars.ContextVar[bool] = contextvars.ContextVar("mira_diagnostics_mirrored", default=False)
 _runtime: RuntimeDiagnostics | None = None
+# Used only when no runtime directory holds a per-install key; refs then stay per process.
+_process_ref_key = os.urandom(32)
 _ID = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
+_SERVICE_EVENT = re.compile(r"[a-z][a-z0-9_.]{0,63}\Z")
+_ISO_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})\Z")
 _FIELDS = frozenset({
     "request_id", "run_id", "connection_id", "session_ref", "workflow_run_id",
     "channel", "tool", "method", "route", "status", "duration_ms", "outcome",
@@ -52,8 +60,50 @@ def correlation_id(value: Any = None) -> str:
     return value if isinstance(value, str) and _ID.fullmatch(value) else uuid.uuid4().hex
 
 
-def opaque_ref(value: Any) -> str:
-    return hashlib.sha256(str(value).encode()).hexdigest()[:16]
+def opaque_ref(value: Any, *, key: bytes | None = None) -> str:
+    """Keyed so exported refs cannot be brute-forced back to phone numbers or paths."""
+    if key is None:
+        key = _runtime.ref_key if _runtime is not None else _process_ref_key
+    return hmac.new(key, str(value).encode(), hashlib.sha256).hexdigest()[:16]
+
+
+def load_ref_key(directory: Path) -> bytes:
+    """Return the per-install ref key, creating it atomically so racing processes agree."""
+    path = Path(directory) / REF_KEY_FILE
+    try:
+        key = path.read_bytes()
+        if len(key) == 32:
+            return key
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return _process_ref_key
+    key = os.urandom(32)
+    temp = path.with_name(f".{REF_KEY_FILE}.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        descriptor = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(key)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            # link() never replaces a key another process published first.
+            os.link(temp, path)
+        except FileExistsError:
+            existing = path.read_bytes()
+            if len(existing) == 32:
+                return existing
+            os.replace(temp, path)
+        except OSError:
+            os.replace(temp, path)
+        return key
+    except OSError:
+        return _process_ref_key
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def redact(value: Any, *, _depth: int = 0) -> Any:
@@ -126,16 +176,29 @@ def read_tail(path: Path, limit: int = MAX_TAIL_BYTES) -> str:
 
 
 def structured_service_tail(path: Path) -> str:
-    """Old stderr may contain user content. Export only lifecycle JSON metadata."""
+    """Old stderr may contain user content. Export only lifecycle JSON metadata.
+
+    Raw stderr from MCP servers or scripts can itself be JSON with an ``event`` key
+    (structlog's default), so only the service manager's own schema is accepted.
+    """
     rows = []
     for line in read_tail(path).splitlines()[-200:]:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
         try:
             row = json.loads(line)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             continue
-        if isinstance(row, dict) and isinstance(row.get("event"), str):
-            rows.append(json.dumps({"timestamp": row.get("timestamp"), "event": row["event"],
-                                    **safe_fields(row)}, ensure_ascii=False))
+        if not (isinstance(row, dict) and row.get("component") == "engine-service"
+                and row.get("schema_version") == SCHEMA_VERSION):
+            continue
+        event, timestamp = row.get("event"), row.get("timestamp")
+        if not (isinstance(event, str) and _SERVICE_EVENT.fullmatch(event)
+                and isinstance(timestamp, str) and _ISO_TIMESTAMP.fullmatch(timestamp)):
+            continue
+        rows.append(json.dumps({"timestamp": timestamp, "event": event, **safe_fields(row)},
+                               ensure_ascii=False))
     return "\n".join(rows) + ("\n" if rows else "")
 
 
@@ -157,6 +220,8 @@ class StandardLogHandler(logging.Handler):
         self.runtime = runtime
 
     def emit(self, record: logging.LogRecord) -> None:
+        if _mirrored.get():
+            return
         self.runtime.write("runtime.standard_log", level=record.levelname,
                            exception=record.exc_info[1] if record.exc_info else None,
                            reason=f"{record.name}:{record.funcName}:{record.lineno}")
@@ -171,10 +236,11 @@ class RuntimeDiagnostics:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.boot_id = uuid.uuid4().hex
         self.path = self.directory / f"engine-{os.getpid()}-{self.boot_id}.jsonl"
+        self.ref_key = load_ref_key(self.directory)
         self.identity = {"schema_version": SCHEMA_VERSION, "component": "engine",
                          "boot_id": self.boot_id, "pid": os.getpid(),
                          "version": __version__, "mode": mode,
-                         "instance_ref": opaque_ref(self.directory.resolve())}
+                         "instance_ref": opaque_ref(self.directory.resolve(), key=self.ref_key)}
         self.write_errors = 0
         self._closed = False
         self._handler = DiagnosticFileHandler(self.path, maxBytes=max_bytes, backupCount=backups,
@@ -185,7 +251,15 @@ class RuntimeDiagnostics:
         self._sink_id = logger.add(self._loguru_sink, level="INFO", diagnose=False, backtrace=False,
                                    catch=True)
         self._standard_handler = StandardLogHandler(self)
-        logging.getLogger().addHandler(self._standard_handler)
+        root = logging.getLogger()
+        # A root handler disables logging.lastResort. Keep library warnings visible on
+        # stderr (and so in agent-service.log) as they were before diagnostics started.
+        self._stderr_handler: logging.Handler | None = None
+        if not root.handlers:
+            self._stderr_handler = logging.StreamHandler(sys.stderr)
+            self._stderr_handler.setLevel(logging.WARNING)
+            root.addHandler(self._stderr_handler)
+        root.addHandler(self._standard_handler)
         self._old_sys_hook = sys.excepthook
         self._old_thread_hook = threading.excepthook
         self._sys_hook = self._on_uncaught
@@ -261,10 +335,14 @@ class RuntimeDiagnostics:
         def handler(active_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
             self.write("asyncio.unhandled_exception", level="ERROR",
                        exception=context.get("exception"))
-            if previous is not None:
-                previous(active_loop, context)
-            else:
-                active_loop.default_exception_handler(context)
+            token = _mirrored.set(True)
+            try:
+                if previous is not None:
+                    previous(active_loop, context)
+                else:
+                    active_loop.default_exception_handler(context)
+            finally:
+                _mirrored.reset(token)
 
         loop.set_exception_handler(handler)
 
@@ -275,6 +353,8 @@ class RuntimeDiagnostics:
         self._closed = True
         logger.remove(self._sink_id)
         logging.getLogger().removeHandler(self._standard_handler)
+        if self._stderr_handler is not None:
+            logging.getLogger().removeHandler(self._stderr_handler)
         if sys.excepthook is self._sys_hook:
             sys.excepthook = self._old_sys_hook
         if threading.excepthook is self._thread_hook:
