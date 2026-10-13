@@ -458,6 +458,35 @@ def _validate_profile_falsify_fields(
     return []
 
 
+def validate_experiment_contract(
+    exp: dict[str, Any], *, profile: str, project_dir: Path
+) -> list[str]:
+    """Read-only strict validation shared with native experiment Runs.
+
+    Unlike task-plan recovery this never fabricates or repairs evidence. Failed
+    and skipped records remain valid outcomes, not successful experiment claims.
+    """
+    if exp.get("status") != "completed":
+        return []
+    exp_id = str(exp.get("id", "experiment"))
+    issues = []
+    if not (_is_nonempty(exp.get("results")) or _is_nonempty(exp.get("conclusion"))):
+        issues.append(f"{exp_id}: completed experiment missing results/conclusion")
+    issues.extend(_validate_profile_required_fields(
+        exp_id, exp, profile=profile, contract_version=STRICT_CONTRACT_VERSION,
+    ))
+    issues.extend(_validate_profile_falsify_fields(
+        exp_id, exp, profile=profile, contract_version=STRICT_CONTRACT_VERSION,
+    ))
+    issues.extend(_validate_evidence_refs(exp_id, exp, project_dir))
+    paths = [*exp.get("results", {}).get("artifacts", []),
+             *(ref["path"] for ref in exp.get("evidence_refs", []) if "path" in ref)]
+    for path in paths:
+        if not isinstance(path, str) or not _artifact_reference_exists(project_dir, path):
+            issues.append(f"{exp_id}: artifact path does not exist '{path}'")
+    return issues
+
+
 def _count_numeric_leaves(value: object, depth: int = 0, max_depth: int = 4) -> tuple[int, int]:
     if depth > max_depth:
         return 0, 0

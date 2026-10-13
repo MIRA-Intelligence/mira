@@ -248,9 +248,15 @@ class LocalServiceManager:
         self.paths.log_file.touch(exist_ok=True)
 
     def _append_log(self, event: str, **details: Any) -> None:
+        from mira_engine.observability import correlation_id
+
         self.paths.ensure()
         self._rotate_log_if_needed()
         payload = {
+            "schema_version": 1,
+            "component": "engine-service",
+            "pid": os.getpid(),
+            "request_id": correlation_id(os.environ.get("MIRA_DIAGNOSTIC_REQUEST_ID")),
             "timestamp": _now_iso(),
             "event": event,
             "service_mode": self._default_state().get("service_mode"),
@@ -422,21 +428,58 @@ class LocalServiceManager:
         )
 
     def export_diagnostics(self) -> tuple[int, str]:
+        from mira_engine.observability import read_tail, redact, structured_service_tail
+
         self.paths.ensure()
         self.paths.backups_dir.mkdir(parents=True, exist_ok=True)
         diagnostics_dir = self.paths.runtime_dir / "diagnostics"
         diagnostics_dir.mkdir(parents=True, exist_ok=True)
-        bundle = diagnostics_dir / f"diagnostics-{_now_iso().replace(':', '-')}.zip"
+        import uuid
+        bundle = diagnostics_dir / f"diagnostics-{_now_iso().replace(':', '-')}-{uuid.uuid4().hex[:8]}.zip"
 
         _, doctor_payload = self.doctor()
         with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("doctor.json", json.dumps(doctor_payload, ensure_ascii=False, indent=2) + "\n")
+            zf.writestr("doctor.json", json.dumps(redact(doctor_payload), ensure_ascii=False, indent=2) + "\n")
             if self.paths.state_file.exists():
-                zf.write(self.paths.state_file, arcname="agent-service-state.json")
+                zf.writestr("agent-service-state.json", json.dumps(redact(self.load_state()), indent=2) + "\n")
             if self.paths.log_file.exists():
-                lines = self.paths.log_file.read_text(encoding="utf-8").splitlines()
-                tail = "\n".join(lines[-DIAGNOSTICS_LOG_TAIL_LINES:]) + ("\n" if lines else "")
-                zf.writestr("agent-service.log.tail", tail)
+                zf.writestr("agent-service.log.tail", structured_service_tail(self.paths.log_file))
+            config_path = self.load_state().get("config_path")
+            runtime_dir = (Path(config_path).parent if config_path else self.paths.root) / "logs" / "runtime"
+            files = []
+            errors = []
+            if runtime_dir.is_dir():
+                candidates = [path for path in runtime_dir.iterdir()
+                              if re.fullmatch(r"(?:engine|fault)-\d+-[a-f0-9]{32}\.(?:jsonl|log)(?:\.\d+)?", path.name)
+                              and not path.is_symlink() and path.is_file()]
+                for path in sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)[:16]:
+                    try:
+                        lines = read_tail(path).splitlines()
+                        if path.name.startswith("engine-"):
+                            records = []
+                            for line in lines:
+                                try:
+                                    row = json.loads(line)
+                                except ValueError:
+                                    errors.append({"file": path.name, "error_type": "InvalidJSONL"})
+                                    continue
+                                if isinstance(row, dict):
+                                    # Redact individual values, not the serialized line:
+                                    # long tracebacks must remain complete, parseable JSON.
+                                    records.append(json.dumps(redact(row), ensure_ascii=False))
+                            tail = "\n".join(records) + "\n"
+                        else:
+                            tail = "\n".join(redact(line) for line in lines) + "\n"
+                        zf.writestr(f"engine-runtime/{path.name}.tail", tail)
+                        files.append(path.name)
+                    except OSError as exc:
+                        errors.append({"file": path.name, "error_type": type(exc).__name__})
+            zf.writestr("manifest.json", json.dumps({
+                "schema_version": 1, "created_at": _now_iso(), "runtime_files": files,
+                "errors": errors, "privacy": "No config, conversation, tool arguments or native minidumps. Legacy unstructured service output omitted.",
+                "tail_bytes_per_file": 131072,
+            }, indent=2) + "\n")
+        bundle.chmod(0o600)
         self._append_log("diagnostics_exported", bundle=str(bundle))
         return EXIT_OK, str(bundle)
 

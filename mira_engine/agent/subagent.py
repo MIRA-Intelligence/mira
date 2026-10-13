@@ -10,9 +10,10 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from mira_engine.agent.hook import AgentHook
+from mira_engine.agent.hook import AgentHook, CompositeHook
 from mira_engine.agent.routing import RoutedProviderManager
 from mira_engine.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
+from mira_engine.agent.skill_events import skill_loaded, skill_read_details
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
@@ -82,6 +83,24 @@ class _DelegationHook(AgentHook):
             raise _DelegationStoppedError(reason)
 
 
+class _SkillAuditHook(AgentHook):
+    def __init__(self, callback, agent: str):
+        super().__init__()
+        self.callback = callback
+        self.agent = agent
+
+    async def after_iteration(self, context):
+        delivered = {message.get("tool_call_id"): message.get("content")
+                     for message in context.messages if message.get("role") == "tool"}
+        for call, result in zip(context.tool_calls, context.tool_results):
+            if call.id not in delivered:
+                continue
+            event = skill_read_details(call.name, call.arguments, result)
+            if event:
+                event["partial"] = event["partial"] or delivered[call.id] != result
+                await self.callback({**event, "agent": self.agent})
+
+
 class SubagentManager:
     """Manages background subagent execution and synchronous role consults."""
 
@@ -130,6 +149,23 @@ class SubagentManager:
         self._delegation_policy: ContextVar[DelegationPolicy | None] = ContextVar(
             f"delegation_policy_{id(self)}", default=None
         )
+        self._skill_audit: ContextVar[Any] = ContextVar(f"skill_audit_{id(self)}", default=None)
+
+    @contextmanager
+    def skill_audit_scope(self, callback):
+        token = self._skill_audit.set(callback)
+        try:
+            yield
+        finally:
+            self._skill_audit.reset(token)
+
+    async def _skill_hook(self, agent: str, loaded_skills: list[str]):
+        callback = self._skill_audit.get()
+        if callback is None:
+            return None
+        for name in loaded_skills:
+            await callback(skill_loaded(name, "always", agent=agent))
+        return _SkillAuditHook(callback, agent)
 
     @contextmanager
     def delegation_scope(self, policy: DelegationPolicy):
@@ -143,7 +179,7 @@ class SubagentManager:
         policy = self._delegation_policy.get()
         if policy is None:
             return await runner.run(spec)
-        spec.hook = _DelegationHook(policy)
+        spec.hook = CompositeHook([_DelegationHook(policy), spec.hook] if spec.hook else [_DelegationHook(policy)])
         try:
             with spec.tools.restrict_to(policy.allowed_tools, execution_guard=policy.execution_guard):
                 return await runner.run(spec)
@@ -280,7 +316,8 @@ class SubagentManager:
             provider, model, runner = self._resolve_role(role)
             role_temperature = ROLE_CONFIGS.get(role or "", {}).get("temperature", self.temperature)
 
-            system_prompt = self._build_subagent_prompt(run_workspace, role)
+            loaded_skills: list[str] = []
+            system_prompt = self._build_subagent_prompt(run_workspace, role, loaded_skills)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -298,6 +335,7 @@ class SubagentManager:
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
                     fail_on_tool_error=False,
+                    hook=await self._skill_hook(f"{role or 'subagent'}:{task_id}", loaded_skills),
                 )
             )
             final_result = result.final_content or "Task completed but no final response was generated."
@@ -432,7 +470,8 @@ without guessing.""",
     }
 
     def _build_subagent_prompt(
-        self, workspace: Path | None = None, role: str | None = None
+        self, workspace: Path | None = None, role: str | None = None,
+        loaded_skills: list[str] | None = None,
     ) -> str:
         """Build a focused system prompt for the subagent (role-aware)."""
         from mira_engine.agent.context import ContextBuilder
@@ -440,7 +479,7 @@ without guessing.""",
         run_workspace = workspace or self.workspace
         context = ContextBuilder(run_workspace)
         time_ctx = ContextBuilder._build_runtime_context(None, None)
-        parts = [context.build_system_prompt(), f"""# Subagent
+        parts = [context.build_system_prompt(loaded_skills=loaded_skills), f"""# Subagent
 
 {time_ctx}
 
@@ -489,8 +528,9 @@ Stay focused on the assigned task. Your final response will be reported back to 
             raise ValueError("consult session does not belong to this project, role, and Run attempt")
         self._consult_scopes[consult_id] = scope
         history = self._consult_sessions.get(consult_id)
+        loaded_skills: list[str] = []
         if history is None:
-            history = [{"role": "system", "content": self._build_subagent_prompt(run_workspace, role)}]
+            history = [{"role": "system", "content": self._build_subagent_prompt(run_workspace, role, loaded_skills)}]
         messages = list(history)
         messages.append({"role": "user", "content": task})
 
@@ -506,6 +546,7 @@ Stay focused on the assigned task. Your final response will be reported back to 
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
                 fail_on_tool_error=False,
+                hook=await self._skill_hook(consult_id, loaded_skills),
             )
         )
         # Persist the accumulated conversation so a follow-up consult with the

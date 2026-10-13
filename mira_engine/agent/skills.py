@@ -173,7 +173,7 @@ class SkillsLoader:
 
         return None
 
-    def load_skills_for_context(self, skill_names: list[str]) -> str:
+    def load_skills_for_context(self, skill_names: list[str], *, loaded_skills: list[str] | None = None) -> str:
         """
         Load specific skills for inclusion in agent context.
 
@@ -188,7 +188,10 @@ class SkillsLoader:
             content = self.load_skill(name)
             if content:
                 content = self._strip_frontmatter(content)
-                parts.append(f"### Skill: {name}\n\n{content}")
+                if content.strip():
+                    parts.append(f"### Skill: {name}\n\n{content}")
+                    if loaded_skills is not None:
+                        loaded_skills.append(name)
 
         return "\n\n---\n\n".join(parts) if parts else ""
 
@@ -364,9 +367,8 @@ class SkillsLoader:
             name = entry["name"]
             meta = self.get_skill_metadata(name) or {}
             desc = str(meta.get("description") or "")
-            path = str(entry.get("path") or "")
-
-            base_text = " ".join((name, desc, path))
+            # Installation paths are not evidence of the user's task.
+            base_text = " ".join((name, desc))
             score = self._score_skill_match(
                 query_lc=query_lc,
                 query_tokens=query_tokens,
@@ -375,11 +377,9 @@ class SkillsLoader:
                 meta=meta,
             )
 
-            # Session memory: recent skills always get a boost
-            if name in recent_set:
-                score += 15
-                if is_follow_up:
-                    score += 10
+            # History is relevant only when the user asks to resume that task.
+            if is_follow_up and name in recent_set:
+                score += 25
 
             if score >= 4:
                 scored.append((score, name))
@@ -395,11 +395,14 @@ class SkillsLoader:
 
     @staticmethod
     def _looks_like_follow_up(text: str) -> bool:
-        lowered = text.lower()
-        markers = (
-            "继续", "接着", "刚才", "之前", "上次", "继续之前", "continue", "resume", "previous", "last task",
-        )
-        return any(marker in lowered for marker in markers)
+        # Mentioning "previous"/"之前" is not itself a request to continue.
+        # Require an affirmative continuation instruction, not an incidental
+        # substring (e.g. "resume" in a CV filename or "don't continue").
+        return bool(re.match(
+            r"^\s*(?:(?:请(?:你)?|麻烦(?:你)?|帮我|那就|好的)[，,\s]*)*(?:继续|接着|沿用|接上|恢复(?:之前|上次|刚才))"
+            r"|^\s*(?:(?:please|ok(?:ay)?|yes|let['’]s)[,\s]+)*(?:continue|resume|carry on|pick up where)(?=\s|[.!?]*$)",
+            text, re.IGNORECASE,
+        ))
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
@@ -411,7 +414,14 @@ class SkillsLoader:
             tokens.add(chunk)
             if len(chunk) > 1:
                 tokens.update(chunk)
-        return {t for t in tokens if t}
+        # Shared grammatical words are not task evidence. Otherwise two words
+        # such as "a" and "with" alone reach the automatic loading threshold.
+        stop_words = {
+            "a", "an", "the", "and", "or", "of", "to", "in", "on", "at", "by", "for", "from", "with",
+            "is", "are", "was", "were", "be", "as", "it", "its", "this", "that", "these", "those",
+            "i", "me", "my", "you", "your", "we", "our", "can", "could", "would", "should", "please",
+        }
+        return {t for t in tokens if t and t not in stop_words}
 
     @staticmethod
     def _skill_aliases(skill_name: str) -> tuple[str, ...]:
@@ -436,7 +446,6 @@ class SkillsLoader:
         meta: dict | None = None,
     ) -> int:
         score = 0
-        skill_lc = skill_text.lower()
         name_tokens = self._tokenize(skill_name.replace("-", " "))
         score += len(name_tokens.intersection(query_tokens)) * 4
 
@@ -469,9 +478,13 @@ class SkillsLoader:
             alias_list = list(self._skill_aliases(skill_name))
 
         for alias in alias_list:
-            alias_lc = alias.lower()
-            if alias_lc in query_lc:
+            alias_lc = alias.strip().lower()
+            if not alias_lc:
+                continue
+            # Latin aliases must match token boundaries: CT != introduction.
+            # CJK phrases and file extensions still work inside natural text.
+            prefix = r"(?<![a-z0-9_])" if re.match(r"[a-z0-9_]", alias_lc) else ""
+            suffix = r"(?![a-z0-9_])" if re.search(r"[a-z0-9_]$", alias_lc) else ""
+            if re.search(prefix + re.escape(alias_lc) + suffix, query_lc):
                 score += 6
-            if alias_lc in skill_lc:
-                score += 1
         return score

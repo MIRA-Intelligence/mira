@@ -8,8 +8,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from mira_engine.task_plan.guardrails import get_task_plan_contract
+
 from .models import ModuleRun
 from .repository import JsonWorkflowRepository
+
+
+def experiment_contract(run: ModuleRun, profile: str = "research") -> dict[str, Any]:
+    """Mode is Run-owned; pin rigor to the first executing profile on retries."""
+    return get_task_plan_contract(
+        profile=run.attempts[0].agent_profile if run.attempts else profile,
+        contract_version=run.module_data.get("experiment_contract_version", 1),
+    )
 
 
 def manual_experiments(run: ModuleRun) -> bool:
@@ -48,6 +58,9 @@ class ExperimentRecord(BaseModel):
     theoretical_proof: str = Field(default="", max_length=20000)
     isolation_test: dict[str, Any] = Field(default_factory=dict)
     post_mortem: dict[str, Any] = Field(default_factory=dict)
+    commit: str = Field(default="", max_length=1000)
+    repro: dict[str, Any] = Field(default_factory=dict)
+    tests: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_display_fields(self) -> ExperimentRecord:
@@ -55,6 +68,8 @@ class ExperimentRecord(BaseModel):
         for data, keys in (
             (self.results, ("findings",)),
             (self.progress, ("current_metric",)),
+            (self.repro, ("script_path",)),
+            (self.tests, ("summary",)),
             (self.isolation_test, ("control", "treatment", "isolated_variable", "result")),
             (self.post_mortem, ("residual_analysis", "implementation_fidelity")),
         ):

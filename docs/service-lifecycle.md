@@ -56,3 +56,7 @@ MIRA_TEST_REAL_LAUNCHD=1 .venv/bin/pytest -q tests/test_agent_service_lifecycle.
 ```
 
 默认测试模拟 OS 调用，不操作用户已安装的服务。Windows SCM 的状态、安装归属、后台进程和失败路径有模拟回归；仍应在 Windows 真机上验收提权、WinSW 和安装包集成。
+
+## 运行日志与崩溃诊断
+
+日志路径、请求和任务关联、崩溃捕获、桌面白屏时的导出入口，以及 `mira-engine doctor --export` 的诊断包范围，见 [运行日志与故障诊断](runtime-diagnostics.md)。质量控制原则见 [AI 辅助开发的速度与软件质量](research/ai-assisted-development-quality-2026-10-12.md)。

@@ -17,6 +17,7 @@ from typing import Any
 import json_repair
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.usage import extract_usage
 from mira_engine.providers.registry import find_by_name, model_overrides_for
 
 _DEFAULT_API_BASE = "https://inference-api.nvidia.com/v1"
@@ -313,14 +314,7 @@ class NvidiaProvider(LLMProvider):
 
     @staticmethod
     def _extract_usage(response: Any) -> dict[str, int]:
-        if not isinstance(response, dict) or not isinstance(response.get("usage"), dict):
-            return {}
-        usage = response["usage"]
-        return {
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        }
+        return extract_usage(response)
 
     @classmethod
     def _parse_success(cls, response: Any) -> LLMResponse:

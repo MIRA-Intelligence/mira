@@ -10,9 +10,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from mira_engine.task_plan.guardrails import validate_experiment_contract
+
 from .confirmations import confirmation_approved, confirmation_required
-from .experiments import ExperimentRecord, experiment_boundary_decision, manual_experiments
+from .experiments import ExperimentRecord, experiment_boundary_decision, experiment_contract, manual_experiments
 from .input_paths import normalize_input_paths
+from .journals import normalize_journal_selection
 from .models import (
     MODULE_TYPES,
     Actor,
@@ -48,6 +51,32 @@ EventListener = Callable[[WorkflowEvent], None]
 
 
 class WorkflowService:
+    @staticmethod
+    def _validate_experiment_mode(module_type: str, data: dict[str, Any]) -> None:
+        if "experiment_contract_version" not in data:
+            return
+        version = data["experiment_contract_version"]
+        if module_type != "experiment" or type(version) is not int or version not in (1, 2):
+            raise WorkflowError(
+                "invalid_experiment_contract", "experiment_contract_version must be 1 (compat) or 2 (strict), only for experiment Runs",
+                status=422,
+            )
+
+    def _check_experiment_contract(self, run: ModuleRun, records: list[dict[str, Any]]) -> None:
+        contract = experiment_contract(run)
+        if run.module_type != "experiment" or contract["contract_version"] != 2:
+            return
+        issues = [] if records else ["Register experiment outcomes before completing a strict experiment Run"]
+        for record in records:
+            issues.extend(validate_experiment_contract(
+                record, profile=contract["profile"], project_dir=self.repository.project_dir,
+            ))
+        if issues:
+            raise WorkflowError(
+                "experiment_contract_incomplete", "Strict experiment validation: " + "; ".join(issues),
+                status=409, details={"issues": issues, "contract": contract},
+            )
+
     @staticmethod
     def _validate_input_paths(module_type: str, data: dict[str, Any]) -> dict[str, Any]:
         if module_type != "experiment":
@@ -153,9 +182,11 @@ class WorkflowService:
             raise WorkflowError("invalid_module_type", f"unsupported module_type: {module_type}", status=422)
         if not command_id:
             raise WorkflowError("command_id_required", "command_id is required", status=422)
+        self._validate_experiment_mode(module_type, module_data or {})
         if module_type == "experiment":
             module_data = dict(module_data or {})
             module_data.setdefault("experiment_execution_mode", "auto")
+            module_data.setdefault("experiment_contract_version", 1)
             if module_data["experiment_execution_mode"] not in ("auto", "manual"):
                 raise WorkflowError("invalid_execution_mode", "experiment_execution_mode must be auto or manual", status=422)
         with self.repository.transaction():
@@ -163,6 +194,11 @@ class WorkflowService:
             duplicate = self._duplicate_receipt(command_id, workflow)
             if duplicate:
                 return duplicate
+            if module_data and ("target_journal" in module_data or "journal_profile_version" in module_data):
+                try:
+                    module_data = normalize_journal_selection(module_type, module_data)
+                except ValueError as exc:
+                    raise WorkflowError("invalid_journal_selection", str(exc), status=422) from exc
             if module_data and "external_read_paths" in module_data:
                 module_data = self._validate_input_paths(module_type, module_data)
             self._check_revision(workflow.revision, expected_revision, "project")
@@ -759,6 +795,7 @@ class WorkflowService:
                     raise WorkflowError("invalid_experiment", "artifact paths must be strings", status=422)
                 if Path(path).is_absolute() or not (self.repository.project_dir / path).resolve().is_relative_to(self.repository.project_dir.resolve()):
                     raise WorkflowError("invalid_experiment", "artifact path escapes Project", status=422)
+            self._check_experiment_contract(run, [record])
             if status == "running" and manual_experiments(run):
                 if previous.get("status") == "running" and record["status"] == "pending":
                     raise WorkflowError("invalid_experiment", "finish or skip the active experiment before resetting it", status=409)
@@ -781,6 +818,17 @@ class WorkflowService:
             ] if previous else [*records, record]
             return status, "run.experiment_recorded", "applied"
         if command == "update_draft" and status == "created":
+            proposed = {**run.module_data, **(payload.get("module_data") or {})}
+            self._validate_experiment_mode(run.module_type, proposed)
+            try:
+                proposed = normalize_journal_selection(run.module_type, proposed)
+            except ValueError as exc:
+                raise WorkflowError("invalid_journal_selection", str(exc), status=422) from exc
+            if proposed.get("target_journal"):
+                payload = dict(payload, module_data={
+                    **(payload.get("module_data") or {}),
+                    "journal_profile_version": proposed["journal_profile_version"],
+                })
             if "external_read_paths" in (payload.get("module_data") or {}):
                 payload = dict(payload, module_data=self._validate_input_paths(run.module_type, payload["module_data"]))
             mode = (payload.get("module_data") or {}).get("experiment_execution_mode", "auto")
@@ -925,6 +973,7 @@ class WorkflowService:
             self._close_attempt(run, "failed", utc_now())
             return "failed", "run.failed", "applied"
         if command == "complete" and status in {"running", "waiting_input", "paused"}:
+            self._check_experiment_contract(run, run.module_data.get("experiments") or [])
             if manual_experiments(run) and run.module_data.get("_manual_experiment_boundary") and experiment_boundary_decision(run) is None:
                 raise WorkflowError("experiment_confirmation_required", "answer the experiment continuation form before completing the Run", status=409)
             if any(item.get("status") in {"pending", "running"} for item in run.module_data.get("experiments", [])):

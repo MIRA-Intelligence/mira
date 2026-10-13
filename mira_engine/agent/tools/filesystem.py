@@ -214,7 +214,9 @@ class ReadFileTool(_FsTool):
                     "Only UTF-8 text and images are supported."
                 )
 
-            if offset == 1 and limit is None and "\n" not in text_content:
+            # Keep skill instructions on the numbered-text path even for a
+            # one-line file, so successful loads have an unambiguous signature.
+            if offset == 1 and limit is None and "\n" not in text_content and fp.name.lower() != "skill.md":
                 if len(text_content) > self._MAX_CHARS:
                     return (
                         text_content[: self._MAX_CHARS]

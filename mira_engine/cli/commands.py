@@ -1405,6 +1405,9 @@ def gateway(
         logging.basicConfig(level=logging.DEBUG)
 
     config = _load_runtime_config(config, workspace)
+    from mira_engine.observability import configure_runtime_logging, emit_event
+
+    diagnostics = configure_runtime_logging(mode="gateway")
     _prepare_gateway_ui_channel(config, no_ui=no_ui)
 
     if host is not None:
@@ -1638,6 +1641,9 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def run():
+        if diagnostics is not None:
+            diagnostics.install_asyncio_handler(asyncio.get_running_loop())
+        emit_event("gateway.starting", host=gateway_host, port=gateway_port)
         try:
             await cron.start()
             await heartbeat.start()
@@ -1647,12 +1653,16 @@ def gateway(
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+        except Exception as exc:
+            emit_event("gateway.failed", level="CRITICAL", exception=exc)
+            raise
         finally:
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
             agent.stop()
             await channels.stop_all()
+            emit_event("gateway.stopped")
 
     asyncio.run(run())
 
@@ -1674,6 +1684,9 @@ def serve(
     from mira_engine.session.manager import SessionManager
 
     cfg = _load_runtime_config(config, workspace)
+    from mira_engine.observability import configure_runtime_logging
+
+    diagnostics = configure_runtime_logging(mode="api")
     sync_workspace_templates(cfg.workspace_path)
 
     provider = _make_provider(cfg)
@@ -1710,6 +1723,10 @@ def serve(
         model_name=cfg.agents.defaults.primary_model,
         request_timeout=request_timeout,
     )
+    if diagnostics is not None:
+        async def configure_api_diagnostics(_app):
+            diagnostics.install_asyncio_handler(asyncio.get_running_loop())
+        api_app.on_startup.append(configure_api_diagnostics)
     web.run_app(api_app, host=api_host, port=api_port, print=None)
 
 

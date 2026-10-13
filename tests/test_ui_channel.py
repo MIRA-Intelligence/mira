@@ -110,6 +110,62 @@ def test_load_ui_instructions_joins_present_files(monkeypatch: pytest.MonkeyPatc
     assert _load_ui_instructions() == "alpha\n\n---\n\nbeta"
 
 
+@pytest.mark.asyncio
+async def test_skill_load_history_persist_stream_paginate_and_isolate(ui_channel):
+    from mira_engine.agent.skill_events import skill_loaded
+
+    ws = SimpleNamespace(closed=False, send_json=AsyncMock())
+    ui_channel._clients["chat-test"] = ws
+    for session_id, name in [("chat-test", "one"), ("other", "private"), ("chat-test", "two"), ("chat-test", "three")]:
+        await ui_channel.send(OutboundMessage(channel="ui", chat_id=session_id, content="", metadata={
+            "_audit_only": True, "_audit_event": "skill_loaded",
+            "_audit_details": skill_loaded(name, "manual"),
+            "workflow_module_type": "experiment", "workflow_run_id": "run-1",
+        }))
+    assert ws.send_json.call_count == 3
+    payload = ws.send_json.call_args.args[0]
+    assert payload["type"] == "skill_loaded"
+    assert payload["metadata"]["skill_event"]["module_type"] == "experiment"
+    assert payload["metadata"]["skill_event"]["run_id"] == "run-1"
+    # Disconnect: only persisted audit facts are used by the history endpoint.
+    ui_channel._clients.clear()
+    ui_channel._audit(source="agent", action="skill_invoked", session_id="chat-test", details={"skill_name": "failed"})
+    request = SimpleNamespace(match_info={"session_id": "chat-test"}, query={"limit": "2"})
+    first = json.loads((await ui_channel._handle_skill_history(request)).text)
+    assert [e["skill_name"] for e in first["events"]] == ["two", "three"]
+    request.query["cursor"] = str(first["next_cursor"])
+    second = json.loads((await ui_channel._handle_skill_history(request)).text)
+    assert [e["skill_name"] for e in second["events"]] == ["one"]
+    assert second["next_cursor"] is None
+    request.query["cursor"] = "-1"
+    assert (await ui_channel._handle_skill_history(request)).status == 400
+    request.match_info["session_id"] = "unknown"
+    request.query = {}
+    assert json.loads((await ui_channel._handle_skill_history(request)).text)["events"] == []
+
+
+async def test_token_usage_snapshot_and_side_effect_free_push(ui_channel):
+    from mira_engine.agent.token_usage import TokenUsageStore
+
+    snapshot = TokenUsageStore(ui_channel.workspace).record("chat-test", "", "model",
+        {"prompt_tokens": 120, "completion_tokens": 3, "total_tokens": 123, "cached_tokens": 100})
+    ws = SimpleNamespace(closed=False, send_json=AsyncMock())
+    ui_channel._clients["chat-test"] = ws
+    ui_channel._workflow_api.broadcast_activity = AsyncMock()
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="chat-test", content="", metadata={
+        "_usage_only": True, "token_usage": snapshot, "workflow_run_id": "run", "project_id": "project",
+    }))
+    assert ws.send_json.call_args.args[0]["type"] == "token_usage"
+    assert ws.send_json.call_args.args[0]["metadata"]["token_usage"] == snapshot
+    assert snapshot["cached_tokens"] == 100
+    assert snapshot["cache_reported_calls"] == 1
+    ui_channel._workflow_api.broadcast_activity.assert_not_called()
+    response = await ui_channel._handle_token_usage(SimpleNamespace(match_info={"session_id": "chat-test"}))
+    assert json.loads(response.text) == snapshot
+    response = await ui_channel._handle_token_usage(SimpleNamespace(match_info={"session_id": "other"}))
+    assert json.loads(response.text)["total_tokens"] == 0
+
+
 def test_load_ui_instructions_skips_missing_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(ui_channel_mod, "_ASSETS_DIR", tmp_path)
     (tmp_path / "AGENTS_UI.md").write_text("only", encoding="utf-8")

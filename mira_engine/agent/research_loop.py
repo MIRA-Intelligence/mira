@@ -19,6 +19,8 @@ from loguru import logger
 
 from mira_engine.agent.base_loop import UNIFIED_SESSION_KEY, BaseAgentLoop
 from mira_engine.agent.context import ContextBuilder
+from mira_engine.agent.skill_events import skill_loaded
+from mira_engine.agent.token_usage import track_token_usage
 from mira_engine.agent.tools.message import MessageTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.command.router import CommandContext
@@ -1186,6 +1188,7 @@ class ResearchAgentLoop(BaseAgentLoop):
     # _process_message override (research orchestration)
     # ------------------------------------------------------------------
 
+    @track_token_usage
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1431,7 +1434,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             limit=3,
         )
         active_skills: list[str] = []
-        for name in [*selected_skills, *suggested_skills, *recent_skill_names]:
+        for name in [*selected_skills, *suggested_skills]:
             if name not in active_skills:
                 active_skills.append(name)
         active_skills = active_skills[:8]
@@ -1470,10 +1473,12 @@ class ResearchAgentLoop(BaseAgentLoop):
             extra_system = skill_hint + "\n\n" + extra_system if skill_hint else extra_system
         else:
             extra_system = skill_hint or None
+        loaded_skills: list[str] = []
         initial_messages = ctx.build_messages(
             history=history,
             current_message=msg.content,
             skill_names=active_skills or None,
+            loaded_skills=loaded_skills,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
@@ -1503,13 +1508,19 @@ class ResearchAgentLoop(BaseAgentLoop):
 
         progress_cb = on_progress or _bus_progress
         current_turn_skills: set[str] = set()
+        loaded_this_turn: set[tuple[str | None, str]] = set()
         audit_cb = None
         emit_audit_to_channel = msg.channel == "ui" or bool(meta.get("_emit_skill_audit"))
         allow_result_write = self._looks_like_result_request(msg.content, meta)
         if emit_audit_to_channel or audit_hook:
             async def _audit(details: dict[str, Any]) -> None:
+                if details.get("loaded"):
+                    identity = (details.get("agent"), details.get("skill_name"))
+                    if identity in loaded_this_turn:
+                        return
+                    loaded_this_turn.add(identity)
                 skill_name = details.get("skill_name")
-                if isinstance(skill_name, str) and skill_name.strip():
+                if not details.get("loaded") and isinstance(skill_name, str) and skill_name.strip():
                     current_turn_skills.add(skill_name.strip())
                 if audit_hook:
                     await audit_hook(details)
@@ -1518,6 +1529,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                 metadata = dict(msg.metadata or {})
                 metadata["_audit_only"] = True
                 metadata["_audit_event"] = (
+                    "skill_loaded" if details.get("loaded") else
                     "skill_selected" if details.get("selected") else "skill_invoked"
                 )
                 metadata["_audit_details"] = details
@@ -1530,6 +1542,9 @@ class ResearchAgentLoop(BaseAgentLoop):
 
             audit_cb = _audit
         if audit_cb:
+            for name in loaded_skills:
+                source = "manual" if name in selected_skills else "auto" if name in suggested_skills else "recent" if name in recent_skill_names else "always"
+                await audit_cb(skill_loaded(name, source, tool="system_prompt"))
             for selected_skill in selected_skills:
                 await audit_cb({
                     "tool": "system_prompt",
@@ -1784,13 +1799,9 @@ class ResearchAgentLoop(BaseAgentLoop):
             final_content = "I've completed processing but have no response to give."
 
         if isinstance(session.metadata, dict):
-            prior = session.metadata.get("_recent_skills")
             merged: list[str] = []
-            if isinstance(prior, list):
-                for item in prior:
-                    if isinstance(item, str) and item not in merged:
-                        merged.append(item)
-            for item in [*selected_skills, *sorted(current_turn_skills)]:
+            # Remember this task's skills, not an ever-growing list of old topics.
+            for item in [*(name for name in active_skills if name in loaded_skills), *sorted(current_turn_skills)]:
                 if item not in merged:
                     merged.append(item)
             session.metadata["_recent_skills"] = merged[-10:]
