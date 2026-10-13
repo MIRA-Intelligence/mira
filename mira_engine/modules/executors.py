@@ -7,6 +7,7 @@ from abc import ABC
 from typing import ClassVar
 
 from mira_engine.workflows.confirmations import confirmation_context
+from mira_engine.workflows.experiments import experiment_contract
 from mira_engine.workflows.journals import journal_instructions, normalize_journal_selection
 from mira_engine.workflows.models import ModuleType
 
@@ -242,6 +243,22 @@ class ExperimentExecutor(NativeModuleExecutor):
         "maxExperiments is a hard cap, maxTokens is a token budget, and goals are "
         "stopping conditions combined by its AND/OR logic."
     )
+
+    def system_instructions(self, context: ModuleExecutionContext) -> str:
+        contract = experiment_contract(context.run, context.agent_profile)
+        instructions = super().system_instructions(context)
+        if contract["contract_version"] != 2:
+            return instructions + "\nExperiment acceptance: COMPAT. Record truthful outcomes; profile-specific strict fields do not block completion."
+        return instructions + (
+            "\nExperiment acceptance: STRICT (fixed for this Run, independent of workspace permissions). "
+            "Before record_workflow_experiment(status=completed), supply results or conclusion and all required fields: "
+            + json.dumps(contract, ensure_ascii=False)
+            + ". Evidence and result artifact paths must reference existing project files. "
+            "complete_workflow_run rechecks every completed experiment and requires registered outcomes. "
+            "Missing fields block completion; repair the record and retry. Never invent evidence, commits, "
+            "tests or results to pass validation. If inputs or authorization are missing, request_workflow_interaction "
+            "to clarify or obtain approval. Failed/skipped experiments must be reported honestly, not as successes."
+        )
 
 
 class DeliveryExecutor(NativeModuleExecutor):

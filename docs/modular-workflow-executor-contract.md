@@ -117,6 +117,32 @@ experiments inside one script/record. The gate operates at registered experiment
 boundaries, not arbitrary operating-system subprocess boundaries. Explicit Stop
 or pause/cancel remains the interruption mechanism during an active experiment.
 
+### Experiment acceptance mode
+
+Both experiment launch dialogs show execution and acceptance modes side by side
+as segmented toggles. Acceptance is `module_data.experiment_contract_version`:
+`1` = Compat (default), `2` = Strict. It replaces the project/global UI selector,
+applies only to experiments, and is independent of strict-workspace permissions.
+The choice can be edited while the Run is a draft, then is fixed after enqueue.
+The first attempt's profile determines the required fields, including on retries.
+Historical native Runs without this field remain compatible, regardless of the
+legacy project's `contract_version`.
+
+Strict acceptance reuses the legacy profile field contract: research/team require
+theoretical support, controlled isolation, post-mortem and evidence references;
+engineering requires commit, reproduction and test information. A completed record
+also needs results or a conclusion; referenced evidence/artifact files must exist.
+Both `record_workflow_experiment` and Run completion check these requirements.
+Validation errors list missing fields for correction; prompts explicitly forbid
+inventing evidence and direct the agent to ask for clarification/approval when
+needed. A strict Run must register outcomes before completion, but honest failed
+or skipped outcomes do not have to masquerade as successful experiments.
+These checks establish record completeness, not scientific validity.
+
+Compat retains existing native completion behavior; structural validation,
+path boundaries, approvals and execution limits still apply in both modes.
+Initiation, planning and delivery do not run this acceptance check.
+
 An attempt is one scheduler claim of a Run, not the whole lifetime of the Run.
 
 ```text
