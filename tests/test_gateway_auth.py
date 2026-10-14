@@ -229,7 +229,7 @@ async def test_started_gateway_never_logs_query_token(
 ) -> None:
     monkeypatch.delenv(gateway_auth.TOKEN_ENV, raising=False)
     channel = _make_channel(tmp_path, monkeypatch, auth_token=TOKEN, bind_port=0)
-    monkeypatch.setattr(channel, "_kill_stale_listener", lambda: None)
+    monkeypatch.setattr(channel, "_free_port_from_stale_engine", lambda: None)
     events: list[str] = []
     from mira_engine import observability
 

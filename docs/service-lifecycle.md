@@ -54,6 +54,12 @@ mira-engine stop --gateway --port 18790 --force
 - **租约记录**：`<MIRA_HOME>/engine.lease`，JSON，记录主机名、PID、端口、版本、启动时间和心跳时间（每 30 秒刷新）。同一台机器上按 PID 和进程创建时间判断是否还活着；其他机器上的记录在心跳超过 90 秒未更新时视为失效，可以接管。
 - 已有引擎在运行时，第二个 `mira gateway` 不启动，退出码为 `3`，并在 stderr 说明占用者的主机、PID 和端口。
 
+## 停止与端口占用
+
+`mira gateway`（以及打包版的 `mira-engine run-gateway`）收到 SIGTERM 或 SIGINT（Windows 上还有 Ctrl+Break；WinSW 停止服务时发送 Ctrl+C）后优雅退出：停止接受新连接，用 1001（going away）关闭 WebSocket，停止各渠道、cron、heartbeat 和 MCP 子进程，释放引擎租约（删除 `engine.lease`），退出码 `0`。整个过程最多 10 秒，超时则释放租约后以退出码 `1` 强制退出；期间再收到一次信号会立即退出，退出码为 128 + 信号编号（SIGINT 为 130，SIGTERM 为 143）。
+
+启动时如果端口已被占用，gateway 只会停止能证明是“同一 `MIRA_HOME` 的遗留引擎”的进程：属于当前用户、命令行是 Mira gateway、环境变量或本机 gateway 登记记录指向同一个 `MIRA_HOME`，且不是当前持有租约的引擎。其他进程（包括其他用户的进程、其他 `MIRA_HOME` 的引擎）一律不发信号，gateway 以退出码 `4` 退出，并在 stderr 给出占用者的 PID 和进程名。`mira remote attach` 遇到退出码 `4` 时会换一个空闲端口重试。完整的退出码表见 [Remote-SSH](remote-ssh.md#gateway-shutdown-and-exit-codes)。
+
 运行时目录用于锁、租约等临时状态，按以下顺序确定，并为每个 `MIRA_HOME` 单独建子目录（权限 0700）：
 
 1. 环境变量 `MIRA_RUNTIME_DIR`；
@@ -67,7 +73,7 @@ mira-engine stop --gateway --port 18790 --force
 ## 验证
 
 ```sh
-.venv/bin/pytest -q tests/test_agent_service_lifecycle.py tests/test_agent_service_launchd.py tests/test_agent_service_platform_managers.py tests/test_agent_service_cli.py tests/test_gateway_failsafe.py
+.venv/bin/pytest -q tests/test_agent_service_lifecycle.py tests/test_agent_service_launchd.py tests/test_agent_service_platform_managers.py tests/test_agent_service_cli.py tests/test_gateway_failsafe.py tests/test_gateway_shutdown.py tests/test_port_guard.py
 
 # 仅 macOS：显式启用真实 launchd 测试，随机服务名、临时目录、空闲端口
 MIRA_TEST_REAL_LAUNCHD=1 .venv/bin/pytest -q tests/test_agent_service_lifecycle.py::test_real_macos_lifecycle

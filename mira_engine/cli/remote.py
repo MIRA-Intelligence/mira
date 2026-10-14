@@ -221,6 +221,7 @@ def _log_tail(limit: int = 2000) -> str:
 def attach(timeout_s: float = HEALTH_TIMEOUT_S) -> dict[str, Any]:
     """Reuse this user's running engine or start one bound to loopback."""
     from mira_engine.cli.engine_lease import LEASE_CONFLICT_EXIT_CODE
+    from mira_engine.cli.port_guard import PORT_IN_USE_EXIT_CODE
 
     token = _token()
     deadline = time.monotonic() + timeout_s
@@ -247,8 +248,10 @@ def attach(timeout_s: float = HEALTH_TIMEOUT_S) -> dict[str, Any]:
             raise RemoteError("health_timeout",
                               f"the engine (pid {proc.pid}) did not become healthy within {timeout_s:.0f}s; "
                               f"see {_log_path()}")
-        if code == LEASE_CONFLICT_EXIT_CODE or not _port_free(port):
-            continue  # Lost a race to another engine or for the port; look again.
+        if code in (LEASE_CONFLICT_EXIT_CODE, PORT_IN_USE_EXIT_CODE) or not _port_free(port):
+            # Lost a race to another engine or for the port; look again. The gateway
+            # never stops an unrelated port holder, so picking another port is the fix.
+            continue
         tail = _log_tail()
         raise RemoteError("start_failed",
                           f"the engine exited with code {code}" + (f": {tail.splitlines()[-1]}" if tail else ""))
@@ -299,7 +302,7 @@ def stop(timeout_s: float = STOP_TIMEOUT_S) -> str:
 
 
 def _remove_record_of(record: dict[str, Any]) -> None:
-    """SIGTERM ends the gateway before its own cleanup runs; drop its record if still there."""
+    """The gateway releases its lease on SIGTERM; drop the record if it crashed or was killed instead."""
     from mira_engine.cli.engine_lease import lease_path, read_lease
 
     current = read_lease(_home())

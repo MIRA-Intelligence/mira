@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 from mira_engine.cli import engine_lease, remote
 from mira_engine.cli.commands import app
 from mira_engine.cli.engine_lease import acquire_engine_lease, lease_path, read_lease
+from mira_engine.cli.port_guard import PORT_IN_USE_EXIT_CODE
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,6 +32,8 @@ _FAKE_GATEWAY = textwrap.dedent(
     if mode == "crash":
         print("boom: provider misconfigured", flush=True)
         sys.exit(1)
+    if mode == "port-in-use":
+        sys.exit(4)  # PORT_IN_USE_EXIT_CODE: the port was taken by a process the gateway must not stop
     lease = acquire_engine_lease(host="127.0.0.1", port=port)
     if mode == "hang":
         time.sleep(60)
@@ -128,6 +131,23 @@ def test_attach_uses_a_random_port_when_the_default_is_taken(spawned, default_po
         code, payload = _invoke("attach", "--json")
     assert code == 0
     assert payload["port"] != default_port
+
+
+def test_attach_retries_when_the_gateway_finds_its_port_taken(spawned, monkeypatch):
+    state, children = spawned
+    first_spawn = remote._spawn_gateway
+
+    def spawn(port: int):
+        proc = first_spawn(port)
+        state["mode"] = "serve"
+        return proc
+
+    state["mode"] = "port-in-use"
+    monkeypatch.setattr(remote, "_spawn_gateway", spawn)
+    code, payload = _invoke("attach", "--json")
+    assert code == 0 and payload["started"] is True
+    assert len(children) == 2
+    assert children[0].returncode == PORT_IN_USE_EXIT_CODE
 
 
 def test_attach_replaces_a_stale_lease(spawned):
