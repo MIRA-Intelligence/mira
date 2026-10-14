@@ -40,6 +40,7 @@ from rich.text import Text
 from loguru import logger
 
 from mira_engine import __logo__, __version__
+from mira_engine.cli.remote import remote_app
 from mira_engine.cli.workflow import workflow_app
 from mira_engine.config.paths import get_workspace_path
 from mira_engine.config.schema import Config
@@ -53,6 +54,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(workflow_app, name="workflow")
+app.add_typer(remote_app, name="remote")
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
@@ -1419,6 +1421,7 @@ def gateway(
     gateway_host = config.gateway.host
     gateway_port = config.gateway.port
 
+    _refuse_exposed_remote_engine(gateway_host)
     engine_lease = _acquire_engine_lease_or_exit(gateway_host, gateway_port)
     _gateway_failsafe_check(gateway_host, gateway_port, verbose)
 
@@ -1671,6 +1674,16 @@ def gateway(
         engine_lease.release()
 
 
+def _refuse_exposed_remote_engine(gateway_host: str) -> None:
+    """Remote-SSH engines are reached through an SSH tunnel and must never listen publicly."""
+    from mira_engine.cli.remote import LAUNCH_MODE_ENV, REMOTE_LAUNCH_MODE
+    from mira_engine.security.gateway_auth import is_loopback_host
+
+    if os.environ.get(LAUNCH_MODE_ENV) == REMOTE_LAUNCH_MODE and not is_loopback_host(gateway_host):
+        typer.echo(f"Error: a Remote-SSH engine must bind a loopback address, not {gateway_host}.", err=True)
+        raise typer.Exit(2)
+
+
 def _acquire_engine_lease_or_exit(gateway_host: str, gateway_port: int):
     """Take the single-engine lease for MIRA_HOME before touching its data."""
     import atexit
@@ -1685,8 +1698,8 @@ def _acquire_engine_lease_or_exit(gateway_host: str, gateway_port: int):
         lease = acquire_engine_lease(host=gateway_host, port=gateway_port)
     except LeaseConflictError as exc:
         typer.echo(f"Error: {exc}.", err=True)
-        typer.echo("Stop it first: `mira-engine stop` for the service, "
-                   "`mira-engine stop --gateway` for a standalone gateway.", err=True)
+        typer.echo("Inspect it with `mira remote status`. Stop it with `mira remote stop`, "
+                   "or `mira-engine stop` for the system service.", err=True)
         raise typer.Exit(LEASE_CONFLICT_EXIT_CODE) from None
     # Covers exits before the event loop starts; release() is idempotent.
     atexit.register(lease.release)

@@ -101,7 +101,7 @@ sets the explicit bind opt-in. Longer term, the multi-user Docker deployment
 becomes the Mira Server deployment (#159) and the browser talks only to Mira
 Server.
 
-### 2.2 Mode B: Remote-SSH (ticket to be filed)
+### 2.2 Mode B: Remote-SSH (#166, MIRA-Intelligence/mira-ui#73)
 
 The desktop app automates the SSH-tunnel setup, like VS Code Remote-SSH:
 
@@ -111,10 +111,9 @@ sequenceDiagram
   participant S as ssh client
   participant H as Server (user's account)
   D->>S: ssh host (honours ~/.ssh/config, ProxyJump, agent)
-  S->>H: mira --version (install / upgrade check)
-  S->>H: start or attach engine: mira gateway --host 127.0.0.1 --port P (engine lease, §7.3)
-  S->>H: mira gateway-token
-  S-->>D: token (over SSH, never on disk locally)
+  S->>H: sh -lc 'mira remote attach --json' (start or reuse, engine lease §7.3)
+  H-->>S: one JSON line: port P, token, version, pid
+  S-->>D: port + token (over SSH, never on disk locally)
   D->>S: ssh -L localport:127.0.0.1:P
   D->>D: connect http://127.0.0.1:localport with Bearer token
 ```
@@ -123,6 +122,8 @@ sequenceDiagram
   2FA keep working. Mira stores no SSH credentials.
 - The engine keeps running on the server when the laptop sleeps or the tunnel
   drops; the desktop reconnects and re-attaches.
+- Engine-side contract: [`docs/remote-ssh.md`](../remote-ssh.md) (protocol 1,
+  error codes, PATH discovery for non-interactive SSH).
 - Engine version check on connect: if the server has no compatible engine, the
   desktop shows install or upgrade instructions (automatic install is a later
   option).
