@@ -4,7 +4,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from mira_engine.agent.tools.base import Tool
+from mira_engine.agent.tools.base import UNSET, Tool, turn_value
 
 if TYPE_CHECKING:
     from mira_engine.agent.subagent import SubagentManager
@@ -22,23 +22,23 @@ class SpawnTool(Tool):
         self._project_dir: Path | None = None
         self._runtime_origin_channel: ContextVar[str | None] = ContextVar(
             "spawn_origin_channel",
-            default=None,
+            default=UNSET,
         )
         self._runtime_origin_chat_id: ContextVar[str | None] = ContextVar(
             "spawn_origin_chat_id",
-            default=None,
+            default=UNSET,
         )
         self._runtime_session_key: ContextVar[str | None] = ContextVar(
             "spawn_session_key",
-            default=None,
+            default=UNSET,
         )
         self._runtime_project_id: ContextVar[str | None] = ContextVar(
             "spawn_project_id",
-            default=None,
+            default=UNSET,
         )
         self._runtime_project_dir: ContextVar[Path | None] = ContextVar(
             "spawn_project_dir",
-            default=None,
+            default=UNSET,
         )
 
     def set_context(self, channel: str, chat_id: str) -> None:
@@ -106,9 +106,9 @@ class SpawnTool(Tool):
         return await self._manager.spawn(
             task=task,
             label=label,
-            origin_channel=self._runtime_origin_channel.get() or self._origin_channel,
-            origin_chat_id=self._runtime_origin_chat_id.get() or self._origin_chat_id,
-            session_key=self._runtime_session_key.get() or self._session_key,
-            workspace=self._runtime_project_dir.get() or self._project_dir,
-            project_id=self._runtime_project_id.get() or self._project_id,
+            origin_channel=turn_value(self._runtime_origin_channel, self._origin_channel),
+            origin_chat_id=turn_value(self._runtime_origin_chat_id, self._origin_chat_id),
+            session_key=turn_value(self._runtime_session_key, self._session_key),
+            workspace=turn_value(self._runtime_project_dir, self._project_dir),
+            project_id=turn_value(self._runtime_project_id, self._project_id),
         )
