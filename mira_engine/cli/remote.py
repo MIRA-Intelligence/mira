@@ -336,6 +336,29 @@ def _run(action, *, as_json: bool, render) -> None:
         raise typer.Exit(1)
 
 
+def setup() -> dict[str, Any]:
+    from mira_engine import __version__
+    from mira_engine.cli import launcher
+
+    try:
+        path = launcher.setup()
+    except launcher.LauncherError as exc:
+        raise RemoteError(exc.code, exc.message) from exc
+    return {"protocol": PROTOCOL, "ok": True, "launcher": str(path),
+            "executable": sys.executable, "version": __version__}
+
+
+@remote_app.command("setup")
+def setup_command(
+    as_json: bool = typer.Option(False, "--json", help="Print one JSON line (for the desktop app)"),
+) -> None:
+    """Write $MIRA_HOME/bin/mira (default ~/.mira/bin/mira), a launcher that needs no env activation."""
+    _run(setup, as_json=as_json,
+         render=lambda p: (f"wrote {p['launcher']} -> {p['executable']} (mira {p['version']})\n"
+                           "The desktop app finds the engine on this host through this launcher; "
+                           "run `mira remote setup` again after switching environments."))
+
+
 @remote_app.command("attach")
 def attach_command(
     as_json: bool = typer.Option(False, "--json", help="Print one JSON line (for the desktop app)"),
