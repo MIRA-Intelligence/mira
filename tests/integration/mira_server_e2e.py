@@ -184,10 +184,10 @@ def main() -> int:
 
     step("alice and bob sign in with their host passwords (PAM)")
     status, alice = client.login("alice")
-    check(status == 200, f"alice login -> {status} {alice}")
+    check(status == 200, f"alice login -> {status}")
     check(alice["user"]["roles"] == ["user"], f"alice roles {alice['user']['roles']}")
     status, bob = client.login("bob")
-    check(status == 200, f"bob login -> {status} {bob}")
+    check(status == 200, f"bob login -> {status}")
     check(bob["user"]["roles"] == ["user", "admin"], f"bob roles {bob['user']['roles']}")
     at, bt = alice["access_token"], bob["access_token"]
 

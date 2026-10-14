@@ -261,6 +261,7 @@ class MiraServer:
                            f"your account is not allowed to use Mira Server (group {self.config.auth.users_group})") \
                 from None
         self.limiter.reset(key)
+        request[REQUEST_USER] = identity.name
         self._identities[identity.name] = (identity, self._clock())
         self.store.upsert_user(identity.name, uid=identity.uid, display_name=identity.display_name,
                                roles=list(identity.roles), login=True)
@@ -288,6 +289,7 @@ class MiraServer:
             grant = self.sessions.check_refresh(token)
         except RefreshError as exc:
             raise self._refresh_rejected(request, exc) from None
+        request[REQUEST_USER] = grant.username
         identity = await self.current_identity(grant.username, force=True)  # 403 or 503
         try:
             grant, tokens = self.sessions.refresh(token)
