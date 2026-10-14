@@ -729,7 +729,10 @@ def main(
     ),
 ):
     """mira - Personal AI Assistant."""
-    pass
+    from mira_engine.cli.launcher import ensure_launcher
+
+    # Keeps <MIRA_HOME>/bin/mira pointing at a working install for Remote-SSH.
+    ensure_launcher()
 
 
 # ============================================================================
