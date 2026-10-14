@@ -432,7 +432,7 @@ Artifact import/content, executor activity streaming, recovery UI, structured in
 
 ## Not in scope
 
-- Remote multi-user authentication and authorization; the first contract remains local-engine scoped.
+- Remote multi-user authentication and authorization; the first contract remains local-engine scoped. Multi-user deployments are handled by Mira Server in front of one engine per user, which speaks this contract unchanged to each engine (see `docs/server-edition/architecture.md`).
 - Exactly-once WebSocket delivery; durable events are at-least-once and client application is idempotent.
 - GraphQL, gRPC, SSE, or an external message broker.
 - Persisting token deltas or activity pings.
