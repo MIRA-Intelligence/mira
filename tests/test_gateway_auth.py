@@ -383,3 +383,51 @@ def test_service_manager_sends_token_to_config_probe(tmp_path: Path, monkeypatch
     seen.clear()
     assert svc._gateway_config_path("http://127.0.0.1:1", str(config)) == "/x/config.json"
     assert seen == [f"Bearer {stale}", f"Bearer {good}"]
+
+
+# --- legacy wildcard CORS migration ---------------------------------------------
+
+
+def _load_ui_origins(tmp_path: Path, ui: dict) -> list[str]:
+    from mira_engine.config import loader
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"channels": {"ui": ui}}), encoding="utf-8")
+    section = loader.load_config(path).channels.ui
+    data = section if isinstance(section, dict) else section.model_dump(by_alias=True)
+    return data.get("corsOrigins", data.get("cors_origins"))
+
+
+@pytest.mark.parametrize("key", ["corsOrigins", "cors_origins"])
+def test_legacy_wildcard_cors_is_migrated_to_defaults(tmp_path: Path, key: str) -> None:
+    assert _load_ui_origins(tmp_path, {key: ["*"]}) == list(DEFAULT_ALLOWED_ORIGINS)
+
+
+@pytest.mark.parametrize("origins", [
+    ["https://mira.example.com"],
+    ["*", "https://mira.example.com"],
+    [],
+])
+def test_non_legacy_cors_lists_are_untouched(tmp_path: Path, origins: list[str]) -> None:
+    assert _load_ui_origins(tmp_path, {"corsOrigins": origins}) == origins
+
+
+def test_cors_migration_is_idempotent_and_logged_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mira_engine.config import loader
+
+    monkeypatch.setattr(loader, "_legacy_cors_migration_logged", False)
+    # Other tests toggle loguru namespaces globally; stub the loader's logger instead.
+    fake_logger = MagicMock()
+    monkeypatch.setattr(loader, "logger", fake_logger)
+    first = _load_ui_origins(tmp_path, {"corsOrigins": ["*"]})
+    second = _load_ui_origins(tmp_path, {"corsOrigins": first})
+    _load_ui_origins(tmp_path, {"corsOrigins": ["*"]})
+    assert first == second == list(DEFAULT_ALLOWED_ORIGINS)
+    fake_logger.info.assert_called_once()
+
+
+def test_wildcard_opt_out_via_env_survives_migration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(gateway_auth.ALLOWED_ORIGINS_ENV, "*")
+    origins = gateway_auth.allowed_origins(_load_ui_origins(tmp_path, {"corsOrigins": ["*"]}))
+    assert "*" in origins
+    assert gateway_auth.origin_allowed("https://any.example", origins)

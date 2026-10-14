@@ -53,8 +53,16 @@ without editing the config through `MIRA_GATEWAY_ALLOWED_ORIGINS`
 (comma-separated), which the Docker stack uses for the web UI container.
 
 `"*"` is still honored and accepts any website origin; the gateway logs a
-warning at startup. Configs written by older versions contain `"*"` because it
-was the previous default; replace it with the list above unless you need it.
+warning at startup.
+
+**Upgrade migration.** Older versions saved the whole config, so most existing
+`config.json` files contain `"corsOrigins": ["*"]`, the previous default. When
+the config is loaded, a value of exactly `["*"]` is replaced with the default
+list above (logged once at INFO); the change is written back the next time the
+config is saved. Any other list, including one that mixes `"*"` with other
+origins, is left as is. To keep accepting any origin, set
+`MIRA_GATEWAY_ALLOWED_ORIGINS=*` (or use a mixed list) instead of a bare
+`["*"]`.
 
 ## Bind address
 
