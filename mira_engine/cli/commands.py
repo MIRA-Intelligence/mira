@@ -1419,6 +1419,7 @@ def gateway(
     gateway_host = config.gateway.host
     gateway_port = config.gateway.port
 
+    engine_lease = _acquire_engine_lease_or_exit(gateway_host, gateway_port)
     _gateway_failsafe_check(gateway_host, gateway_port, verbose)
 
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
@@ -1664,7 +1665,32 @@ def gateway(
             await channels.stop_all()
             emit_event("gateway.stopped")
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    finally:
+        engine_lease.release()
+
+
+def _acquire_engine_lease_or_exit(gateway_host: str, gateway_port: int):
+    """Take the single-engine lease for MIRA_HOME before touching its data."""
+    import atexit
+
+    from mira_engine.cli.engine_lease import (
+        LEASE_CONFLICT_EXIT_CODE,
+        LeaseConflictError,
+        acquire_engine_lease,
+    )
+
+    try:
+        lease = acquire_engine_lease(host=gateway_host, port=gateway_port)
+    except LeaseConflictError as exc:
+        typer.echo(f"Error: {exc}.", err=True)
+        typer.echo("Stop it first: `mira-engine stop` for the service, "
+                   "`mira-engine stop --gateway` for a standalone gateway.", err=True)
+        raise typer.Exit(LEASE_CONFLICT_EXIT_CODE) from None
+    # Covers exits before the event loop starts; release() is idempotent.
+    atexit.register(lease.release)
+    return lease
 
 
 @app.command("gateway-token")
