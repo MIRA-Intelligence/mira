@@ -1,0 +1,24 @@
+# systemd unit for Mira Server. Install as /etc/systemd/system/mira-server.service.
+[Unit]
+Description=Mira Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mira-server
+Group=mira-server
+# Debian/Ubuntu with local (pam_unix) accounts: lets PAM verify passwords.
+SupplementaryGroups=shadow
+ExecStart=/opt/mira/bin/mira-server serve --config /etc/mira-server/mira-server.toml
+Restart=on-failure
+# Engines are started through sudo and keep running across Mira Server restarts;
+# only the Mira Server process itself is stopped.
+KillMode=process
+StateDirectory=mira-server
+StateDirectoryMode=0700
+UMask=0077
+# sudo needs to gain privileges, so NoNewPrivileges must stay off.
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

@@ -38,7 +38,7 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Lint with ruff
-        run: ruff check mira_engine --select F401,F841
+        run: ruff check mira_engine mira_server --select F401,F841
 
       - name: Run tests with coverage
         run: |
