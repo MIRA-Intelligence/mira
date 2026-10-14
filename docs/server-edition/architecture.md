@@ -401,12 +401,17 @@ A person may have a Mira Server-spawned engine, a Remote-SSH engine and a manual
 started `mira gateway`, all pointing at the same `~/.mira`, possibly on
 different hosts sharing an NFS home. Only one may run at a time.
 
-- **Engine lease** (engine work item): on start the engine creates
-  `~/.mira/engine.lease` with `O_EXCL` (safe on NFSv3+), containing host, pid,
-  port and start time, and refreshes a heartbeat every 30 s. A lease whose
-  heartbeat is older than 3 intervals is stale and may be taken over.
-- A second start fails with a clear message naming the holder
-  (`engine already running on host X, pid Y`).
+- **Engine lease** (#165, implemented): on start the engine takes a local
+  OS lock (`engine.lock` in the runtime dir, released by the kernel when the
+  process dies) and creates `~/.mira/engine.lease` with `O_EXCL` (safe on
+  NFSv3+), containing hostname, pid, process start time, port, version and
+  start time, and refreshes a heartbeat every 30 s. On the same host a record
+  is live while its pid and start time match; from another host it is live
+  while its heartbeat is newer than 3 intervals. Stale records may be taken
+  over. The record also guards against a runtime dir wiped under a live
+  engine (`/run/user/<uid>` removed at logout).
+- A second start fails with exit code 3 and a clear message naming the
+  holder (`engine already running for <home> (host X, pid Y, port P)`).
 - Mira Server and Remote-SSH desktop show that message and offer to stop the other
   engine. Stopping is done by the launcher or over SSH as the same user, so no
   extra privilege is needed.
@@ -427,8 +432,8 @@ different hosts sharing an NFS home. Only one may run at a time.
   engine.lease                # single-engine lease (§7.3)
   logs/ media/ cron/ ui/ workspace/ skills/
 
-$MIRA_RUNTIME_DIR             # local disk: /run/user/<uid>/mira or /var/lib/mira/run/<user>
-  gateway-token, pid, sockets, temp files, local SQLite state
+$MIRA_RUNTIME_DIR/<home-key>/ # local disk: MIRA_RUNTIME_DIR, else private $XDG_RUNTIME_DIR/mira,
+  engine.lock, sockets, temp   # else ~/.mira/runtime; one subdir per MIRA_HOME (#165)
 
 <any project dir alice can write>/   # e.g. ~/research/x or /data/lab/x
   .mira/                      # sessions/*.jsonl, memory, skills, token-usage.sqlite3

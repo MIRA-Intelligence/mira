@@ -9,8 +9,14 @@ def isolate_runtime_home(tmp_path, monkeypatch):
     from mira_engine.config import loader
 
     monkeypatch.setenv("MIRA_HOME", str(tmp_path / "mira-home"))
+    monkeypatch.setenv("MIRA_RUNTIME_DIR", str(tmp_path / "mira-run"))
     monkeypatch.delenv("MIRA_CONFIG_PATH", raising=False)
     monkeypatch.setattr(loader, "_current_config_path", None)
+    yield
+    # Gateway tests that stop before the event loop leave their lease to atexit.
+    from mira_engine.cli.engine_lease import release_all_leases
+
+    release_all_leases()
 
 @pytest.fixture(autouse=True)
 def mock_gateway_failsafe():
