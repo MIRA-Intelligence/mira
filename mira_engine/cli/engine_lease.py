@@ -232,7 +232,8 @@ def _claim_record(home: Path, *, host: str, port: int, launch_mode: str | None) 
         "port": port,
         "version": _engine_version(),
         "mira_home": str(home),
-        "launch_mode": launch_mode or os.environ.get("MIRA_SERVICE_MODE", "standalone"),
+        "launch_mode": (launch_mode or os.environ.get("MIRA_LAUNCH_MODE")
+                        or os.environ.get("MIRA_SERVICE_MODE", "standalone")),
         "started_at": now,
         "heartbeat_at": now,
     }
