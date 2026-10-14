@@ -211,9 +211,12 @@ Compose services include:
 - local build/run services: `mira-gateway`, `mira-api`, `mira-cli`
 - self-hosted release services (profile `self-hosted`): `mira-engine`, `mira-ui`
 
-Operator guide:
+Operator guides:
 
 - `docs/self-hosted-docker.md`
+- `docs/remote-access.md`: using an engine on another machine. Direct plaintext
+  `http`/`ws` connections to a remote engine are deprecated; use an SSH tunnel
+  (Remote-SSH mode once released) or a TLS reverse proxy.
 
 ## 💬 Multi-Channel Deployment (Coming Soon)
 Features to deploy Mira seamlessly to platforms like Telegram, Discord, Feishu, or Slack to assist your research team in real-time are in active development.
