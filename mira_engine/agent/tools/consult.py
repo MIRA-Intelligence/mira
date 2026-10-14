@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from mira_engine.agent.tools.base import Tool
+from mira_engine.agent.tools.base import UNSET, Tool, turn_value
 
 if TYPE_CHECKING:
     from mira_engine.agent.subagent import SubagentManager
@@ -27,7 +27,7 @@ class ConsultRoleTool(Tool):
         self._project_dir: Path | None = None
         self._runtime_project_dir: ContextVar[Path | None] = ContextVar(
             "consult_project_dir",
-            default=None,
+            default=UNSET,
         )
 
     def set_project_context(self, project_id: str, project_dir: str) -> None:
@@ -94,7 +94,7 @@ class ConsultRoleTool(Tool):
             return (
                 f"Error: unknown role '{role}'. Valid roles: {', '.join(_VALID_ROLES)}."
             )
-        workspace = self._runtime_project_dir.get() or self._project_dir
+        workspace = turn_value(self._runtime_project_dir, self._project_dir)
         result, returned_session = await self._manager.consult(
             role=role_normalized,
             task=task,
