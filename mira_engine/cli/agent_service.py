@@ -84,6 +84,22 @@ def _tree_stopped(processes: list[psutil.Process]) -> bool:
     return True
 
 
+def _gateway_config_path(base: str, config_path: str | None = None) -> str | None:
+    """Read ``config_path`` from ``/api/config`` using the local gateway token."""
+    from mira_engine.security.gateway_auth import local_gateway_tokens
+
+    for token in local_gateway_tokens(config_path) or [None]:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        request = urllib.request.Request(f"{base}/api/config", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=1) as response:
+                return json.load(response).get("config_path")
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                raise
+    return None
+
+
 def _endpoint_gateway(host: str, port: int) -> dict[str, Any] | None:
     """Read-only diagnosis of a leftover listener; never authorize a kill by HTTP."""
     host = "127.0.0.1" if host == "0.0.0.0" else "::1" if host == "::" else host
@@ -96,8 +112,7 @@ def _endpoint_gateway(host: str, port: int) -> dict[str, Any] | None:
             return None
         info = {"endpoint": base, "config_path": None}
         try:
-            with urllib.request.urlopen(f"{base}/api/config", timeout=1) as response:
-                info["config_path"] = json.load(response).get("config_path")
+            info["config_path"] = _gateway_config_path(base)
         except (OSError, ValueError, urllib.error.URLError):
             pass
         return info
@@ -125,9 +140,8 @@ def _gateway_healthy(pid: int | None, host: str, port: int, config_path: str | N
             healthy = (resp.status == 200 and data.get("status") == "ok"
                        and data.get("service") == "mira-gateway" and data.get("running") is True)
         if healthy and config_path:
-            with urllib.request.urlopen(f"http://{address}:{port}/api/config", timeout=1) as resp:
-                actual = json.load(resp).get("config_path")
-                return bool(actual) and Path(actual).resolve() == Path(config_path).resolve()
+            actual = _gateway_config_path(f"http://{address}:{port}", config_path)
+            return bool(actual) and Path(actual).resolve() == Path(config_path).resolve()
         return healthy
     except (psutil.Error, OSError, ValueError, urllib.error.URLError):
         return False

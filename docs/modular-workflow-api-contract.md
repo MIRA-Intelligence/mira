@@ -34,6 +34,8 @@ executor callback ----->|                   |----> Project events.jsonl
 
 New REST routes live under `/api/workflow/v1`. The new WebSocket lives at `/ws/workflow/v1`. A separate path avoids adding another set of branches to the current project/session-oriented WebSocket handler.
 
+All workflow routes sit behind the UI gateway token: send `Authorization: Bearer <token>`, or `?access_token=<token>` where headers cannot be set (WebSocket, `EventSource`). See [gateway-auth.md](gateway-auth.md).
+
 Every request and message carries `workflow_contract_version: 1`. URI `v1` is the breaking transport version; the contract field supports mira/mira-ui compatibility checks and additive feature negotiation within that version.
 
 ## Contract discovery

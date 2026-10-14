@@ -4,10 +4,25 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextvars import ContextVar
 from copy import deepcopy
 from typing import Any, TypeVar
 
 _ToolT = TypeVar("_ToolT", bound="Tool")
+
+# Default for per-turn context vars: distinguishes "no turn set this" from a
+# turn that explicitly set None (e.g. a chat without a project).
+UNSET: Any = object()
+
+
+def turn_value(var: ContextVar[Any], fallback: Any) -> Any:
+    """Return this turn's value, even None; use ``fallback`` only outside turns.
+
+    Falling back on a falsy turn value would leak whatever a concurrent
+    session last wrote into the shared tool instance.
+    """
+    value = var.get()
+    return fallback if value is UNSET else value
 
 _JSON_TYPE_MAP: dict[str, type | tuple[type, ...]] = {
     "string": str,
