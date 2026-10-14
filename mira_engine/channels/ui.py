@@ -70,6 +70,15 @@ from mira_engine.providers.model_fetch import (
     read_model_cache,
 )
 from mira_engine.providers.registry import find_by_name
+from mira_engine.security.gateway_auth import (
+    EXEMPT_PATHS as GATEWAY_EXEMPT_PATHS,
+    allowed_origins,
+    origin_allowed,
+    presented_token,
+    resolve_gateway_token,
+    token_matches,
+    warn_if_exposed,
+)
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
     get_task_plan_contract,
@@ -865,6 +874,7 @@ class UiChannel(BaseChannel):
         bind_port: int | None = None,
         restrict_to_workspace: bool = True,
         on_runtime_config_updated: Callable[[Config, Path], Awaitable[None]] | None = None,
+        auth_token: str | None = None,
     ):
         super().__init__(config, bus)
         self.config: UiChannelConfig = config
@@ -873,13 +883,16 @@ class UiChannel(BaseChannel):
         legacy_port = getattr(config, "port", None)
         self.bind_host: str = (
             bind_host
-            or (legacy_host if isinstance(legacy_host, str) and legacy_host.strip() else "0.0.0.0")
+            or (legacy_host if isinstance(legacy_host, str) and legacy_host.strip() else "127.0.0.1")
         )
         self.bind_port: int = (
             bind_port if bind_port is not None else (legacy_port if isinstance(legacy_port, int) else 18790)
         )
         self.restrict_to_workspace: bool = restrict_to_workspace
         self._on_runtime_config_updated = on_runtime_config_updated
+        # Resolved lazily when the app is built so constructing a channel never touches MIRA_HOME.
+        self._configured_auth_token = auth_token
+        self._auth_token: str | None = None
         storage_mode = getattr(config, "project_storage", "user_selectable")
         managed_root = getattr(config, "managed_project_root", None)
         from mira_engine.config.loader import get_home_dir
@@ -1177,12 +1190,16 @@ class UiChannel(BaseChannel):
             import time
             time.sleep(0.5)
 
-    async def start(self) -> None:
-        self._kill_stale_listener()
-
+    def _build_app(self) -> web.Application:
         from mira_engine.observability import request_middleware
 
-        self._app = web.Application(middlewares=[self._cors_middleware, request_middleware()])
+        if self._auth_token is None:
+            self._auth_token = resolve_gateway_token(self._configured_auth_token)
+        # CORS outermost so 401/403 stay readable by browser clients; auth innermost so
+        # rejected requests are still logged (by route template, never by query string).
+        self._app = web.Application(
+            middlewares=[self._cors_middleware, request_middleware(), self._auth_middleware],
+        )
         self._app.router.add_get("/ws", self._ws_handler)
         self._app.router.add_get("/health", self._handle_health)
         self._app.router.add_get("/version", self._handle_version)
@@ -1238,8 +1255,14 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
         self._app.router.add_delete("/api/projects/{session_id}/skill-plugins/{plugin_id}", self._handle_skill_plugins_uninstall)
         self._workflow_api.add_routes(self._app)
+        return self._app
 
-        self._runner = web.AppRunner(self._app)
+    async def start(self) -> None:
+        self._kill_stale_listener()
+        self._build_app()
+
+        # The access log would record request lines, including ?access_token=.
+        self._runner = web.AppRunner(self._app, access_log=None)
         await self._runner.setup()
         self._site = web.TCPSite(
             self._runner, self.bind_host, self.bind_port,
@@ -1252,6 +1275,7 @@ class UiChannel(BaseChannel):
             self.bind_host,
             self.bind_port,
         )
+        warn_if_exposed(self.bind_host, self._allowed_origins())
 
         # Keep the channel alive until stopped
         try:
@@ -1693,7 +1717,29 @@ class UiChannel(BaseChannel):
         except OSError as exc:
             logger.warning("Failed to write plan patch to {}: {}", plan_path, exc)
 
-    # ── CORS middleware ──────────────────────────────────────────────
+    # ── CORS / auth middleware ───────────────────────────────────────
+
+    def _allowed_origins(self) -> list[str]:
+        return allowed_origins(getattr(self.config, "cors_origins", None))
+
+    @web.middleware
+    async def _auth_middleware(
+        self,
+        request: web.Request,
+        handler: Any,
+    ) -> web.StreamResponse:
+        """Reject foreign browser origins and requests without the gateway token."""
+        if request.method == "OPTIONS" or (
+            request.method in {"GET", "HEAD"} and request.path in GATEWAY_EXEMPT_PATHS
+        ):
+            return await handler(request)
+        if not origin_allowed(request.headers.get("Origin"), self._allowed_origins()):
+            return web.json_response({"error": "origin not allowed"}, status=403)
+        if not token_matches(self._auth_token or "", presented_token(request)):
+            return web.json_response(
+                {"error": "unauthorized"}, status=401, headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await handler(request)
 
     @web.middleware
     async def _cors_middleware(
@@ -1713,14 +1759,14 @@ class UiChannel(BaseChannel):
                 resp = exc
 
         origin = request.headers.get("Origin", "*")
-        allowed = self.config.cors_origins
+        allowed = self._allowed_origins()
         if "*" in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
         elif origin in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
 
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Mira-Request-Id"
+        resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Mira-Request-Id"
         resp.headers["Access-Control-Expose-Headers"] = "X-Mira-Request-Id"
         return resp
 

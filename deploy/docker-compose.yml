@@ -17,8 +17,14 @@ services:
   mira-gateway:
     container_name: mira-gateway
     <<: *common-config
-    command: ["gateway"]
+    # The gateway binds 127.0.0.1 by default; inside a container it must listen on
+    # all interfaces. Every non-probe request still needs the gateway token
+    # (`docker compose exec mira-gateway mira gateway-token`).
+    command: ["gateway", "--host", "0.0.0.0"]
     restart: unless-stopped
+    environment:
+      - MIRA_GATEWAY_TOKEN=${MIRA_GATEWAY_TOKEN:-}
+      - MIRA_GATEWAY_ALLOWED_ORIGINS=${MIRA_GATEWAY_ALLOWED_ORIGINS:-}
     ports:
       - 18790:18790
     deploy:
@@ -73,13 +79,18 @@ services:
     profiles:
       - self-hosted
     restart: unless-stopped
-    command: ["mira", "gateway", "--port", "18790"]
+    # Listen on all interfaces inside the container; access requires the gateway token.
+    command: ["mira", "gateway", "--host", "0.0.0.0", "--port", "18790"]
     ports:
       - "${MIRA_AGENT_PORT:-18790}:18790"
     volumes:
       - mira_data:/root/.mira
     environment:
       - MIRA_CONFIG_PATH=/root/.mira/config.json
+      # Optional fixed token; when empty the engine generates /root/.mira/runtime/gateway-token.
+      - MIRA_GATEWAY_TOKEN=${MIRA_GATEWAY_TOKEN:-}
+      # Browser origins of the mira-ui container below; update when MIRA_UI_PORT or the host changes.
+      - MIRA_GATEWAY_ALLOWED_ORIGINS=${MIRA_GATEWAY_ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
 
   mira-ui:
     image: ghcr.io/mira-intelligence/mira-ui:${MIRA_UI_TAG:-latest}
