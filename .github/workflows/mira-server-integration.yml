@@ -1,0 +1,121 @@
+name: Mira Server integration
+
+# Acceptance test for Mira Server (#152): two real host accounts sign in through
+# PAM, each gets an engine running as their own uid through the sudo launcher,
+# and neither can reach the other's engine, files or config.
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - feat/server-edition
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-multiuser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Python (wheel build only)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip wheel . --no-deps -w dist
+          ls -l dist
+
+      - name: Create host accounts and groups
+        run: |
+          sudo groupadd mira-users
+          sudo groupadd mira-admins
+          for user in alice bob carol; do sudo useradd --create-home --shell /bin/bash "$user"; done
+          sudo usermod -aG mira-users alice
+          sudo usermod -aG mira-users,mira-admins bob   # carol stays outside mira-users
+          printf 'alice:alice-Pw-1\nbob:bob-Pw-2\ncarol:carol-Pw-3\n' | sudo chpasswd
+          id alice; id bob; id carol
+
+      - name: Install the engine system-wide in /opt/mira
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-venv
+          sudo /usr/bin/python3 -m venv /opt/mira
+          sudo /opt/mira/bin/pip install --quiet --upgrade pip
+          sudo /opt/mira/bin/pip install --quiet "$(ls dist/mira_engine-*.whl)[server]"
+          /opt/mira/bin/mira-server --help >/dev/null
+
+      - name: Mira Server account, launcher, sudoers and PAM service
+        run: |
+          sudo useradd --system --home-dir /var/lib/mira-server --create-home --shell /usr/sbin/nologin mira-server
+          sudo chmod 700 /var/lib/mira-server
+          sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local --engine-python /opt/mira/bin/python
+          echo 'mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch' \
+            | sudo tee /etc/sudoers.d/mira-server >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/mira-server
+          sudo visudo -cf /etc/sudoers.d/mira-server
+          sudo cp deploy/mira-server/pam.d-mira-server /etc/pam.d/mira-server
+          sudo mkdir -p /etc/mira-server
+          sudo tee /etc/mira-server/mira-server.toml >/dev/null <<'EOF'
+          [server]
+          listen = "127.0.0.1:8740"
+          public_url = "http://127.0.0.1:8740"
+          data_dir = "/var/lib/mira-server"
+          [auth]
+          group_recheck_interval = 0
+          [spawner]
+          idle_timeout = 0
+          EOF
+          ls -l /usr/local/libexec/mira/engine-launch /usr/sbin/unix_chkpwd
+
+      - name: "Probe: PAM as an unprivileged account without the shadow group"
+        run: |
+          sudo -u mira-server /opt/mira/bin/python -c "
+          import pam
+          p = pam.pam()
+          ok = p.authenticate('alice', 'alice-Pw-1', service='mira-server', resetcreds=False)
+          print('PAM for another user without shadow group:', ok, p.code, p.reason)
+          " || true
+
+      - name: Allow PAM (pam_unix) to verify local passwords
+        run: |
+          sudo usermod -aG shadow mira-server
+          sudo -u mira-server /opt/mira/bin/python -c "
+          import pam
+          p = pam.pam()
+          ok = p.authenticate('alice', 'alice-Pw-1', service='mira-server', resetcreds=False)
+          print('PAM for another user with shadow group:', ok, p.code, p.reason)
+          "
+
+      - name: mira-server check
+        run: sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml
+
+      - name: Start Mira Server as mira-server
+        run: |
+          sudo -u mira-server -H sh -c 'cd / && nohup /opt/mira/bin/mira-server serve --config /etc/mira-server/mira-server.toml >> /tmp/mira-server.log 2>&1 &'
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8740/server/info && break; sleep 0.5; done
+
+      - name: End-to-end checks
+        run: /opt/mira/bin/python tests/integration/mira_server_e2e.py --url http://127.0.0.1:8740
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          echo "--- mira-server.log"; sudo cat /tmp/mira-server.log || true
+          for user in alice bob; do
+            echo "--- $user engine logs"
+            sudo find "/home/$user/.mira" -name '*.log' -exec sh -c 'echo "== $1"; tail -n 60 "$1"' _ {} \; || true
+          done
+          echo "--- processes"; ps -eo user,pid,args | grep -E 'mira|gateway' | grep -v grep || true
+          echo "--- auth log"; sudo tail -n 40 /var/log/auth.log 2>/dev/null || sudo journalctl -n 40 --no-pager || true
