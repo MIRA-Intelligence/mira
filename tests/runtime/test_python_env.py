@@ -300,7 +300,7 @@ class TestDetectUvBundledFallback:
 class TestEnsureProjectVenvDisabled:
 
     def test_returns_none_when_manager_off(self, tmp_path: Path) -> None:
-        cfg = PythonRuntimeConfig()
+        cfg = PythonRuntimeConfig(manager="off")
         assert ensure_project_venv(tmp_path, cfg) is None
 
     def test_returns_none_when_manager_system(self, tmp_path: Path) -> None:

@@ -539,7 +539,7 @@ class PythonRuntimeConfig(Base):
     When ``manager == "uv"`` and ``auto_bootstrap`` is true, the exec tool
     creates a project-local ``.venv`` (configurable via ``venv_dir``) on the
     first python-related command and prepends it to PATH for every subsequent
-    subprocess. With ``manager == "off"`` (the default) the exec tool keeps
+    subprocess. With ``manager == "off"`` the exec tool keeps
     its legacy behaviour and resolves ``python`` against the parent process
     environment, leaving environment management entirely to the user.
 
@@ -549,7 +549,7 @@ class PythonRuntimeConfig(Base):
     # ``off`` keeps the historical behaviour. ``uv`` enables per-project venv
     # auto-bootstrap. ``system`` is reserved for a future passthrough mode
     # (no venv, but with explicit interpreter pinning).
-    manager: Literal["off", "uv", "system"] = "off"
+    manager: Literal["off", "uv", "system"] = "uv"
 
     # Whether to lazily create the project venv the first time the agent runs
     # a python-shaped command (python, pip, pytest, jupyter, ipython, uv).
@@ -574,9 +574,11 @@ class PythonRuntimeConfig(Base):
     baseline_requirements: list[str] = Field(default_factory=list)
 
     # Pinned interpreter version, e.g. ``3.11``, ``3.12``, ``3.11.10``.
-    # Empty means "let uv pick a compatible interpreter, downloading a
-    # standalone build if necessary".
-    python_version: str = ""
+    # Defaults to the project minimum so uv never picks an old system
+    # interpreter (e.g. macOS' 3.9) and can download a standalone build on
+    # hosts with no Python at all (typical Windows desktop install).
+    # Empty means "let uv pick any compatible interpreter".
+    python_version: str = "3.11"
 
     # Opt-in: when True and ``manager == "uv"``, the exec tool rewrites
     # ``pip install ...`` and ``python -m pip install ...`` into

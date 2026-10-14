@@ -95,6 +95,20 @@ jobs:
       - name: Build standalone mira-engine executable
         run: pyinstaller --clean mira-engine.spec
 
+      - name: Verify uv is embedded in the standalone build
+        shell: bash
+        run: |
+          python <<'PY'
+          import platform
+          from pathlib import Path
+
+          name = "uv.exe" if platform.system() == "Windows" else "uv"
+          hits = list(Path("dist").rglob(name))
+          if not hits:
+              raise SystemExit(f"{name} missing from dist/; fetch_uv.py output was not bundled")
+          print("Bundled uv:", hits[0])
+          PY
+
       - name: Smoke test standalone mira-engine executable
         shell: bash
         run: |
