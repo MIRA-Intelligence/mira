@@ -83,7 +83,7 @@ def main() -> int:
     # restrict_to_workspace refuses the absolute path; the sandbox would hide it anyway.
     output = asyncio.run(tool.execute(command=f"cat {secret_file}"))
     check("do-not-leak" not in output, "exec tool cannot read the Mira home")
-    output = asyncio.run(tool.execute(command="cat ../../.mira/runtime/isolation-check-secret"))
+    output = asyncio.run(tool.execute(command="cat ../.mira/runtime/isolation-check-secret"))
     check("do-not-leak" not in output, "exec tool cannot reach the Mira home through a relative path")
     output = asyncio.run(tool.execute(command="pwd", working_dir="/"))
     check("working_dir outside the workspace" in output, "exec tool refuses a working_dir outside the workspace")
