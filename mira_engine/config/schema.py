@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -599,6 +599,10 @@ class ExecToolConfig(Base):
     timeout: int = 60
     path_append: str = ""
     sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
+    sandbox_network: Literal["full", "none"] = "full"  # "none": no network inside the sandbox
+    # Extra host paths visible read-only inside the sandbox (e.g. a conda
+    # install). Paths inside the Mira home (config, tokens) are never mounted.
+    sandbox_read_only_paths: list[str] = Field(default_factory=list)
     python: PythonRuntimeConfig = Field(default_factory=PythonRuntimeConfig)
 
 
@@ -633,6 +637,11 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+
+    # The user's own values of settings the host policy overrides
+    # (security/host_policy.py), keyed by config.json path; save_config writes
+    # these instead of the enforced values.
+    _policy_user_values: dict[tuple[str, ...], Any] = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="after")
     def _enable_channel_builtin_access(self) -> "Config":

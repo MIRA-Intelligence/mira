@@ -34,6 +34,8 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # bubblewrap: the agent sandbox tests run it for real (tests/tools/test_sandbox.py).
+          sudo apt-get install -y -qq bubblewrap
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
@@ -41,6 +43,8 @@ jobs:
         run: ruff check mira_engine mira_server --select F401,F841
 
       - name: Run tests with coverage
+        env:
+          MIRA_REQUIRE_BWRAP: "1"
         run: |
           python -m pytest tests/ \
             --cov=mira_engine \

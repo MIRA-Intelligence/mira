@@ -34,6 +34,7 @@ from loguru import logger
 
 from mira_engine import __version__
 from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
+from mira_engine.agent.tools.sandbox import sandbox_status
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
@@ -79,6 +80,12 @@ from mira_engine.security.gateway_auth import (
     token_matches,
     warn_if_exposed,
 )
+from mira_engine.security.host_policy import (
+    LOCKED_ERROR_CODE,
+    HostPolicyError,
+    PolicyLockedError,
+    load_host_policy,
+)
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
     get_task_plan_contract,
@@ -92,6 +99,37 @@ PLAN_FILENAME = "task_plan.json"
 # Sentinel session id used by the UI to manage globally-scoped skill plugins
 # without a selected project. Mirrors GLOBAL_SKILLS_SESSION_ID in the frontend.
 _GLOBAL_SKILLS_SESSION_ID = "__global__"
+
+
+def host_policy_payload() -> dict[str, Any]:
+    """The host policy summary for clients (locked settings, source)."""
+    try:
+        return load_host_policy().summary()
+    except HostPolicyError as exc:
+        return {"source": None, "groups": [], "locked": [], "plugin_install": False, "error": str(exc)}
+
+
+def sandbox_status_payload() -> dict[str, Any]:
+    try:
+        exec_config = config_loader.load_config().tools.exec
+    except Exception as exc:  # noqa: BLE001 - status must not fail
+        return {"mode": None, "available": False, "reason": str(exc)}
+    return sandbox_status(exec_config.sandbox, network=exec_config.sandbox_network)
+
+
+def plugin_install_refusal() -> web.Response | None:
+    """403 when the host policy forbids installing or removing skill plugins."""
+    try:
+        policy = load_host_policy()
+    except HostPolicyError as exc:
+        return web.json_response({"error": str(exc), "code": LOCKED_ERROR_CODE}, status=403)
+    if policy.plugin_install_disabled:
+        return web.json_response(
+            {"error": f"installing skill plugins is disabled by the host policy ({policy.source})",
+             "code": LOCKED_ERROR_CODE},
+            status=403,
+        )
+    return None
 _ASSETS_DIR = Path(__file__).parent / "ui_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".mira") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
@@ -2417,6 +2455,8 @@ class UiChannel(BaseChannel):
             "connected_clients": len(self._clients),
             "uptime_host": f"{self.bind_host}:{self.bind_port}",
             "projects_root": str(self.projects_root),
+            "policy": host_policy_payload(),
+            "sandbox": sandbox_status_payload(),
         })
 
     async def _handle_sessions(self, _request: web.Request) -> web.Response:
@@ -2720,6 +2760,7 @@ class UiChannel(BaseChannel):
             persisted=False,
         )
         payload["project_location"] = self._project_location_payload()
+        payload["policy"] = host_policy_payload()
         return web.json_response(payload)
 
     async def _handle_config(self, request: web.Request) -> web.Response:
@@ -2752,6 +2793,8 @@ class UiChannel(BaseChannel):
                 body,
                 current_projects_root=previous_root,
             )
+        except PolicyLockedError as exc:
+            return web.json_response({"error": str(exc), "code": exc.code}, status=403)
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
@@ -3946,6 +3989,8 @@ class UiChannel(BaseChannel):
         session_id = request.match_info.get("session_id", "").strip()
         if not session_id:
             return web.json_response({"error": "session_id required"}, status=400)
+        if refusal := plugin_install_refusal():
+            return refusal
         manager = self._skill_plugin_manager(session_id)
 
         content_type = request.headers.get("Content-Type", "").lower()
@@ -4040,6 +4085,8 @@ class UiChannel(BaseChannel):
             return web.json_response({"error": "session_id required"}, status=400)
         if not plugin_id:
             return web.json_response({"error": "plugin_id required"}, status=400)
+        if refusal := plugin_install_refusal():
+            return refusal
 
         manager = self._skill_plugin_manager(session_id)
         try:

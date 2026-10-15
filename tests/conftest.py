@@ -12,6 +12,12 @@ def isolate_runtime_home(tmp_path, monkeypatch):
     monkeypatch.setenv("MIRA_RUNTIME_DIR", str(tmp_path / "mira-run"))
     monkeypatch.delenv("MIRA_CONFIG_PATH", raising=False)
     monkeypatch.setattr(loader, "_current_config_path", None)
+    # The host policy (/etc/mira/policy.toml) of the machine running the tests
+    # must not change their outcome.
+    from mira_engine.security import host_policy
+
+    monkeypatch.setattr(host_policy, "POLICY_PATH", tmp_path / "etc-mira" / "policy.toml")
+    host_policy.reset_cache()
     yield
     # Gateway tests that stop before the event loop leave their lease to atexit.
     from mira_engine.cli.engine_lease import release_all_leases

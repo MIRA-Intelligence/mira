@@ -92,6 +92,9 @@ def _map_remote_error(code: str, message: str) -> SpawnerError:
         return SpawnerError(CONFLICT, message)
     if code == "health_timeout":
         return SpawnerError(HEALTH_TIMEOUT, message)
+    if code == "listener_mismatch":
+        log.warning("security: %s", message)
+        return SpawnerError(START_FAILED, message)
     if code in {"start_failed", "config_invalid"}:
         return SpawnerError(START_FAILED, message)
     return SpawnerError(INTERNAL, message or code)

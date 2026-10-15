@@ -193,7 +193,7 @@ class TestMaybeBootstrapVenv:
         proj_a.mkdir()
         proj_b.mkdir()
 
-        def _fake(cwd: str, runtime):
+        def _fake(cwd: str, runtime, sandbox_spec=None):
             return Path(cwd) / ".venv"
 
         with patch.object(

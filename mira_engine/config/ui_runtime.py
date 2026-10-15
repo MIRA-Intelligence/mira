@@ -10,6 +10,7 @@ from pydantic.alias_generators import to_camel
 
 from mira_engine.config.schema import AgentDefaults, Config, ProvidersConfig
 from mira_engine.providers.registry import find_by_name
+from mira_engine.security.host_policy import RESTRICT_PATH, check_runtime_change
 
 _ALLOWED_REASONING_EFFORTS = {"low", "medium", "high", "adaptive"}
 # ``team`` profile roles, each bindable to its own provider + model.
@@ -643,6 +644,7 @@ def apply_ui_runtime_update(
             restrict_to_workspace = runtime_payload["restrict_to_workspace"]
             if not isinstance(restrict_to_workspace, bool):
                 raise ValueError("runtime.restrict_to_workspace must be a boolean")
+            check_runtime_change(RESTRICT_PATH, config.tools.restrict_to_workspace, restrict_to_workspace)
             if config.tools.restrict_to_workspace != restrict_to_workspace:
                 config.tools.restrict_to_workspace = restrict_to_workspace
                 changed = True

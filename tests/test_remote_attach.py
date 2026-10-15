@@ -183,6 +183,54 @@ def test_attach_failure_codes(spawned, mode, code):
     assert payload["error"]["message"]
 
 
+_SQUATTER = textwrap.dedent(
+    """
+    import sys
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    port, log = int(sys.argv[1]), sys.argv[2]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            with open(log, "a") as handle:
+                handle.write(f"{self.path} {self.headers.get('Authorization')}\\n")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", port), Handler)
+    print("ready", flush=True)
+    server.serve_forever()
+    """
+)
+
+
+def test_attach_never_sends_the_token_to_a_port_squatter(spawned, tmp_path):
+    # The lease names this process and a port; another process answers there.
+    port = _free_port()
+    log = tmp_path / "squatter.log"
+    squatter = subprocess.Popen([sys.executable, "-c", _SQUATTER, str(port), str(log)],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        assert squatter.stdout.readline().strip() == "ready"
+        lease = acquire_engine_lease(host="127.0.0.1", port=port, heartbeat=False)
+        try:
+            exit_code, payload = _invoke("attach", "--json", "--timeout", "3")
+        finally:
+            lease.release()
+    finally:
+        squatter.kill()
+        squatter.wait(timeout=10)
+    assert exit_code == 1
+    assert payload["error"]["code"] == "listener_mismatch"
+    received = log.read_text() if log.exists() else ""
+    assert "Bearer" not in received
+    assert spawned[1] == []
+
+
 def test_attach_reports_engine_on_another_host_as_lease_conflict(spawned):
     _write_record(hostname="other-node", pid=4242)
     exit_code, payload = _invoke("attach", "--json")
