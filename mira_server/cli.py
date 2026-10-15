@@ -137,6 +137,9 @@ def install_launcher_command(
         typer.echo(f"    {rule}")
     typer.echo("")
     typer.echo("Notes:")
+    typer.echo("- Cmnd_Alias/Defaults run `start` through the mira-engine PAM service (install")
+    typer.echo("  deploy/mira-server/pam.d-mira-engine as /etc/pam.d/mira-engine first): engines then run in")
+    typer.echo("  the user's user-<uid>.slice, where per-user systemd limits apply.")
     typer.echo(f"- The first rule starts, inspects and stops engines of {users_group} members. The second only")
     typer.echo(f"  stops engines, for people removed from {users_group} (their engine would keep running otherwise).")
     typer.echo(f"- {path} and every directory above it must stay root-owned and not group/world-writable.")
@@ -217,11 +220,28 @@ def _check_sudo(cfg: ServerConfig, report: _Report) -> None:
     else:
         report.fail(f"no NOPASSWD sudo rule lets this account run {launcher} (`sudo -n -l` exit "
                     f"{result.returncode}); run `mira-server install-launcher` for the rules")
+    _check_engine_session(result.stdout, report)
     if stop:
         report.ok(f"sudo allows `{launcher} stop` for accounts outside {cfg.auth.users_group}")
     elif full:
         report.warn(f"no sudo rule for `{launcher} stop` as other accounts: engines of people removed from "
                     f"{cfg.auth.users_group} keep running until stopped over SSH (see `install-launcher`)")
+
+
+def _check_engine_session(sudo_list: str, report: _Report) -> None:
+    """`start` must go through the mira-engine PAM service for per-user slices."""
+    from mira_server.spawner.launcher import PAM_SESSION_SERVICE
+
+    pam_file = Path("/etc/pam.d") / PAM_SESSION_SERVICE
+    if f"pam_service={PAM_SESSION_SERVICE}" not in sudo_list.replace(" ", ""):
+        report.warn("sudo does not run `engine-launch start` through the mira-engine PAM service: engines "
+                    "will not run in the users' user-<uid>.slice, so per-user limits do not apply "
+                    "(see `install-launcher`)")
+    elif not pam_file.exists():
+        report.fail(f"sudoers uses PAM service {PAM_SESSION_SERVICE} but {pam_file} is missing, so engines "
+                    "cannot start (copy deploy/mira-server/pam.d-mira-engine)")
+    else:
+        report.ok(f"engines start in a user session (PAM service {pam_file})")
 
 
 def _check_host_policy(report: _Report) -> None:

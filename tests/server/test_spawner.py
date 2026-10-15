@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -166,6 +167,33 @@ async def test_launcher_spawner_runs_and_parses() -> None:
     await spawner.stop(ALICE)
 
 
+async def test_start_does_not_wait_for_a_launcher_that_holds_the_session() -> None:
+    # The launcher prints its result, then stays to keep the user's session open.
+    script = (
+        "import json, os, sys, time\n"
+        "print(json.dumps({'protocol': 1, 'ok': True, 'port': 4242, 'token': 'tok', 'pid': 7, 'started': True}),"
+        " flush=True)\n"
+        "devnull = os.open(os.devnull, os.O_RDWR)\n"
+        "[os.dup2(devnull, fd) for fd in (0, 1, 2)]\n"
+        "time.sleep(30)\n"
+    )
+    spawner = ScriptSpawner(script, timeout=5)
+    started = asyncio.get_running_loop().time()
+    handle = await spawner.start(ALICE)
+    assert asyncio.get_running_loop().time() - started < 5
+    assert handle.port == 4242
+    assert len(spawner._held) == 1
+    task = next(iter(spawner._held))
+    task.cancel()
+
+
+async def test_start_failure_before_any_result_line_uses_stderr() -> None:
+    script = "import sys; print('sudo: a password is required', file=sys.stderr); sys.exit(1)"
+    with pytest.raises(SpawnerError) as info:
+        await ScriptSpawner(script).start(ALICE)
+    assert info.value.code == DENIED
+
+
 async def test_status_on_other_host_is_conflict() -> None:
     script = ("import json; print(json.dumps({'protocol': 1, 'ok': True, 'running': True, 'port': 1, "
               "'hostname': 'other'}))")
@@ -253,3 +281,15 @@ def test_psutil_check(listening_port) -> None:
     assert not check_psutil_listener(listening_port, os.getuid() + 1, pid).ok
     assert not check_psutil_listener(1, os.getuid(), pid).ok
     assert not check_psutil_listener(listening_port, os.getuid(), None).ok
+
+
+def test_user_slice_of(tmp_path) -> None:
+    from mira_server.spawner.netcheck import user_slice_of
+
+    (tmp_path / "42").mkdir()
+    (tmp_path / "42" / "cgroup").write_text("0::/user.slice/user-1001.slice/session-7.scope\n")
+    assert user_slice_of(42, proc_root=tmp_path) == "user-1001.slice"
+    (tmp_path / "43").mkdir()
+    (tmp_path / "43" / "cgroup").write_text("0::/system.slice/mira-server.service\n")
+    assert user_slice_of(43, proc_root=tmp_path) is None
+    assert user_slice_of(44, proc_root=tmp_path) is None

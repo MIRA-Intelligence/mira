@@ -93,7 +93,7 @@ sudo useradd --system --home-dir /var/lib/mira-server --create-home \
 sudo chmod 700 /var/lib/mira-server
 ```
 
-### 4. Launcher and sudoers rule
+### 4. Launcher, sudoers rules and engine sessions
 
 ```sh
 sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local \
@@ -101,10 +101,14 @@ sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local \
 ```
 
 This writes `/usr/local/libexec/mira/engine-launch` (root-owned, mode 0755) and
-prints the two sudoers rules Mira Server needs:
+prints the sudoers lines Mira Server needs. Install the `mira-engine` PAM
+service first, because the sudoers lines refer to it:
 
 ```sh
+sudo cp deploy/mira-server/pam.d-mira-engine /etc/pam.d/mira-engine
 sudo tee /etc/sudoers.d/mira-server >/dev/null <<'EOF'
+Cmnd_Alias MIRA_ENGINE_START = /usr/local/libexec/mira/engine-launch start
+Defaults!MIRA_ENGINE_START pam_service=mira-engine
 mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch
 mira-server ALL=(ALL,!root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop
 EOF
@@ -112,6 +116,12 @@ sudo chmod 0440 /etc/sudoers.d/mira-server
 sudo visudo -cf /etc/sudoers.d/mira-server
 ```
 
+- `Cmnd_Alias`/`Defaults` run `engine-launch start` through the PAM service
+  [`mira-engine`](../../deploy/mira-server/pam.d-mira-engine). Its session
+  stack (`pam_systemd`) registers a logind session for the user, so the engine
+  runs in the user's `user-<uid>.slice` like their SSH sessions, and the
+  per-user limits below apply. `status` and `stop` open no session. See
+  [Resource limits](#resource-limits).
 - The first rule lets Mira Server start, inspect and stop the engines of
   `mira-users` members.
 - The second allows only `engine-launch stop` (sudoers matches the argument
@@ -124,13 +134,21 @@ The launcher accepts exactly one argument, `start`, `status` or `stop`, and no
 other input. It discards the caller's environment, sets `HOME`, `USER`,
 `MIRA_HOME=~/.mira` and `PATH` from the passwd entry of the uid sudo runs it as
 (plus `XDG_RUNTIME_DIR=/run/user/<uid>` when that directory exists and is
-private, so it shares the runtime dir with the user's SSH sessions), and execs:
+private, so it shares the runtime dir with the user's SSH sessions), and runs:
 
 | Action | Command run as the user |
 |---|---|
 | `start` | `/opt/mira/bin/python -I -m mira_engine remote attach --json --timeout 60` |
 | `status` | `/opt/mira/bin/python -I -m mira_engine remote status --json` |
 | `stop` | `/opt/mira/bin/python -I -m mira_engine remote stop --json` |
+
+For `start` inside a logind session, the launcher prints the attach result and
+then stays, with its output closed, until the engine exits (one such process
+per engine). This keeps the session open: when a user's last session ends,
+logind removes `/run/user/<uid>` and, with the default `RemoveIPC=yes`, the
+user's shared memory and semaphores, which a running engine (and Python
+multiprocessing in its tools) relies on. Mira Server reads the result line and
+does not wait for the launcher to exit.
 
 Re-run `install-launcher` after moving the engine install.
 
@@ -282,6 +300,33 @@ nginx to confirm the token never reaches its access log.
 - On hosts with systemd-logind, consider `loginctl enable-linger <user>` (see
   [remote-ssh.md](../remote-ssh.md)) so logging out of SSH does not affect the
   engine.
+
+## Resource limits
+
+Engines Mira Server starts run in the user's `user-<uid>.slice` (see step 4),
+so systemd's per-user limits cover them together with the user's SSH sessions:
+one budget per person. Set them for all users with a drop-in such as
+[`deploy/mira-server/user-slice-mira.conf`](../../deploy/mira-server/user-slice-mira.conf):
+
+```sh
+sudo install -D -m 0644 deploy/mira-server/user-slice-mira.conf \
+     /etc/systemd/system/user-.slice.d/50-mira.conf
+sudo systemctl daemon-reload
+```
+
+```ini
+[Slice]
+MemoryMax=16G
+MemorySwapMax=0
+CPUQuota=400%
+TasksMax=4096
+```
+
+Use `/etc/systemd/system/user-<uid>.slice.d/` for one user. `pam_limits`
+(`/etc/security/limits.conf`) also applies to the engine session. Mira Server
+logs a warning and an `engine.outside_user_slice` audit event when an engine
+runs outside its user's slice (for example when the `mira-engine` PAM service
+is not set up), and `mira-server check` reports a missing setup.
 
 ## Agent isolation
 
@@ -438,9 +483,9 @@ passwords, tokens, prompts or request bodies.
 
 ## Limitations (follow-ups)
 
-- **Per-user resource limits (#153)**: engines started through sudo do not run
-  in the user's `user-<uid>.slice` yet, so per-user systemd limits do not apply
-  to them.
+- **Resource limits for engines started over Remote-SSH** come from the
+  user's SSH session (also `user-<uid>.slice`); an engine started by hand with
+  `nohup` outside any session gets none.
 - **MCP servers** run outside the sandbox; disable them with `tools.mcp = false`
   where that matters.
 - **Team keys and the LLM proxy (#154)**.

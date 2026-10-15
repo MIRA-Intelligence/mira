@@ -114,3 +114,21 @@ def check_listener(port: int, expected_uid: int, *, pid: int | None = None,
     if (platform or sys.platform).startswith("linux"):
         return check_proc_listener(port, expected_uid, proc_root=proc_root)
     return check_psutil_listener(port, expected_uid, pid)
+
+
+def user_slice_of(pid: int, *, proc_root: Path | str = "/proc") -> str | None:
+    """The ``user-<uid>.slice`` the process runs in, or None (outside one, or unknown).
+
+    Engines Mira Server starts run there when sudo opens a logind session for
+    ``engine-launch start``; per-user systemd limits apply only then.
+    """
+    try:
+        text = (Path(proc_root) / str(pid) / "cgroup").read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        path = line.split(":", 2)[-1]
+        for part in path.split("/"):
+            if part.startswith("user-") and part.endswith(".slice") and part[5:-6].isdigit():
+                return part
+    return None

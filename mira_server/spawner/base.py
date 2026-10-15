@@ -156,6 +156,10 @@ class LauncherSpawner(Spawner):
     def __init__(self, *, start_timeout: float, stop_timeout: float) -> None:
         self.start_timeout = start_timeout
         self.stop_timeout = stop_timeout
+        # Launchers still running after printing their result: for `start` in
+        # a logind session the launcher keeps the session open while the
+        # engine runs. Reaped in the background.
+        self._held: set[asyncio.Task] = set()
 
     @abc.abstractmethod
     def command(self, identity: Identity, action: str) -> tuple[list[str], dict[str, str]]:
@@ -174,6 +178,8 @@ class LauncherSpawner(Spawner):
             )
         except OSError as exc:
             raise SpawnerError(INTERNAL, f"cannot run the engine launcher: {exc}") from exc
+        if action == "start":
+            return await self._read_result(proc, identity, timeout)
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError:
@@ -189,6 +195,54 @@ class LauncherSpawner(Spawner):
                       stderr[-2000:].decode("utf-8", errors="replace"))
         return parse_remote_output(stdout[-_MAX_OUTPUT:], stderr[-_MAX_OUTPUT:], proc.returncode)
 
+    async def _read_result(self, proc: asyncio.subprocess.Process, identity: Identity,
+                           timeout: float) -> dict[str, Any]:
+        """Read up to the launcher's JSON result line without waiting for it to exit."""
+        assert proc.stdout is not None and proc.stderr is not None
+        stderr = bytearray()
+
+        async def drain_stderr() -> None:
+            while chunk := await proc.stderr.read(4096):
+                if len(stderr) < _MAX_OUTPUT:
+                    stderr.extend(chunk)
+
+        stderr_task = asyncio.create_task(drain_stderr())
+        lines: list[bytes] = []
+        try:
+            async with asyncio.timeout(timeout):
+                while line := await proc.stdout.readline():
+                    lines.append(line)
+                    if _is_result_line(line):
+                        break
+                else:
+                    await proc.wait()
+                    await stderr_task
+        except TimeoutError:
+            _kill_group(proc)
+            await proc.wait()
+            stderr_task.cancel()
+            raise SpawnerError(TIMEOUT, f"the engine launcher did not finish start within {timeout:.0f}s") \
+                from None
+        except asyncio.CancelledError:
+            _kill_group(proc)
+            stderr_task.cancel()
+            raise
+        if stderr:
+            log.debug("launcher start for %s stderr: %s", identity.name,
+                      bytes(stderr[-2000:]).decode("utf-8", errors="replace"))
+        if proc.returncode is None:
+            task = asyncio.create_task(self._reap(proc, stderr_task))
+            self._held.add(task)
+            task.add_done_callback(self._held.discard)
+        return parse_remote_output(b"".join(lines)[-_MAX_OUTPUT:], bytes(stderr), proc.returncode)
+
+    @staticmethod
+    async def _reap(proc: asyncio.subprocess.Process, stderr_task: asyncio.Task) -> None:
+        try:
+            await proc.wait()
+        finally:
+            stderr_task.cancel()
+
     async def start(self, identity: Identity) -> EngineHandle:
         payload = await self._run(identity, "start", self.start_timeout)
         return handle_from_payload(payload)
@@ -203,6 +257,13 @@ class LauncherSpawner(Spawner):
 
     async def stop(self, identity: Identity) -> None:
         await self._run(identity, "stop", self.stop_timeout)
+
+
+def _is_result_line(line: bytes) -> bool:
+    try:
+        return isinstance(json.loads(line), dict)
+    except ValueError:
+        return False
 
 
 def _kill_group(proc: asyncio.subprocess.Process) -> None:

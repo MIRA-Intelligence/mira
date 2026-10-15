@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -25,7 +27,7 @@ import aiohttp
 
 from mira_server.auth.identity import Identity
 from mira_server.spawner.base import INTERNAL, EngineHandle, Spawner, SpawnerError
-from mira_server.spawner.netcheck import ListenerCheck, check_listener
+from mira_server.spawner.netcheck import ListenerCheck, check_listener, user_slice_of
 from mira_server.store import Store
 
 log = logging.getLogger(__name__)
@@ -197,6 +199,7 @@ class EngineManager:
                 self._set_error(engine, "the engine port is not owned by your account; "
                                         "Mira Server refused to connect (security event logged)")
                 return False
+            self._check_user_slice(identity, handle, expected)
         try:
             version = await self._probe(handle.port)
         except EngineProbeError as exc:
@@ -217,6 +220,18 @@ class EngineManager:
         log.info("engine for %s %s on port %s (pid %s)", identity.name,
                  "started" if handle.started else "attached", handle.port, handle.pid)
         return True
+
+    def _check_user_slice(self, identity: Identity, handle: EngineHandle, uid: int) -> None:
+        """Warn when a user's engine is outside their user-<uid>.slice (no per-user limits)."""
+        if not sys.platform.startswith("linux") or handle.pid is None or uid == os.getuid():
+            return
+        found = user_slice_of(handle.pid)
+        if found == f"user-{uid}.slice":
+            return
+        log.warning("engine for %s (pid %s) runs outside user-%s.slice, so per-user resource limits do not "
+                    "apply; see the mira-engine PAM service in docs/server-edition/mira-server.md",
+                    identity.name, handle.pid, uid)
+        self.store.audit("engine.outside_user_slice", username=identity.name, pid=handle.pid, slice=found)
 
     async def _probe(self, port: int) -> str | None:
         """``/health`` and ``/version`` must answer as a Mira gateway (both are open routes)."""
