@@ -469,7 +469,15 @@ place_file() {
 	log "wrote $dest"
 }
 
-same_content() { [[ -f $2 ]] && cmp -s "$1" "$2"; }
+# Compares a file (or a <(...) stream) with a file. Reads both completely, so a
+# generator is never cut off with SIGPIPE as with cmp.
+same_content() {
+	[[ -e $1 && -f $2 ]] || return 1
+	local want have
+	want=$(cat "$1" && printf x)
+	have=$(cat "$2" && printf x)
+	[[ $want == "$have" ]]
+}
 
 tmpfile() { mktemp "${TMPDIR:-/tmp}/mira-install.XXXXXX"; }
 
@@ -734,7 +742,7 @@ required_packages() {
 
 add_caddy_repo() {
 	say "  adding the official Caddy apt repository (Ubuntu has no caddy package here)"
-	run apt-get install -y -q debian-keyring debian-archive-keyring apt-transport-https gnupg
+	run apt-get install -y -q gnupg
 	run bash -c "curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o $CADDY_REPO_KEY"
 	run curl -fsSL -o "$CADDY_REPO_LIST" https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt
 	state_set added_caddy_repo yes
@@ -883,11 +891,11 @@ print("\n".join(sudoers_rules(Path(sys.argv[1]), server_user=sys.argv[2], users_
 
 check_launcher() {
 	[[ -f $LAUNCHER && -f $SUDOERS_FILE ]] || return 1
-	"$VENV/bin/python" -c '
+	same_content <("$VENV/bin/python" -c '
 import sys
 from mira_server.spawner.launcher import render_launcher
 sys.stdout.write(render_launcher(sys.argv[1]))
-' "$VENV/bin/python" | cmp -s - "$LAUNCHER" || return 1
+' "$VENV/bin/python") "$LAUNCHER" || return 1
 	[[ $(grep -v '^[[:space:]]*#' "$SUDOERS_FILE" | sed '/^[[:space:]]*$/d') == "$(expected_sudoers_rules)" ]]
 }
 
@@ -1088,6 +1096,22 @@ render_caddyfile() {
 	render_caddy_site
 }
 
+# Validates as the caddy user with its storage, as the service would load it.
+# (Run as root, `caddy validate` creates the access log root-owned, and the
+# service then cannot open it.)
+caddy_validate() {
+	chmod 0644 "$1"
+	fix_caddy_log
+	run runuser -u caddy -- env HOME=/var/lib/caddy caddy validate --config "$1" --adapter caddyfile
+}
+
+fix_caddy_log() {
+	local log=/var/log/caddy/mira-server.access.log
+	mkdir -p /var/log/caddy
+	chown caddy:caddy /var/log/caddy
+	if [[ -e $log ]]; then chown caddy:caddy "$log"; fi
+}
+
 check_caddy() {
 	[[ $S_mode == proxy ]] && return 0
 	systemctl is-active --quiet caddy || return 1
@@ -1116,7 +1140,7 @@ Replace it with the installer's version? It is backed up first." yes; then
 		rm -f "$tmp"
 		if grep -qE "^[[:space:]]*import[[:space:]]+$CADDY_SNIPPET" "$CADDYFILE" &&
 			{ [[ $S_mode != lan ]] || grep -qE "^[[:space:]]*default_sni[[:space:]]+$S_ip" "$CADDYFILE"; }; then
-			run caddy validate --config "$CADDYFILE" --adapter caddyfile
+			caddy_validate "$CADDYFILE"
 			run systemctl reload-or-restart caddy
 		else
 			need_manual "$CADDYFILE has other sites, so the installer did not change it.
@@ -1135,11 +1159,9 @@ $([[ $S_mode == lan ]] && printf '  2. Add to the global options block at the ve
 	fi
 	state_set caddy_layout main
 	render_caddyfile >"$tmp"
-	run caddy validate --config "$tmp" --adapter caddyfile
+	caddy_validate "$tmp"
 	install -D -o root -g root -m 0644 "$tmp" "$CADDYFILE"
 	rm -f "$tmp"
-	mkdir -p /var/log/caddy
-	chown caddy: /var/log/caddy 2>/dev/null || true
 	run systemctl enable caddy
 	run systemctl reload-or-restart caddy
 }
