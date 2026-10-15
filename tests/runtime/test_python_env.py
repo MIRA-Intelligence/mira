@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import uv
 
 from mira_engine.config.schema import PythonRuntimeConfig
 from mira_engine.runtime import python_env
@@ -26,7 +27,6 @@ from mira_engine.runtime.python_env import (
     venv_exists,
     venv_python_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -93,11 +93,33 @@ def _fake_run_factory(stdout: str = "", stderr: str = "", returncode: int = 0):
     return _fake_run
 
 
+def _missing_uv_bin() -> str:
+    raise FileNotFoundError
+
+
 class TestDetectUv:
 
     def test_returns_none_when_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(python_env.shutil, "which", lambda *_a, **_k: None)
+        monkeypatch.setattr(uv, "find_uv_bin", _missing_uv_bin)
         assert detect_uv() is None
+
+    def test_falls_back_to_uv_package_binary(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        fake = tmp_path / "uv"
+        fake.touch()
+        monkeypatch.setattr(python_env.shutil, "which", lambda *_a, **_k: None)
+        monkeypatch.setattr(uv, "find_uv_bin", lambda: str(fake))
+        monkeypatch.setattr(
+            python_env.subprocess, "run", _fake_run_factory(stdout="uv 0.5.4\n")
+        )
+
+        result = detect_uv()
+
+        assert result is not None
+        assert result.path == fake
+        assert result.version == (0, 5, 4)
 
     def test_returns_binary_when_recent_enough(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -288,6 +310,7 @@ class TestDetectUvBundledFallback:
         monkeypatch.setattr(python_env.sys, "executable", str(tmp_path / "python"))
 
         monkeypatch.setattr(python_env.shutil, "which", lambda *_a, **_k: None)
+        monkeypatch.setattr(uv, "find_uv_bin", _missing_uv_bin)
         self._stub_run(monkeypatch, "0.5.4")
         assert detect_uv() is None
 
