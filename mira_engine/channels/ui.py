@@ -15,6 +15,7 @@ import base64
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import shutil
 import subprocess
@@ -26,6 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import quote
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from loguru import logger
@@ -66,6 +68,7 @@ from mira_engine.providers.model_fetch import (
     read_model_cache,
 )
 from mira_engine.providers.registry import find_by_name
+from mira_engine.security.gateway_auth import gateway_auth_middleware, load_gateway_token
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
     get_task_plan_contract,
@@ -721,26 +724,30 @@ _PROJECT_FILE_LIST_SKIP_DIRS = frozenset({".mira", "__pycache__", ".git", "node_
 def _collect_project_file_entries(project_dir: Path) -> list[dict[str, Any]]:
     """Walk a project directory and return file rows for the UI explorer."""
     entries: list[dict[str, Any]] = []
-    for path in sorted(project_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(project_dir).as_posix()
-        if any(part in _PROJECT_FILE_LIST_SKIP_DIRS for part in rel.split("/")):
-            continue
-        if path.name == ".DS_Store":
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        entries.append({
-            "name": path.name,
-            "path": rel,
-            "size": stat.st_size,
-            "mtime": int(stat.st_mtime),
-            "is_dir": False,
-        })
-    return entries
+    root = project_dir.resolve()
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        # Prune before descending: filtering rglob results still scans every
+        # dependency, Git object and internal session log.
+        dirnames[:] = [name for name in dirnames if name not in _PROJECT_FILE_LIST_SKIP_DIRS]
+        for name in filenames:
+            if name == ".DS_Store" or name in _PROJECT_FILE_LIST_SKIP_DIRS:
+                continue
+            path = Path(directory) / name
+            try:
+                path.resolve().relative_to(root)
+                if not path.is_file():
+                    continue
+                stat = path.stat()
+            except (OSError, ValueError, RuntimeError):
+                continue
+            entries.append({
+                "name": name,
+                "path": path.relative_to(root).as_posix(),
+                "size": stat.st_size,
+                "mtime": int(stat.st_mtime),
+                "is_dir": False,
+            })
+    return sorted(entries, key=lambda entry: entry["path"])
 
 
 def _next_available_dir(base_dir: Path, dirname: str) -> Path:
@@ -1136,82 +1143,57 @@ class UiChannel(BaseChannel):
 
     # ── lifecycle ────────────────────────────────────────────────────
 
-    def _kill_stale_listener(self) -> None:
-        """Kill any leftover process occupying our port before binding."""
-        import os
-        import signal
-        import subprocess
-
-        my_pid = os.getpid()
-        try:
-            result = subprocess.run(
-                ["lsof", "-ti", f":{self.bind_port}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            pids = {
-                int(p) for p in result.stdout.split() if p.strip()
-            } - {my_pid}
-        except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
-            return
-
-        for pid in pids:
-            try:
-                logger.warning("Killing stale process {} on port {}", pid, self.bind_port)
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
-
-        if pids:
-            import time
-            time.sleep(0.5)
-
-    async def start(self) -> None:
-        self._kill_stale_listener()
-
-        self._app = web.Application(middlewares=[self._cors_middleware])
-        self._app.router.add_get("/ws", self._ws_handler)
-        self._app.router.add_get("/health", self._handle_health)
-        self._app.router.add_get("/version", self._handle_version)
-        self._app.router.add_get("/api/health", self._handle_health)
-        self._app.router.add_get("/api/version", self._handle_version)
-        self._app.router.add_get("/api/status", self._handle_status)
-        self._app.router.add_get("/api/sessions", self._handle_sessions)
-        self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
-        self._app.router.add_get("/api/plan", self._handle_plan)
-        self._app.router.add_get("/api/plan/contract", self._handle_plan_contract)
-        self._app.router.add_get("/api/plan/lint", self._handle_plan_lint)
-        self._app.router.add_get("/api/config", self._handle_get_config)
-        self._app.router.add_post("/api/config", self._handle_config)
-        self._app.router.add_get("/api/providers/{name}/models", self._handle_provider_models)
-        self._app.router.add_post("/api/providers/{name}/test", self._handle_provider_test)
-        self._app.router.add_get("/api/feedback/config", self._handle_feedback_config)
-        self._app.router.add_post("/api/feedback", self._handle_feedback)
-        self._app.router.add_get("/api/projects", self._handle_list_projects)
-        self._app.router.add_post("/api/projects", self._handle_create_project)
-        self._app.router.add_get("/api/organization", self._handle_organization)
-        self._app.router.add_post("/api/organization/folders", self._handle_create_folder)
-        self._app.router.add_patch("/api/organization/folders/{folder_id}", self._handle_rename_folder)
-        self._app.router.add_delete("/api/organization/folders/{folder_id}", self._handle_delete_folder)
-        self._app.router.add_patch(
+    def _create_app(self, token: str) -> web.Application:
+        app = web.Application(middlewares=[self._cors_middleware, gateway_auth_middleware(token)])
+        app.router.add_get("/ws", self._ws_handler)
+        app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/version", self._handle_version)
+        app.router.add_get("/api/health", self._handle_health)
+        app.router.add_get("/api/version", self._handle_version)
+        app.router.add_get("/api/status", self._handle_status)
+        app.router.add_get("/api/sessions", self._handle_sessions)
+        app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
+        app.router.add_get("/api/plan", self._handle_plan)
+        app.router.add_get("/api/plan/contract", self._handle_plan_contract)
+        app.router.add_get("/api/plan/lint", self._handle_plan_lint)
+        app.router.add_get("/api/config", self._handle_get_config)
+        app.router.add_post("/api/config", self._handle_config)
+        app.router.add_get("/api/providers/{name}/models", self._handle_provider_models)
+        app.router.add_post("/api/providers/{name}/test", self._handle_provider_test)
+        app.router.add_get("/api/feedback/config", self._handle_feedback_config)
+        app.router.add_post("/api/feedback", self._handle_feedback)
+        app.router.add_get("/api/projects", self._handle_list_projects)
+        app.router.add_post("/api/projects", self._handle_create_project)
+        app.router.add_get("/api/organization", self._handle_organization)
+        app.router.add_post("/api/organization/folders", self._handle_create_folder)
+        app.router.add_patch("/api/organization/folders/{folder_id}", self._handle_rename_folder)
+        app.router.add_delete("/api/organization/folders/{folder_id}", self._handle_delete_folder)
+        app.router.add_patch(
             "/api/organization/items/{kind}/{item_id}/folder",
             self._handle_assign_folder,
         )
-        self._app.router.add_post("/api/organization/chats/import", self._handle_import_chats)
-        self._app.router.add_patch("/api/organization/chats/{chat_id}", self._handle_update_chat)
-        self._app.router.add_delete("/api/organization/chats/{chat_id}", self._handle_delete_chat)
-        self._app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
-        self._app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
-        self._app.router.add_post("/api/projects/{session_id}/remove", self._handle_remove_project)
-        self._app.router.add_delete("/api/projects", self._handle_delete_project)
-        self._app.router.add_get("/api/projects/{session_id}/files", self._handle_list_project_files)
-        self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
-        self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
-        self._app.router.add_get("/api/projects/{session_id}/skill-plugins", self._handle_skill_plugins_list)
-        self._app.router.add_post("/api/projects/{session_id}/skill-plugins/install", self._handle_skill_plugins_install)
-        self._app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
-        self._app.router.add_delete("/api/projects/{session_id}/skill-plugins/{plugin_id}", self._handle_skill_plugins_uninstall)
+        app.router.add_post("/api/organization/chats/import", self._handle_import_chats)
+        app.router.add_patch("/api/organization/chats/{chat_id}", self._handle_update_chat)
+        app.router.add_delete("/api/organization/chats/{chat_id}", self._handle_delete_chat)
+        app.router.add_post("/api/data-path/validate", self._handle_validate_data_path)
+        app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
+        app.router.add_post("/api/projects/{session_id}/remove", self._handle_remove_project)
+        app.router.add_delete("/api/projects", self._handle_delete_project)
+        app.router.add_get("/api/projects/{session_id}/files", self._handle_list_project_files)
+        app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
+        app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
+        app.router.add_get("/api/projects/{session_id}/skill-plugins", self._handle_skill_plugins_list)
+        app.router.add_post("/api/projects/{session_id}/skill-plugins/install", self._handle_skill_plugins_install)
+        app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
+        app.router.add_delete("/api/projects/{session_id}/skill-plugins/{plugin_id}", self._handle_skill_plugins_uninstall)
 
-        self._runner = web.AppRunner(self._app)
+        return app
+
+    async def start(self) -> None:
+        token = load_gateway_token(config_loader.get_home_dir())
+        self._app = self._create_app(token)
+
+        self._runner = web.AppRunner(self._app, access_log=None)
         await self._runner.setup()
         self._site = web.TCPSite(
             self._runner, self.bind_host, self.bind_port,
@@ -1627,7 +1609,7 @@ class UiChannel(BaseChannel):
             resp.headers["Access-Control-Allow-Origin"] = origin
 
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Mira-Request-Id"
         return resp
 
     # ── WebSocket handler ────────────────────────────────────────────
@@ -3316,7 +3298,7 @@ class UiChannel(BaseChannel):
 
         return web.json_response({
             "session_id": session_id,
-            "files": _collect_project_file_entries(project_dir),
+            "files": await asyncio.to_thread(_collect_project_file_entries, project_dir),
         })
 
     async def _handle_upload_project_files(self, request: web.Request) -> web.Response:
@@ -3448,7 +3430,7 @@ class UiChannel(BaseChannel):
         if not session_id:
             return web.json_response({"error": "session_id required"}, status=400)
 
-        rel_path = request.query.get("path", "").strip()
+        rel_path = request.query.get("path", "")
         if not rel_path:
             return web.json_response({"error": "path required"}, status=400)
 
@@ -3465,7 +3447,18 @@ class UiChannel(BaseChannel):
         if not candidate.is_file():
             return web.json_response({"error": "artifact not found"}, status=404)
 
-        return web.FileResponse(candidate)
+        response = web.FileResponse(candidate)
+        if mimetypes.guess_type(candidate.name)[0] in {
+            "text/html", "application/xhtml+xml", "image/svg+xml",
+            "application/xml", "text/xml", "application/xslt+xml",
+        }:
+            # Untrusted project documents must not execute with a gateway token.
+            response.headers["Content-Security-Policy"] = "sandbox"
+        if request.query.get("download") == "1":
+            response.headers["Content-Disposition"] = (
+                f"attachment; filename*=UTF-8''{quote(candidate.name, safe='')}"
+            )
+        return response
 
     def _skill_plugin_manager(self, session_id: str) -> SkillPluginManager:
         # Skills are managed at a single global scope. The UI sends a sentinel

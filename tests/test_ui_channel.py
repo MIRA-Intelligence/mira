@@ -1,4 +1,6 @@
 import json
+import os
+import socket
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -7,7 +9,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiohttp import web
+from aiohttp import WSServerHandshakeError, web
+from aiohttp.test_utils import TestClient, TestServer
 
 from mira_engine import __version__
 from mira_engine.agent import skill_plugins as skill_plugins_mod
@@ -100,6 +103,142 @@ def ui_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> UiChannel:
         with patch.object(ui_channel_mod, "_load_ui_instructions", return_value=""):
             ch = UiChannel(config, bus, workspace=tmp_path)
             return ch
+
+
+_GATEWAY_TEST_TOKEN = "test-gateway-token-1234567890"
+
+
+async def test_gateway_start_does_not_take_over_an_occupied_port(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_home_dir", lambda: tmp_path)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        ui_channel.bind_host = "127.0.0.1"
+        ui_channel.bind_port = listener.getsockname()[1]
+        try:
+            with pytest.raises(OSError):
+                await ui_channel.start()
+            assert listener.getsockname()[1] == ui_channel.bind_port
+        finally:
+            await ui_channel.stop()
+
+
+@pytest.fixture
+async def gateway_client(ui_channel: UiChannel):
+    ui_channel.config.cors_origins = ["http://localhost:5173"]
+    project_dir = ui_channel.projects_root / "PRJ-http"
+    project_dir.mkdir(parents=True)
+    (project_dir / "keep.txt").write_text("keep", encoding="utf-8")
+    async with TestClient(TestServer(ui_channel._create_app(_GATEWAY_TEST_TOKEN))) as client:
+        yield client, project_dir
+
+
+@pytest.mark.parametrize(("method", "url"), [
+    ("GET", "/api/projects/PRJ-http/files"),
+    ("POST", "/api/config"),
+    ("PATCH", "/api/projects/PRJ-http/meta"),
+    ("DELETE", "/api/projects?session_id=PRJ-http"),
+])
+async def test_gateway_rejects_unauthenticated_operations(gateway_client, method, url):
+    client, project_dir = gateway_client
+    response = await client.request(method, url)
+    assert response.status == 401
+    assert await response.json() == {"error": "unauthorized"}
+    assert (project_dir / "keep.txt").read_text() == "keep"
+
+
+@pytest.mark.parametrize("path", ["/health", "/version", "/api/health", "/api/version"])
+async def test_gateway_health_and_version_remain_public(gateway_client, path):
+    client, _ = gateway_client
+    response = await client.get(path)
+    assert response.status == 200
+
+
+async def test_gateway_accepts_bearer_and_supports_browser_preflight(gateway_client):
+    client, _ = gateway_client
+    preflight = await client.options("/api/projects/PRJ-http/files", headers={
+        "Origin": "http://localhost:5173",
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization,x-mira-request-id",
+    })
+    assert preflight.status == 204
+    assert preflight.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+    allowed = preflight.headers["Access-Control-Allow-Headers"].lower()
+    assert "authorization" in allowed and "x-mira-request-id" in allowed
+    response = await client.get("/api/projects/PRJ-http/files", headers={
+        "Authorization": f"Bearer {_GATEWAY_TEST_TOKEN}",
+        "Origin": "http://localhost:5173",
+    })
+    assert response.status == 200
+    assert [f["path"] for f in (await response.json())["files"]] == ["keep.txt"]
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.parametrize("header", ["Bearer wrong-token", "Basic wrong-token", "Bearer 非法"])
+async def test_gateway_does_not_fall_back_from_bad_header_to_query(gateway_client, header):
+    client, _ = gateway_client
+    response = await client.get("/api/projects/PRJ-http/artifacts", params={
+        "path": "keep.txt", "access_token": _GATEWAY_TEST_TOKEN,
+    }, headers={"Authorization": header})
+    assert response.status == 401
+
+
+async def test_query_tokens_only_authorize_artifacts_and_websocket(gateway_client):
+    client, _ = gateway_client
+    params = {"access_token": _GATEWAY_TEST_TOKEN}
+    response = await client.get("/api/projects/PRJ-http/files", params=params)
+    assert response.status == 401
+    response = await client.post("/api/config", params=params, json={})
+    assert response.status == 401
+    response = await client.get("/api/projects/PRJ-http/artifacts", params={
+        **params, "path": "keep.txt", "download": "1",
+    })
+    assert response.status == 200
+    assert await response.read() == b"keep"
+    assert response.headers["Content-Disposition"].startswith("attachment;")
+    assert response.headers["Referrer-Policy"] == "no-referrer"
+    with pytest.raises(WSServerHandshakeError) as exc:
+        await client.ws_connect("/ws")
+    assert exc.value.status == 401
+    async with client.ws_connect("/ws", params=params) as ws:
+        assert not ws.closed
+
+
+async def test_gateway_rejects_duplicate_credentials(gateway_client):
+    client, _ = gateway_client
+    response = await client.get("/api/projects/PRJ-http/files", headers=[
+        ("Authorization", f"Bearer {_GATEWAY_TEST_TOKEN}"),
+        ("Authorization", "Bearer wrong-token"),
+    ])
+    assert response.status == 401
+    response = await client.get("/api/projects/PRJ-http/artifacts", params=[
+        ("path", "keep.txt"), ("access_token", _GATEWAY_TEST_TOKEN),
+        ("access_token", "wrong-token"),
+    ])
+    assert response.status == 401
+
+
+async def test_single_file_deletion_remains_unavailable(gateway_client):
+    client, project_dir = gateway_client
+    response = await client.delete("/api/projects/PRJ-http/files?path=keep.txt", headers={
+        "Authorization": f"Bearer {_GATEWAY_TEST_TOKEN}",
+    })
+    assert response.status == 405
+    assert (project_dir / "keep.txt").read_text() == "keep"
+
+
+@pytest.mark.parametrize("suffix", [".html", ".svg", ".shtml", ".xht"])
+async def test_untrusted_documents_are_sandboxed(gateway_client, suffix):
+    client, project_dir = gateway_client
+    (project_dir / f"document{suffix}").write_text("<script>untrusted()</script>")
+    response = await client.get("/api/projects/PRJ-http/artifacts", params={
+        "path": f"document{suffix}", "access_token": _GATEWAY_TEST_TOKEN,
+    })
+    assert response.status == 200
+    assert response.headers["Content-Security-Policy"] == "sandbox"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
 
 
 def test_load_ui_instructions_joins_present_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1799,7 +1938,59 @@ async def test_handle_list_project_files_returns_project_tree(ui_channel: UiChan
     paths = {item["path"] for item in body["files"]}
     assert "task_plan.json" in paths
     assert "experiments/exp001/metrics.json" in paths
-    assert "ui.jsonl" not in paths
+    assert paths == {"task_plan.json", "experiments/exp001/metrics.json"}
+
+
+def test_project_file_scan_prunes_internal_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ui_channel_mod._PROJECT_FILE_LIST_SKIP_DIRS:
+        (tmp_path / name / "nested").mkdir(parents=True)
+        (tmp_path / name / "nested" / "hidden.txt").write_text("internal")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "ok.txt").write_text("ok")
+    (tmp_path / ".DS_Store").write_text("ignored")
+    visited: list[Path] = []
+    original_scandir = ui_channel_mod.os.scandir
+
+    def tracking_scandir(path):
+        visited.append(Path(path))
+        return original_scandir(path)
+
+    monkeypatch.setattr(ui_channel_mod.os, "scandir", tracking_scandir)
+    rows = ui_channel_mod._collect_project_file_entries(tmp_path)
+    assert [row["path"] for row in rows] == ["data/ok.txt"]
+    assert set(visited) == {tmp_path, tmp_path / "data"}
+
+
+async def test_project_file_scan_runs_off_event_loop(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    project_dir = ui_channel.projects_root / "PRJ-0001"
+    project_dir.mkdir(parents=True)
+    loop_thread = threading.get_ident()
+
+    def collect(path):
+        assert threading.get_ident() != loop_thread
+        assert path == project_dir
+        return []
+
+    monkeypatch.setattr(ui_channel_mod, "_collect_project_file_entries", collect)
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    resp = await ui_channel._handle_list_project_files(req)
+    assert resp.status == 200
+
+
+async def test_project_files_reject_external_symlinks(ui_channel: UiChannel, tmp_path: Path) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
+    project_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep")
+    (project_dir / "link.txt").symlink_to(outside)
+    assert ui_channel_mod._collect_project_file_entries(project_dir) == []
 
 
 async def test_handle_upload_project_files_invalid_multipart(ui_channel: UiChannel) -> None:
@@ -1992,6 +2183,70 @@ async def test_handle_project_artifact_serves_file(ui_channel: UiChannel) -> Non
     assert isinstance(resp, web.FileResponse)
     assert resp.status == 200
     assert Path(resp._path) == artifact
+
+
+@pytest.mark.parametrize("download", [False, True])
+async def test_artifact_download_preserves_unicode_filename_and_bytes(
+    ui_channel: UiChannel, download: bool,
+) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-download"
+    project_dir.mkdir(parents=True)
+    artifact = project_dir / '中文 文件.txt'
+    original = "这是 A 项目的文件".encode("utf-8")
+    artifact.write_bytes(original)
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-download"}
+    req.query = {"path": artifact.name, **({"download": "1"} if download else {})}
+
+    resp = await ui_channel._handle_project_artifact(req)
+
+    assert isinstance(resp, web.FileResponse)
+    assert Path(resp._path).read_bytes() == original
+    if download:
+        assert resp.headers["Content-Disposition"] == (
+            "attachment; filename*=UTF-8''%E4%B8%AD%E6%96%87%20%E6%96%87%E4%BB%B6.txt"
+        )
+    else:
+        assert "Content-Disposition" not in resp.headers
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX filenames may end in whitespace")
+@pytest.mark.parametrize("name", [" report.txt", "report.txt ", "report.txt\t", "report.txt\n"])
+@pytest.mark.parametrize("download", [False, True])
+async def test_artifact_uses_exact_filename(
+    ui_channel: UiChannel, name: str, download: bool,
+) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-exact"
+    project_dir.mkdir(parents=True)
+    exact = project_dir / name
+    exact.write_text("requested file", encoding="utf-8")
+    other = project_dir / name.strip()
+    other.write_text("different file", encoding="utf-8")
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-exact"}
+    req.query = {"path": name, **({"download": "1"} if download else {})}
+
+    resp = await ui_channel._handle_project_artifact(req)
+
+    assert isinstance(resp, web.FileResponse)
+    assert Path(resp._path) == exact
+    assert Path(resp._path).read_text(encoding="utf-8") == "requested file"
+    assert other.read_text(encoding="utf-8") == "different file"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX filenames may end in whitespace")
+async def test_missing_exact_artifact_does_not_fall_back_to_trimmed_name(ui_channel: UiChannel) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-exact"
+    project_dir.mkdir(parents=True)
+    (project_dir / "report.txt").write_text("different file", encoding="utf-8")
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-exact"}
+    req.query = {"path": "report.txt "}
+
+    resp = await ui_channel._handle_project_artifact(req)
+
+    assert resp.status == 404
+    assert (project_dir / "report.txt").read_text(encoding="utf-8") == "different file"
 
 
 async def test_handle_project_artifact_blocks_traversal(ui_channel: UiChannel, tmp_path: Path) -> None:
