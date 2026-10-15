@@ -62,7 +62,7 @@ jobs:
           sudo chmod 700 /var/lib/mira-server
           sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local --engine-python /opt/mira/bin/python \
             | grep -E '^    mira-server ALL=' | sed 's/^    //' | sudo tee /etc/sudoers.d/mira-server
-          test "$(sudo wc -l < /etc/sudoers.d/mira-server)" -eq 2
+          test "$(sudo grep -c '^mira-server ALL=' /etc/sudoers.d/mira-server)" -eq 2
           sudo chmod 0440 /etc/sudoers.d/mira-server
           sudo visudo -cf /etc/sudoers.d/mira-server
           sudo cp deploy/mira-server/pam.d-mira-server /etc/pam.d/mira-server
