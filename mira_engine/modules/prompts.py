@@ -122,6 +122,8 @@ This is a Delivery Run. Work directly from the selected manuscript, draft, resul
 or other supplied artifacts. Clarify audience, format, style, and claim constraints;
 then write, polish, analyze, or package the deliverable. Do not launch literature
 research or experiments unless the user explicitly creates a separate Run for them.
+For an HTML slide deck (delivery_format `slides`) use the `bento-slides` skill; for a reproduction
+notebook (delivery_format `notebook`) use the `jupyter-notebook-export` skill.
 """.strip(),
 }
 
