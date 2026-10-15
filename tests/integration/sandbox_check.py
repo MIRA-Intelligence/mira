@@ -78,9 +78,13 @@ def main() -> int:
         sandbox=config.tools.exec.sandbox,
         sandbox_network=config.tools.exec.sandbox_network,
     )
-    output = asyncio.run(tool.execute(command=f"echo written > out.txt; cat {secret_file} 2>&1; ls /proc | wc -l"))
-    check((workspace / "out.txt").read_text() == "written\n", "exec tool writes inside the workspace")
+    output = asyncio.run(tool.execute(command="echo written > out.txt && echo $HOME"))
+    check((workspace / "out.txt").read_text() == "written\n", f"exec tool writes inside the workspace ({output!r})")
+    # restrict_to_workspace refuses the absolute path; the sandbox would hide it anyway.
+    output = asyncio.run(tool.execute(command=f"cat {secret_file}"))
     check("do-not-leak" not in output, "exec tool cannot read the Mira home")
+    output = asyncio.run(tool.execute(command="cat ../../.mira/runtime/isolation-check-secret"))
+    check("do-not-leak" not in output, "exec tool cannot reach the Mira home through a relative path")
     output = asyncio.run(tool.execute(command="pwd", working_dir="/"))
     check("working_dir outside the workspace" in output, "exec tool refuses a working_dir outside the workspace")
 
