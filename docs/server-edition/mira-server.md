@@ -72,18 +72,31 @@ sudo usermod -aG mira-users,mira-admins bob
 LDAP/SSSD groups work the same way, as long as `getent group mira-users` and
 `id alice` show the membership.
 
-### 2. The engine, system-wide
+### 2. Source and engine, system-wide
 
-Install the engine and Mira Server into a root-owned virtual environment. Every
-user's engine runs from it.
+Check out the Mira source to `/opt/mira-src`. The install steps below copy
+their files (PAM services, config, host policy, systemd units) from
+`/opt/mira-src/deploy/mira-server/`. Then install the engine and Mira Server
+from it into a root-owned virtual environment. Every user's engine runs from
+it.
 
 ```sh
+sudo git clone --depth 1 -b feat/server-edition \
+     --recurse-submodules=mira_engine/skills --shallow-submodules \
+     https://github.com/MIRA-Intelligence/mira.git /opt/mira-src
 sudo python3 -m venv /opt/mira
-sudo /opt/mira/bin/pip install 'mira-engine[server]'
+sudo env SETUPTOOLS_SCM_PRETEND_VERSION=0.3.5.dev0 \
+     /opt/mira/bin/pip install '/opt/mira-src[server]'
 ```
 
-The venv must stay writable by root only: the launcher runs its interpreter as
-each user.
+The package version comes from git tags, which a shallow checkout of this
+branch does not have; without `SETUPTOOLS_SCM_PRETEND_VERSION` the engine
+reports `0.0.0` and the desktop app refuses it as older than its minimum engine
+version (`min_agent_for_ui` in mira-ui's `compatibility.json`).
+
+Both directories must stay writable by root only: the launcher runs the venv's
+interpreter as each user. To upgrade, `sudo git -C /opt/mira-src pull` and run
+the `pip install` again.
 
 ### 3. The mira-server account
 
@@ -105,7 +118,7 @@ prints the sudoers lines Mira Server needs. Install the `mira-engine` PAM
 service first, because the sudoers lines refer to it:
 
 ```sh
-sudo cp deploy/mira-server/pam.d-mira-engine /etc/pam.d/mira-engine
+sudo cp /opt/mira-src/deploy/mira-server/pam.d-mira-engine /etc/pam.d/mira-engine
 sudo tee /etc/sudoers.d/mira-server >/dev/null <<'EOF'
 Cmnd_Alias MIRA_ENGINE_START = /usr/local/libexec/mira/engine-launch start
 Defaults!MIRA_ENGINE_START pam_service=mira-engine
@@ -154,8 +167,14 @@ Re-run `install-launcher` after moving the engine install.
 
 ### 5. PAM service
 
-Copy [`deploy/mira-server/pam.d-mira-server`](../../deploy/mira-server/pam.d-mira-server)
-to `/etc/pam.d/mira-server`:
+Install [`deploy/mira-server/pam.d-mira-server`](../../deploy/mira-server/pam.d-mira-server)
+as `/etc/pam.d/mira-server`:
+
+```sh
+sudo cp /opt/mira-src/deploy/mira-server/pam.d-mira-server /etc/pam.d/mira-server
+```
+
+It contains:
 
 ```text
 @include common-auth
@@ -190,9 +209,14 @@ host's password policy strong and Mira Server patched.
 
 ### 6. Configuration
 
-Copy [`deploy/mira-server/mira-server.toml`](../../deploy/mira-server/mira-server.toml)
-to `/etc/mira-server/mira-server.toml` and set at least `public_url`. Every
+Install [`deploy/mira-server/mira-server.toml`](../../deploy/mira-server/mira-server.toml)
+as `/etc/mira-server/mira-server.toml` and set at least `public_url`. Every
 setting is documented in that file. Unknown keys are rejected.
+
+```sh
+sudo install -D -m 0644 /opt/mira-src/deploy/mira-server/mira-server.toml /etc/mira-server/mira-server.toml
+sudo editor /etc/mira-server/mira-server.toml
+```
 
 | Section | Key | Default | Meaning |
 |---|---|---|---|
@@ -218,7 +242,7 @@ setting is documented in that file. Unknown keys are rejected.
 
 ```sh
 sudo apt-get install bubblewrap
-sudo install -D -o root -g root -m 0644 deploy/mira-server/policy.toml /etc/mira/policy.toml
+sudo install -D -o root -g root -m 0644 /opt/mira-src/deploy/mira-server/policy.toml /etc/mira/policy.toml
 ```
 
 [`deploy/mira-server/policy.toml`](../../deploy/mira-server/policy.toml) keeps
@@ -233,7 +257,7 @@ namespaces for bwrap only, with
 (or the distribution's own bwrap profile, if it ships one):
 
 ```sh
-sudo install -m 0644 deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+sudo install -m 0644 /opt/mira-src/deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
 sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
 ```
 
@@ -254,7 +278,7 @@ Keep `KillMode=process`: user engines are started through sudo and must survive
 a Mira Server restart. Mira Server refuses to run as root.
 
 ```sh
-sudo cp deploy/mira-server/mira-server.service /etc/systemd/system/
+sudo cp /opt/mira-src/deploy/mira-server/mira-server.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now mira-server
 ```
 
@@ -309,7 +333,7 @@ one budget per person. Set them for all users with a drop-in such as
 [`deploy/mira-server/user-slice-mira.conf`](../../deploy/mira-server/user-slice-mira.conf):
 
 ```sh
-sudo install -D -m 0644 deploy/mira-server/user-slice-mira.conf \
+sudo install -D -m 0644 /opt/mira-src/deploy/mira-server/user-slice-mira.conf \
      /etc/systemd/system/user-.slice.d/50-mira.conf
 sudo systemctl daemon-reload
 ```
