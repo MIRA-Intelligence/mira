@@ -16,10 +16,10 @@ from mira_server.cli import app
 from mira_server.spawner.launcher import (
     MARKER,
     LauncherInstallError,
+    granted_launcher_rules,
     inspect_launcher,
     install_launcher,
     read_engine_python,
-    granted_launcher_rules,
     render_launcher,
     sudoers_line,
     sudoers_rules,
