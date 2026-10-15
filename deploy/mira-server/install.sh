@@ -472,9 +472,10 @@ place_file() {
 # Compares a file (or a <(...) stream) with a file. Reads both completely, so a
 # generator is never cut off with SIGPIPE as with cmp.
 same_content() {
-	[[ -e $1 && -f $2 ]] || return 1
 	local want have
+	[[ -e $1 ]] || return 1
 	want=$(cat "$1" && printf x)
+	[[ -f $2 ]] || return 1
 	have=$(cat "$2" && printf x)
 	[[ $want == "$have" ]]
 }
