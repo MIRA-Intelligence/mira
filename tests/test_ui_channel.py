@@ -3081,3 +3081,35 @@ async def test_handle_provider_test_reports_failure(
     body = json.loads(resp.text)
     assert body["ok"] is False
     assert body["message"] == "unauthorized"
+
+
+async def test_ws_handler_rejects_non_object_frames(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = _FakeWs([_FakeWsMessage(web.WSMsgType.TEXT, "[]"), _FakeWsMessage(web.WSMsgType.TEXT, '"x"')])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+    assert [item["content"] for item in ws.sent] == ["Invalid JSON", "Invalid JSON"]
+
+
+async def test_ws_handler_cleans_up_bound_client_when_loop_raises(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mira_engine.observability as observability
+
+    events: list[str] = []
+    monkeypatch.setattr(observability, "emit_event", lambda event, **_fields: events.append(event))
+
+    class _BrokenWs(_FakeWs):
+        def __aiter__(self):
+            async def _gen():
+                yield _FakeWsMessage(web.WSMsgType.TEXT, json.dumps({"type": "bind", "session_id": "s-1"}))
+                raise ConnectionResetError("peer reset")
+            return _gen()
+
+    ws = _BrokenWs([])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    with pytest.raises(ConnectionResetError):
+        await ui_channel._ws_handler(MagicMock(spec=web.Request))
+    assert "s-1" not in ui_channel._clients
+    assert events[-1] == "websocket.disconnected"

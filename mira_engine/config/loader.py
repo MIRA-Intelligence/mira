@@ -5,8 +5,11 @@ import os
 import re
 from pathlib import Path
 
+from loguru import logger
+
 from mira_engine.config.schema import Config
 from mira_engine.providers.registry import set_user_model_param_rules
+from mira_engine.security.gateway_auth import ALLOWED_ORIGINS_ENV, DEFAULT_ALLOWED_ORIGINS
 from mira_engine.security.network import configure_ssrf_whitelist
 
 
@@ -19,6 +22,9 @@ def _apply_runtime_registry_config(config: Config) -> None:
 
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
+
+# load_config runs many times per process; report the CORS migration once.
+_legacy_cors_migration_logged = False
 
 
 def set_config_path(path: Path) -> None:
@@ -164,4 +170,25 @@ def _migrate_config(data: dict) -> dict:
                 gateway["port"] = ui["port"]
             ui.pop("host", None)
             ui.pop("port", None)
+            _migrate_legacy_cors_origins(ui)
     return data
+
+
+def _migrate_legacy_cors_origins(ui: dict) -> None:
+    """Replace the pre-gateway-auth wildcard default with the app origins.
+
+    Older versions saved the whole config, so a bare ``["*"]`` is the old
+    default rather than a choice. Mixed lists are left alone; a deliberate
+    wildcard is kept by setting ``MIRA_GATEWAY_ALLOWED_ORIGINS=*``.
+    """
+    global _legacy_cors_migration_logged
+    for key in ("corsOrigins", "cors_origins"):
+        if ui.get(key) != ["*"]:
+            continue
+        ui[key] = list(DEFAULT_ALLOWED_ORIGINS)
+        if not _legacy_cors_migration_logged:
+            _legacy_cors_migration_logged = True
+            logger.info(
+                "Replaced legacy UI corsOrigins ['*'] with the app defaults; "
+                "set {}=* to keep accepting any origin", ALLOWED_ORIGINS_ENV,
+            )

@@ -808,3 +808,55 @@ async def test_run_main_loop_and_process_direct(monkeypatch, tmp_path: Path) -> 
     assert await loop.process_direct("hello") == ""
     loop.stop()
     assert loop._running is False
+
+
+async def test_cancelled_tool_is_logged_as_cancelled_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mira_engine.agent.base_loop as base_loop_mod
+
+    events: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        base_loop_mod, "emit_event",
+        lambda event, *, level="INFO", **_fields: events.append((event, level)),
+    )
+    loop = _make_loop(tmp_path)
+
+    async def _cancelled(_name: str, _arguments: dict[str, Any]) -> str:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(loop.tools, "execute", _cancelled)
+    runtime = _RuntimeStub(
+        [LLMResponse(content="", tool_calls=[ToolCallRequest(id="c1", name="echo", arguments={"value": 1})])]
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await loop._run_agent_loop([{"role": "user", "content": "go"}], model_runtime=runtime)
+
+    assert ("tool.cancelled", "INFO") in events
+    assert all(event != "tool.failed" for event, _ in events)
+
+
+async def test_stop_is_logged_with_its_request_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mira_engine.agent.base_loop as base_loop_mod
+    from mira_engine import observability
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        base_loop_mod, "emit_event",
+        lambda event, **fields: captured.append((event, {**observability._context.get(), **fields})),
+    )
+    loop = _make_loop(tmp_path)
+    loop.bus = MessageBus()
+    loop.subagents = SimpleNamespace(cancel_by_session=lambda _k: asyncio.sleep(0, result=0))
+    loop._active_tasks = {}
+    msg = InboundMessage(channel="ui", sender_id="u", chat_id="c", content="/stop",
+                         metadata={"_diagnostic_request_id": "stop-req-1"})
+
+    await loop._handle_stop(msg)
+
+    assert [event for event, _ in captured] == ["agent.stop.requested", "agent.stop.completed"]
+    assert all(fields["request_id"] == "stop-req-1" for _, fields in captured)
+    assert captured[-1][1]["count"] == 0
+    assert (await loop.bus.consume_outbound()).metadata["_stop_ack"] is True

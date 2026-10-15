@@ -117,6 +117,7 @@ class ChannelManager:
                     kwargs["bind_port"] = self.config.gateway.port
                     kwargs["restrict_to_workspace"] = self.config.tools.restrict_to_workspace
                     kwargs["on_runtime_config_updated"] = self.on_ui_runtime_config_updated
+                    kwargs["auth_token"] = self.config.gateway.auth_token
                 self.channels[name] = cls(self._to_ns(section), self.bus, **kwargs)
                 logger.info("{} channel enabled", name)
             except ImportError as e:

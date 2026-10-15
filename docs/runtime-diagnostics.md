@@ -43,9 +43,10 @@ flowchart LR
 - `request_id`：UI HTTP 或 WebSocket 请求的 ID；WebSocket 入站传入 agent 的诊断 metadata，执行日志沿用它。
 - `run_id`：每次 agent dispatch/direct 执行生成，用于区分并发任务。
 - `connection_id`：引擎 WebSocket 连接 ID。
-- `session_ref`：会话 key 的不可直接读出的摘要，避免记录用户标识或完整路径。
+- `session_ref`：会话 key 的 HMAC-SHA256 摘要（截取 64 bit），避免记录用户标识或完整路径。密钥是每个安装随机生成的 `logs/runtime/ref.key`（权限 0600，不进入诊断包），因此诊断包接收方无法对手机号等低熵 key 做暴力还原；同一安装内同一会话的 ref 保持稳定。日志目录不可用时退化为进程级随机密钥，ref 仅在该进程内稳定。`instance_ref` 使用同一密钥。
+- `/stop` 不经过 dispatch，单独记录 `agent.stop.requested/completed`，并沿用 WebSocket stop 请求的 `request_id`。
 - `workflow_run_id`：存在且符合元数据规则时补充已有工作流 ID。
-- 引擎管理命令通过 `MIRA_DIAGNOSTIC_REQUEST_ID` 将桌面命令 ID 传入 CLI 生命周期日志；常规非提权命令已覆盖，Windows 提权链路不承诺自动继承该环境变量。
+- 引擎管理命令通过 `MIRA_DIAGNOSTIC_REQUEST_ID` 将桌面命令 ID 传入 CLI 生命周期日志；常规非提权命令已覆盖，Windows 提权链路不承诺自动继承该环境变量。未继承时，同一 CLI 进程写出的所有生命周期事件共用一个进程级 `request_id`。
 
 HTTP 追踪头为 `X-Mira-Request-Id`。UI 先读取 `/api/version`：只有 `diagnostics_contract=1` 时才追加此头，避免旧版远程引擎的 CORS 预检失败。服务器允许并暴露此响应头。查询字符串、请求体、响应正文和认证头均不进入诊断记录。
 
@@ -59,11 +60,12 @@ HTTP 追踪头为 `X-Mira-Request-Id`。UI 先读取 `/api/version`：只有 `di
 | --- | --- |
 | 进程生命周期 | process.started、gateway.starting、gateway.failed、gateway.stopped |
 | Python 全局异常 | process.uncaught_exception、thread.uncaught_exception、asyncio.unhandled_exception |
-| 旧日志桥接 | runtime.log、runtime.standard_log，仅保留级别、位置和异常栈 |
+| 旧日志桥接 | runtime.log、runtime.standard_log，仅保留级别、位置和异常栈。asyncio 默认处理器转写的同一异常不重复记录为 runtime.standard_log |
 | 请求 | http.completed、http.failed；UI 为 http.response_error、http.network_error |
 | WebSocket | websocket.connected、received/sent、disconnected/closed、failed |
 | Agent | agent.dispatch.started/finished/failed/cancelled、agent.turn.failed、agent.direct.* |
-| 工具与模型 | tool.started/finished/failed、provider.failed |
+| 工具与模型 | tool.started/finished/failed/cancelled、provider.failed；/stop 或关闭导致的取消记为 INFO 级 tool.cancelled，不计入 ERROR |
+| 停止请求 | agent.stop.requested、agent.stop.completed（count 为取消的任务数） |
 | 桌面状态 | app.started、app.previous_unclean_exit、app.quit_requested、engine.phase_changed |
 | 引擎管理命令 | engine.command_started/finished/timeout、engine.elevated_command_started/finished |
 | UI 崩溃与卡死 | renderer.react_error、uncaught_error、unhandled_rejection、process_gone、unresponsive、load_failed |
@@ -80,6 +82,7 @@ HTTP 追踪头为 `X-Mira-Request-Id`。UI 先读取 `/api/version`：只有 `di
 - 原生 dump 启动时执行有界扫描，尽力保留 30 天以内、最新 10 个且合计不超过 64 MiB 的 `.dmp`。不处理其他文件或符号链接。
 - ERROR/CRITICAL 同步刷新，避免关键事件滞留在异步队列。一般事件也采用有界、同步追加。
 - 日志目录不可写或磁盘出错不应阻止应用工作；记录 write-error 数量。完全无法打开日志目录时只给固定 stderr 提示，不输出私有内容。
+- 诊断处理器挂到 root logger 会关闭 Python 的 `logging.lastResort`。若启动时 root 尚无其他 handler，引擎同时挂一个 WARNING 级 stderr handler，第三方库（asyncio、aiohttp 等）的 WARNING/ERROR 仍像以前一样输出到 stderr 与 `agent-service.log`。
 - Renderer IPC 只接受当前主窗口顶层 frame，字段经 allowlist 过滤，每秒限 60 条。日志环形缓存最多 300 条。
 - 桌面引擎命令 stdout/stderr 仅在内存中保留最后 256 KiB，日志不复制其正文。
 
@@ -97,7 +100,9 @@ mira-engine doctor --export
 
 返回 JSON 的 `diagnostics_bundle` 给出 ZIP 路径。doctor 健康检查失败时仍可能已生成诊断包，应读取结果中的路径，而不是只看进程返回码。非默认 config 的运行日志根据 service state 中的 config_path 收集；未注册到 service state 的独立自定义实例，需另外取得其日志目录。
 
-桌面 ZIP 包含桌面日志 tail、manifest，以及成功收集时的嵌套 `engine-diagnostics.zip`。引擎包包含 doctor、service state、结构化生命周期 tail 和运行日志 tail。每个日志文件最多读 128 KiB，最多选 16 个，读取失败在 manifest 记录；不为导出启动或修复引擎服务。
+桌面 ZIP 包含桌面日志 tail、manifest，以及成功收集时的嵌套 `engine-diagnostics.zip`。引擎包包含 doctor、service state、结构化生命周期 tail 和运行日志 tail。每个日志文件最多读 128 KiB，最多选 16 个，读取失败（包括导出期间被轮转或清理的文件）在 manifest 记录；不为导出启动或修复引擎服务。诊断包创建时即为 0600，导出失败时删除半成品。
+
+结构化生命周期 tail 只接受 service 管理器自己写出的行：`component=engine-service`、`schema_version=1`，`event` 为小写事件名，`timestamp` 为 ISO 8601。MCP server 或脚本的 stderr 即使是带 `event` 字段的 JSON（如 structlog 默认输出）也会被丢弃；无法解析或嵌套过深的行同样跳过。
 
 远程模式不收集本机未使用的引擎。浏览器版导出当前标签页的诊断缓存，无法保留标签页崩溃前已丢失的内存；远程引擎日志需在服务器端导出。
 

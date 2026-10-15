@@ -905,6 +905,10 @@ class BaseAgentLoop:
                         scope = manager.skill_audit_scope(audit_hook) if manager is not None else nullcontext()
                         with scope:
                             result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    except asyncio.CancelledError:
+                        # /stop and shutdown cancel tools; they are not tool failures.
+                        emit_event("tool.cancelled", tool=tool_call.name)
+                        raise
                     except BaseException as exc:
                         emit_event("tool.failed", level="ERROR", tool=tool_call.name, exception=exc)
                         raise
@@ -1126,6 +1130,15 @@ class BaseAgentLoop:
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
+        metadata = msg.metadata or {}
+        # /stop bypasses _dispatch, so it needs its own correlation scope.
+        with diagnostic_context(request_id=correlation_id(metadata.get("_diagnostic_request_id")),
+                                session_ref=opaque_ref(msg.session_key), channel=msg.channel):
+            emit_event("agent.stop.requested")
+            total = await self._handle_stop_with_context(msg)
+            emit_event("agent.stop.completed", count=total)
+
+    async def _handle_stop_with_context(self, msg: InboundMessage) -> int:
         project_ref = self._project_ref_from_metadata(msg.metadata)
         raw_key = (
             UNIFIED_SESSION_KEY
@@ -1150,6 +1163,7 @@ class BaseAgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=content,
             metadata=metadata,
         ))
+        return total
 
     async def _cancel_session_work(self, scoped_key: str) -> tuple[int, int, int]:
         """Cancel agent, subagent and background work owned by a session."""

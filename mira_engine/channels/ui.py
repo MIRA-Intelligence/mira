@@ -70,6 +70,15 @@ from mira_engine.providers.model_fetch import (
     read_model_cache,
 )
 from mira_engine.providers.registry import find_by_name
+from mira_engine.security.gateway_auth import (
+    EXEMPT_PATHS as GATEWAY_EXEMPT_PATHS,
+    allowed_origins,
+    origin_allowed,
+    presented_token,
+    resolve_gateway_token,
+    token_matches,
+    warn_if_exposed,
+)
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
     get_task_plan_contract,
@@ -865,6 +874,7 @@ class UiChannel(BaseChannel):
         bind_port: int | None = None,
         restrict_to_workspace: bool = True,
         on_runtime_config_updated: Callable[[Config, Path], Awaitable[None]] | None = None,
+        auth_token: str | None = None,
     ):
         super().__init__(config, bus)
         self.config: UiChannelConfig = config
@@ -873,13 +883,16 @@ class UiChannel(BaseChannel):
         legacy_port = getattr(config, "port", None)
         self.bind_host: str = (
             bind_host
-            or (legacy_host if isinstance(legacy_host, str) and legacy_host.strip() else "0.0.0.0")
+            or (legacy_host if isinstance(legacy_host, str) and legacy_host.strip() else "127.0.0.1")
         )
         self.bind_port: int = (
             bind_port if bind_port is not None else (legacy_port if isinstance(legacy_port, int) else 18790)
         )
         self.restrict_to_workspace: bool = restrict_to_workspace
         self._on_runtime_config_updated = on_runtime_config_updated
+        # Resolved lazily when the app is built so constructing a channel never touches MIRA_HOME.
+        self._configured_auth_token = auth_token
+        self._auth_token: str | None = None
         storage_mode = getattr(config, "project_storage", "user_selectable")
         managed_root = getattr(config, "managed_project_root", None)
         from mira_engine.config.loader import get_home_dir
@@ -1177,12 +1190,16 @@ class UiChannel(BaseChannel):
             import time
             time.sleep(0.5)
 
-    async def start(self) -> None:
-        self._kill_stale_listener()
-
+    def _build_app(self) -> web.Application:
         from mira_engine.observability import request_middleware
 
-        self._app = web.Application(middlewares=[self._cors_middleware, request_middleware()])
+        if self._auth_token is None:
+            self._auth_token = resolve_gateway_token(self._configured_auth_token)
+        # CORS outermost so 401/403 stay readable by browser clients; auth innermost so
+        # rejected requests are still logged (by route template, never by query string).
+        self._app = web.Application(
+            middlewares=[self._cors_middleware, request_middleware(), self._auth_middleware],
+        )
         self._app.router.add_get("/ws", self._ws_handler)
         self._app.router.add_get("/health", self._handle_health)
         self._app.router.add_get("/version", self._handle_version)
@@ -1238,8 +1255,14 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
         self._app.router.add_delete("/api/projects/{session_id}/skill-plugins/{plugin_id}", self._handle_skill_plugins_uninstall)
         self._workflow_api.add_routes(self._app)
+        return self._app
 
-        self._runner = web.AppRunner(self._app)
+    async def start(self) -> None:
+        self._kill_stale_listener()
+        self._build_app()
+
+        # The access log would record request lines, including ?access_token=.
+        self._runner = web.AppRunner(self._app, access_log=None)
         await self._runner.setup()
         self._site = web.TCPSite(
             self._runner, self.bind_host, self.bind_port,
@@ -1252,6 +1275,7 @@ class UiChannel(BaseChannel):
             self.bind_host,
             self.bind_port,
         )
+        warn_if_exposed(self.bind_host, self._allowed_origins())
 
         # Keep the channel alive until stopped
         try:
@@ -1693,7 +1717,29 @@ class UiChannel(BaseChannel):
         except OSError as exc:
             logger.warning("Failed to write plan patch to {}: {}", plan_path, exc)
 
-    # ── CORS middleware ──────────────────────────────────────────────
+    # ── CORS / auth middleware ───────────────────────────────────────
+
+    def _allowed_origins(self) -> list[str]:
+        return allowed_origins(getattr(self.config, "cors_origins", None))
+
+    @web.middleware
+    async def _auth_middleware(
+        self,
+        request: web.Request,
+        handler: Any,
+    ) -> web.StreamResponse:
+        """Reject foreign browser origins and requests without the gateway token."""
+        if request.method == "OPTIONS" or (
+            request.method in {"GET", "HEAD"} and request.path in GATEWAY_EXEMPT_PATHS
+        ):
+            return await handler(request)
+        if not origin_allowed(request.headers.get("Origin"), self._allowed_origins()):
+            return web.json_response({"error": "origin not allowed"}, status=403)
+        if not token_matches(self._auth_token or "", presented_token(request)):
+            return web.json_response(
+                {"error": "unauthorized"}, status=401, headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await handler(request)
 
     @web.middleware
     async def _cors_middleware(
@@ -1713,14 +1759,14 @@ class UiChannel(BaseChannel):
                 resp = exc
 
         origin = request.headers.get("Origin", "*")
-        allowed = self.config.cors_origins
+        allowed = self._allowed_origins()
         if "*" in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
         elif origin in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
 
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Mira-Request-Id"
+        resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Mira-Request-Id"
         resp.headers["Access-Control-Expose-Headers"] = "X-Mira-Request-Id"
         return resp
 
@@ -1736,162 +1782,385 @@ class UiChannel(BaseChannel):
 
         session_id: str | None = None
 
-        async for raw in ws:
-            if raw.type != web.WSMsgType.TEXT:
-                continue
-
-            try:
-                data: dict = json.loads(raw.data)
-            except (json.JSONDecodeError, TypeError):
-                await ws.send_json({"type": "error", "content": "Invalid JSON"})
-                continue
-
-            msg_type = data.get("type")
-            data["request_id"] = correlation_id(data.get("request_id"))
-            emit_event("websocket.received", connection_id=connection_id,
-                       request_id=data["request_id"], operation=msg_type if isinstance(msg_type, str) and msg_type in {
-                           "stop", "skill_fallback_response", "message", "user_input", "chat", "bind", "plan_decision", "plan_answers",
-                       } else "unknown")
-
-            if msg_type == "stop":
-                session_id = data.get("session_id", session_id)
-                if session_id is None:
-                    await ws.send_json({"type": "error", "content": "session_id required"})
+        try:
+            async for raw in ws:
+                if raw.type != web.WSMsgType.TEXT:
                     continue
-                loop_mode = _normalize_loop_mode(data.get("loop_mode"))
-                project_dir_path = (
-                    self._resolve_project_dir(session_id, create=False)
-                    if loop_mode == "project"
-                    else None
-                )
-                self._clients[session_id] = ws
-                self._client_project_dirs[session_id] = project_dir_path
-                metadata: dict[str, Any] = {
-                    "source": "ui",
-                    "loop_mode": loop_mode,
-                    "_stop_request_id": data.get("request_id"),
-                    "turn_id": data.get("turn_id"),
-                }
-                if project_dir_path is not None:
-                    metadata.update({
-                        "project_id": session_id,
-                        "project_dir": str(project_dir_path),
-                    })
-                await self._handle_message(
-                    sender_id=data.get("user_id", "ui_user"),
-                    chat_id=session_id,
-                    content="/stop",
-                    media=[],
-                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
-                    session_key=f"ui:{session_id}",
-                )
-            elif msg_type == "skill_fallback_response":
-                session_id = data.get("session_id", session_id)
-                if session_id is None:
-                    await ws.send_json({"type": "error", "content": "session_id required"})
+
+                try:
+                    data: dict = json.loads(raw.data)
+                except (json.JSONDecodeError, TypeError, RecursionError):
+                    await ws.send_json({"type": "error", "content": "Invalid JSON"})
                     continue
-                approved = bool(data.get("approved"))
-                selected_skill_ids = data.get("selected_skill_ids")
-                if not isinstance(selected_skill_ids, list):
-                    selected_skill_ids = []
-                selected_skill_ids = [
-                    str(item).strip() for item in selected_skill_ids
-                    if isinstance(item, str) and str(item).strip()
-                ][:8]
-                if not approved:
+                if not isinstance(data, dict):
+                    await ws.send_json({"type": "error", "content": "Invalid JSON"})
+                    continue
+
+                msg_type = data.get("type")
+                data["request_id"] = correlation_id(data.get("request_id"))
+                emit_event("websocket.received", connection_id=connection_id,
+                           request_id=data["request_id"], operation=msg_type if isinstance(msg_type, str) and msg_type in {
+                               "stop", "skill_fallback_response", "message", "user_input", "chat", "bind", "plan_decision", "plan_answers",
+                           } else "unknown")
+
+                if msg_type == "stop":
+                    session_id = data.get("session_id", session_id)
+                    if session_id is None:
+                        await ws.send_json({"type": "error", "content": "session_id required"})
+                        continue
+                    loop_mode = _normalize_loop_mode(data.get("loop_mode"))
+                    project_dir_path = (
+                        self._resolve_project_dir(session_id, create=False)
+                        if loop_mode == "project"
+                        else None
+                    )
+                    self._clients[session_id] = ws
+                    self._client_project_dirs[session_id] = project_dir_path
+                    metadata: dict[str, Any] = {
+                        "source": "ui",
+                        "loop_mode": loop_mode,
+                        "_stop_request_id": data.get("request_id"),
+                        "turn_id": data.get("turn_id"),
+                    }
+                    if project_dir_path is not None:
+                        metadata.update({
+                            "project_id": session_id,
+                            "project_dir": str(project_dir_path),
+                        })
+                    await self._handle_message(
+                        sender_id=data.get("user_id", "ui_user"),
+                        chat_id=session_id,
+                        content="/stop",
+                        media=[],
+                        metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
+                        session_key=f"ui:{session_id}",
+                    )
+                elif msg_type == "skill_fallback_response":
+                    session_id = data.get("session_id", session_id)
+                    if session_id is None:
+                        await ws.send_json({"type": "error", "content": "session_id required"})
+                        continue
+                    approved = bool(data.get("approved"))
+                    selected_skill_ids = data.get("selected_skill_ids")
+                    if not isinstance(selected_skill_ids, list):
+                        selected_skill_ids = []
+                    selected_skill_ids = [
+                        str(item).strip() for item in selected_skill_ids
+                        if isinstance(item, str) and str(item).strip()
+                    ][:8]
+                    if not approved:
+                        self._audit(
+                            source="ui",
+                            action="skill_fallback_rejected",
+                            session_id=session_id,
+                            project_dir=self._resolve_project_dir(session_id),
+                            details={"selected_skill_ids": selected_skill_ids},
+                        )
+                        await ws.send_json({
+                            "type": "response",
+                            "session_id": session_id,
+                            "content": "Skill fallback cancelled.",
+                            "metadata": {"_skill_fallback_cancelled": True},
+                        })
+                        continue
+                    loop_mode = _normalize_loop_mode(data.get("loop_mode"))
+                    project_dir_path = (
+                        self._resolve_project_dir(session_id, create=False)
+                        if loop_mode == "project"
+                        else None
+                    )
+                    self._clients[session_id] = ws
+                    self._client_project_dirs[session_id] = project_dir_path
                     self._audit(
                         source="ui",
-                        action="skill_fallback_rejected",
+                        action="skill_fallback_approved",
                         session_id=session_id,
-                        project_dir=self._resolve_project_dir(session_id),
+                        project_dir=project_dir_path,
                         details={"selected_skill_ids": selected_skill_ids},
                     )
-                    await ws.send_json({
-                        "type": "response",
-                        "session_id": session_id,
-                        "content": "Skill fallback cancelled.",
-                        "metadata": {"_skill_fallback_cancelled": True},
-                    })
-                    continue
-                loop_mode = _normalize_loop_mode(data.get("loop_mode"))
-                project_dir_path = (
-                    self._resolve_project_dir(session_id, create=False)
-                    if loop_mode == "project"
-                    else None
-                )
-                self._clients[session_id] = ws
-                self._client_project_dirs[session_id] = project_dir_path
-                self._audit(
-                    source="ui",
-                    action="skill_fallback_approved",
-                    session_id=session_id,
-                    project_dir=project_dir_path,
-                    details={"selected_skill_ids": selected_skill_ids},
-                )
-                metadata = {
-                    "source": "ui",
-                    "loop_mode": loop_mode,
-                    "turn_id": data.get("turn_id"),
-                    "selected_skill_ids": selected_skill_ids,
-                    "_skill_fallback_approved": True,
-                    "_wants_stream": True,
-                }
-                if project_dir_path is not None:
-                    metadata.update({
-                        "project_id": session_id,
-                        "project_dir": str(project_dir_path),
-                    })
-                await self._handle_message(
-                    sender_id=data.get("user_id", "ui_user"),
-                    chat_id=session_id,
-                    content="The user approved the proposed Skill fallback. Continue only with that fallback.",
-                    media=[],
-                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
-                    session_key=f"ui:{session_id}",
-                )
-            elif msg_type == "message":
-                session_id = data.get("session_id", session_id)
-                user_id = data.get("user_id", session_id or "anonymous")
-                content = data.get("content", "")
-                media = data.get("media", [])
-                loop_mode = _normalize_loop_mode(data.get("loop_mode"))
-                run_mode = _normalize_run_mode(data.get("mode"))
-                agent_profile = _normalize_agent_profile(data.get("agent_profile"))
-                contract_version = (
-                    _normalize_contract_version(data.get("contract_version"))
-                    if "contract_version" in data
-                    else None
-                )
-                incoming_policy = _normalize_automation_policy(data.get("automation_policy"))
-                workflow_run_id = data.get("workflow_run_id")
-                workflow_run = None
-                allow_result_write = bool(data.get("allow_result_write"))
-                turn_id = data.get("turn_id")
-                selected_skill_ids = data.get("selected_skill_ids")
-                if not isinstance(selected_skill_ids, list):
-                    selected_skill_ids = []
-                selected_skill_ids = [
-                    str(item).strip() for item in selected_skill_ids
-                    if isinstance(item, str) and str(item).strip()
-                ][:8]
-                # Token streaming is opt-in per message. Default on so clients
-                # that omit the flag still get a responsive experience.
-                stream_pref = data.get("stream")
-                wants_stream = True if stream_pref is None else bool(stream_pref)
-
-                if session_id is None:
-                    await ws.send_json(
-                        {"type": "error", "content": "session_id required"}
+                    metadata = {
+                        "source": "ui",
+                        "loop_mode": loop_mode,
+                        "turn_id": data.get("turn_id"),
+                        "selected_skill_ids": selected_skill_ids,
+                        "_skill_fallback_approved": True,
+                        "_wants_stream": True,
+                    }
+                    if project_dir_path is not None:
+                        metadata.update({
+                            "project_id": session_id,
+                            "project_dir": str(project_dir_path),
+                        })
+                    await self._handle_message(
+                        sender_id=data.get("user_id", "ui_user"),
+                        chat_id=session_id,
+                        content="The user approved the proposed Skill fallback. Continue only with that fallback.",
+                        media=[],
+                        metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
+                        session_key=f"ui:{session_id}",
                     )
-                    continue
+                elif msg_type == "message":
+                    session_id = data.get("session_id", session_id)
+                    user_id = data.get("user_id", session_id or "anonymous")
+                    content = data.get("content", "")
+                    media = data.get("media", [])
+                    loop_mode = _normalize_loop_mode(data.get("loop_mode"))
+                    run_mode = _normalize_run_mode(data.get("mode"))
+                    agent_profile = _normalize_agent_profile(data.get("agent_profile"))
+                    contract_version = (
+                        _normalize_contract_version(data.get("contract_version"))
+                        if "contract_version" in data
+                        else None
+                    )
+                    incoming_policy = _normalize_automation_policy(data.get("automation_policy"))
+                    workflow_run_id = data.get("workflow_run_id")
+                    workflow_run = None
+                    allow_result_write = bool(data.get("allow_result_write"))
+                    turn_id = data.get("turn_id")
+                    selected_skill_ids = data.get("selected_skill_ids")
+                    if not isinstance(selected_skill_ids, list):
+                        selected_skill_ids = []
+                    selected_skill_ids = [
+                        str(item).strip() for item in selected_skill_ids
+                        if isinstance(item, str) and str(item).strip()
+                    ][:8]
+                    # Token streaming is opt-in per message. Default on so clients
+                    # that omit the flag still get a responsive experience.
+                    stream_pref = data.get("stream")
+                    wants_stream = True if stream_pref is None else bool(stream_pref)
 
-                project_dir_path: Path | None = None
-                project_dir: str | None = None
-                meta: dict[str, Any] = {
-                    "contract_version": PROJECT_META_DEFAULT_CONTRACT_VERSION,
-                    "automation_policy": None,
-                }
-                if loop_mode == "project":
+                    if session_id is None:
+                        await ws.send_json(
+                            {"type": "error", "content": "session_id required"}
+                        )
+                        continue
+
+                    project_dir_path: Path | None = None
+                    project_dir: str | None = None
+                    meta: dict[str, Any] = {
+                        "contract_version": PROJECT_META_DEFAULT_CONTRACT_VERSION,
+                        "automation_policy": None,
+                    }
+                    if loop_mode == "project":
+                        project_dir_path = self._resolve_project_dir(
+                            session_id, create=True
+                        )
+                        if project_dir_path is None:
+                            await ws.send_json(
+                                {"type": "error", "content": "project_dir resolution failed"}
+                            )
+                            continue
+                        project_dir = str(project_dir_path)
+                        meta = self._persist_project_runtime_preferences(
+                            project_dir_path,
+                            run_mode=run_mode,
+                            agent_profile=agent_profile,
+                            contract_version=contract_version,
+                            automation_policy=incoming_policy,
+                        )
+                        if workflow_run_id is not None:
+                            if not isinstance(workflow_run_id, str) or not workflow_run_id:
+                                await ws.send_json({"type": "error", "content": "invalid workflow_run_id"})
+                                continue
+                            try:
+                                workflow_service = self._workflow_api._service(session_id)
+                                workflow_run = workflow_service.repository.load_run(workflow_run_id)
+                                claim_receipt = workflow_service.claim_run(
+                                    workflow_run_id,
+                                    lease_owner=f"ui:{self._workflow_executor_id}:{user_id}",
+                                    agent_profile=agent_profile,
+                                )
+                                workflow_run = workflow_service.repository.load_run(
+                                    workflow_run_id
+                                )
+                                if (
+                                    claim_receipt
+                                    and claim_receipt.event
+                                    and claim_receipt.event.event_type
+                                    == "run.recovery_required"
+                                ):
+                                    await ws.send_json({
+                                        "type": "error",
+                                        "content": (
+                                            "MIRA restarted while this module was running. "
+                                            "The Run is paused to avoid repeating uncertain work; "
+                                            "review it and choose Resume to continue."
+                                        ),
+                                    })
+                                    continue
+                            except Exception as exc:
+                                await ws.send_json({"type": "error", "content": str(exc)})
+                                continue
+                    elif workflow_run_id is not None:
+                        await ws.send_json({
+                            "type": "error",
+                            "content": "workflow_run_id is valid only in project mode",
+                        })
+                        continue
+                    self._clients[session_id] = ws
+                    self._client_project_dirs[session_id] = project_dir_path
+                    effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
+                    plan_ids_before = (
+                        _extract_plan_experiment_ids(project_dir_path)
+                        if project_dir_path and workflow_run is None
+                        else []
+                    )
+                    guard = (
+                        guard_task_plan_file(project_dir_path, auto_fix=True)
+                        if project_dir_path and workflow_run is None
+                        else {"fixed": False, "blocking": False}
+                    )
+                    guard_notice: str | None = None
+                    if guard.get("fixed"):
+                        plan_ids_after = _extract_plan_experiment_ids(project_dir_path) if project_dir_path else []
+                        reassignments = _detect_guard_id_reassignments(plan_ids_before, plan_ids_after)
+                        guard_notice = _build_task_plan_guard_notice(reassignments)
+                    if guard.get("fixed"):
+                        self._audit(
+                            source="system",
+                            action="task_plan_guard_auto_fix_applied",
+                            session_id=session_id,
+                            project_dir=project_dir_path,
+                            details={"issues_after_fix": guard.get("issues", [])[:5]},
+                        )
+                        if guard_notice:
+                            self._audit(
+                                source="system",
+                                action="task_plan_guard_id_reassigned",
+                                session_id=session_id,
+                                project_dir=project_dir_path,
+                                details={"notice": guard_notice},
+                            )
+                    elif guard.get("blocking"):
+                        self._audit(
+                            source="system",
+                            action="task_plan_guard_blocking_issue",
+                            session_id=session_id,
+                            project_dir=project_dir_path,
+                            details={"issues": guard.get("issues", [])[:5]},
+                        )
+                    self._audit(
+                        source="ui",
+                        action="ws_message_received",
+                        session_id=session_id,
+                        project_dir=project_dir_path,
+                        details={
+                            "user_id": user_id,
+                            "loop_mode": loop_mode,
+                            "run_mode": run_mode,
+                            "agent_profile": agent_profile,
+                            "contract_version": _normalize_contract_version(
+                                meta.get("contract_version")
+                            ),
+                            "has_automation_policy": bool(effective_policy),
+                            "goal_count": len(effective_policy.get("goals", [])) if effective_policy else 0,
+                            "allow_result_write": allow_result_write,
+                            "content_preview": self._preview(content),
+                            "media_count": len(media) if isinstance(media, list) else 0,
+                        },
+                    )
+                    if project_dir_path:
+                        SessionManager(project_dir_path).append_ui_event(
+                            key=(
+                                f"ui:{session_id}:run:{workflow_run_id}"
+                                if workflow_run is not None
+                                else f"ui:{session_id}"
+                            ),
+                            role="user",
+                            content=content,
+                            msg_type="response",
+                            metadata={"_user": True},
+                        )
+                    elif loop_mode == "normal" and self.workspace is not None:
+                        # Quick-chat sessions have no project dir; persist the user
+                        # turn under the workspace-level session log so history loads.
+                        SessionManager(self.workspace).append_ui_event(
+                            key=f"ui:{session_id}",
+                            role="user",
+                            content=content,
+                            msg_type="response",
+                            metadata={"_user": True},
+                        )
+                    metadata: dict[str, Any] = {
+                        "source": "ui",
+                        "loop_mode": loop_mode,
+                        "run_mode": run_mode,
+                        "agent_profile": agent_profile,
+                        "contract_version": _normalize_contract_version(
+                            meta.get("contract_version")
+                        ),
+                        "_allow_result_write": allow_result_write,
+                        "turn_id": turn_id,
+                        "selected_skill_ids": selected_skill_ids,
+                    }
+                    if wants_stream:
+                        metadata["_wants_stream"] = True
+                    if project_dir is not None:
+                        metadata["project_id"] = session_id
+                        metadata["project_dir"] = project_dir
+                    if workflow_run is not None:
+                        metadata["workflow_run_id"] = workflow_run_id
+                        metadata["workflow_module_type"] = workflow_run.module_type
+                        # The legacy research loop's auto mode assumes one mandatory
+                        # four-stage task_plan. ModuleRuns control their own lifecycle.
+                        metadata["run_mode"] = "manual"
+                    if effective_policy:
+                        metadata["automation_policy"] = effective_policy
+                    if loop_mode == "project":
+                        if workflow_run is not None:
+                            instruction_parts = [
+                                module_system_instructions(
+                                    workflow_run.module_type, workflow_run_id
+                                )
+                            ]
+                            interaction = workflow_run.module_data.get("interaction")
+                            if (
+                                isinstance(interaction, dict)
+                                and interaction.get("response") is not None
+                            ):
+                                instruction_parts.append(
+                                    "The latest structured interaction has been resolved. "
+                                    "Continue from this authoritative response:\n"
+                                    + json.dumps(
+                                        {
+                                            "interaction_id": interaction.get("interaction_id"),
+                                            "interaction_type": interaction.get("interaction_type"),
+                                            "response": interaction.get("response"),
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                )
+                        else:
+                            instruction_parts = (
+                                [self._ui_instructions] if self._ui_instructions else []
+                            )
+                        if instruction_parts:
+                            metadata["_ui_system_instructions"] = "\n\n".join(instruction_parts)
+                    if guard_notice:
+                        metadata["_task_plan_guard_notice"] = guard_notice
+                    await self._handle_message(
+                        sender_id=user_id,
+                        chat_id=session_id,
+                        content=content,
+                        media=media,
+                        metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
+                        session_key=(
+                            f"ui:{session_id}:run:{workflow_run_id}"
+                            if workflow_run is not None
+                            else f"ui:{session_id}"
+                        ),
+                    )
+                elif msg_type == "set_mode":
+                    session_id = data.get("session_id", session_id)
+                    user_id = data.get("user_id", session_id or "anonymous")
+                    run_mode = _normalize_run_mode(data.get("mode"))
+
+                    if session_id is None:
+                        await ws.send_json(
+                            {"type": "error", "content": "session_id required"}
+                        )
+                        continue
+
                     project_dir_path = self._resolve_project_dir(
                         session_id, create=True
                     )
@@ -1900,416 +2169,197 @@ class UiChannel(BaseChannel):
                             {"type": "error", "content": "project_dir resolution failed"}
                         )
                         continue
+                    self._clients[session_id] = ws
+                    self._client_project_dirs[session_id] = project_dir_path
                     project_dir = str(project_dir_path)
+                    self._audit(
+                        source="ui",
+                        action="ws_set_mode_received",
+                        session_id=session_id,
+                        project_dir=project_dir_path,
+                        details={
+                            "user_id": user_id,
+                            "run_mode": run_mode,
+                        },
+                    )
+                    metadata = {
+                        "source": "ui",
+                        "project_id": session_id,
+                        "project_dir": project_dir,
+                        "run_mode": run_mode,
+                        "_control": "set_mode",
+                    }
+                    await self._handle_message(
+                        sender_id=user_id,
+                        chat_id=session_id,
+                        content="__set_mode__",
+                        media=[],
+                        metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
+                        session_key=f"ui:{session_id}",
+                    )
+                elif msg_type == "plan_answer":
+                    session_id = data.get("session_id", session_id)
+                    user_id = data.get("user_id", session_id or "anonymous")
+                    answers = data.get("answers")
+                    if not isinstance(answers, dict):
+                        answers = {}
+                    if session_id is None:
+                        await ws.send_json(
+                            {"type": "error", "content": "session_id required"}
+                        )
+                        continue
+                    project_dir_path = self._resolve_project_dir(session_id, create=True)
+                    if project_dir_path is None:
+                        await ws.send_json(
+                            {"type": "error", "content": "project_dir resolution failed"}
+                        )
+                        continue
+                    self._clients[session_id] = ws
+                    self._client_project_dirs[session_id] = project_dir_path
+                    project_dir = str(project_dir_path)
+                    run_mode = _normalize_run_mode(data.get("mode"))
+                    agent_profile = _normalize_agent_profile(data.get("agent_profile"))
                     meta = self._persist_project_runtime_preferences(
                         project_dir_path,
                         run_mode=run_mode,
                         agent_profile=agent_profile,
-                        contract_version=contract_version,
-                        automation_policy=incoming_policy,
+                        contract_version=None,
+                        automation_policy=_normalize_automation_policy(
+                            data.get("automation_policy")
+                        ),
                     )
-                    if workflow_run_id is not None:
-                        if not isinstance(workflow_run_id, str) or not workflow_run_id:
-                            await ws.send_json({"type": "error", "content": "invalid workflow_run_id"})
-                            continue
-                        try:
-                            workflow_service = self._workflow_api._service(session_id)
-                            workflow_run = workflow_service.repository.load_run(workflow_run_id)
-                            claim_receipt = workflow_service.claim_run(
-                                workflow_run_id,
-                                lease_owner=f"ui:{self._workflow_executor_id}:{user_id}",
-                                agent_profile=agent_profile,
-                            )
-                            workflow_run = workflow_service.repository.load_run(
-                                workflow_run_id
-                            )
-                            if (
-                                claim_receipt
-                                and claim_receipt.event
-                                and claim_receipt.event.event_type
-                                == "run.recovery_required"
-                            ):
-                                await ws.send_json({
-                                    "type": "error",
-                                    "content": (
-                                        "MIRA restarted while this module was running. "
-                                        "The Run is paused to avoid repeating uncertain work; "
-                                        "review it and choose Resume to continue."
-                                    ),
-                                })
-                                continue
-                        except Exception as exc:
-                            await ws.send_json({"type": "error", "content": str(exc)})
-                            continue
-                elif workflow_run_id is not None:
-                    await ws.send_json({
-                        "type": "error",
-                        "content": "workflow_run_id is valid only in project mode",
-                    })
-                    continue
-                self._clients[session_id] = ws
-                self._client_project_dirs[session_id] = project_dir_path
-                effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
-                plan_ids_before = (
-                    _extract_plan_experiment_ids(project_dir_path)
-                    if project_dir_path and workflow_run is None
-                    else []
-                )
-                guard = (
-                    guard_task_plan_file(project_dir_path, auto_fix=True)
-                    if project_dir_path and workflow_run is None
-                    else {"fixed": False, "blocking": False}
-                )
-                guard_notice: str | None = None
-                if guard.get("fixed"):
-                    plan_ids_after = _extract_plan_experiment_ids(project_dir_path) if project_dir_path else []
-                    reassignments = _detect_guard_id_reassignments(plan_ids_before, plan_ids_after)
-                    guard_notice = _build_task_plan_guard_notice(reassignments)
-                if guard.get("fixed"):
+                    effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
+                    self._persist_plan_patch(project_dir_path, {"answers": answers})
                     self._audit(
-                        source="system",
-                        action="task_plan_guard_auto_fix_applied",
+                        source="ui",
+                        action="ws_plan_answer_received",
                         session_id=session_id,
                         project_dir=project_dir_path,
-                        details={"issues_after_fix": guard.get("issues", [])[:5]},
+                        details={"user_id": user_id, "answer_count": len(answers)},
                     )
-                    if guard_notice:
-                        self._audit(
-                            source="system",
-                            action="task_plan_guard_id_reassigned",
-                            session_id=session_id,
-                            project_dir=project_dir_path,
-                            details={"notice": guard_notice},
-                        )
-                elif guard.get("blocking"):
-                    self._audit(
-                        source="system",
-                        action="task_plan_guard_blocking_issue",
-                        session_id=session_id,
-                        project_dir=project_dir_path,
-                        details={"issues": guard.get("issues", [])[:5]},
-                    )
-                self._audit(
-                    source="ui",
-                    action="ws_message_received",
-                    session_id=session_id,
-                    project_dir=project_dir_path,
-                    details={
-                        "user_id": user_id,
-                        "loop_mode": loop_mode,
+                    metadata = {
+                        "source": "ui",
+                        "loop_mode": "project",
                         "run_mode": run_mode,
                         "agent_profile": agent_profile,
                         "contract_version": _normalize_contract_version(
                             meta.get("contract_version")
                         ),
-                        "has_automation_policy": bool(effective_policy),
-                        "goal_count": len(effective_policy.get("goals", [])) if effective_policy else 0,
-                        "allow_result_write": allow_result_write,
-                        "content_preview": self._preview(content),
-                        "media_count": len(media) if isinstance(media, list) else 0,
-                    },
-                )
-                if project_dir_path:
-                    SessionManager(project_dir_path).append_ui_event(
-                        key=(
-                            f"ui:{session_id}:run:{workflow_run_id}"
-                            if workflow_run is not None
-                            else f"ui:{session_id}"
-                        ),
-                        role="user",
-                        content=content,
-                        msg_type="response",
-                        metadata={"_user": True},
+                        "project_dir": project_dir,
+                        "_wants_stream": True,
+                        "_plan_event": "answer",
+                    }
+                    if effective_policy:
+                        metadata["automation_policy"] = effective_policy
+                    if self._ui_instructions:
+                        metadata["_ui_system_instructions"] = self._ui_instructions
+                    await self._handle_message(
+                        sender_id=user_id,
+                        chat_id=session_id,
+                        content="__plan_answer__",
+                        media=[],
+                        metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
+                        session_key=f"ui:{session_id}",
                     )
-                elif loop_mode == "normal" and self.workspace is not None:
-                    # Quick-chat sessions have no project dir; persist the user
-                    # turn under the workspace-level session log so history loads.
-                    SessionManager(self.workspace).append_ui_event(
-                        key=f"ui:{session_id}",
-                        role="user",
-                        content=content,
-                        msg_type="response",
-                        metadata={"_user": True},
-                    )
-                metadata: dict[str, Any] = {
-                    "source": "ui",
-                    "loop_mode": loop_mode,
-                    "run_mode": run_mode,
-                    "agent_profile": agent_profile,
-                    "contract_version": _normalize_contract_version(
-                        meta.get("contract_version")
-                    ),
-                    "_allow_result_write": allow_result_write,
-                    "turn_id": turn_id,
-                    "selected_skill_ids": selected_skill_ids,
-                }
-                if wants_stream:
-                    metadata["_wants_stream"] = True
-                if project_dir is not None:
-                    metadata["project_id"] = session_id
-                    metadata["project_dir"] = project_dir
-                if workflow_run is not None:
-                    metadata["workflow_run_id"] = workflow_run_id
-                    metadata["workflow_module_type"] = workflow_run.module_type
-                    # The legacy research loop's auto mode assumes one mandatory
-                    # four-stage task_plan. ModuleRuns control their own lifecycle.
-                    metadata["run_mode"] = "manual"
-                if effective_policy:
-                    metadata["automation_policy"] = effective_policy
-                if loop_mode == "project":
-                    if workflow_run is not None:
-                        instruction_parts = [
-                            module_system_instructions(
-                                workflow_run.module_type, workflow_run_id
-                            )
-                        ]
-                        interaction = workflow_run.module_data.get("interaction")
-                        if (
-                            isinstance(interaction, dict)
-                            and interaction.get("response") is not None
-                        ):
-                            instruction_parts.append(
-                                "The latest structured interaction has been resolved. "
-                                "Continue from this authoritative response:\n"
-                                + json.dumps(
-                                    {
-                                        "interaction_id": interaction.get("interaction_id"),
-                                        "interaction_type": interaction.get("interaction_type"),
-                                        "response": interaction.get("response"),
-                                    },
-                                    ensure_ascii=False,
-                                )
-                            )
-                    else:
-                        instruction_parts = (
-                            [self._ui_instructions] if self._ui_instructions else []
+                elif msg_type == "plan_decision":
+                    session_id = data.get("session_id", session_id)
+                    user_id = data.get("user_id", session_id or "anonymous")
+                    raw_decision = data.get("decision")
+                    decision = raw_decision.strip().lower() if isinstance(raw_decision, str) else ""
+                    if decision not in {"approve", "revise"}:
+                        await ws.send_json(
+                            {"type": "error", "content": "decision must be 'approve' or 'revise'"}
                         )
-                    if instruction_parts:
-                        metadata["_ui_system_instructions"] = "\n\n".join(instruction_parts)
-                if guard_notice:
-                    metadata["_task_plan_guard_notice"] = guard_notice
-                await self._handle_message(
-                    sender_id=user_id,
-                    chat_id=session_id,
-                    content=content,
-                    media=media,
-                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
-                    session_key=(
-                        f"ui:{session_id}:run:{workflow_run_id}"
-                        if workflow_run is not None
-                        else f"ui:{session_id}"
-                    ),
-                )
-            elif msg_type == "set_mode":
-                session_id = data.get("session_id", session_id)
-                user_id = data.get("user_id", session_id or "anonymous")
-                run_mode = _normalize_run_mode(data.get("mode"))
-
-                if session_id is None:
-                    await ws.send_json(
-                        {"type": "error", "content": "session_id required"}
+                        continue
+                    raw_feedback = data.get("feedback")
+                    feedback = raw_feedback.strip() if isinstance(raw_feedback, str) else ""
+                    if session_id is None:
+                        await ws.send_json(
+                            {"type": "error", "content": "session_id required"}
+                        )
+                        continue
+                    project_dir_path = self._resolve_project_dir(session_id, create=True)
+                    if project_dir_path is None:
+                        await ws.send_json(
+                            {"type": "error", "content": "project_dir resolution failed"}
+                        )
+                        continue
+                    self._clients[session_id] = ws
+                    self._client_project_dirs[session_id] = project_dir_path
+                    project_dir = str(project_dir_path)
+                    run_mode = _normalize_run_mode(data.get("mode"))
+                    agent_profile = _normalize_agent_profile(data.get("agent_profile"))
+                    meta = self._persist_project_runtime_preferences(
+                        project_dir_path,
+                        run_mode=run_mode,
+                        agent_profile=agent_profile,
+                        contract_version=None,
+                        automation_policy=_normalize_automation_policy(
+                            data.get("automation_policy")
+                        ),
                     )
-                    continue
-
-                project_dir_path = self._resolve_project_dir(
-                    session_id, create=True
-                )
-                if project_dir_path is None:
-                    await ws.send_json(
-                        {"type": "error", "content": "project_dir resolution failed"}
+                    effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
+                    if decision == "revise":
+                        self._persist_plan_patch(project_dir_path, {"feedback": feedback})
+                    self._audit(
+                        source="ui",
+                        action="ws_plan_decision_received",
+                        session_id=session_id,
+                        project_dir=project_dir_path,
+                        details={"user_id": user_id, "decision": decision},
                     )
-                    continue
-                self._clients[session_id] = ws
-                self._client_project_dirs[session_id] = project_dir_path
-                project_dir = str(project_dir_path)
-                self._audit(
-                    source="ui",
-                    action="ws_set_mode_received",
-                    session_id=session_id,
-                    project_dir=project_dir_path,
-                    details={
-                        "user_id": user_id,
+                    metadata = {
+                        "source": "ui",
+                        "loop_mode": "project",
                         "run_mode": run_mode,
-                    },
-                )
-                metadata = {
-                    "source": "ui",
-                    "project_id": session_id,
-                    "project_dir": project_dir,
-                    "run_mode": run_mode,
-                    "_control": "set_mode",
-                }
-                await self._handle_message(
-                    sender_id=user_id,
-                    chat_id=session_id,
-                    content="__set_mode__",
-                    media=[],
-                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
-                    session_key=f"ui:{session_id}",
-                )
-            elif msg_type == "plan_answer":
-                session_id = data.get("session_id", session_id)
-                user_id = data.get("user_id", session_id or "anonymous")
-                answers = data.get("answers")
-                if not isinstance(answers, dict):
-                    answers = {}
-                if session_id is None:
-                    await ws.send_json(
-                        {"type": "error", "content": "session_id required"}
+                        "agent_profile": agent_profile,
+                        "contract_version": _normalize_contract_version(
+                            meta.get("contract_version")
+                        ),
+                        "project_dir": project_dir,
+                        "_wants_stream": True,
+                        "_plan_event": "decision",
+                        "_plan_decision": decision,
+                    }
+                    if feedback:
+                        metadata["_plan_feedback"] = feedback
+                    if effective_policy:
+                        metadata["automation_policy"] = effective_policy
+                    if self._ui_instructions:
+                        metadata["_ui_system_instructions"] = self._ui_instructions
+                    await self._handle_message(
+                        sender_id=user_id,
+                        chat_id=session_id,
+                        content="__plan_decision__",
+                        media=[],
+                        metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
+                        session_key=f"ui:{session_id}",
                     )
-                    continue
-                project_dir_path = self._resolve_project_dir(session_id, create=True)
-                if project_dir_path is None:
-                    await ws.send_json(
-                        {"type": "error", "content": "project_dir resolution failed"}
+                elif msg_type == "bind":
+                    session_id = data.get("session_id", session_id)
+                    user_id = data.get("user_id", session_id or "anonymous")
+                    if session_id is None:
+                        await ws.send_json(
+                            {"type": "error", "content": "session_id required"}
+                        )
+                        continue
+                    project_dir_path = self._resolve_project_dir(session_id)
+                    self._clients[session_id] = ws
+                    self._client_project_dirs[session_id] = project_dir_path
+                    self._audit(
+                        source="ui",
+                        action="ws_bind_received",
+                        session_id=session_id,
+                        project_dir=project_dir_path,
+                        details={"user_id": user_id},
                     )
-                    continue
-                self._clients[session_id] = ws
-                self._client_project_dirs[session_id] = project_dir_path
-                project_dir = str(project_dir_path)
-                run_mode = _normalize_run_mode(data.get("mode"))
-                agent_profile = _normalize_agent_profile(data.get("agent_profile"))
-                meta = self._persist_project_runtime_preferences(
-                    project_dir_path,
-                    run_mode=run_mode,
-                    agent_profile=agent_profile,
-                    contract_version=None,
-                    automation_policy=_normalize_automation_policy(
-                        data.get("automation_policy")
-                    ),
-                )
-                effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
-                self._persist_plan_patch(project_dir_path, {"answers": answers})
-                self._audit(
-                    source="ui",
-                    action="ws_plan_answer_received",
-                    session_id=session_id,
-                    project_dir=project_dir_path,
-                    details={"user_id": user_id, "answer_count": len(answers)},
-                )
-                metadata = {
-                    "source": "ui",
-                    "loop_mode": "project",
-                    "run_mode": run_mode,
-                    "agent_profile": agent_profile,
-                    "contract_version": _normalize_contract_version(
-                        meta.get("contract_version")
-                    ),
-                    "project_dir": project_dir,
-                    "_wants_stream": True,
-                    "_plan_event": "answer",
-                }
-                if effective_policy:
-                    metadata["automation_policy"] = effective_policy
-                if self._ui_instructions:
-                    metadata["_ui_system_instructions"] = self._ui_instructions
-                await self._handle_message(
-                    sender_id=user_id,
-                    chat_id=session_id,
-                    content="__plan_answer__",
-                    media=[],
-                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
-                    session_key=f"ui:{session_id}",
-                )
-            elif msg_type == "plan_decision":
-                session_id = data.get("session_id", session_id)
-                user_id = data.get("user_id", session_id or "anonymous")
-                raw_decision = data.get("decision")
-                decision = raw_decision.strip().lower() if isinstance(raw_decision, str) else ""
-                if decision not in {"approve", "revise"}:
-                    await ws.send_json(
-                        {"type": "error", "content": "decision must be 'approve' or 'revise'"}
-                    )
-                    continue
-                raw_feedback = data.get("feedback")
-                feedback = raw_feedback.strip() if isinstance(raw_feedback, str) else ""
-                if session_id is None:
-                    await ws.send_json(
-                        {"type": "error", "content": "session_id required"}
-                    )
-                    continue
-                project_dir_path = self._resolve_project_dir(session_id, create=True)
-                if project_dir_path is None:
-                    await ws.send_json(
-                        {"type": "error", "content": "project_dir resolution failed"}
-                    )
-                    continue
-                self._clients[session_id] = ws
-                self._client_project_dirs[session_id] = project_dir_path
-                project_dir = str(project_dir_path)
-                run_mode = _normalize_run_mode(data.get("mode"))
-                agent_profile = _normalize_agent_profile(data.get("agent_profile"))
-                meta = self._persist_project_runtime_preferences(
-                    project_dir_path,
-                    run_mode=run_mode,
-                    agent_profile=agent_profile,
-                    contract_version=None,
-                    automation_policy=_normalize_automation_policy(
-                        data.get("automation_policy")
-                    ),
-                )
-                effective_policy = _normalize_automation_policy(meta.get("automation_policy"))
-                if decision == "revise":
-                    self._persist_plan_patch(project_dir_path, {"feedback": feedback})
-                self._audit(
-                    source="ui",
-                    action="ws_plan_decision_received",
-                    session_id=session_id,
-                    project_dir=project_dir_path,
-                    details={"user_id": user_id, "decision": decision},
-                )
-                metadata = {
-                    "source": "ui",
-                    "loop_mode": "project",
-                    "run_mode": run_mode,
-                    "agent_profile": agent_profile,
-                    "contract_version": _normalize_contract_version(
-                        meta.get("contract_version")
-                    ),
-                    "project_dir": project_dir,
-                    "_wants_stream": True,
-                    "_plan_event": "decision",
-                    "_plan_decision": decision,
-                }
-                if feedback:
-                    metadata["_plan_feedback"] = feedback
-                if effective_policy:
-                    metadata["automation_policy"] = effective_policy
-                if self._ui_instructions:
-                    metadata["_ui_system_instructions"] = self._ui_instructions
-                await self._handle_message(
-                    sender_id=user_id,
-                    chat_id=session_id,
-                    content="__plan_decision__",
-                    media=[],
-                    metadata={**metadata, "_diagnostic_request_id": data["request_id"]},
-                    session_key=f"ui:{session_id}",
-                )
-            elif msg_type == "bind":
-                session_id = data.get("session_id", session_id)
-                user_id = data.get("user_id", session_id or "anonymous")
-                if session_id is None:
-                    await ws.send_json(
-                        {"type": "error", "content": "session_id required"}
-                    )
-                    continue
-                project_dir_path = self._resolve_project_dir(session_id)
-                self._clients[session_id] = ws
-                self._client_project_dirs[session_id] = project_dir_path
-                self._audit(
-                    source="ui",
-                    action="ws_bind_received",
-                    session_id=session_id,
-                    project_dir=project_dir_path,
-                    details={"user_id": user_id},
-                )
-
-        # Client disconnected
-        emit_event("websocket.disconnected", connection_id=connection_id, code=getattr(ws, "close_code", None))
-        if session_id and self._clients.get(session_id) is ws:
-            del self._clients[session_id]
-            self._client_project_dirs.pop(session_id, None)
-            logger.info("WebSocket client disconnected: {}", session_id)
+        finally:
+            # Runs on errors too, so a crashed loop cannot leave a stale client bound.
+            emit_event("websocket.disconnected", connection_id=connection_id, code=getattr(ws, "close_code", None))
+            if session_id and self._clients.get(session_id) is ws:
+                del self._clients[session_id]
+                self._client_project_dirs.pop(session_id, None)
+                logger.info("WebSocket client disconnected: {}", session_id)
 
         return ws
 

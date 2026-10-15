@@ -1667,6 +1667,34 @@ def gateway(
     asyncio.run(run())
 
 
+@app.command("gateway-token")
+def gateway_token(
+    rotate: bool = typer.Option(False, "--rotate", help="Generate a new token file (restart the gateway to apply)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Print the UI gateway auth token (created on first use)."""
+    from mira_engine.config.loader import load_config
+    from mira_engine.security.gateway_auth import (
+        TOKEN_ENV,
+        ensure_token_file,
+        gateway_token_path,
+        resolve_gateway_token,
+    )
+
+    config_path = Path(config).expanduser().resolve() if config else None
+    if config_path is not None and not config_path.exists():
+        typer.echo(f"Error: Config file not found: {config_path}", err=True)
+        raise typer.Exit(1)
+    configured = load_config(config_path).gateway.auth_token
+    if rotate:
+        ensure_token_file(gateway_token_path(), rotate=True)
+        if os.environ.get(TOKEN_ENV, "").strip() or configured.strip():
+            typer.echo(f"Warning: {TOKEN_ENV} or gateway.authToken overrides the rotated token file.",
+                       err=True)
+    # stdout carries only the token so scripts can capture it.
+    typer.echo(resolve_gateway_token(configured))
+
+
 @app.command()
 def serve(
     host: str | None = typer.Option(None, "--host", help="API host"),
