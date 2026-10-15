@@ -121,7 +121,7 @@ def install_launcher_command(
         LauncherInstallError,
         default_launcher_path,
         install_launcher,
-        sudoers_line,
+        sudoers_rules,
     )
 
     path = default_launcher_path(prefix)
@@ -130,11 +130,15 @@ def install_launcher_command(
     except (LauncherInstallError, OSError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from None
-    rule = sudoers_line(path, server_user=server_user, users_group=users_group)
+    rules = sudoers_rules(path, server_user=server_user, users_group=users_group)
     typer.echo(f"Wrote {path} (engine: {engine_python}).\n")
-    typer.echo("Add this sudoers rule (for example: visudo -f /etc/sudoers.d/mira-server):\n")
-    typer.echo(f"    {rule}\n")
+    typer.echo("Add these sudoers rules (for example: visudo -f /etc/sudoers.d/mira-server):\n")
+    for rule in rules:
+        typer.echo(f"    {rule}")
+    typer.echo("")
     typer.echo("Notes:")
+    typer.echo(f"- The first rule starts, inspects and stops engines of {users_group} members. The second only")
+    typer.echo(f"  stops engines, for people removed from {users_group} (their engine would keep running otherwise).")
     typer.echo(f"- {path} and every directory above it must stay root-owned and not group/world-writable.")
     typer.echo(f"- The engine at {engine_python} must be root-owned too (e.g. a venv in /opt/mira).")
     typer.echo(f"- In mira-server.toml set [spawner] launcher = \"{path}\".")
@@ -190,7 +194,7 @@ def _check_groups(cfg: ServerConfig, report: _Report) -> None:
 
 
 def _check_sudo(cfg: ServerConfig, report: _Report) -> None:
-    from mira_server.spawner.launcher import inspect_launcher
+    from mira_server.spawner.launcher import granted_launcher_rules, inspect_launcher
 
     launcher = cfg.spawner.launcher
     problems = inspect_launcher(launcher)
@@ -207,11 +211,17 @@ def _check_sudo(cfg: ServerConfig, report: _Report) -> None:
     except (OSError, subprocess.TimeoutExpired) as exc:
         report.fail(f"`sudo -n -l` failed: {exc}")
         return
-    if str(launcher) in result.stdout:
+    full, stop = granted_launcher_rules(result.stdout, launcher)
+    if full:
         report.ok(f"sudo allows this account to run {launcher}")
     else:
-        report.fail(f"no sudo rule lets this account run {launcher} (`sudo -n -l` exit {result.returncode}); "
-                    f"run `mira-server install-launcher` for the rule")
+        report.fail(f"no NOPASSWD sudo rule lets this account run {launcher} (`sudo -n -l` exit "
+                    f"{result.returncode}); run `mira-server install-launcher` for the rules")
+    if stop:
+        report.ok(f"sudo allows `{launcher} stop` for accounts outside {cfg.auth.users_group}")
+    elif full:
+        report.warn(f"no sudo rule for `{launcher} stop` as other accounts: engines of people removed from "
+                    f"{cfg.auth.users_group} keep running until stopped over SSH (see `install-launcher`)")
 
 
 def _check_data_dir(cfg: ServerConfig, report: _Report) -> None:

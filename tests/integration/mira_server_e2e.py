@@ -2,7 +2,7 @@
 """Mira Server end-to-end check on a real multi-user Linux host (CI acceptance test).
 
 Run by .github/workflows/mira-server-integration.yml after it has created the
-accounts, installed the engine in /opt/mira, the launcher, the sudoers rule and
+accounts, installed the engine in /opt/mira, the launcher, the sudoers rules and
 the PAM service, and started ``mira-server serve`` as the ``mira-server`` user.
 The caller needs passwordless sudo (GitHub's ubuntu runners have it) to inspect
 other users' processes and files and to restart Mira Server.
@@ -294,7 +294,8 @@ def main() -> int:
     check(not pid_alive(alice_pid), f"alice's engine pid {alice_pid} exited")
     check(pid_alive(leases["bob"]["pid"]), "bob's engine is untouched")
 
-    step("removal from mira-users revokes access")
+    step("removal from mira-users revokes access and stops the engine")
+    bob_pid = leases["bob"]["pid"]
     sudo("gpasswd", "-d", "bob", "mira-users")
     status, _, payload = client.request("GET", "/server/me", token=bt)
     check(status == 403 and payload["error"] == "forbidden", f"bob after group removal -> {status}")
@@ -302,6 +303,12 @@ def main() -> int:
     check(status == 401, "bob's sessions were revoked")
     status, _ = client.login("bob")
     check(status == 403, "bob can no longer sign in")
+    # Through the stop-only sudo rule: bob is no longer in mira-users.
+    for _ in range(150):
+        if not pid_alive(bob_pid):
+            break
+        time.sleep(0.2)
+    check(not pid_alive(bob_pid), f"bob's engine pid {bob_pid} was stopped after the removal")
 
     print("\nAll Mira Server end-to-end checks passed.")
     return 0

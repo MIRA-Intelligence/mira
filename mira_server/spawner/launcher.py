@@ -1,9 +1,11 @@
 """The root-owned ``engine-launch`` script that sudo runs as each user.
 
 sudoers lets the ``mira-server`` account run exactly this file as members of
-``mira-users``::
+``mira-users``, and ``engine-launch stop`` as any other non-root account, so it
+can still stop the engine of someone removed from the group::
 
     mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch
+    mira-server ALL=(ALL,!root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop
 
 The script accepts one argument, ``start``, ``status`` or ``stop``, and reads no
 other input. It discards the caller's environment, builds a minimal one from the
@@ -131,6 +133,43 @@ def install_launcher(path: Path, engine_python: str, *, require_root: bool = Tru
 
 def sudoers_line(path: Path, *, server_user: str, users_group: str) -> str:
     return f"{server_user} ALL=(%{users_group}) NOPASSWD: {path}"
+
+
+def sudoers_stop_line(path: Path, *, server_user: str) -> str:
+    """Lets Mira Server stop the engine of someone no longer in the users group.
+
+    sudoers matches the argument exactly, so only ``stop`` is allowed; the
+    launcher itself also refuses to run as root.
+    """
+    return f"{server_user} ALL=(ALL,!root) NOPASSWD: {path} stop"
+
+
+def sudoers_rules(path: Path, *, server_user: str, users_group: str) -> list[str]:
+    return [sudoers_line(path, server_user=server_user, users_group=users_group),
+            sudoers_stop_line(path, server_user=server_user)]
+
+
+def granted_launcher_rules(sudo_list: str, path: Path) -> tuple[bool, bool]:
+    """Read ``sudo -n -l`` output: (launcher allowed, ``stop`` allowed as any account).
+
+    Only NOPASSWD entries count: Mira Server runs ``sudo -n`` and cannot answer
+    a password prompt. The second value needs a rule whose run-as list starts
+    with ``ALL`` (such as ``(ALL, !root)``), not just the users group.
+    """
+    launcher, stop = str(path), f"{path} stop"
+    full = stop_for_others = False
+    for line in sudo_list.splitlines():
+        if "NOPASSWD:" not in line:
+            continue
+        spec, commands = line.split("NOPASSWD:", 1)
+        names = {" ".join(command.split()) for command in commands.split(",")}
+        runas = spec[spec.find("(") + 1:spec.find(")")] if "(" in spec and ")" in spec else ""
+        any_user = runas.split(":", 1)[0].split(",")[0].strip() == "ALL"
+        if launcher in names:
+            full = True
+        if any_user and (launcher in names or stop in names):
+            stop_for_others = True
+    return full, stop_for_others
 
 
 def read_engine_python(path: Path) -> str | None:

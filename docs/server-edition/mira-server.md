@@ -26,8 +26,8 @@ desktop app ──HTTPS──> TLS proxy ──> mira-server (user mira-server, 
   names are configurable. Group membership is re-read at least every
   `group_recheck_interval` seconds and on every token refresh. Someone removed
   from `mira-users` loses all sessions at the next check, and Mira Server stops
-  their engine.
-- **Engines**: Mira Server runs the root-owned launcher through one sudo rule:
+  their engine (through the `stop`-only sudo rule, see step 4).
+- **Engines**: Mira Server runs the root-owned launcher through sudo:
   `sudo -n -u alice /usr/local/libexec/mira/engine-launch start`. The launcher
   runs `mira remote attach --json` as alice (the same command the desktop app
   uses over Remote-SSH, see [remote-ssh.md](../remote-ssh.md)), which starts or
@@ -100,14 +100,24 @@ sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local \
 ```
 
 This writes `/usr/local/libexec/mira/engine-launch` (root-owned, mode 0755) and
-prints the one sudoers rule Mira Server needs:
+prints the two sudoers rules Mira Server needs:
 
 ```sh
-echo 'mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch' \
-  | sudo tee /etc/sudoers.d/mira-server
+sudo tee /etc/sudoers.d/mira-server >/dev/null <<'EOF'
+mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch
+mira-server ALL=(ALL,!root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop
+EOF
 sudo chmod 0440 /etc/sudoers.d/mira-server
 sudo visudo -cf /etc/sudoers.d/mira-server
 ```
+
+- The first rule lets Mira Server start, inspect and stop the engines of
+  `mira-users` members.
+- The second allows only `engine-launch stop` (sudoers matches the argument
+  exactly), as any account except root. Mira Server uses it to stop the engine
+  of someone who was removed from `mira-users`; without it that engine keeps
+  running as the user until it is stopped over SSH or the host restarts. The
+  launcher itself also refuses to run as root.
 
 The launcher accepts exactly one argument, `start`, `status` or `stop`, and no
 other input. It discards the caller's environment, sets `HOME`, `USER`,
@@ -144,8 +154,19 @@ sudo usermod -aG shadow mira-server
 ```
 
 This lets Mira Server read password hashes, which is a real privilege: keep the
-host's password policy strong and Mira Server patched. Accounts that come from
-LDAP/SSSD (`pam_sss`) authenticate through `sssd` and need no extra group.
+host's password policy strong and Mira Server patched.
+
+- **LDAP/SSSD**: accounts that come from `sssd` (`pam_sss`) need no extra group,
+  and the `shadow` group does not affect them. On a host with both local and
+  LDAP accounts, add the group for the local ones; the `common-auth` stack
+  tries `pam_unix` first and falls through to `pam_sss` as usual.
+- **RHEL/Fedora** have no `shadow` group (`/etc/shadow` is readable by root
+  only), so only LDAP/SSSD accounts can sign in there for now. A small
+  privileged helper for local passwords is a follow-up.
+- The systemd unit does not set `SupplementaryGroups=shadow`, because the unit
+  would fail to start on hosts without the group; `User=` picks up the
+  membership added with `usermod`.
+
 `mira-server check` warns when `/etc/shadow` is not readable.
 
 ### 6. Configuration
@@ -182,7 +203,8 @@ sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mi
 
 `check` validates the config, the PAM service file, the groups, the launcher's
 ownership and permissions (and of every directory above it), the engine
-interpreter, the sudo rule (`sudo -n -l`) and the data dir.
+interpreter, the sudo rules (`sudo -n -l`; a missing `stop` rule is a warning)
+and the data dir.
 
 Run Mira Server with systemd using
 [`deploy/mira-server/mira-server.service`](../../deploy/mira-server/mira-server.service).
@@ -198,23 +220,28 @@ sudo systemctl daemon-reload && sudo systemctl enable --now mira-server
 
 Mira Server speaks plain HTTP on loopback. Put a TLS proxy in front, forward
 WebSocket upgrades, disable response buffering (streaming and SSE), and allow
-large request bodies (uploads). Caddy:
+large request bodies (uploads). Set `trusted_proxies = ["127.0.0.1", "::1"]` so
+rate limiting sees real client IPs.
 
-```text
-mira.example.com {
-    reverse_proxy 127.0.0.1:8740 {
-        flush_interval -1
-    }
-}
-```
+`<img>`, `<iframe>`, download and WebSocket URLs carry the access token as
+`?access_token=`, so **the proxy's access log must not record query strings**.
+Mira Server itself never logs query strings or tokens. Access tokens expire
+after 15 minutes (`access_token_ttl`), which limits what a leaked log line is
+worth, but keep them out of logs anyway. The examples do this:
 
-nginx needs `proxy_http_version 1.1`, the `Upgrade`/`Connection` headers for
-`/ws`, `proxy_buffering off` and a suitable `client_max_body_size`. Set
-`trusted_proxies = ["127.0.0.1", "::1"]` so rate limiting sees real client IPs.
+- [`deploy/mira-server/nginx.conf`](../../deploy/mira-server/nginx.conf): a
+  `log_format` that records `$uri` (the path) instead of `$request`, which the
+  default `combined` format uses and which includes the query string. nginx's
+  *error* log still quotes the full request line when an upstream request fails
+  (for example while Mira Server restarts), so keep `/var/log/nginx` readable
+  by administrators only, as distributions do by default.
+- [`deploy/mira-server/Caddyfile`](../../deploy/mira-server/Caddyfile): Caddy
+  writes no access log unless a site has a `log` block. The example has one with
+  a filter that deletes `access_token` from the logged URI. Caddy already redacts
+  `Authorization` and `Cookie` headers.
 
-`<img>`, `<iframe>` and download URLs carry the access token as
-`?access_token=`, so **exclude query strings from the proxy's access log** (or
-disable it). Mira Server itself never logs query strings or tokens.
+CI checks both examples (`nginx -t`, `caddy validate`) and runs requests through
+nginx to confirm the token never reaches its access log.
 
 ## Several users on one host
 
@@ -351,11 +378,10 @@ passwords, tokens, prompts or request bodies.
   inside `mira remote attach` itself (it checks the engine with the token before
   Mira Server's own listener check).
 - **Team keys and the LLM proxy (#154)**.
-- **Stopping an engine after group removal**: sudo only allows running the
-  launcher as members of `mira-users`, so once someone is removed Mira Server can
-  no longer stop their engine. It revokes their sessions and stops using the
-  engine; the engine keeps running as that user until it is stopped over SSH or
-  the host restarts. A second rule such as
-  `mira-server ALL=(ALL,!root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop`
-  would close this gap.
+- **Local passwords on RHEL/Fedora**: there is no `shadow` group, so only
+  LDAP/SSSD accounts can sign in until a privileged password helper exists.
+- **`Origin: null`**: the packaged desktop app sends `Origin: null`, which any
+  sandboxed page can also send. This is acceptable while all authentication is
+  by bearer token (a page cannot obtain one without the user's password); it
+  will be revisited when browser sign-in with cookies is added.
 - Browser sign-in with cookies, LDAP bind without PAM, and OIDC come later.

@@ -12,4 +12,5 @@
 # pam_unix (local /etc/shadow passwords): a non-root process can only verify
 # OTHER users' passwords if it can read /etc/shadow. On Debian/Ubuntu add the
 # mira-server account to the "shadow" group (see docs/server-edition/mira-server.md).
+# RHEL/Fedora have no such group: only LDAP/SSSD accounts work there for now.
 # pam_sss (SSSD/LDAP) needs no extra privileges.

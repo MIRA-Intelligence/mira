@@ -60,9 +60,9 @@ jobs:
         run: |
           sudo useradd --system --home-dir /var/lib/mira-server --create-home --shell /usr/sbin/nologin mira-server
           sudo chmod 700 /var/lib/mira-server
-          sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local --engine-python /opt/mira/bin/python
-          echo 'mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch' \
-            | sudo tee /etc/sudoers.d/mira-server >/dev/null
+          sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local --engine-python /opt/mira/bin/python \
+            | grep -E '^    mira-server ALL=' | sed 's/^    //' | sudo tee /etc/sudoers.d/mira-server
+          test "$(sudo wc -l < /etc/sudoers.d/mira-server)" -eq 2
           sudo chmod 0440 /etc/sudoers.d/mira-server
           sudo visudo -cf /etc/sudoers.d/mira-server
           sudo cp deploy/mira-server/pam.d-mira-server /etc/pam.d/mira-server
@@ -99,7 +99,9 @@ jobs:
           "
 
       - name: mira-server check
-        run: sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml
+        run: |
+          sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml | tee /tmp/check.txt
+          grep -q '^ok    sudo allows `/usr/local/libexec/mira/engine-launch stop`' /tmp/check.txt
 
       - name: Start Mira Server as mira-server
         run: |
@@ -108,6 +110,55 @@ jobs:
 
       - name: End-to-end checks
         run: /opt/mira/bin/python tests/integration/mira_server_e2e.py --url http://127.0.0.1:8740
+
+      - name: "nginx example: WebSocket works and the access log has no tokens"
+        run: |
+          sudo apt-get install -y -qq nginx
+          sudo mkdir -p /etc/ssl/mira-server
+          sudo openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=mira.example.com \
+            -keyout /etc/ssl/mira-server/privkey.pem -out /etc/ssl/mira-server/fullchain.pem 2>/dev/null
+          sed -e 's/listen 443 /listen 8443 /; s/listen \[::\]:443 /listen [::]:8443 /' \
+              -e 's/listen 80;/listen 8080;/; s/listen \[::\]:80;/listen [::]:8080;/' \
+              deploy/mira-server/nginx.conf | sudo tee /etc/nginx/conf.d/mira-server.conf >/dev/null
+          sudo nginx -t
+          sudo systemctl restart nginx
+          base=https://127.0.0.1:8443
+          curl -fsSk "$base/server/info"
+          token=$(curl -fsSk -H 'Content-Type: application/json' \
+            -d '{"username":"alice","password":"alice-Pw-1","client":"desktop"}' \
+            "$base/server/auth/login" | /opt/mira/bin/python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+          for i in $(seq 1 60); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "$base/api/status?access_token=$token")
+            [ "$code" = 200 ] && break; sleep 2
+          done
+          test "$code" = 200
+          MIRA_TOKEN="$token" /opt/mira/bin/python - <<'EOF'
+          import asyncio, os
+          import aiohttp
+
+          async def main():
+              url = "wss://127.0.0.1:8443/ws?access_token=" + os.environ["MIRA_TOKEN"]
+              async with aiohttp.ClientSession() as session:
+                  async with session.ws_connect(url, ssl=False, headers={"Origin": "null"}) as ws:
+                      print("WebSocket through nginx: connected", ws.protocol)
+
+          asyncio.run(main())
+          EOF
+          log=/var/log/nginx/mira-server.access.log
+          sudo cat "$log"
+          sudo grep -q '"GET /api/status HTTP/1.1" 200' "$log"
+          sudo grep -q '"GET /ws HTTP/1.1" 101' "$log"
+          if sudo grep -q 'access_token' "$log"; then echo "access token in the nginx access log"; exit 1; fi
+
+      - name: "Caddy example: config is valid and drops access_token from the log"
+        run: |
+          curl -fsSL -o /tmp/caddy.tar.gz \
+            https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz
+          tar -xzf /tmp/caddy.tar.gz -C /tmp caddy
+          sudo mkdir -p /var/log/caddy
+          sudo /tmp/caddy validate --config deploy/mira-server/Caddyfile --adapter caddyfile
+          /tmp/caddy adapt --config deploy/mira-server/Caddyfile --adapter caddyfile > /tmp/caddy.json
+          grep -q '"access_token"' /tmp/caddy.json
 
       - name: Diagnostics
         if: always()

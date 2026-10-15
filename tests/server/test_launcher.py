@@ -19,8 +19,10 @@ from mira_server.spawner.launcher import (
     inspect_launcher,
     install_launcher,
     read_engine_python,
+    granted_launcher_rules,
     render_launcher,
     sudoers_line,
+    sudoers_rules,
 )
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX only")
@@ -126,6 +128,35 @@ def test_sudoers_line() -> None:
         "mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch"
 
 
+def test_sudoers_rules_add_stop_for_removed_users() -> None:
+    assert sudoers_rules(Path("/usr/local/libexec/mira/engine-launch"), server_user="mira-server",
+                         users_group="mira-users") == [
+        "mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch",
+        "mira-server ALL=(ALL,!root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop",
+    ]
+
+
+LAUNCHER = Path("/usr/local/libexec/mira/engine-launch")
+SUDO_L_HEADER = ("Matching Defaults entries for mira-server on host:\n    env_reset, secure_path=/usr/bin\n\n"
+                 "User mira-server may run the following commands on host:\n")
+
+
+@pytest.mark.parametrize(("rules", "expected"), [
+    ("", (False, False)),
+    ("    (%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch\n", (True, False)),
+    ("    (%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch\n"
+     "    (ALL, !root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop\n", (True, True)),
+    # A password-protected rule is useless to `sudo -n`.
+    ("    (%mira-users) /usr/local/libexec/mira/engine-launch\n", (False, False)),
+    # Another launcher path, or stop limited to the group, does not count.
+    ("    (%mira-users) NOPASSWD: /opt/other/engine-launch\n", (False, False)),
+    ("    (%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch stop\n", (False, False)),
+    ("    (ALL : ALL) NOPASSWD: /usr/bin/true, /usr/local/libexec/mira/engine-launch\n", (True, True)),
+])
+def test_granted_launcher_rules(rules: str, expected: tuple[bool, bool]) -> None:
+    assert granted_launcher_rules(SUDO_L_HEADER + rules, LAUNCHER) == expected
+
+
 # ── CLI ──────────────────────────────────────────────────────────────
 
 
@@ -142,6 +173,7 @@ def test_cli_install_launcher(tmp_path) -> None:
     path = tmp_path / "libexec" / "mira" / "engine-launch"
     assert path.exists()
     assert f"mira-server ALL=(%mira-users) NOPASSWD: {path}" in result.output
+    assert f"mira-server ALL=(ALL,!root) NOPASSWD: {path} stop" in result.output
 
 
 def test_cli_serve_refuses_dev_settings(tmp_path) -> None:
