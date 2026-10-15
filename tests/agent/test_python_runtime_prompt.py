@@ -37,6 +37,8 @@ class TestBuildPythonRuntimeHint:
         assert ".venv" in hint
         # Discourages bare pip.
         assert "Do **not** call `pip install` directly" in hint
+        assert "Never search the filesystem for a Python interpreter" in hint
+        assert "`where python`" in hint
 
     def test_section_includes_pinned_python_version(self) -> None:
         hint = build_python_runtime_hint(

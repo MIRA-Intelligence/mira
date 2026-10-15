@@ -102,11 +102,26 @@ jobs:
           import platform
           from pathlib import Path
 
+          from PyInstaller.archive.readers import CArchiveReader
+
           name = "uv.exe" if platform.system() == "Windows" else "uv"
           hits = list(Path("dist").rglob(name))
-          if not hits:
-              raise SystemExit(f"{name} missing from dist/; fetch_uv.py output was not bundled")
-          print("Bundled uv:", hits[0])
+          if hits:
+              print("Bundled uv file:", hits[0])
+              raise SystemExit(0)
+
+          for executable in Path("dist").rglob("mira-engine*"):
+              if not executable.is_file():
+                  continue
+              try:
+                  archive = CArchiveReader(str(executable))
+              except Exception:
+                  continue
+              if name in archive.toc:
+                  print("Bundled uv archive entry:", executable)
+                  raise SystemExit(0)
+
+          raise SystemExit(f"{name} missing from dist/; fetch_uv.py output was not bundled")
           PY
 
       - name: Smoke test standalone mira-engine executable
