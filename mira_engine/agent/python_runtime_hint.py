@@ -49,6 +49,10 @@ def build_python_runtime_hint(runtime: "PythonRuntimeConfig | None") -> str | No
         "the wrong interpreter on some hosts.",
         "- To run something in the project's environment from outside "
         "the activated shell, use `uv run <cmd>`.",
+        "- Never search the filesystem for a Python interpreter "
+        "(`where python`, `which python`, `ls C:/Python*`, glob "
+        "`*/python.exe`, ...). The interpreter is already provided; if "
+        "`python` fails, report the error to the user instead of hunting.",
         "- Do not create additional venvs in subdirectories. The "
         "project venv is shared across the whole project tree.",
         "- The first python-shaped command in a fresh project may "

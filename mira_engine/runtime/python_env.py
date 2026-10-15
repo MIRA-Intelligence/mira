@@ -115,6 +115,8 @@ def detect_uv(*, search_path: str | None = None) -> UvBinary | None:
        ``mira-engine`` desktop release.
     2. ``shutil.which("uv", path=search_path)`` — PATH-based discovery
        for source / pip installs.
+    3. ``uv.find_uv_bin()`` — the binary shipped by the ``uv`` PyPI
+       dependency, for installs where its directory is not on PATH.
 
     A candidate is considered "usable" if ``uv --version`` exits 0 and
     reports a version >= :data:`MIN_UV_VERSION`. Older binaries are
@@ -129,6 +131,16 @@ def detect_uv(*, search_path: str | None = None) -> UvBinary | None:
     path_hit = shutil.which("uv", path=search_path)
     if path_hit:
         candidates.append(path_hit)
+
+    # ``uv`` is a declared dependency, so a pip install ships the binary next
+    # to the interpreter even when that venv's Scripts/bin is not on PATH.
+    if search_path is None:
+        try:
+            from uv import find_uv_bin
+
+            candidates.append(find_uv_bin())
+        except Exception:  # noqa: BLE001 - package missing or binary absent
+            pass
 
     for binary in candidates:
         result = _query_uv_version(binary)
