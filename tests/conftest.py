@@ -21,5 +21,6 @@ def isolate_runtime_home(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def mock_gateway_failsafe():
     """Globally mock the gateway failsafe check to avoid PID/port collision issues in tests."""
-    with patch("mira_engine.cli.commands._gateway_failsafe_check") as mock:
+    with patch("mira_engine.cli.commands._gateway_failsafe_check") as mock, \
+            patch("mira_engine.cli.commands._free_gateway_port_or_exit"):
         yield mock

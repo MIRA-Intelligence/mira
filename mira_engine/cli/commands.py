@@ -1426,6 +1426,7 @@ def gateway(
 
     _refuse_exposed_remote_engine(gateway_host)
     engine_lease = _acquire_engine_lease_or_exit(gateway_host, gateway_port)
+    _free_gateway_port_or_exit(gateway_host, gateway_port)
     _gateway_failsafe_check(gateway_host, gateway_port, verbose)
 
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
@@ -1647,33 +1648,51 @@ def gateway(
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
+    from mira_engine.cli.gateway_shutdown import GatewayShutdown, run_bounded
+
+    shutdown = GatewayShutdown(on_force_exit=engine_lease.release)
+
     async def run():
+        loop = asyncio.get_running_loop()
         if diagnostics is not None:
-            diagnostics.install_asyncio_handler(asyncio.get_running_loop())
+            diagnostics.install_asyncio_handler(loop)
+        stop_requested = shutdown.bind(loop)
         emit_event("gateway.starting", host=gateway_host, port=gateway_port)
+        main: asyncio.Future | None = None
+        stop_wait = asyncio.create_task(stop_requested.wait())
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            main = asyncio.gather(agent.run(), channels.start_all())
+            done, _ = await asyncio.wait({main, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if main in done:
+                main.result()
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         except Exception as exc:
             emit_event("gateway.failed", level="CRITICAL", exception=exc)
             raise
         finally:
-            await agent.close_mcp()
+            stop_wait.cancel()
+            # Leave a margin inside the watchdog budget for asyncio's own teardown.
+            deadline = loop.time() + max(1.0, shutdown.timeout_s - 2.0)
+            # Stop accepting connections and close WebSockets first, so no new work arrives.
+            await run_bounded("channels", channels.stop_all(), deadline)
             heartbeat.stop()
             cron.stop()
             agent.stop()
-            await channels.stop_all()
-            emit_event("gateway.stopped")
+            await run_bounded("MCP servers", agent.close_mcp(), deadline)
+            if main is not None and not main.done():
+                main.cancel()
+                await run_bounded("agent loop", asyncio.gather(main, return_exceptions=True), deadline)
+            engine_lease.release()
+            emit_event("gateway.stopped", signal=shutdown.signum)
 
+    shutdown.install()
     try:
         asyncio.run(run())
     finally:
+        shutdown.restore()
         engine_lease.release()
 
 
@@ -1707,6 +1726,23 @@ def _acquire_engine_lease_or_exit(gateway_host: str, gateway_port: int):
     # Covers exits before the event loop starts; release() is idempotent.
     atexit.register(lease.release)
     return lease
+
+
+def _free_gateway_port_or_exit(gateway_host: str, gateway_port: int) -> None:
+    """Stop only a provably stale engine for this MIRA_HOME on our port; refuse anything else."""
+    from mira_engine.cli.port_guard import (
+        PORT_IN_USE_EXIT_CODE,
+        PortInUseError,
+        free_port_from_stale_engine,
+    )
+
+    try:
+        free_port_from_stale_engine(gateway_host, gateway_port)
+    except PortInUseError as exc:
+        typer.echo(f"Error: {exc}.", err=True)
+        typer.echo("Mira only stops a leftover engine for this MIRA_HOME. Stop that process, "
+                   "or start the gateway on another port with --port.", err=True)
+        raise typer.Exit(PORT_IN_USE_EXIT_CODE) from None
 
 
 @app.command("gateway-token")
