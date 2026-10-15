@@ -67,13 +67,55 @@ stopped or was not running.
   listens on loopback or all interfaces.
 - **Starting.** Attach runs `mira gateway --host 127.0.0.1` on port 18790, or on a
   random free port when 18790 is taken, and waits for `/health`. An engine started
-  this way refuses any non-loopback bind.
+  this way refuses any non-loopback bind. If another process takes the port between
+  the check and the bind, the gateway exits with code 4 (see below) and attach picks
+  another port. Attach never stops a process to free a port.
 - **Detached.** The engine runs in its own session (`setsid`; on Windows a detached
   process group), so closing SSH or letting the laptop sleep does not stop it. Its
   output goes to `<MIRA_HOME>/logs/remote-gateway.log`.
 - **Stopping.** `mira remote stop` sends SIGTERM to a standalone or Remote-SSH
-  engine after checking its PID belongs to a Mira gateway. Service-managed engines
-  are left to `mira-engine stop`.
+  engine after checking its PID belongs to a Mira gateway, and waits up to 15 s.
+  Service-managed engines are left to `mira-engine stop`.
+
+### Gateway shutdown and exit codes
+
+`mira gateway` (and the bundled `mira-engine run-gateway`) handles SIGTERM and
+SIGINT (Ctrl+C; also Ctrl+Break on Windows):
+
+1. It stops accepting connections and closes open WebSockets with code **1001**
+   (going away).
+2. It stops the channels, cron and heartbeat, and closes MCP servers.
+3. It releases the engine lease (removes `<MIRA_HOME>/engine.lease`) and exits
+   with code **0**.
+
+Shutdown is bounded at 10 s. If it takes longer, the engine releases its lease and
+exits with code **1**. A second signal skips the wait: the engine releases its lease
+and exits at once with code 128 + signal number (130 for SIGINT, 143 for SIGTERM).
+`kill -9` still leaves a lease record behind; it is recognised as dead and replaced.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Stopped cleanly after SIGTERM or SIGINT. |
+| `1` | Startup error, or shutdown hit the 10 s limit. |
+| `3` | Another engine already holds the lease for this `MIRA_HOME`. |
+| `4` | The port is held by a process the gateway must not stop (see below). |
+| `128 + n` | A second signal `n` forced the exit. |
+
+### Port already in use
+
+Before binding, the gateway checks the port. It stops the holder only when it can
+prove the holder is a leftover Mira engine for the **same** `MIRA_HOME`: owned by the
+same user, running a Mira gateway command, tied to this `MIRA_HOME` by its environment
+or the local gateway registry, and not the engine that holds the lease. That engine
+gets SIGTERM and up to 15 s to exit.
+
+Anything else is left alone, including processes of other users and Mira engines
+for another `MIRA_HOME`. The gateway then exits with code 4 and names the holder:
+
+```text
+Error: port 18790 on 127.0.0.1 is already in use by pid 4242 (python3: python -m http.server 18790), which is not a Mira engine.
+Mira only stops a leftover engine for this MIRA_HOME. Stop that process, or start the gateway on another port with --port.
+```
 
 ## Finding `mira` over non-interactive SSH
 

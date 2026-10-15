@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, WSCloseCode, web
 from loguru import logger
 
 from mira_engine import __version__
@@ -860,6 +860,10 @@ def _merge_recovered_results(existing: Any, recovered_metrics: Any, artifacts: l
     return results
 
 
+_WS_CLOSE_TIMEOUT_S = 2.0
+_HTTP_SHUTDOWN_TIMEOUT_S = 3.0
+
+
 class UiChannel(BaseChannel):
     """WebSocket + REST channel for frontend clients (desktop/browser UI)."""
 
@@ -925,6 +929,8 @@ class UiChannel(BaseChannel):
         self._engine_identity: dict[str, Any] = _current_engine_identity()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
+        # Every open WebSocket, bound to a session or not, so shutdown can close them all.
+        self._sockets: set[web.WebSocketResponse] = set()
         self._client_project_dirs: dict[str, Path | None] = {}
         # Accumulates streamed assistant text per session so the final turn can
         # be persisted to the UI history log on stream end.
@@ -1161,34 +1167,15 @@ class UiChannel(BaseChannel):
 
     # ── lifecycle ────────────────────────────────────────────────────
 
-    def _kill_stale_listener(self) -> None:
-        """Kill any leftover process occupying our port before binding."""
-        import os
-        import signal
-        import subprocess
+    def _free_port_from_stale_engine(self) -> None:
+        """Before binding, stop a leftover engine for this MIRA_HOME that still holds our port.
 
-        my_pid = os.getpid()
-        try:
-            result = subprocess.run(
-                ["lsof", "-ti", f":{self.bind_port}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            pids = {
-                int(p) for p in result.stdout.split() if p.strip()
-            } - {my_pid}
-        except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
-            return
+        Raises :class:`~mira_engine.cli.port_guard.PortInUseError` when anything
+        else holds it; such a process is never signalled.
+        """
+        from mira_engine.cli.port_guard import free_port_from_stale_engine
 
-        for pid in pids:
-            try:
-                logger.warning("Killing stale process {} on port {}", pid, self.bind_port)
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
-
-        if pids:
-            import time
-            time.sleep(0.5)
+        free_port_from_stale_engine(self.bind_host, self.bind_port)
 
     def _build_app(self) -> web.Application:
         from mira_engine.observability import request_middleware
@@ -1258,11 +1245,12 @@ class UiChannel(BaseChannel):
         return self._app
 
     async def start(self) -> None:
-        self._kill_stale_listener()
+        self._free_port_from_stale_engine()
         self._build_app()
 
         # The access log would record request lines, including ?access_token=.
-        self._runner = web.AppRunner(self._app, access_log=None)
+        # A short shutdown_timeout keeps in-flight requests from stalling engine shutdown.
+        self._runner = web.AppRunner(self._app, access_log=None, shutdown_timeout=_HTTP_SHUTDOWN_TIMEOUT_S)
         await self._runner.setup()
         self._site = web.TCPSite(
             self._runner, self.bind_host, self.bind_port,
@@ -1287,12 +1275,16 @@ class UiChannel(BaseChannel):
     async def stop(self) -> None:
         self._running = False
 
-        await self._close_active_clients()
-        await self._workflow_api.close()
-
+        # Stop accepting connections first, then tell clients the engine is going away.
         if self._site:
             await self._site.stop()
             self._site = None
+        sockets = {*self._sockets, *self._clients.values()}
+        self._clients.clear()
+        self._client_project_dirs.clear()
+        await self._close_sockets(sockets, code=WSCloseCode.GOING_AWAY, message=b"engine shutting down")
+        await self._workflow_api.close()
+
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -1300,10 +1292,25 @@ class UiChannel(BaseChannel):
         logger.info("UI channel stopped")
 
     async def _close_active_clients(self) -> None:
-        for _sid, ws in list(self._clients.items()):
-            await ws.close()
+        clients = set(self._clients.values())
         self._clients.clear()
         self._client_project_dirs.clear()
+        await self._close_sockets(clients)
+
+    @staticmethod
+    async def _close_sockets(
+        sockets: set[web.WebSocketResponse], *, code: int = WSCloseCode.OK, message: bytes = b"",
+    ) -> None:
+        if not sockets:
+            return
+        # Close in parallel and bounded: an unresponsive client must not hold up the rest.
+        closing = asyncio.gather(
+            *(ws.close(code=code, message=message) for ws in sockets), return_exceptions=True,
+        )
+        try:
+            await asyncio.wait_for(closing, _WS_CLOSE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning("Some WebSocket clients did not acknowledge close within {}s", _WS_CLOSE_TIMEOUT_S)
 
     def _stream_history_dir(
         self, chat_id: str, metadata: dict[str, Any]
@@ -1779,6 +1786,7 @@ class UiChannel(BaseChannel):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         emit_event("websocket.connected", connection_id=connection_id)
+        self._sockets.add(ws)
 
         session_id: str | None = None
 
@@ -2356,6 +2364,7 @@ class UiChannel(BaseChannel):
         finally:
             # Runs on errors too, so a crashed loop cannot leave a stale client bound.
             emit_event("websocket.disconnected", connection_id=connection_id, code=getattr(ws, "close_code", None))
+            self._sockets.discard(ws)
             if session_id and self._clients.get(session_id) is ws:
                 del self._clients[session_id]
                 self._client_project_dirs.pop(session_id, None)
