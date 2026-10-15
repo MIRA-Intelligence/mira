@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -166,6 +167,7 @@ def main() -> int:
     parser.add_argument("--config", default="/etc/mira-server/mira-server.toml")
     parser.add_argument("--mira-server", default="/opt/mira/bin/mira-server")
     parser.add_argument("--log", default="/tmp/mira-server.log")
+    parser.add_argument("--expect-tasks-max", default="", help="pids.max set by the user-.slice.d drop-in")
     args = parser.parse_args()
     client = Client(args.url)
     wait_server(client)
@@ -212,6 +214,15 @@ def main() -> int:
         check(record["mira_home"] == f"/home/{name}/.mira", f"{name}'s MIRA_HOME is {record['mira_home']}")
     check(leases["alice"]["port"] != leases["bob"]["port"],
           f"distinct ports {leases['alice']['port']} / {leases['bob']['port']}")
+
+    step("each engine runs in its user's slice, under the per-user limits")
+    for name, record in leases.items():
+        uid = int(subprocess.run(["id", "-u", name], capture_output=True, text=True).stdout)
+        cgroup = Path(f"/proc/{record['pid']}/cgroup").read_text()
+        check(f"/user-{uid}.slice/session-" in cgroup, f"{name}'s engine is in a session of user-{uid}.slice: {cgroup.strip()}")
+        if args.expect_tasks_max:
+            limit = Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/pids.max").read_text().strip()
+            check(limit == args.expect_tasks_max, f"user-{uid}.slice pids.max is {limit}")
 
     step("/api returns each user's own data")
     _, _, a_status = client.request("GET", "/api/status", token=at)
@@ -293,6 +304,14 @@ def main() -> int:
         time.sleep(0.2)
     check(not pid_alive(alice_pid), f"alice's engine pid {alice_pid} exited")
     check(pid_alive(leases["bob"]["pid"]), "bob's engine is untouched")
+    # The launcher that kept alice's logind session open exits with her engine.
+    for _ in range(60):
+        sessions = subprocess.run(["loginctl", "list-sessions", "--no-legend"], capture_output=True, text=True).stdout
+        if not any(line.split()[2:3] == ["alice"] for line in sessions.splitlines() if line.split()):
+            break
+        time.sleep(0.5)
+    check(not any(line.split()[2:3] == ["alice"] for line in sessions.splitlines() if line.split()),
+          f"alice's engine session closed with the engine: {sessions.strip()!r}")
 
     step("removal from mira-users revokes access and stops the engine")
     bob_pid = leases["bob"]["pid"]

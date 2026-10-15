@@ -61,11 +61,16 @@ jobs:
           sudo useradd --system --home-dir /var/lib/mira-server --create-home --shell /usr/sbin/nologin mira-server
           sudo chmod 700 /var/lib/mira-server
           sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local --engine-python /opt/mira/bin/python \
-            | grep -E '^    mira-server ALL=' | sed 's/^    //' | sudo tee /etc/sudoers.d/mira-server
-          test "$(sudo grep -c '^mira-server ALL=' /etc/sudoers.d/mira-server)" -eq 2
+            | grep -E '^    (Cmnd_Alias|Defaults!|mira-server ALL=)' | sed 's/^    //' | sudo tee /etc/sudoers.d/mira-server
+          test "$(sudo grep -cE '^(Cmnd_Alias|Defaults!|mira-server ALL=)' /etc/sudoers.d/mira-server)" -eq 4
           sudo chmod 0440 /etc/sudoers.d/mira-server
           sudo visudo -cf /etc/sudoers.d/mira-server
           sudo cp deploy/mira-server/pam.d-mira-server /etc/pam.d/mira-server
+          sudo cp deploy/mira-server/pam.d-mira-engine /etc/pam.d/mira-engine
+          # Per-user limits; the e2e test checks that engines get them.
+          sudo install -D -m 0644 deploy/mira-server/user-slice-mira.conf /etc/systemd/system/user-.slice.d/50-mira.conf
+          sudo sed -i 's/^TasksMax=.*/TasksMax=4321/' /etc/systemd/system/user-.slice.d/50-mira.conf
+          sudo systemctl daemon-reload
           sudo install -D -o root -g root -m 0644 deploy/mira-server/policy.toml /etc/mira/policy.toml
           sudo mkdir -p /etc/mira-server
           sudo tee /etc/mira-server/mira-server.toml >/dev/null <<'EOF'
@@ -112,6 +117,7 @@ jobs:
           sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml | tee /tmp/check.txt
           grep -q '^ok    sudo allows `/usr/local/libexec/mira/engine-launch stop`' /tmp/check.txt
           grep -q '^ok    bwrap sandbox works on this host' /tmp/check.txt
+          grep -q '^ok    engines start in a user session' /tmp/check.txt
 
       - name: Start Mira Server as mira-server
         run: |
@@ -119,7 +125,7 @@ jobs:
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8740/server/info && break; sleep 0.5; done
 
       - name: End-to-end checks
-        run: /opt/mira/bin/python tests/integration/mira_server_e2e.py --url http://127.0.0.1:8740
+        run: /opt/mira/bin/python tests/integration/mira_server_e2e.py --url http://127.0.0.1:8740 --expect-tasks-max 4321
 
       - name: "nginx example: WebSocket works and the access log has no tokens"
         run: |

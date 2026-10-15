@@ -131,6 +131,8 @@ def test_sudoers_line() -> None:
 def test_sudoers_rules_add_stop_for_removed_users() -> None:
     assert sudoers_rules(Path("/usr/local/libexec/mira/engine-launch"), server_user="mira-server",
                          users_group="mira-users") == [
+        "Cmnd_Alias MIRA_ENGINE_START = /usr/local/libexec/mira/engine-launch start",
+        "Defaults!MIRA_ENGINE_START pam_service=mira-engine",
         "mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch",
         "mira-server ALL=(ALL,!root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop",
     ]

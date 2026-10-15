@@ -2,15 +2,24 @@
 
 sudoers lets the ``mira-server`` account run exactly this file as members of
 ``mira-users``, and ``engine-launch stop`` as any other non-root account, so it
-can still stop the engine of someone removed from the group::
+can still stop the engine of someone removed from the group. ``start`` goes
+through the ``mira-engine`` PAM service, whose pam_systemd session places the
+engine in the user's ``user-<uid>.slice``::
 
+    Cmnd_Alias MIRA_ENGINE_START = /usr/local/libexec/mira/engine-launch start
+    Defaults!MIRA_ENGINE_START pam_service=mira-engine
     mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch
     mira-server ALL=(ALL,!root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop
+
+For ``start`` in such a session the launcher prints the attach result, then
+stays (with no open output) until the engine exits, keeping the session open:
+logind removes ``/run/user/<uid>`` and the user's IPC objects when their last
+session ends.
 
 The script accepts one argument, ``start``, ``status`` or ``stop``, and reads no
 other input. It discards the caller's environment, builds a minimal one from the
 passwd entry of the uid it runs as (``HOME``, ``MIRA_HOME=~/.mira``, ``PATH``)
-and execs the system engine::
+and runs the system engine::
 
     <engine python> -I -m mira_engine remote attach --json   # start
     <engine python> -I -m mira_engine remote status --json   # status
@@ -35,15 +44,59 @@ _TEMPLATE = '''#!{python} -I
 {marker}
 #
 # sudo runs this as a member of the Mira users group. It accepts only
-# start|status|stop, ignores the caller's environment and execs the system
+# start|status|stop, ignores the caller's environment and runs the system
 # engine's `mira remote` command for the account it runs as.
+import fcntl
+import json
 import os
 import pwd
 import stat
+import subprocess
 import sys
+import time
 
 ENGINE_PYTHON = {python!r}
 ACTIONS = {actions!r}
+
+
+def in_user_session(uid):
+    # sudo opened a logind session for `start` (pam_systemd through the
+    # mira-engine PAM service): this process is in user-<uid>.slice/session-N.scope.
+    try:
+        with open("/proc/self/cgroup") as handle:
+            text = handle.read()
+    except OSError:
+        return False
+    return ("/user-%d.slice/" % uid) in text and "/session-" in text
+
+
+def start_time(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            return handle.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def hold_session(mira_home, pid):
+    # Keep the session (and so /run/user/<uid> and the user's IPC objects,
+    # which logind removes when a user's last session ends) open while the
+    # engine runs. One holder per engine: the lock is released on exit.
+    runtime = os.path.join(mira_home, "runtime")
+    try:
+        os.makedirs(runtime, mode=0o700, exist_ok=True)
+        lock = os.open(os.path.join(runtime, "engine-session.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    started = start_time(pid)
+    if started is None:
+        return
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    while start_time(pid) == started:
+        time.sleep(5)
 
 
 def main():
@@ -80,7 +133,20 @@ def main():
     except OSError:
         os.chdir("/")
     argv = [ENGINE_PYTHON, "-I", "-m", "mira_engine", "remote"] + list(ACTIONS[sys.argv[1]])
-    os.execve(ENGINE_PYTHON, argv, env)
+    if sys.argv[1] != "start" or not in_user_session(uid):
+        os.execve(ENGINE_PYTHON, argv, env)
+    # Print the result as soon as it is known (Mira Server reads this one line
+    # and does not wait for exit), then keep the session for the engine.
+    result = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stdout.flush()
+    try:
+        payload = json.loads(result.stdout.decode("utf-8", "replace").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        payload = {{}}
+    if result.returncode == 0 and payload.get("ok") is True and isinstance(payload.get("pid"), int):
+        hold_session(env["MIRA_HOME"], payload["pid"])
+    return result.returncode
 
 
 if __name__ == "__main__":
@@ -144,8 +210,24 @@ def sudoers_stop_line(path: Path, *, server_user: str) -> str:
     return f"{server_user} ALL=(ALL,!root) NOPASSWD: {path} stop"
 
 
+PAM_SESSION_SERVICE = "mira-engine"
+START_ALIAS = "MIRA_ENGINE_START"
+
+
+def sudoers_session_lines(path: Path) -> list[str]:
+    """Run ``engine-launch start`` through the ``mira-engine`` PAM service.
+
+    Its session stack (pam_systemd) puts the engine in the user's logind
+    session, i.e. ``user-<uid>.slice``, where per-user systemd limits apply.
+    ``status`` and ``stop`` keep sudo's default PAM service and open no session.
+    """
+    return [f"Cmnd_Alias {START_ALIAS} = {path} start",
+            f"Defaults!{START_ALIAS} pam_service={PAM_SESSION_SERVICE}"]
+
+
 def sudoers_rules(path: Path, *, server_user: str, users_group: str) -> list[str]:
-    return [sudoers_line(path, server_user=server_user, users_group=users_group),
+    return [*sudoers_session_lines(path),
+            sudoers_line(path, server_user=server_user, users_group=users_group),
             sudoers_stop_line(path, server_user=server_user)]
 
 

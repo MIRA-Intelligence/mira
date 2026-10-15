@@ -385,8 +385,10 @@ bwrap sandbox effective. The spawner sits behind an interface
 ### 7.2 Sudo launcher details
 
 - Mira Server runs as the unprivileged system user `mira-server`.
-- One sudoers rule, nothing else:
-  `mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch`
+- sudoers allows only the launcher:
+  `mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch`,
+  plus `engine-launch stop` as any non-root account (to stop the engine of
+  someone removed from the group) and the PAM service for `start` (below).
 - `engine-launch` is a small root-owned script (the JupyterHub sudospawner
   pattern), written by `mira-server install-launcher`. It accepts only
   `start|status|stop` and reads no other input. It discards the caller's
@@ -395,11 +397,14 @@ bwrap sandbox effective. The spawner sits behind an interface
   `/opt/mira/bin/python -I -m mira_engine remote attach|status|stop --json`
   (#152 decision: reuse the Remote-SSH commands). It never runs caller-supplied
   commands.
-- **Resource limits**: when the user has a systemd user manager (lingering
-  enabled by the admin), the launcher starts the engine with
-  `systemd-run --user --unit mira-engine -p MemoryMax=… -p CPUQuota=…`;
-  otherwise admins set limits for all of a user's processes with a
-  `user-.slice.d/` drop-in. Either way limits are per user, not per Mira Server instance.
+- **Resource limits** (#153): sudo runs `engine-launch start` through the
+  `mira-engine` PAM service (`Defaults!` for that command only), whose
+  `pam_systemd` session puts the engine in the user's `user-<uid>.slice`.
+  Admins set limits for all of a user's processes (SSH sessions and engine)
+  with a `user-.slice.d/` drop-in. The launcher keeps that session open while
+  the engine runs, because logind removes `/run/user/<uid>` and the user's IPC
+  objects when their last session ends. Either way limits are per user, not
+  per Mira Server instance.
 - **Ports**: `mira remote attach` binds 18790, or a random free loopback port
   when it is taken, so many users' engines coexist. **Port squatting**: before
   sending the token, Mira Server checks in `/proc/net/tcp{,6}` that every
