@@ -99,6 +99,14 @@ jobs:
           print('PAM for another user with shadow group:', ok, p.code, p.reason)
           "
 
+      - name: Allow bwrap to create user namespaces (Ubuntu AppArmor)
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          ls /etc/apparmor.d /usr/share/apparmor/extra-profiles 2>/dev/null | grep -i bwrap || true
+          sudo install -m 0644 deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+          sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
+          bwrap --ro-bind / / --unshare-pid --proc /proc true && echo "bwrap works"
+
       - name: mira-server check
         run: |
           sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml | tee /tmp/check.txt

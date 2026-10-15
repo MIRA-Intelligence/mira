@@ -205,10 +205,19 @@ sudo install -D -o root -g root -m 0644 deploy/mira-server/policy.toml /etc/mira
 
 [`deploy/mira-server/policy.toml`](../../deploy/mira-server/policy.toml) keeps
 file and shell tools inside the current project and runs every shell command in
-the bubblewrap sandbox. See [Agent isolation](#agent-isolation). Ubuntu 23.10+
-restricts unprivileged user namespaces through AppArmor; if `mira-server check`
-reports that bwrap cannot create a sandbox, allow it for bwrap (an AppArmor
-profile with `userns`) or set `kernel.apparmor_restrict_unprivileged_userns=0`.
+the bubblewrap sandbox. See [Agent isolation](#agent-isolation).
+
+Ubuntu 23.10+ restricts unprivileged user namespaces through AppArmor, and
+bwrap then fails with `setting up uid map: Permission denied` (`mira-server
+check` reports it, and agents' shell commands are refused). Allow user
+namespaces for bwrap only, with
+[`deploy/mira-server/apparmor-bwrap`](../../deploy/mira-server/apparmor-bwrap)
+(or the distribution's own bwrap profile, if it ships one):
+
+```sh
+sudo install -m 0644 deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
+```
 
 ### 8. Check and start
 
