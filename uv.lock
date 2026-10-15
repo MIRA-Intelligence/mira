@@ -1595,10 +1595,15 @@ matrix = [
     { name = "mistune" },
     { name = "nh3" },
 ]
+server = [
+    { name = "aiohttp" },
+    { name = "python-pam", marker = "sys_platform != 'win32'" },
+]
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", marker = "extra == 'dev'", specifier = ">=3.9.0,<4.0.0" },
+    { name = "aiohttp", marker = "extra == 'dev'", specifier = ">=3.10.0,<4.0.0" },
+    { name = "aiohttp", marker = "extra == 'server'", specifier = ">=3.10.0,<4.0.0" },
     { name = "chardet", specifier = ">=3.0.2,<6.0.0" },
     { name = "croniter", specifier = ">=6.0.0,<7.0.0" },
     { name = "ddgs", specifier = ">=9.0.0,<10.0.0" },
@@ -1626,6 +1631,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.0,<10.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.3.0,<2.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0.0" },
+    { name = "python-pam", marker = "sys_platform != 'win32' and extra == 'server'", specifier = ">=2.0.2,<3.0.0" },
     { name = "python-socketio", specifier = ">=5.16.0,<6.0.0" },
     { name = "python-socks", extras = ["asyncio"], specifier = ">=2.8.0,<3.0.0" },
     { name = "python-telegram-bot", extras = ["socks"], specifier = ">=22.6,<23.0" },
@@ -1641,7 +1647,7 @@ requires-dist = [
     { name = "websocket-client", specifier = ">=1.9.0,<2.0.0" },
     { name = "websockets", specifier = ">=16.0,<17.0" },
 ]
-provides-extras = ["dev", "matrix"]
+provides-extras = ["dev", "matrix", "server"]
 
 [[package]]
 name = "mistune"
@@ -2416,6 +2422,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/6b/56/652349f97dc2ce6d1aed43481d179c775f565e68796517836406fb7794c7/python_olm-3.2.16-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:16bbb209d43d62135450696526ed0a811150e9de9df32ed91542bf9434e79030", size = 293671, upload-time = "2023-11-28T19:25:21.525Z" },
     { url = "https://files.pythonhosted.org/packages/39/ee/1e15304ac67d3a7ebecbcac417d6479abb7186aad73c6a035647938eaa8e/python_olm-3.2.16-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:45e76b3f5060a5cf8451140d6c7e3b438f972ff432b6f39d0ca2c7f2296509bb", size = 301030, upload-time = "2023-11-28T19:25:26.634Z" },
     { url = "https://files.pythonhosted.org/packages/79/93/f6729f10149305262194774d6c8b438c0b084740cf239f48ab97b4df02fa/python_olm-3.2.16-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:10a5e68a2f4b5a2bfa5fdb5dbfa22396a551730df6c4a572235acaa96e997d3f", size = 297000, upload-time = "2023-11-28T19:25:31.045Z" },
+]
+
+[[package]]
+name = "python-pam"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e1/3f/cdf0b4823505df2534feb21ad6c1f552a6d1584278e6c2337b99b2c12e6a/python_pam-2.1.0.tar.gz", hash = "sha256:04598b0fba9e3fa290f27e4f8d1762a9d61b75f1e38b53e9d8d861af53eb0d2a", size = 13227, upload-time = "2026-09-17T02:46:28.279Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ad/b6/1f9d82f4f4466159dbf3ddf5d9960cea5e81c6b66eba318d3252fd5bc64a/python_pam-2.1.0-py3-none-any.whl", hash = "sha256:5bbad1e2b93b30a48466a285e4979c702d4e6f61f3c920db874f171dfb0bb146", size = 13122, upload-time = "2026-09-17T02:46:27.013Z" },
 ]
 
 [[package]]

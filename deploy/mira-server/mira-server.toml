@@ -1,0 +1,70 @@
+# Mira Server configuration (example). Install as /etc/mira-server/mira-server.toml.
+# Every key is optional; the values shown are the defaults unless noted.
+# Validate with:  sudo -u mira-server mira-server check --config /etc/mira-server/mira-server.toml
+# Guide: docs/server-edition/mira-server.md
+
+[server]
+# Address Mira Server listens on. Keep it on loopback and put a TLS reverse
+# proxy (Caddy, nginx) in front for remote clients.
+listen = "127.0.0.1:8740"
+
+# The URL clients use (through the TLS proxy). Its origin is allowed for CORS.
+# Not a default: set it for your host.
+public_url = "https://mira.example.com"
+
+# State (SQLite database). Created with mode 0700, owned by the mira-server account.
+data_dir = "/var/lib/mira-server"
+
+# Browser origins allowed to call Mira Server. Empty means "file://" (the desktop
+# app) plus the origin of public_url. A non-empty list replaces that default.
+allowed_origins = []
+
+# Peers whose X-Forwarded-For header gives the real client IP (used for login
+# rate limiting). Set this to the TLS proxy's address when it runs on this host:
+# trusted_proxies = ["127.0.0.1", "::1"]
+trusted_proxies = []
+
+[auth]
+# "pam" (production). "dev" (scrypt hashes below) needs `serve --dev` on loopback.
+backend = "pam"
+# PAM service: /etc/pam.d/<pam_service>
+pam_service = "mira-server"
+# Members (primary or supplementary, via NSS) may sign in; admins get the admin role.
+users_group = "mira-users"
+admins_group = "mira-admins"
+# Token lifetimes in seconds.
+access_token_ttl = 900
+refresh_token_ttl = 2592000
+# Group membership is re-read at most this often per user (seconds). Removing a
+# user from users_group revokes their sessions and stops their engine.
+group_recheck_interval = 300
+# Failed sign-ins allowed per (username, client IP) within login_window seconds.
+login_max_attempts = 5
+login_window = 300
+
+# Dev backend users (only with backend = "dev"). Create hashes with
+# `mira-server hash-password`.
+# [[auth.dev_users]]
+# name = "alice"
+# password_hash = "scrypt$16384$8$1$..."
+# admin = true
+
+[spawner]
+# "sudo" (production): sudo -n -u <user> <launcher> start|status|stop.
+# "local" (dev, needs --dev): runs `mira remote ...` as the current user.
+backend = "sudo"
+# Written by `mira-server install-launcher`; must be root-owned.
+launcher = "/usr/local/libexec/mira/engine-launch"
+sudo = "/usr/bin/sudo"
+# Seconds to wait for the launcher's start (attach) and status/stop.
+start_timeout = 90
+stop_timeout = 30
+# Stop an engine Mira Server started after this many seconds without proxied
+# requests or open WebSockets. 0 disables culling.
+idle_timeout = 7200
+# Check that the engine's listening socket belongs to the user before sending
+# it the engine token. Turning this off needs --dev.
+verify_listener = true
+# local backend only:
+# engine_python = "/path/to/venv/bin/python"
+# local_mira_home = "/tmp/mira-dev/{user}"

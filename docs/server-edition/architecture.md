@@ -225,15 +225,19 @@ Jupyter-specific APIs would need heavy adaptation).
 
 ### 4.2 Per-user engine
 
-The existing `mira gateway`, unchanged in behaviour, started by the launcher
-as the user's own uid with:
+The existing `mira gateway`, unchanged in behaviour, started as the user's
+own uid by the launcher through `mira remote attach` (the Remote-SSH command,
+§7.2), with:
 
 - `MIRA_HOME=~/.mira` (the same home a local or Remote-SSH engine uses)
-- `MIRA_RUNTIME_DIR` on local disk (§8.1; new engine setting)
-- `--host 127.0.0.1 --port <assigned>`
-- `MIRA_GATEWAY_TOKEN=<Mira Server-generated>` in the environment (§6.3)
-- `MIRA_GATEWAY_ALLOWED_ORIGINS=<Mira Server origin>`
-- Provider `api_base` for team models pointing at the Mira Server LLM proxy (§8.3)
+- the runtime dir on local disk (§8.1): `/run/user/<uid>` when it exists, else
+  `~/.mira/runtime`
+- `--host 127.0.0.1` and port 18790, or a random free port when that is taken
+- the user's own gateway token (§6.3)
+- Provider `api_base` for team models pointing at the Mira Server LLM proxy (§8.3, #154)
+
+Mira Server forwards requests without an `Origin`, so the engine's own origin
+allowlist needs no Mira Server entry.
 
 Everything else comes from the user's own `~/.mira/config.json`. The user
 owns that file, so nothing that protects *other* users is enforced through it
@@ -341,16 +345,21 @@ Tokens are stored hashed; logout, group removal and account disable revoke them.
 
 ### 6.3 Mira Server ↔ engine
 
-Mira Server uses the Step 0 engine contract (#149):
+Mira Server uses the Step 0 engine contract (#149) through the Remote-SSH
+contract (#171, #174). **Decision for the MVP (#152): reuse `mira remote
+attach` instead of a Mira Server-generated token.**
 
-- Mira Server generates a random token per engine start and passes it as
-  `MIRA_GATEWAY_TOKEN`. It cannot read the user's `0600`
-  `~/.mira/runtime/gateway-token`, and it does not need to.
-- The token is handed to the launcher on **stdin**, never in argv (argv is
-  visible to every user through `ps`). `/proc/<pid>/environ` is readable only
-  by the process owner and root.
+- The launcher runs `mira remote attach --json` as the user. It starts or
+  reuses the user's engine and prints one JSON line with `port` and the user's
+  own gateway `token` (from `~/.mira/runtime/gateway-token`, `0600`, readable
+  only by the user and root). Mira Server reads both from the launcher's stdout;
+  nothing secret is passed in argv or the environment.
+- Because Remote-SSH and Mira Server use the same command and the engine lease,
+  a user has one engine whichever way it was started, and Mira Server can attach
+  to an engine started over SSH.
 - The engine binds `127.0.0.1`. Every local user can reach a loopback port, so
-  the token is mandatory, and Mira Server verifies the listener before sending it
+  the token is mandatory, and before the first proxied request to a port Mira
+  Server verifies that every loopback listener on it belongs to the user's uid
   (§7.2, port squatting).
 - The engine must strip `MIRA_GATEWAY_TOKEN` from the environment of tool
   subprocesses (shell, MCP stdio servers), so a prompt-injected command cannot
@@ -379,22 +388,26 @@ bwrap sandbox effective. The spawner sits behind an interface
 - One sudoers rule, nothing else:
   `mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch`
 - `engine-launch` is a small root-owned script (the JupyterHub sudospawner
-  pattern). It accepts only `start|stop|status`, reads the port and token from
-  stdin as JSON, validates them, sets `MIRA_HOME`, `MIRA_RUNTIME_DIR`,
-  `MIRA_GATEWAY_TOKEN` and allowed origins, and execs the system-installed
-  engine (`/opt/mira/bin/mira gateway --host 127.0.0.1 --port P`). It never
-  runs caller-supplied commands.
+  pattern), written by `mira-server install-launcher`. It accepts only
+  `start|status|stop` and reads no other input. It discards the caller's
+  environment, sets `HOME`, `MIRA_HOME=~/.mira` and `PATH` from the passwd entry
+  of the uid it runs as, and execs the system-installed engine:
+  `/opt/mira/bin/python -I -m mira_engine remote attach|status|stop --json`
+  (#152 decision: reuse the Remote-SSH commands). It never runs caller-supplied
+  commands.
 - **Resource limits**: when the user has a systemd user manager (lingering
   enabled by the admin), the launcher starts the engine with
   `systemd-run --user --unit mira-engine -p MemoryMax=… -p CPUQuota=…`;
   otherwise admins set limits for all of a user's processes with a
   `user-.slice.d/` drop-in. Either way limits are per user, not per Mira Server instance.
-- **Ports** come from a configured range. **Port squatting**: before sending
-  the token, Mira Server checks in `/proc/net/tcp{,6}` that the listening socket on
-  that port belongs to the expected uid; on mismatch it picks another port and
-  logs a security event.
-- **Readiness**: Mira Server polls `GET /health` and `GET /version` (open per
-  #149), then checks version compatibility.
+- **Ports**: `mira remote attach` binds 18790, or a random free loopback port
+  when it is taken, so many users' engines coexist. **Port squatting**: before
+  sending the token, Mira Server checks in `/proc/net/tcp{,6}` that every
+  loopback listening socket on that port belongs to the expected uid; on
+  mismatch it refuses the engine (state `error`) and logs a security event.
+- **Readiness**: Mira Server checks `GET /health` and `GET /version` (open per
+  #149) for a Mira gateway and the launcher JSON for remote protocol 1.
+- Install and API details: [mira-server.md](mira-server.md).
 
 ### 7.3 Single engine per user
 
@@ -586,7 +599,7 @@ one session" for desktop users. On top, Mira Server adds:
 | Threat | Mitigation |
 |---|---|
 | Unauthenticated network access to an engine | #149: token on all routes, loopback bind, Origin allowlist. Mode A is deprecated (§2.1); until removed, only through an SSH tunnel or TLS. |
-| Another local user connecting to an engine's loopback port | Token required; token passed via stdin/env, never argv; tool subprocesses don't inherit it. |
+| Another local user connecting to an engine's loopback port | Token required; the token reaches Mira Server only on the launcher's stdout, never in argv; tool subprocesses don't inherit it (#153). |
 | Another local user squatting the assigned port to capture the token | Mira Server verifies the listener's uid in `/proc/net/tcp` before sending the token. |
 | User A reads user B's files via the agent | Engine runs as A's uid; kernel permissions apply exactly as over SSH. bwrap and `restrict_to_workspace` additionally protect A from prompt injection. |
 | Team key exfiltration | Team keys only in the Mira Server LLM proxy, never in any home directory. |
