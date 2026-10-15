@@ -198,7 +198,7 @@ Always write the **full** JSON (not a patch).
 |-------|------|----------|
 | `summary` | `string` (final summary) | NO |
 | `output_path` | `string` (file path to deliverable) | NO |
-| `output_type` | `string` (`paper` / `report` / `analysis` / `code`) | NO |
+| `output_type` | `string` (`paper` / `report` / `analysis` / `code` / `slides` / `notebook`) | NO |
 | `sections` | `array` of `{title, content}` | NO |
 
 ## Rules
