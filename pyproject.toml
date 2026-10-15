@@ -97,6 +97,10 @@ packages = ["mira_engine", "mira_server"]
 "mira_engine" = "mira_engine"
 "mira_server" = "mira_server"
 
+# Deployment files (PAM services, unit, policy, installer) for `mira-server deploy-dir`.
+[tool.hatch.build.targets.wheel.force-include]
+"deploy/mira-server" = "mira_server/deploy"
+
 # Include non-Python files in skills and templates
 [tool.hatch.build]
 include = [
@@ -111,6 +115,7 @@ include = [
 include = [
     "mira_engine/",
     "mira_server/",
+    "deploy/mira-server/",
     "bridge/",
     "README.md",
     "LICENSE",

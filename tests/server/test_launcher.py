@@ -19,6 +19,7 @@ from mira_server.spawner.launcher import (
     granted_launcher_rules,
     inspect_launcher,
     install_launcher,
+    install_sudoers,
     read_engine_python,
     render_launcher,
     sudoers_line,
@@ -176,6 +177,70 @@ def test_cli_install_launcher(tmp_path) -> None:
     assert path.exists()
     assert f"mira-server ALL=(%mira-users) NOPASSWD: {path}" in result.output
     assert f"mira-server ALL=(ALL,!root) NOPASSWD: {path} stop" in result.output
+
+
+def _fake_visudo(tmp_path: Path, exit_code: int) -> Path:
+    visudo = tmp_path / "visudo"
+    visudo.write_text(f"#!/bin/sh\necho \"$@\" > {tmp_path}/visudo.args\n"
+                      f"[ {exit_code} -eq 0 ] || echo 'syntax error near line 2' >&2\nexit {exit_code}\n")
+    visudo.chmod(0o755)
+    return visudo
+
+
+def test_install_sudoers_validates_then_writes(tmp_path) -> None:
+    target = tmp_path / "sudoers.d" / "mira-server"
+    rules = sudoers_rules(Path("/usr/local/libexec/mira/engine-launch"), server_user="mira-server",
+                          users_group="mira-users")
+    install_sudoers(target, rules, visudo=str(_fake_visudo(tmp_path, 0)), require_root=False)
+    lines = target.read_text().splitlines()
+    assert lines[0].startswith("# ") and lines[1:] == rules
+    assert stat.S_IMODE(target.stat().st_mode) == 0o440
+    checked = (tmp_path / "visudo.args").read_text().split()
+    assert checked[0] == "-cf" and Path(checked[1]).name.startswith(".mira-server.")
+    assert sorted(p.name for p in target.parent.iterdir()) == ["mira-server"]
+
+
+def test_install_sudoers_keeps_the_old_file_when_visudo_refuses(tmp_path) -> None:
+    target = tmp_path / "mira-server"
+    target.write_text("old\n")
+    with pytest.raises(LauncherInstallError, match="syntax error"):
+        install_sudoers(target, ["bad"], visudo=str(_fake_visudo(tmp_path, 1)), require_root=False)
+    assert target.read_text() == "old\n"
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".")) == []
+
+
+def test_cli_install_launcher_writes_sudoers(tmp_path) -> None:
+    sudoers = tmp_path / "sudoers.d" / "mira-server"
+    result = CliRunner().invoke(app, ["install-launcher", "--prefix", str(tmp_path), "--engine-python",
+                                      "/opt/mira/bin/python", "--sudoers-file", str(sudoers),
+                                      "--visudo", str(_fake_visudo(tmp_path, 0)), "--no-root-check"])
+    assert result.exit_code == 0, result.output
+    assert f"Wrote {sudoers}" in result.output
+    assert "pam_service=mira-engine" in sudoers.read_text()
+
+
+def test_cli_deploy_dir() -> None:
+    from mira_server.deploy_files import MARKER_FILE
+
+    result = CliRunner().invoke(app, ["deploy-dir"])
+    assert result.exit_code == 0, result.output
+    path = Path(result.stdout.strip())
+    for name in (MARKER_FILE, "pam.d-mira-engine", "mira-server.service", "policy.toml", "install.sh",
+                 "uninstall.sh"):
+        assert (path / name).is_file(), name
+
+
+def test_deploy_dir_prefers_the_packaged_copy(tmp_path, monkeypatch) -> None:
+    from mira_server import deploy_files
+
+    packaged = tmp_path / "mira_server" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / deploy_files.MARKER_FILE).write_text("")
+    monkeypatch.setattr(deploy_files, "PACKAGE_DIR", tmp_path / "mira_server")
+    assert deploy_files.deploy_dir() == packaged
+    (packaged / deploy_files.MARKER_FILE).unlink()
+    with pytest.raises(deploy_files.DeployFilesMissingError, match="reinstall"):
+        deploy_files.deploy_dir()
 
 
 def test_cli_serve_refuses_dev_settings(tmp_path) -> None:
