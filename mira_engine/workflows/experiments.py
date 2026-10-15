@@ -39,6 +39,49 @@ def experiment_boundary_decision(run: ModuleRun) -> str | None:
     return None
 
 
+MAX_BRANCH_DEPTH = 2
+_ID_LIST = Field(default_factory=list, max_length=50)
+
+
+class ReplanDecision(BaseModel):
+    """Closed-loop plan update recorded on a finished experiment before the next one starts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["branch", "revise", "skip", "continue", "finish"]
+    rationale: str = Field(min_length=1, max_length=20000)
+    children: list[str] = _ID_LIST
+    revised: list[str] = _ID_LIST
+    skipped: list[str] = _ID_LIST
+    next: str | None = None
+
+
+def parent_id_of(experiment_id: str) -> str | None:
+    """`Exp001.a.b` -> `Exp001.a`; top-level ids have no parent."""
+    return experiment_id.rpartition(".")[0] or None
+
+
+def experiment_depth(experiment_id: str) -> int:
+    return experiment_id.count(".")
+
+
+def max_branch_depth(run: ModuleRun) -> int:
+    policy = run.module_data.get("automation_policy") or {}
+    depth = policy.get("maxBranchDepth") if isinstance(policy, dict) else None
+    return depth if isinstance(depth, int) and not isinstance(depth, bool) and depth >= 0 else MAX_BRANCH_DEPTH
+
+
+def describe_replan(record: dict[str, Any]) -> str:
+    replan = record.get("replan") or {}
+    parts = [replan.get("action", "")]
+    for key in ("children", "revised", "skipped"):
+        if replan.get(key):
+            parts.append(f"{key}: {', '.join(replan[key])}")
+    if replan.get("next"):
+        parts.append(f"next: {replan['next']}")
+    return f"{'; '.join(p for p in parts if p)} — {replan.get('rationale', '')}"
+
+
 class ExperimentRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
@@ -54,6 +97,7 @@ class ExperimentRecord(BaseModel):
     next: str = Field(default="", max_length=20000)
     progress: dict[str, Any] = Field(default_factory=dict)
     parent: str | None = None
+    replan: ReplanDecision | None = None
     evidence_refs: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     theoretical_proof: str = Field(default="", max_length=20000)
     isolation_test: dict[str, Any] = Field(default_factory=dict)

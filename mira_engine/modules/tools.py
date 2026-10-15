@@ -609,9 +609,11 @@ class WorkflowExperimentTool(InitiationResearchResultTool):
     def description(self) -> str:
         return (
             "Register or update one experiment in the active Experiment Run. "
-            "Use a stable local id (e.g. Exp001). Record pending/running before "
-            "execution, then update the same id with completed/failed/skipped, "
-            "methods, metrics, findings and project-relative artifact paths. "
+            "Use a stable local id (e.g. Exp001; follow-ups Exp001.a with parent Exp001). "
+            "Record pending/running before execution, then update the same id with "
+            "completed/failed/skipped, methods, metrics, findings and project-relative "
+            "artifact paths. After completed/failed, record replan on the same id "
+            "before starting another experiment. "
             "Omitted fields retain their previous values. The UI experiment list "
             "and detail panel update from these records."
         )

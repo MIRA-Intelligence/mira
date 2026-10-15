@@ -14,7 +14,7 @@ from mira_engine.workflows.confirmations import (
     confirmation_required,
     expected_confirmation_type,
 )
-from mira_engine.workflows.experiments import experiment_boundary_decision, manual_experiments
+from mira_engine.workflows.experiments import describe_replan, experiment_boundary_decision, manual_experiments
 from mira_engine.workflows.input_paths import run_read_paths
 from mira_engine.workflows.models import new_id
 
@@ -124,11 +124,21 @@ class NativeModuleRuntime:
 
             def request_manual_boundary(current):
                 boundary = current.module_data.get("_manual_experiment_boundary")
+                finished = next((
+                    item for item in current.module_data.get("experiments") or []
+                    if isinstance(boundary, dict) and item.get("id") == boundary.get("experiment_id")
+                ), None)
+                # Wait for the replan decision so the user confirms a concrete proposal.
                 if (
                     current.status == "running" and current.pending_control is None
                     and manual_experiments(current) and boundary
                     and experiment_boundary_decision(current) is None
+                    and (finished is None or finished.get("replan") or finished.get("status") == "skipped")
                 ):
+                    proposal = (
+                        f"\n建议下一步 / Proposed next step: {describe_replan(finished)}"
+                        if finished and finished.get("replan") else ""
+                    )
                     service.request_interaction(
                         run_id, command_id=f"experiment-boundary:{boundary['interaction_id']}",
                         attempt_id=current.attempt.current_attempt_id,
@@ -136,9 +146,9 @@ class NativeModuleRuntime:
                             "interaction_id": boundary["interaction_id"],
                             "interaction_type": "confirm_experiment_continuation",
                             "title": f"实验 {boundary['experiment_id']} 已结束：确认下一步",
-                            "prompt": f"{boundary['title']}\n手动模式已保存本实验记录。继续执行下一个实验，还是结束并汇总？\nManual mode: the experiment record is saved. Continue with one more experiment or finish and summarize?",
+                            "prompt": f"{boundary['title']}{proposal}\n手动模式已保存本实验记录。按建议继续执行下一个实验，还是结束并汇总？\nManual mode: the experiment record is saved. Continue with one more experiment as proposed or finish and summarize?",
                             "choices": [
-                                {"value": "continue", "label": "继续下一个实验 / Continue one experiment"},
+                                {"value": "continue", "label": "按建议继续 / Continue as proposed"},
                                 {"value": "finish", "label": "结束并汇总 / Finish and summarize"},
                             ],
                             "response_schema": {"type": "object", "required": ["selection"], "properties": {
@@ -239,6 +249,16 @@ class NativeModuleRuntime:
                         return (
                             "The user chose finish. Do not execute more experiments. Mark remaining "
                             "pending proposals skipped, publish existing results, and complete_workflow_run."
+                        )
+                    unplanned = [
+                        item["id"] for item in current.module_data["experiments"]
+                        if item.get("status") in {"completed", "failed"} and not item.get("replan")
+                    ]
+                    if unplanned:
+                        return (
+                            f"Experiment(s) {', '.join(unplanned)} finished without a replan decision. Reflect on "
+                            "the outcome and update the same id with replan (branch/revise/skip/continue/finish, "
+                            "rationale, children/revised/skipped/next) before continuing or completing."
                         )
                     return (
                         "This Experiment Run is still running. A progress statement is not completion. "
