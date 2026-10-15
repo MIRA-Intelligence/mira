@@ -12,10 +12,10 @@ import pytest
 from mira_engine.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 
 DOCS = BUILTIN_SKILLS_DIR / "builtin_skills" / "documents"
-BENTO = DOCS / "bento-slides"
+SLIDES = DOCS / "mira-slides"
 NOTEBOOK = DOCS / "jupyter-notebook-export"
 
-pytestmark = pytest.mark.skipif(not BENTO.exists(), reason="mira-skills submodule not checked out")
+pytestmark = pytest.mark.skipif(not SLIDES.exists(), reason="mira-skills submodule not checked out")
 
 
 def _load(path: Path):
@@ -50,24 +50,25 @@ def _deck() -> dict:
 def test_new_skills_are_discovered(tmp_path: Path) -> None:
     loader = SkillsLoader(tmp_path)
     names = {skill["name"] for skill in loader.list_skills(filter_unavailable=False)}
-    assert {"bento-slides", "jupyter-notebook-export"} <= names
-    for name in ("bento-slides", "jupyter-notebook-export"):
+    assert {"mira-slides", "jupyter-notebook-export"} <= names
+    for name in ("mira-slides", "jupyter-notebook-export"):
         assert len((loader.get_skill_metadata(name) or {}).get("description", "")) <= 250
 
 
-def test_bento_bundle_is_offline_and_self_contained() -> None:
-    app = (BENTO / "assets" / "Bento_Slides.bento.html").read_text(encoding="utf-8")
-    assert 'id="bento-doc"' in app
-    assert (BENTO / "references" / "agents.md").is_file()
-    assert (BENTO / "LICENSE").is_file()
-    assert "curl" not in (BENTO / "SKILL.md").read_text(encoding="utf-8")
+def test_slides_bundle_is_offline_and_mira_branded() -> None:
+    app = (SLIDES / "assets" / "Mira_Slides.html").read_text(encoding="utf-8")
+    assert 'id="bento-doc"' in app  # Bento's document format is kept on purpose
+    assert "<title>mira/slides</title>" in app
+    assert (SLIDES / "references" / "agents.md").is_file()
+    assert (SLIDES / "LICENSE").is_file()
+    assert "curl" not in (SLIDES / "SKILL.md").read_text(encoding="utf-8")
 
 
 def test_build_deck_injects_escaped_readonly_document(tmp_path: Path) -> None:
-    build = _load(BENTO / "scripts" / "build_deck.py")
+    build = _load(SLIDES / "scripts" / "build_deck.py")
     source = tmp_path / "deck.json"
     source.write_text(json.dumps(_deck()), encoding="utf-8")
-    out = tmp_path / "out.bento.html"
+    out = tmp_path / "out.mira.html"
     assert build.main(["build_deck.py", "build", str(source), str(out)]) == 0
 
     html = out.read_text(encoding="utf-8")
@@ -79,10 +80,10 @@ def test_build_deck_injects_escaped_readonly_document(tmp_path: Path) -> None:
 
 
 def test_build_deck_editable_flag_and_validation(tmp_path: Path) -> None:
-    build = _load(BENTO / "scripts" / "build_deck.py")
+    build = _load(SLIDES / "scripts" / "build_deck.py")
     source = tmp_path / "deck.json"
     source.write_text(json.dumps(_deck()), encoding="utf-8")
-    out = tmp_path / "e.bento.html"
+    out = tmp_path / "e.mira.html"
     assert build.main(["build_deck.py", "build", str(source), str(out), "--editable"]) == 0
     assert '"readonly"' not in out.read_text(encoding="utf-8")
 
