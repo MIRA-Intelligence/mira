@@ -50,7 +50,7 @@ jobs:
       - name: Install the engine system-wide in /opt/mira
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-venv
+          sudo apt-get install -y -qq python3-venv bubblewrap
           sudo /usr/bin/python3 -m venv /opt/mira
           sudo /opt/mira/bin/pip install --quiet --upgrade pip
           sudo /opt/mira/bin/pip install --quiet "$(ls dist/mira_engine-*.whl)[server]"
@@ -66,6 +66,7 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/mira-server
           sudo visudo -cf /etc/sudoers.d/mira-server
           sudo cp deploy/mira-server/pam.d-mira-server /etc/pam.d/mira-server
+          sudo install -D -o root -g root -m 0644 deploy/mira-server/policy.toml /etc/mira/policy.toml
           sudo mkdir -p /etc/mira-server
           sudo tee /etc/mira-server/mira-server.toml >/dev/null <<'EOF'
           [server]
@@ -98,10 +99,19 @@ jobs:
           print('PAM for another user with shadow group:', ok, p.code, p.reason)
           "
 
+      - name: Allow bwrap to create user namespaces (Ubuntu AppArmor)
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          ls /etc/apparmor.d /usr/share/apparmor/extra-profiles 2>/dev/null | grep -i bwrap || true
+          sudo install -m 0644 deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+          sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
+          bwrap --ro-bind / / --unshare-pid --proc /proc true && echo "bwrap works"
+
       - name: mira-server check
         run: |
           sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml | tee /tmp/check.txt
           grep -q '^ok    sudo allows `/usr/local/libexec/mira/engine-launch stop`' /tmp/check.txt
+          grep -q '^ok    bwrap sandbox works on this host' /tmp/check.txt
 
       - name: Start Mira Server as mira-server
         run: |
@@ -149,6 +159,13 @@ jobs:
           sudo grep -q '"GET /api/status HTTP/1.1" 200' "$log"
           sudo grep -q '"GET /ws HTTP/1.1" 101' "$log"
           if sudo grep -q 'access_token' "$log"; then echo "access token in the nginx access log"; exit 1; fi
+
+      - name: "Agent isolation: bob's sandbox cannot reach his secrets, alice's home or her engine"
+        run: |
+          # The nginx step above left alice's engine running.
+          port=$(sudo /opt/mira/bin/python -c "import json; print(json.load(open('/home/alice/.mira/engine.lease'))['port'])")
+          sudo install -m 0644 tests/integration/sandbox_check.py /tmp/sandbox_check.py
+          sudo -u bob -H /opt/mira/bin/python /tmp/sandbox_check.py --other-home /home/alice --other-port "$port"
 
       - name: "Caddy example: config is valid and drops access_token from the log"
         run: |

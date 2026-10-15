@@ -224,6 +224,38 @@ def _check_sudo(cfg: ServerConfig, report: _Report) -> None:
                     f"{cfg.auth.users_group} keep running until stopped over SSH (see `install-launcher`)")
 
 
+def _check_host_policy(report: _Report) -> None:
+    """The engine host policy (/etc/mira/policy.toml) that isolates users' agents."""
+    from mira_engine.agent.tools.sandbox import sandbox_available
+    from mira_engine.security import host_policy
+
+    path = host_policy.POLICY_PATH
+    if not path.exists():
+        report.warn(f"no host policy at {path}: agents run shell commands without the sandbox and may "
+                    "leave their project; copy deploy/mira-server/policy.toml there")
+        return
+    try:
+        policy = host_policy.parse_policy(path.read_text(encoding="utf-8"), path, groups=set())
+    except (host_policy.HostPolicyError, OSError, UnicodeDecodeError) as exc:
+        report.fail(f"host policy is invalid, so engines will not start: {exc}")
+        return
+    info = path.stat()
+    if info.st_uid != 0 or info.st_mode & 0o022:
+        report.warn(f"{path} should be owned by root and not writable by group or others")
+    report.ok(f"host policy {path} is valid (enforces: {', '.join(policy.locked_settings()) or 'nothing'})")
+    if not policy.restrict_to_workspace:
+        report.warn("the host policy does not set tools.restrict_to_workspace = true")
+    if policy.sandbox != "bwrap":
+        report.warn("the host policy does not set sandbox.mode = \"bwrap\"")
+        return
+    ok, reason = sandbox_available(not policy.network_disabled)
+    if ok:
+        report.ok("bwrap sandbox works on this host")
+    else:
+        report.fail(f"the host policy requires the bwrap sandbox but it does not work here ({reason}); "
+                    "agents cannot run shell commands until it does")
+
+
 def _check_data_dir(cfg: ServerConfig, report: _Report) -> None:
     data_dir = cfg.server.data_dir
     if not data_dir.exists():
@@ -267,6 +299,7 @@ def check(config: Path | None = ConfigOption) -> None:
         report.fail(f"engine interpreter {cfg.spawner.engine_python} not found")
     if not sys.platform.startswith("linux") and cfg.spawner.backend == "sudo":
         report.warn("production Mira Server (PAM, sudo, /proc/net/tcp) is supported on Linux only")
+    _check_host_policy(report)
     if report.errors:
         typer.echo(f"\n{report.errors} problem(s) found.")
         raise typer.Exit(1)

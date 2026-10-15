@@ -53,6 +53,7 @@ desktop app ──HTTPS──> TLS proxy ──> mira-server (user mira-server, 
 
 - Linux (PAM, sudo and `/proc/net/tcp` are required in production). Python 3.11+.
 - sudo, and a TLS reverse proxy (Caddy or nginx) for remote clients.
+- bubblewrap (`bwrap`) and unprivileged user namespaces for the agent sandbox.
 - The users' home directories hold their Mira data (`~/.mira`), as with SSH.
 
 ## Install
@@ -195,7 +196,30 @@ setting is documented in that file. Unknown keys are rejected.
 | | `idle_timeout` | `7200` | Seconds; `0` disables culling. |
 | | `verify_listener` | `true` | `false` needs `--dev`. |
 
-### 7. Check and start
+### 7. Host policy and agent sandbox
+
+```sh
+sudo apt-get install bubblewrap
+sudo install -D -o root -g root -m 0644 deploy/mira-server/policy.toml /etc/mira/policy.toml
+```
+
+[`deploy/mira-server/policy.toml`](../../deploy/mira-server/policy.toml) keeps
+file and shell tools inside the current project and runs every shell command in
+the bubblewrap sandbox. See [Agent isolation](#agent-isolation).
+
+Ubuntu 23.10+ restricts unprivileged user namespaces through AppArmor, and
+bwrap then fails with `setting up uid map: Permission denied` (`mira-server
+check` reports it, and agents' shell commands are refused). Allow user
+namespaces for bwrap only, with
+[`deploy/mira-server/apparmor-bwrap`](../../deploy/mira-server/apparmor-bwrap)
+(or the distribution's own bwrap profile, if it ships one):
+
+```sh
+sudo install -m 0644 deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
+```
+
+### 8. Check and start
 
 ```sh
 sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml
@@ -203,8 +227,8 @@ sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mi
 
 `check` validates the config, the PAM service file, the groups, the launcher's
 ownership and permissions (and of every directory above it), the engine
-interpreter, the sudo rules (`sudo -n -l`; a missing `stop` rule is a warning)
-and the data dir.
+interpreter, the sudo rules (`sudo -n -l`; a missing `stop` rule is a warning),
+the data dir, the host policy and whether the bwrap sandbox works.
 
 Run Mira Server with systemd using
 [`deploy/mira-server/mira-server.service`](../../deploy/mira-server/mira-server.service).
@@ -216,7 +240,7 @@ sudo cp deploy/mira-server/mira-server.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now mira-server
 ```
 
-### 8. TLS reverse proxy
+### 9. TLS reverse proxy
 
 Mira Server speaks plain HTTP on loopback. Put a TLS proxy in front, forward
 WebSocket upgrades, disable response buffering (streaming and SSE), and allow
@@ -258,6 +282,47 @@ nginx to confirm the token never reaches its access log.
 - On hosts with systemd-logind, consider `loginctl enable-linger <user>` (see
   [remote-ssh.md](../remote-ssh.md)) so logging out of SSH does not affect the
   engine.
+
+## Agent isolation
+
+Users are separated by their OS accounts: each engine runs as its user, so the
+kernel applies the same permissions as over SSH. On top of that, the **host
+policy** `/etc/mira/policy.toml` protects each user's agent from prompt
+injection and limits what agents may do. Every engine on the host reads it,
+whether Mira Server, Remote-SSH or the user started it; its values override the
+user's `~/.mira/config.json`, and the app cannot change them (`POST /api/config`
+answers 403 `locked_by_policy`; `GET /api/config` and `GET /api/status` list
+the enforced settings under `policy`). It is not a boundary against the user,
+who can run any program as themselves. An invalid file stops engines from
+starting.
+
+| Setting | Effect |
+|---|---|
+| `tools.restrict_to_workspace = true` | File tools and the shell tool's paths and `working_dir` stay inside the current project. |
+| `tools.exec = false` | No shell tool. |
+| `tools.mcp = false` | MCP servers in users' configs are not started. MCP servers run unsandboxed as the user. |
+| `tools.plugin_install = false` | Skill plugins cannot be installed or removed (403). |
+| `sandbox.mode = "bwrap"` | Every shell command, background job and project venv setup (`uv sync`) runs in bubblewrap. If bwrap does not work, commands are refused, never run unsandboxed. |
+| `sandbox.network = "none"` | Sandboxed commands get a private network namespace (no network at all). |
+| `sandbox.read_only_paths`, `read_write_paths` | Extra host paths visible in the sandbox (datasets, software, scratch). |
+| `[[groups]]` with `name = "<group>"` | Overrides for members of a Unix group, applied in file order; can relax the base policy. |
+
+Inside the sandbox a command sees: system directories read-only (`/usr`,
+`/etc`, `/opt`, ...), its own `/proc` (pid namespace), `/dev` with GPU device
+nodes, a private `/tmp`, the project read-write, skills and uploaded media
+read-only, uv's cache and interpreters, and a persistent `$HOME` backed by
+`~/.mira/sandbox/home` (pip caches, `pip --user`). The Mira home itself
+(config with provider keys, the gateway token) is hidden, as are other
+directories, including the user's real home and other users' homes. The shell
+runs inside without a login profile and with the exec tool's curated
+environment, which never contains credentials (`*KEY*`, `*TOKEN*`, `*SECRET*`,
+`*PASSWORD*`, `*COOKIE*`).
+
+With network access, sandboxed commands can connect to other users' engines on
+loopback, which refuse requests without that engine's token. `mira remote
+attach` checks that the engine's port is held by the engine process before it
+sends the token, so another account squatting the port receives nothing
+(`listener_mismatch`).
 
 ## Dev mode (UI development only)
 
@@ -373,10 +438,11 @@ passwords, tokens, prompts or request bodies.
 
 ## Limitations (follow-ups)
 
-- **Isolation hardening (#153)**: per-user resource limits, stripping the
-  engine token from tool subprocess environments, and port-squatting defence
-  inside `mira remote attach` itself (it checks the engine with the token before
-  Mira Server's own listener check).
+- **Per-user resource limits (#153)**: engines started through sudo do not run
+  in the user's `user-<uid>.slice` yet, so per-user systemd limits do not apply
+  to them.
+- **MCP servers** run outside the sandbox; disable them with `tools.mcp = false`
+  where that matters.
 - **Team keys and the LLM proxy (#154)**.
 - **Local passwords on RHEL/Fedora**: there is no `shadow` group, so only
   LDAP/SSSD accounts can sign in until a privileged password helper exists.

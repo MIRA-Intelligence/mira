@@ -35,10 +35,16 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from mira_engine.config.schema import PythonRuntimeConfig
+
+# Prefixes a uv command, e.g. with the exec tool's bwrap sandbox.
+Wrap = Callable[[list[str]], list[str]]
+# Same markers as the exec tool's environment scrubbing (agent/tools/shell.py).
+_SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "COOKIE")
 
 logger = logging.getLogger(__name__)
 
@@ -204,8 +210,11 @@ def ensure_project_venv(
     *,
     uv: UvBinary | None = None,
     extra_env: dict[str, str] | None = None,
+    wrap: Wrap | None = None,
 ) -> Path | None:
     """Make sure ``<project_dir>/<venv_dir>`` is a usable venv.
+
+    ``wrap`` prefixes every uv command (the exec tool passes its sandbox).
 
     Returns the absolute venv path on success, ``None`` when the manager
     is disabled. Raises :class:`PythonEnvError` on hard failures (no uv,
@@ -237,10 +246,10 @@ def ensure_project_venv(
     env = _build_uv_env(cfg, extra_env)
 
     if cfg.python_version:
-        ensure_python_interpreter(binary, cfg.python_version, env=env)
+        ensure_python_interpreter(binary, cfg.python_version, env=env, wrap=wrap)
 
-    _create_venv(binary, venv, cfg, env=env, cwd=project)
-    _install_initial_dependencies(binary, project, venv, cfg, env=env)
+    _create_venv(binary, venv, cfg, env=env, cwd=project, wrap=wrap)
+    _install_initial_dependencies(binary, project, venv, cfg, env=env, wrap=wrap)
 
     return venv
 
@@ -250,6 +259,7 @@ def ensure_python_interpreter(
     version: str,
     *,
     env: dict[str, str] | None = None,
+    wrap: Wrap | None = None,
 ) -> None:
     """Make sure ``uv`` has the requested CPython available locally.
 
@@ -290,6 +300,7 @@ def ensure_python_interpreter(
         env=env if env is not None else os.environ.copy(),
         cwd=Path.cwd(),
         action=f"install python {version}",
+        wrap=wrap,
     )
 
 
@@ -533,8 +544,16 @@ def remove_venv(venv: Path) -> int:
 def _build_uv_env(
     cfg: PythonRuntimeConfig, extra: dict[str, str] | None
 ) -> dict[str, str]:
-    """Compose the env for ``uv`` subprocess calls."""
-    env = os.environ.copy()
+    """Compose the env for ``uv`` subprocess calls.
+
+    uv runs project build code, so credentials in the engine's environment
+    (provider API keys, tokens) are left out, as for the exec tool.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not any(marker in key.upper() for marker in _SENSITIVE_ENV_MARKERS)
+    }
     if cfg.cache_dir:
         env["UV_CACHE_DIR"] = str(Path(cfg.cache_dir).expanduser())
     if cfg.link_mode:
@@ -554,13 +573,14 @@ def _create_venv(
     *,
     env: dict[str, str],
     cwd: Path,
+    wrap: Wrap | None = None,
 ) -> None:
     args: list[str] = [str(uv.path), "venv", str(venv)]
     if cfg.python_version:
         args += ["--python", cfg.python_version]
     if cfg.link_mode:
         args += ["--link-mode", cfg.link_mode]
-    _run(args, env=env, cwd=cwd, action=f"create venv at {venv}")
+    _run(args, env=env, cwd=cwd, action=f"create venv at {venv}", wrap=wrap)
 
 
 def _install_initial_dependencies(
@@ -570,6 +590,7 @@ def _install_initial_dependencies(
     cfg: PythonRuntimeConfig,
     *,
     env: dict[str, str],
+    wrap: Wrap | None = None,
 ) -> None:
     """Install initial deps: prefer pyproject.toml/uv.lock → requirements.txt → baseline.
 
@@ -588,6 +609,7 @@ def _install_initial_dependencies(
             env=install_env,
             cwd=project,
             action="uv sync project dependencies",
+            wrap=wrap,
         )
         return
 
@@ -597,6 +619,7 @@ def _install_initial_dependencies(
             env=install_env,
             cwd=project,
             action="install requirements.txt",
+            wrap=wrap,
         )
         return
 
@@ -606,6 +629,7 @@ def _install_initial_dependencies(
             env=install_env,
             cwd=project,
             action="install baseline requirements",
+            wrap=wrap,
         )
 
 
@@ -615,8 +639,11 @@ def _run(
     env: dict[str, str],
     cwd: Path,
     action: str,
+    wrap: Wrap | None = None,
 ) -> None:
     logger.info("uv: %s — %s", action, " ".join(args))
+    if wrap is not None:
+        args = wrap(args)
     try:
         result = subprocess.run(
             args,

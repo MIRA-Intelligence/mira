@@ -147,10 +147,38 @@ def _check_attachable(record: dict[str, Any], token: str) -> None:
     port = record.get("port")
     if not isinstance(port, int):
         raise RemoteError("internal", "the engine lease has no port")
+    if not _holder_listens(record.get("pid"), port):
+        # Another account (or process) answers on the engine's port: never send
+        # it the token. The lease holder may also have exited a moment ago.
+        raise RemoteError("listener_mismatch",
+                          f"port {port} is not served by the engine (pid {record.get('pid')}) "
+                          "that holds the lease; refusing to send it the gateway token")
     if _http_status(port, "/api/config", token) == 401:
         raise RemoteError("config_invalid",
                           "the running engine rejected the local gateway token "
                           "(was it started with a different MIRA_GATEWAY_TOKEN?)")
+
+
+_LISTEN_ADDRESSES = {"127.0.0.1", "0.0.0.0", "::", "::1", "::ffff:127.0.0.1"}
+
+
+def _holder_listens(pid: Any, port: int) -> bool:
+    """Whether the lease holder ``pid`` itself listens on loopback ``port``.
+
+    Only one socket can be bound to 127.0.0.1:port (SO_REUSEPORT needs the same
+    uid), so this rules out another user's process squatting the port.
+    """
+    if not isinstance(pid, int):
+        return False
+    try:
+        connections = psutil.Process(pid).net_connections(kind="inet")
+    except psutil.Error:
+        return False
+    return any(
+        conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port
+        and conn.laddr.ip in _LISTEN_ADDRESSES
+        for conn in connections
+    )
 
 
 def _wait_healthy(port: int, deadline: float, proc: subprocess.Popen | None = None) -> bool:

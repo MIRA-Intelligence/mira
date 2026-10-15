@@ -405,6 +405,8 @@ bwrap sandbox effective. The spawner sits behind an interface
   sending the token, Mira Server checks in `/proc/net/tcp{,6}` that every
   loopback listening socket on that port belongs to the expected uid; on
   mismatch it refuses the engine (state `error`) and logs a security event.
+  `mira remote attach` itself checks first that the lease holder's process is
+  the listener before it sends the token (`listener_mismatch`, #153).
 - **Readiness**: Mira Server checks `GET /health` and `GET /version` (open per
   #149) for a Mira gateway and the launcher JSON for remote protocol 1.
 - Install and API details: [mira-server.md](mira-server.md).
@@ -469,7 +471,13 @@ The user owns `~/.mira/config.json` and can edit it outside Mira. Therefore:
 
 - **Settings that protect the user** (sandbox, `restrict_to_workspace`) are
   defaults written for new users; a user who weakens them only affects
-  themselves.
+  themselves. An administrator can enforce them for every engine on a host
+  with the **host policy** `/etc/mira/policy.toml` (#153): root-owned, read by
+  each engine whichever way it was started, overriding the user's config for
+  the settings it names (also turning off the shell tool, MCP servers or skill
+  plugin installs, optionally per Unix group), and not changeable from the
+  app. It protects agents from prompt injection; the boundary between users
+  stays the OS account. Details: [mira-server.md](mira-server.md#agent-isolation).
 - **Settings that protect other users or the team** are never enforced through
   the user's config. They are enforced outside the engine:
   - loopback bind, token and allowed origins: launcher arguments and environment
@@ -600,7 +608,7 @@ one session" for desktop users. On top, Mira Server adds:
 |---|---|
 | Unauthenticated network access to an engine | #149: token on all routes, loopback bind, Origin allowlist. Mode A is deprecated (§2.1); until removed, only through an SSH tunnel or TLS. |
 | Another local user connecting to an engine's loopback port | Token required; the token reaches Mira Server only on the launcher's stdout, never in argv; tool subprocesses don't inherit it (#153). |
-| Another local user squatting the assigned port to capture the token | Mira Server verifies the listener's uid in `/proc/net/tcp` before sending the token. |
+| Another local user squatting the assigned port to capture the token | `mira remote attach` verifies that the lease holder's process is the listener, and Mira Server verifies the listener's uid in `/proc/net/tcp`, before either sends the token. |
 | User A reads user B's files via the agent | Engine runs as A's uid; kernel permissions apply exactly as over SSH. bwrap and `restrict_to_workspace` additionally protect A from prompt injection. |
 | Team key exfiltration | Team keys only in the Mira Server LLM proxy, never in any home directory. |
 | User weakens their own config | Affects only themselves; team protections are enforced outside the engine (§8.2). |

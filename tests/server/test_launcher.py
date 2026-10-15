@@ -204,3 +204,34 @@ def test_cli_check_invalid_config(tmp_path) -> None:
     result = CliRunner().invoke(app, ["check", "--config", str(config)])
     assert result.exit_code == 1
     assert "auth.backend" in result.output
+
+
+def _policy_report(capsys, text: str | None) -> tuple[int, str]:
+    from mira_engine.security import host_policy
+    from mira_server.cli import _check_host_policy, _Report
+
+    if text is not None:
+        host_policy.POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        host_policy.POLICY_PATH.write_text(text)
+    report = _Report()
+    _check_host_policy(report)
+    return report.errors, capsys.readouterr().out
+
+
+def test_check_warns_without_a_host_policy(capsys) -> None:
+    errors, output = _policy_report(capsys, None)
+    assert errors == 0 and "no host policy" in output
+
+
+def test_check_fails_on_an_invalid_host_policy(capsys) -> None:
+    errors, output = _policy_report(capsys, "[tools]\nexec = 'no'\n")
+    assert errors == 1 and "engines will not start" in output
+
+
+def test_check_reports_what_the_policy_enforces(capsys, monkeypatch) -> None:
+    from mira_engine.agent.tools import sandbox
+
+    monkeypatch.setattr(sandbox, "sandbox_available", lambda network=True: (False, "bwrap missing"))
+    errors, output = _policy_report(capsys, '[tools]\nrestrict_to_workspace = true\n[sandbox]\nmode = "bwrap"\n')
+    assert "enforces: tools.restrictToWorkspace, tools.exec.sandbox" in output
+    assert errors == 1 and "bwrap missing" in output

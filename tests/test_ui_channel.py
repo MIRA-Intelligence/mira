@@ -3113,3 +3113,53 @@ async def test_ws_handler_cleans_up_bound_client_when_loop_raises(
         await ui_channel._ws_handler(MagicMock(spec=web.Request))
     assert "s-1" not in ui_channel._clients
     assert events[-1] == "websocket.disconnected"
+
+
+def _write_host_policy(text: str) -> None:
+    from mira_engine.security import host_policy
+
+    host_policy.POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    host_policy.POLICY_PATH.write_text(text)
+    host_policy.reset_cache()
+
+
+async def test_host_policy_can_forbid_skill_plugin_install_and_uninstall(
+    ui_channel: UiChannel, tmp_path: Path
+) -> None:
+    _write_host_policy("[tools]\nplugin_install = false\n")
+    src = _create_plugin_source(tmp_path)
+    install_req = MagicMock(spec=web.Request)
+    install_req.match_info = {"session_id": "PRJ-0001"}
+    install_req.headers = {"Content-Type": "application/json"}
+    install_req.json = AsyncMock(return_value={"path": str(src)})
+    resp = await ui_channel._handle_skill_plugins_install(install_req)
+    assert resp.status == 403
+    assert json.loads(resp.text)["code"] == "locked_by_policy"
+
+    remove_req = MagicMock(spec=web.Request)
+    remove_req.match_info = {"session_id": "PRJ-0001", "plugin_id": "plugin-pack"}
+    resp = await ui_channel._handle_skill_plugins_uninstall(remove_req)
+    assert resp.status == 403
+
+
+async def test_config_and_status_report_the_host_policy(ui_channel: UiChannel) -> None:
+    _write_host_policy('[tools]\nrestrict_to_workspace = true\n[sandbox]\nmode = "bwrap"\n')
+    resp = await ui_channel._handle_get_config(MagicMock(spec=web.Request))
+    policy = json.loads(resp.text)["policy"]
+    assert policy["locked"] == ["tools.restrictToWorkspace", "tools.exec.sandbox"]
+    assert policy["source"].endswith("policy.toml")
+
+    resp = await ui_channel._handle_status(MagicMock(spec=web.Request))
+    body = json.loads(resp.text)
+    assert body["policy"]["locked"] == policy["locked"]
+    assert body["sandbox"]["mode"] == "bwrap"
+    assert isinstance(body["sandbox"]["available"], bool)
+
+
+async def test_config_update_cannot_turn_off_an_enforced_setting(ui_channel: UiChannel) -> None:
+    _write_host_policy("[tools]\nrestrict_to_workspace = true\n")
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"runtime": {"restrict_to_workspace": False}})
+    resp = await ui_channel._handle_config(req)
+    assert resp.status == 403
+    assert json.loads(resp.text)["code"] == "locked_by_policy"
