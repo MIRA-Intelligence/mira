@@ -310,11 +310,11 @@ jobs:
       - name: "Upgrade: engines still on the previous version are stopped"
         run: |
           pid=$(sudo python3 -c 'import json; print(json.load(open("/home/alice/.mira/engine.lease"))["pid"])')
-          kill -0 "$pid"
+          test -d "/proc/$pid"
           sudo bash deploy/mira-server/install.sh -y --upgrade | tee /tmp/upgrade.txt
           grep -q 'stopping the engine of alice (previous mira-engine)' /tmp/upgrade.txt
-          for i in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-          if kill -0 "$pid" 2>/dev/null; then echo "alice's old engine still runs"; exit 1; fi
+          for i in $(seq 1 20); do test -d "/proc/$pid" || break; sleep 1; done
+          if test -d "/proc/$pid"; then echo "alice's old engine still runs"; exit 1; fi
           sudo grep -q '^S_restart_engines=0$' /var/lib/mira-server-installer/state
 
       - name: Uninstall (keeps config and data)
