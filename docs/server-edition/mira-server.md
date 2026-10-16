@@ -21,12 +21,14 @@ desktop app ──HTTPS──> TLS proxy ──> mira-server (user mira-server, 
 - **Sign-in**: username and password are checked through the PAM service
   `mira-server`, so local accounts, LDAP/SSSD, password policy, expiry and
   lockouts apply as for SSH. Mira Server stores no passwords.
-- **Access**: members of `mira-users` (primary or supplementary group, through
-  NSS) may sign in; members of `mira-admins` also get the `admin` role. Both
-  names are configurable. Group membership is re-read at least every
-  `group_recheck_interval` seconds and on every token refresh. Someone removed
-  from `mira-users` loses all sessions at the next check, and Mira Server stops
-  their engine (through the `stop`-only sudo rule, see step 4).
+- **Access**: two independent groups (primary or supplementary, through NSS;
+  both names are configurable). Members of `mira-users` get the `user` role: an
+  engine. Members of `mira-admins` get the `admin` role: they manage the
+  [team settings](#team-settings). Either one lets an account sign in. Group
+  membership is re-read at least every `group_recheck_interval` seconds and on
+  every token refresh. Someone removed from both groups loses all sessions at
+  the next check; someone removed from `mira-users` loses their engine. Mira
+  Server stops it through the `stop`-only sudo rule (see step 4).
 - **Engines**: Mira Server runs the root-owned launcher through sudo:
   `sudo -n -u alice /usr/local/libexec/mira/engine-launch start`. The launcher
   runs `mira remote attach --json` as alice (the same command the desktop app
@@ -65,12 +67,16 @@ The commands assume Debian/Ubuntu; adjust package names elsewhere.
 ```sh
 sudo groupadd mira-users
 sudo groupadd mira-admins          # optional
-sudo usermod -aG mira-users alice
-sudo usermod -aG mira-users,mira-admins bob
+sudo gpasswd -a alice mira-users
+sudo gpasswd -a admin-bob mira-admins        # administration account
+sudo gpasswd -a admin-bob mira-users         # optional: lets it try the team settings
 ```
 
 LDAP/SSSD groups work the same way, as long as `getent group mira-users` and
-`id alice` show the membership.
+`id alice` show the membership (use `gpasswd -a`; `usermod -aG` fails for
+directory accounts). Give administrators a separate account for administration
+(`admin-bob` next to their everyday `bob`): what an administrator changes in the
+app's settings applies to everyone.
 
 ### 2. The engine, system-wide
 
@@ -369,6 +375,56 @@ attach` checks that the engine's port is held by the engine process before it
 sends the token, so another account squatting the port receives nothing
 (`listener_mismatch`).
 
+## Team settings
+
+Administrators (`mira-admins`) set up model access for everyone from the
+desktop app: they sign in to the Team Server and use the usual settings pages.
+For an administrator's session Mira Server answers the settings requests
+(`/api/config`, `/api/providers/{name}/models` and `/test`) itself, against the
+**team settings** in `/var/lib/mira-server/team-config.json` (mode 0600, owned
+by `mira-server`), instead of the administrator's own config.
+
+| Groups | Engine | The settings pages change |
+|---|---|---|
+| `mira-users` | yes | the user's own `~/.mira/config.json` |
+| `mira-users` and `mira-admins` | yes | the team settings |
+| `mira-admins` | no (other pages answer 403 `no_engine`) | the team settings |
+
+An administration account that is also in `mira-users` has an engine like
+everyone else, so the administrator can try the team settings the way users get
+them (its usage counts for that account).
+
+What the team settings do in each user's engine:
+
+- **Team providers** (a provider with an API key or endpoint in the team
+  settings) replace the user's own entry for that provider. Users see them as
+  managed by the team and cannot change them (`403 locked_by_team`). Providers
+  the team does not configure stay available for users' own keys.
+- **Defaults** (provider and model, reasoning effort, temperature, iteration
+  limits, team-role models) apply until a user picks their own value.
+- **Model parameter rules**, if the team sets any, replace the users' rules.
+- The host policy (`/etc/mira/policy.toml`) still applies on top. The projects
+  folder and `restrict_to_workspace` are not team settings.
+
+**Team keys never reach users' engines.** Mira Server gives each engine the
+team settings when the engine starts (or Mira Server attaches to it) and again
+after every change, with each team provider pointing at Mira Server's LLM
+proxy, `http://127.0.0.1:8740/llm/<provider>`, and the engine's own token as
+its API key. The proxy accepts only loopback requests that did not come through
+the TLS proxy (no `X-Forwarded-For`) and that carry the token of an engine Mira
+Server runs for a current `mira-users` member. It replaces that token, in
+whichever header the provider client sent it, with the team key and streams
+the provider's answer back. The provider must be reachable from the Mira Server
+host (`providers.proxy` in the team settings is used for these requests).
+
+Changes are recorded in the audit log as `team.config_changed` with the
+account and the changed settings (never values).
+
+Limitations: providers that sign in per user (OpenAI Codex, GitHub Copilot)
+cannot be team providers; a provider without a known default endpoint needs an
+API Base in the team settings; engines older than this feature ignore the team
+settings (logged as `team.push_unsupported`).
+
 ## Dev mode (UI development only)
 
 For working on the desktop client without a Linux host or real accounts:
@@ -384,7 +440,7 @@ backend = "dev"
 [[auth.dev_users]]
 name = "alice"
 password_hash = "scrypt$16384$8$1$..."   # mira-server hash-password
-admin = true
+admin = true          # team settings; add `user = false` for no engine
 
 [spawner]
 backend = "local"
@@ -415,7 +471,8 @@ response carries `X-Mira-Request-Id`.
 | `GET /server/me` | bearer | `{"user": {...}, "engine": {"state", "version", "message"}}` |
 | `POST /server/engine/start` | bearer | Starts the engine; returns the `engine` object (state may still be `starting`) |
 | `POST /server/engine/stop` | bearer | Stops the engine; returns the `engine` object |
-| `/api/*` | bearer (or `?access_token=` on GET/HEAD) | Proxied to the caller's engine |
+| `/api/*` | bearer (or `?access_token=` on GET/HEAD) | Proxied to the caller's engine; for administrators the settings endpoints answer from the [team settings](#team-settings) (`"scope": "team"`) |
+| `/llm/<provider>/*` | an engine's token (loopback only) | The [LLM proxy](#team-settings) for team providers |
 | `GET /ws`, `GET /ws/*` | bearer or `?access_token=` | WebSocket proxy to the same path on the engine (`/ws`, `/ws/workflow/v1`) |
 
 Token response:
@@ -432,7 +489,8 @@ Engine states: `stopped`, `starting`, `running`, `error`, `conflict`.
 |---|---|---|
 | 400 | `bad_request` | Malformed body. |
 | 401 | `unauthorized` | Missing, invalid or expired token; wrong username or password. |
-| 403 | `forbidden` | Not in `mira-users` (or removed from it; all sessions are revoked). |
+| 403 | `forbidden` | In neither `mira-users` nor `mira-admins` (or removed; all sessions are revoked). |
+| 403 | `no_engine` | An account only in `mira-admins` asked for an engine. |
 | 403 | `origin_not_allowed` | A browser `Origin` that is not allowed. |
 | 409 | `engine_conflict` | The engine lease is held by an engine Mira Server cannot attach to. |
 | 429 | `too_many_attempts` | Login rate limit; see `Retry-After`. |
@@ -477,7 +535,8 @@ Details:
 The `audit` table in `mira-server.sqlite3` records metadata only: sign-ins
 (`login.ok`, `login.failed`, `login.denied`, `login.rate_limited`), `logout`,
 `access.revoked`, engine `started`/`attached`/`stopped`/`start_failed`/
-`stop_failed`/`forgotten`/`unhealthy`, and security events
+`stop_failed`/`forgotten`/`unhealthy`/`revoked`, team settings
+(`team.config_changed`, `team.push_failed`, `team.push_unsupported`), and security events
 (`security.refresh_reuse`, `security.listener_mismatch`). It never contains
 passwords, tokens, prompts or request bodies.
 
@@ -488,7 +547,8 @@ passwords, tokens, prompts or request bodies.
   `nohup` outside any session gets none.
 - **MCP servers** run outside the sandbox; disable them with `tools.mcp = false`
   where that matters.
-- **Team keys and the LLM proxy (#154)**.
+- **Usage metering and quotas** for team providers (#157), and personal keys
+  encrypted at rest.
 - **Local passwords on RHEL/Fedora**: there is no `shadow` group, so only
   LDAP/SSSD accounts can sign in until a privileged password helper exists.
 - **`Origin: null`**: the packaged desktop app sends `Origin: null`, which any

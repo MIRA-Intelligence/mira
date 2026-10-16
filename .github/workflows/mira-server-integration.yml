@@ -41,11 +41,12 @@ jobs:
         run: |
           sudo groupadd mira-users
           sudo groupadd mira-admins
-          for user in alice bob carol; do sudo useradd --create-home --shell /bin/bash "$user"; done
+          for user in alice bob carol dave; do sudo useradd --create-home --shell /bin/bash "$user"; done
           sudo usermod -aG mira-users alice
           sudo usermod -aG mira-users,mira-admins bob   # carol stays outside mira-users
-          printf 'alice:alice-Pw-1\nbob:bob-Pw-2\ncarol:carol-Pw-3\n' | sudo chpasswd
-          id alice; id bob; id carol
+          sudo usermod -aG mira-admins dave             # administration only: no engine
+          printf 'alice:alice-Pw-1\nbob:bob-Pw-2\ncarol:carol-Pw-3\ndave:dave-Pw-4\n' | sudo chpasswd
+          id alice; id bob; id carol; id dave
 
       - name: Install the engine system-wide in /opt/mira
         run: |

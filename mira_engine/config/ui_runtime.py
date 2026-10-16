@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic.alias_generators import to_camel
 
+from mira_engine.config import team_layer
 from mira_engine.config.schema import AgentDefaults, Config, ProvidersConfig
 from mira_engine.providers.registry import find_by_name
 from mira_engine.security.host_policy import RESTRICT_PATH, check_runtime_change
@@ -186,6 +187,10 @@ def _build_provider_payload(config: Config) -> dict[str, dict[str, Any]]:
             "enabled": enabled,
             **meta,
         }
+        if team_layer.managed_provider(config, provider_name):
+            # The key is this engine's token for Mira Server's LLM proxy, not a team key.
+            providers[provider_name]["api_key_preview"] = None
+            providers[provider_name]["managed_by"] = "team"
     return providers
 
 
@@ -290,7 +295,7 @@ def build_ui_runtime_payload(
         runtime[f"{role}_provider"] = defaults.role_provider(role)
         runtime[f"{role}_model"] = getattr(defaults, f"{role}_model", None)
 
-    return {
+    payload: dict[str, Any] = {
         "projects_root": str(resolved_projects_root),
         "config_path": str(config_path),
         "persisted": persisted,
@@ -302,6 +307,10 @@ def build_ui_runtime_payload(
             for rule in config.providers.model_params
         ],
     }
+    layer = team_layer.team_values(config).layer
+    if not layer.empty:
+        payload["team"] = layer.summary()
+    return payload
 
 
 def _normalize_model_param_rules(raw: Any) -> list[dict[str, Any]]:
@@ -531,6 +540,7 @@ def save_ui_runtime_update(
         payload,
         current_projects_root=current_projects_root,
     )
+    team_layer.restore_team_values(config, data)
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -687,6 +697,7 @@ def apply_ui_runtime_update(
         from mira_engine.providers.registry import set_user_model_param_rules
 
         rules = _normalize_model_param_rules(payload.get("model_params"))
+        team_layer.check_model_params_change(config, rules)
         next_rules = [ModelParamRule(pattern=r["pattern"], params=r["params"]) for r in rules]
         current = [
             {"pattern": r.pattern, "params": dict(r.params)}
@@ -718,6 +729,9 @@ def apply_ui_runtime_update(
                 raise ValueError(f"unsupported provider: {provider_name}")
             if not isinstance(provider_update, dict):
                 raise ValueError(f"providers.{provider_name} must be an object")
+            team_layer.check_provider_change(config, provider_name, provider_update)
+            if team_layer.managed_provider(config, provider_name):
+                continue  # unchanged (checked above); an empty api_key must not clear the proxy token
 
             provider_cfg = getattr(config.providers, provider_name)
             if "api_key" in provider_update:

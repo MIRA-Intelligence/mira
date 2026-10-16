@@ -642,6 +642,9 @@ class Config(BaseSettings):
     # (security/host_policy.py), keyed by config.json path; save_config writes
     # these instead of the enforced values.
     _policy_user_values: dict[tuple[str, ...], Any] = PrivateAttr(default_factory=dict)
+    # What the Mira Server team layer changed (config/team_layer.py), so
+    # save_config can take it back out.
+    _team_values: Any = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _enable_channel_builtin_access(self) -> "Config":

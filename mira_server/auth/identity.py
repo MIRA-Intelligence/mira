@@ -2,9 +2,11 @@
 
 Production identities come from NSS (``pwd``/``grp``), so local accounts, LDAP
 and SSSD all work the same way. Membership includes supplementary groups
-(``os.getgrouplist``). ``users_group`` grants access, ``admins_group`` adds the
-admin role. Dev identities come from ``[[auth.dev_users]]`` and all map to the
-uid running Mira Server.
+(``os.getgrouplist``). The two groups are independent: ``users_group`` gives
+the user role (an engine), ``admins_group`` the admin role (the team settings,
+see ``mira_server/team.py``). Either one lets the account sign in, so an
+administration account need not run an engine. Dev identities come from
+``[[auth.dev_users]]`` and all map to the uid running Mira Server.
 """
 
 from __future__ import annotations
@@ -31,6 +33,11 @@ class Identity:
     @property
     def is_admin(self) -> bool:
         return ROLE_ADMIN in self.roles
+
+    @property
+    def is_user(self) -> bool:
+        """May run an engine."""
+        return ROLE_USER in self.roles
 
     @property
     def role(self) -> str:
@@ -96,9 +103,11 @@ class NssIdentityResolver:
         if entry.pw_uid == 0:
             raise AccessDeniedError("root may not use Mira Server")
         groups = self.group_names(entry.pw_name, entry.pw_gid)
-        if self.users_group not in groups:
-            raise AccessDeniedError(f"{entry.pw_name} is not a member of {self.users_group}")
-        roles = (ROLE_USER, ROLE_ADMIN) if self.admins_group in groups else (ROLE_USER,)
+        roles = tuple(role for role, group in ((ROLE_USER, self.users_group), (ROLE_ADMIN, self.admins_group))
+                      if group in groups)
+        if not roles:
+            raise AccessDeniedError(f"{entry.pw_name} is not a member of {self.users_group} "
+                                    f"or {self.admins_group}")
         return Identity(
             name=entry.pw_name,
             uid=entry.pw_uid,
@@ -123,5 +132,5 @@ class DevIdentityResolver:
             uid=os.getuid(),
             home=str(Path.home()),
             display_name=user.display_name or user.name,
-            roles=(ROLE_USER, ROLE_ADMIN) if user.admin else (ROLE_USER,),
+            roles=tuple(role for role, member in ((ROLE_USER, user.user), (ROLE_ADMIN, user.admin)) if member),
         )

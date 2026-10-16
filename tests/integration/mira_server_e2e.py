@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,7 +27,9 @@ from typing import Any
 
 import aiohttp
 
-USERS = {"alice": "alice-Pw-1", "bob": "bob-Pw-2", "carol": "carol-Pw-3"}
+USERS = {"alice": "alice-Pw-1", "bob": "bob-Pw-2", "carol": "carol-Pw-3", "dave": "dave-Pw-4"}
+TEAM_KEY = "sk-team-e2e-key-0123456789"
+TEAM_REPLY = "TEAM-REPLY-OK"
 STEP = 0
 
 
@@ -147,6 +150,74 @@ async def ws_status(base: str, token: str, origin: str) -> int:
                 return 101
         except aiohttp.WSServerHandshakeError as exc:
             return exc.status
+
+
+class FakeLLM:
+    """A local OpenAI-compatible provider recording the credentials it receives."""
+
+    def __init__(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = self.seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def _reply(self, payload: dict[str, Any]) -> None:
+                data = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                self._reply({"data": [{"id": "team-model"}]})
+
+            def do_POST(self) -> None:  # noqa: N802 - http.server API
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                usage = {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+                base = {"id": "x", "created": 0, "model": "team-model"}
+                if not body.get("stream"):
+                    self._reply({**base, "object": "chat.completion", "usage": usage, "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": TEAM_REPLY}, "finish_reason": "stop"}]})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for chunk in ({"choices": [{"index": 0, "delta": {"role": "assistant", "content": TEAM_REPLY}}]},
+                              {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage}):
+                    self.wfile.write(f"data: {json.dumps({**base, 'object': 'chat.completion.chunk', **chunk})}\n\n"
+                                     .encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+
+async def ws_chat(base: str, token: str, session_id: str) -> str:
+    """Send one chat message and return the streamed reply."""
+    url = base.replace("http", "ws", 1) + f"/ws?access_token={token}"
+    reply = ""
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(url, headers={"Origin": "file://"}) as ws:
+            await ws.send_json({"type": "message", "session_id": session_id, "content": "hello", "stream": True})
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                msg = await ws.receive(timeout=deadline - time.monotonic())
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    break
+                frame = json.loads(msg.data)
+                if frame.get("type") == "stream_delta":
+                    reply += str(frame.get("content") or frame.get("delta") or "")
+                elif frame.get("type") in ("stream_end", "response", "error"):
+                    reply = reply or str(frame.get("content") or "")
+                    break
+    return reply
 
 
 def restart_server(args: argparse.Namespace, client: Client) -> None:
@@ -285,6 +356,53 @@ def main() -> int:
     payload, _ = client.api_until_ready("/api/status", at)
     check(payload["projects_root"].startswith("/home/alice/"), "proxy works after the restart")
 
+    step("team settings: an account only in mira-admins signs in but runs no engine")
+    status, dave = client.login("dave")
+    check(status == 200 and dave["user"]["roles"] == ["admin"], f"dave login -> {status} {dave}")
+    dt = dave["access_token"]
+    status, _, payload = client.request("GET", "/api/status", token=dt)
+    check(status == 403 and payload["error"] == "no_engine", f"dave /api/status -> {status} {payload}")
+    status, _, payload = client.request("GET", "/api/config", token=dt)
+    check(status == 200 and payload["scope"] == "team", f"dave /api/config is the team scope: {status}")
+    check(sudo("test", "-e", "/home/dave/.mira/engine.lease", check_rc=False).returncode != 0, "dave has no engine")
+
+    step("team settings: an administrator sets a team provider and default model")
+    llm = FakeLLM()
+    status, _, payload = client.request("POST", "/api/config", token=bt, body={
+        "providers": {"custom": {"api_key": TEAM_KEY, "api_base": llm.base}},
+        "runtime": {"provider": "custom", "model": "team-model"},
+    })
+    check(status == 200 and payload["scope"] == "team", f"bob saves team settings -> {status} {payload}")
+    check(TEAM_KEY not in json.dumps(payload), "the team key is not sent back")
+    status, _, payload = client.request("POST", "/api/providers/custom/test", token=bt, body={})
+    check(status == 200 and payload.get("ok") is True, f"bob tests the team provider -> {payload}")
+    team_file = sudo("stat", "-c", "%U %a", "/var/lib/mira-server/team-config.json").stdout.split()
+    check(team_file == ["mira-server", "600"], f"team-config.json is mira-server's, mode 600: {team_file}")
+
+    step("team settings: alice's engine uses the team provider through the LLM proxy")
+    time.sleep(1)  # the push to running engines happens in the background
+    payload, _ = client.api_until_ready("/api/config", at)
+    custom = payload["providers"]["custom"]
+    check(custom.get("managed_by") == "team" and custom["api_key_preview"] is None, f"alice sees {custom}")
+    check((payload["runtime"]["provider"], payload["runtime"]["model"]) == ("custom", "team-model"),
+          f"alice gets the team default model: {payload['runtime']}")
+    status, _, payload = client.request("POST", "/api/config", token=at,
+                                        body={"providers": {"custom": {"api_key": "sk-mine"}}})
+    check(status == 403 and payload.get("code") == "locked_by_team", f"alice cannot change it -> {status}")
+    llm.seen.clear()
+    reply = asyncio.run(ws_chat(args.url, at, "team-e2e"))
+    check(TEAM_REPLY in reply, f"alice's chat is answered by the team provider: {reply!r}")
+    alice_token = sudo("cat", "/home/alice/.mira/runtime/gateway-token").stdout.strip()
+    check(llm.seen and all(auth == f"Bearer {TEAM_KEY}" for _, _, auth in llm.seen),
+          f"the provider only ever saw the team key ({len(llm.seen)} requests)")
+    check(not any(alice_token in str(auth) for _, _, auth in llm.seen), "alice's engine token never left the host")
+    alice_config = sudo("cat", "/home/alice/.mira/config.json").stdout
+    check(TEAM_KEY not in alice_config and alice_token not in alice_config,
+          "neither the team key nor the proxy token is written to alice's config.json")
+    status, _, _ = client.request("POST", "/llm/custom/chat/completions", body={},
+                                  headers={"Authorization": f"Bearer {alice_token}", "X-Forwarded-For": "10.1.2.3"})
+    check(status == 403, "the LLM proxy refuses requests that came through a TLS proxy")
+
     step("logout revokes the session")
     status, _, _ = client.request("POST", "/server/auth/logout", token=at)
     check(status == 204, "logout -> 204")
@@ -313,21 +431,28 @@ def main() -> int:
     check(not any(line.split()[2:3] == ["alice"] for line in sessions.splitlines() if line.split()),
           f"alice's engine session closed with the engine: {sessions.strip()!r}")
 
-    step("removal from mira-users revokes access and stops the engine")
+    step("removal from mira-users stops the engine; bob stays an administrator")
     bob_pid = leases["bob"]["pid"]
     sudo("gpasswd", "-d", "bob", "mira-users")
     status, _, payload = client.request("GET", "/server/me", token=bt)
-    check(status == 403 and payload["error"] == "forbidden", f"bob after group removal -> {status}")
-    status, _, _ = client.request("POST", "/server/auth/refresh", body={"refresh_token": bob["refresh_token"]})
-    check(status == 401, "bob's sessions were revoked")
-    status, _ = client.login("bob")
-    check(status == 403, "bob can no longer sign in")
+    check(status == 200 and payload["user"]["roles"] == ["admin"], f"bob after leaving mira-users -> {status}")
+    status, _, payload = client.request("GET", "/api/status", token=bt)
+    check(status == 403 and payload["error"] == "no_engine", f"bob has no engine any more -> {status}")
     # Through the stop-only sudo rule: bob is no longer in mira-users.
     for _ in range(150):
         if not pid_alive(bob_pid):
             break
         time.sleep(0.2)
     check(not pid_alive(bob_pid), f"bob's engine pid {bob_pid} was stopped after the removal")
+
+    step("removal from both groups revokes access")
+    sudo("gpasswd", "-d", "bob", "mira-admins")
+    status, _, payload = client.request("GET", "/server/me", token=bt)
+    check(status == 403 and payload["error"] == "forbidden", f"bob after group removal -> {status}")
+    status, _, _ = client.request("POST", "/server/auth/refresh", body={"refresh_token": bob["refresh_token"]})
+    check(status == 401, "bob's sessions were revoked")
+    status, _ = client.login("bob")
+    check(status == 403, "bob can no longer sign in")
 
     print("\nAll Mira Server end-to-end checks passed.")
     return 0

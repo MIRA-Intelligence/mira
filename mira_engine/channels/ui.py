@@ -40,6 +40,7 @@ from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.config import loader as config_loader
+from mira_engine.config import team_layer
 from mira_engine.config.paths import get_runtime_subdir, get_workspace_path
 from mira_engine.config.schema import Config, UiChannelConfig
 from mira_engine.config.ui_runtime import (
@@ -1250,6 +1251,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/providers/{name}/models", self._handle_provider_models)
         self._app.router.add_post("/api/providers/{name}/test", self._handle_provider_test)
+        self._app.router.add_put("/api/team/layer", self._handle_team_layer)
         self._app.router.add_get("/api/feedback/config", self._handle_feedback_config)
         self._app.router.add_post("/api/feedback", self._handle_feedback)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
@@ -2859,6 +2861,31 @@ class UiChannel(BaseChannel):
         )
         payload["project_location"] = self._project_location_payload()
         return web.json_response(payload)
+
+    async def _handle_team_layer(self, request: web.Request) -> web.Response:
+        """Mira Server pushes the team layer (config/team_layer.py) here."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict) or "layer" not in body:
+            return web.json_response({"error": "body must be {\"layer\": object or null}"}, status=400)
+        try:
+            layer = team_layer.parse_layer(body["layer"])
+        except team_layer.TeamLayerError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if team_layer.set_team_layer(layer):
+            self._audit(source="ui", action="api_team_layer_updated", details=layer.summary())
+            logger.info("Team layer updated (revision {})", layer.revision or "-")
+            if self._on_runtime_config_updated is not None:
+                config_path = config_loader.get_config_path().expanduser().resolve()
+                runtime_config = config_loader.load_config(config_path)
+                try:
+                    await self._on_runtime_config_updated(runtime_config, self.projects_root)
+                except Exception as exc:
+                    logger.exception("Failed to apply the team layer")
+                    return web.json_response({"error": f"failed to apply the team layer: {exc}"}, status=500)
+        return web.json_response({"ok": True, "revision": layer.revision})
 
     @staticmethod
     def _provider_models_response(cache: ModelCache) -> dict[str, Any]:

@@ -184,9 +184,14 @@ def test_supplementary_group_is_enough() -> None:
     assert _resolver({**MEMBERSHIP, "alice": [1001, 100, 500]}).resolve("alice").name == "alice"
 
 
-def test_admin_without_users_group_is_denied() -> None:
-    with pytest.raises(AccessDeniedError):
-        _resolver({**MEMBERSHIP, "bob": [1002, 501]}).resolve("bob")
+def test_admins_group_alone_gives_admin_without_engine() -> None:
+    identity = _resolver({**MEMBERSHIP, "bob": [1002, 501]}).resolve("bob")
+    assert identity.roles == ("admin",) and identity.is_admin and not identity.is_user
+    assert identity.role == "admin"
+
+
+def test_user_role_means_an_engine() -> None:
+    assert _resolver().resolve("alice").is_user and _resolver().resolve("bob").is_user
 
 
 def test_non_member_and_root_denied_unknown_user() -> None:

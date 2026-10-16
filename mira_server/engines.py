@@ -21,7 +21,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 
@@ -95,6 +95,9 @@ class EngineManager:
         self._engines: dict[str, UserEngine] = {}
         self._tasks: set[asyncio.Task] = set()
         self.http: aiohttp.ClientSession | None = None
+        # Called with (user name, handle) once an engine passed its checks, before
+        # it is used (Mira Server pushes the team layer); failures are logged only.
+        self.on_ready: Callable[[str, EngineHandle], Awaitable[None]] | None = None
 
     # ── lookup ───────────────────────────────────────────────────────
 
@@ -206,6 +209,11 @@ class EngineManager:
             self._set_error(engine, f"the engine did not pass its health check: {exc}")
             self.store.audit("engine.unhealthy", username=identity.name, port=handle.port)
             return False
+        if self.on_ready is not None:
+            try:
+                await self.on_ready(identity.name, handle)
+            except Exception:  # noqa: BLE001 - the engine works without it
+                log.exception("preparing the engine of %s failed", identity.name)
         engine.handle = handle
         engine.version = version or handle.version
         engine.state = RUNNING
