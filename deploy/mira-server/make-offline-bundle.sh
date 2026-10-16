@@ -103,7 +103,8 @@ if [[ -z $WHEEL ]]; then
 	else
 		SETUPTOOLS_SCM_PRETEND_VERSION=$PRETEND_VERSION "$PYTHON" -m pip wheel -q --disable-pip-version-check --no-deps -w "$WORK/dist" "$REPO"
 	fi
-	WHEEL=$(ls "$WORK"/dist/mira_engine-*.whl | head -n 1)
+	set -- "$WORK"/dist/mira_engine-*.whl
+	WHEEL=$1
 fi
 [[ -f $WHEEL && $(basename "$WHEEL") == mira_engine-*.whl ]] || die "not a mira_engine wheel: $WHEEL"
 NAME=$(basename "$WHEEL")
@@ -123,7 +124,7 @@ for py in $PYTHONS; do
 		--abi "cp${py/./}" --abi abi3 --abi none \
 		--platform "manylinux_2_28_$ARCH" --platform "manylinux_2_17_$ARCH" \
 		--platform "manylinux2014_$ARCH" --platform "linux_$ARCH" --platform any \
-		"$DEST/wheels/$NAME[server]"
+		"$DEST/wheels/${NAME}[server]"
 done
 
 # ---- GitHub release assets (python-build-standalone, Caddy)
@@ -171,9 +172,10 @@ host's usual or a local Ubuntu mirror, or install them beforehand.
 Upgrade: unpack a newer bundle and run its install.sh again.
 Uninstall: sudo mira-server-uninstall
 EOF
-(cd "$DEST" && find . -type f ! -name SHA256SUMS | LC_ALL=C sort | while read -r file; do
+(cd "$DEST" && find . -type f | LC_ALL=C sort | while read -r file; do
 	if command -v sha256sum >/dev/null; then sha256sum "$file"; else shasum -a 256 "$file"; fi
-done >SHA256SUMS)
+done) >"$WORK/SHA256SUMS"
+mv "$WORK/SHA256SUMS" "$DEST/SHA256SUMS"
 
 tar -C "$WORK" -czf "$OUT_DIR/$BUNDLE.tar.gz" "$BUNDLE"
 say "wrote $OUT_DIR/$BUNDLE.tar.gz ($(du -h "$OUT_DIR/$BUNDLE.tar.gz" | cut -f1))"
