@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mira_engine.config.schema import Config, primary_model_candidate
+from mira_engine.config.schema import Config, is_custom_provider_id, primary_model_candidate
 from mira_engine.providers.base import LLMProvider, LLMResponse
 
 _BUNDLE_SETUP_MODEL = "custom/mira-ui-bundle-setup"
@@ -103,13 +103,16 @@ def make_provider(
             proxy=resolve_provider_proxy(config),
         )
 
-    if provider_name == "custom":
+    if is_custom_provider_id(provider_name):
         api_base = config.get_api_base(resolved_model, provider_override)
         normalized_base = api_base.rstrip("/") if isinstance(api_base, str) else ""
         if resolved_model == _BUNDLE_SETUP_MODEL or normalized_base == _BUNDLE_SETUP_API_BASE.rstrip("/"):
             return BundleSetupRequiredProvider(default_model=resolved_model)
         # Require explicit apiBase configuration for custom provider
         if not api_base:
+            if provider_name != "custom":
+                label = (provider_config.name if provider_config else None) or provider_name
+                raise ValueError(f"Custom provider '{label}' requires an API base URL.")
             raise ValueError(
                 "Custom provider requires 'providers.custom.apiBase' to be configured. "
                 "Please set the API base URL (e.g., 'http://localhost:8000/v1' or 'https://api.example.com/v1') "
