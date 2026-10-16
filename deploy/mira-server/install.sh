@@ -848,6 +848,7 @@ apply_python() {
 	local bundled=("$(bundle_dir)"/python/cpython-3.11*-install_only*.tar.gz)
 	if [[ -n $(bundle_dir) && -f ${bundled[0]} ]]; then
 		local name=${bundled[-1]##*/}
+		name=${name//%2B/+}
 		say "  installing a root-owned Python 3.11 from the bundle (this Ubuntu has Python < 3.11)"
 		mkdir -p "$UV_PYTHON_DIR/${name%%+*}-bundle"
 		run tar -xzf "${bundled[-1]}" --strip-components 1 -C "$UV_PYTHON_DIR/${name%%+*}-bundle"

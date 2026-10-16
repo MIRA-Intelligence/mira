@@ -142,7 +142,8 @@ if ((WITH_PYTHON)); then
 	url=$(release_asset astral-sh/python-build-standalone \
 		"cpython-3\\.11\\.[0-9]+\\+[0-9]+-$ARCH-unknown-linux-gnu-install_only_stripped\\.tar\\.gz")
 	mkdir -p "$DEST/python"
-	curl -fsSL -o "$DEST/python/$(basename "$url")" "$url"
+	name=$(basename "$url" | sed 's/%2[Bb]/+/g')  # the URL encodes the "+" in the name
+	curl -fsSL -o "$DEST/python/$name" "$url"
 fi
 
 if ((WITH_CADDY)); then
