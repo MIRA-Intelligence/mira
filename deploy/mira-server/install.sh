@@ -921,8 +921,17 @@ apply_engine() {
 	say "  pip install $spec (a few minutes)"
 	if [[ $S_source == *.whl ]]; then
 		[[ -f $S_source ]] || { printf '%s is gone; run the installer from the bundle again\n' "$S_source" >>"$LOG_FILE"; return 1; }
-		local offline=()
-		[[ -n ${S_wheels:-} ]] && offline=(--no-index --find-links "$S_wheels")
+		local offline=() tag
+		if [[ -n ${S_wheels:-} ]]; then
+			offline=(--no-index --find-links "$S_wheels")
+			# Compiled dependencies (pydantic-core, ...) exist per Python version.
+			tag=$("$VENV/bin/python" -c 'import sys; print("cp%d%d" % sys.version_info[:2])')
+			if ! compgen -G "$S_wheels/*-$tag-*.whl" >/dev/null; then
+				printf '%s has no wheels for this Python (%s); build the bundle with --python %s\n' \
+					"$S_wheels" "$tag" "$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')" >>"$LOG_FILE"
+				return 1
+			fi
+		fi
 		run "$VENV/bin/python" -m pip install -q -U "${offline[@]}" "$spec"
 	elif [[ $S_source == pypi ]]; then
 		run "$VENV/bin/python" -m pip install -q -U "$spec"

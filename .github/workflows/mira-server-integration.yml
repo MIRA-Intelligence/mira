@@ -356,7 +356,7 @@ jobs:
           py="${{ steps.py.outputs.python-path }}"
           # Wheels for the Python the installer will use: the host's on 24.04,
           # the bundled 3.11 on 22.04.
-          target=$(python3 -c 'import sys; v = sys.version_info; print(f"{v.major}.{v.minor}" if v >= (3, 11) else "3.11")')
+          target=$(/usr/bin/python3 -c 'import sys; v = sys.version_info; print(f"{v.major}.{v.minor}" if v >= (3, 11) else "3.11")')
           PYTHON="$py" bash deploy/mira-server/make-offline-bundle.sh --python "$target" -o /tmp/bundle
           tar -C /tmp/bundle -xzf /tmp/bundle/mira-server-offline-*.tar.gz
           bundle=$(ls -d /tmp/bundle/mira-server-offline-*/)
@@ -369,7 +369,7 @@ jobs:
             --local-accounts yes --limits none --ufw no | tee /tmp/offline.txt
           sudo grep -q "^S_source=${bundle}wheels/mira_engine-0.3.5.dev0-py3-none-any.whl$" /var/lib/mira-server-installer/state
           sudo grep -q "^S_wheels=${bundle}wheels$" /var/lib/mira-server-installer/state
-          if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+          if ! /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
             ls -d /opt/mira-python/cpython-3.11*-bundle
             test ! -e /opt/mira-uv
           fi
