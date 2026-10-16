@@ -141,11 +141,14 @@ class TeamConfig:
         providers = body.get("providers")
         if not isinstance(providers, dict):
             return
-        for name in providers:
-            if name == "proxy":
+        for name, update in providers.items():
+            if name == "proxy" or not isinstance(update, dict):
                 continue
             spec = find_by_name(name)
-            if spec is not None and spec.is_oauth:
+            # Turning an OAuth provider off (or on) is fine; giving it a team key is not.
+            sets_credential = any(isinstance(update.get(key), str) and update[key].strip()
+                                  for key in ("api_key", "api_base"))
+            if spec is not None and spec.is_oauth and sets_credential:
                 raise TeamConfigError(f"{spec.label} signs in per user and cannot be a team provider")
             record = getattr(config.providers, name, None)
             if record is None or not (record.api_key or record.api_base):
@@ -197,6 +200,16 @@ class TeamConfig:
                            "models": list(_get(record, "models", []) or []), "enabled": _get(record, "enabled")}
         return found
 
+    def disabled_providers(self) -> list[str]:
+        """Providers administrators turned off (other than team providers): off for every user."""
+        providers = self._raw.get("providers")
+        if not isinstance(providers, dict):
+            return []
+        team = self.team_providers()
+        return [name for name in _provider_names()
+                if name not in team and isinstance(_get(providers, name), dict)
+                and _get(_get(providers, name), "enabled") is False]
+
     def upstream(self, name: str) -> Upstream | None:
         record = self.team_providers().get(name)
         if record is None:
@@ -220,7 +233,8 @@ class TeamConfig:
                    "models": record["models"], "enabled": record["enabled"]}
             for name, record in self.team_providers().items()
         }
-        layer: dict[str, Any] = {"revision": self.revision(), "providers": providers}
+        layer: dict[str, Any] = {"revision": self.revision(), "providers": providers,
+                                 "disabled": self.disabled_providers()}
         raw_providers = self._raw.get("providers")
         if isinstance(raw_providers, dict):
             rules = _get(raw_providers, "model_params")

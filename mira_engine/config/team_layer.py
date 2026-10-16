@@ -9,6 +9,8 @@ keeps it in memory only and applies it to the user's raw ``config.json`` in
   and cannot be changed through the API (:class:`TeamLockedError`). Their
   endpoint is Mira Server's LLM proxy and their key is this engine's gateway
   token, so the team's real keys never reach the engine.
+- **Disabled providers**: providers administrators turned off are off for the
+  user too and cannot be turned on (the user's own key is kept, unused).
 - **model_params**, when the team sets them, replace the user's rules (locked).
 - **Defaults** (provider and model, reasoning effort, ...) apply only where the
   user has not chosen a value: the key is missing from config.json or still
@@ -74,16 +76,21 @@ class TeamLayer:
     providers: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_params: list[dict[str, Any]] | None = None
     defaults: dict[str, Any] = field(default_factory=dict)
+    disabled: tuple[str, ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not self.providers and self.model_params is None and not self.defaults
+        return not self.providers and self.model_params is None and not self.defaults and not self.disabled
+
+    def manages(self, provider_name: str) -> bool:
+        return provider_name in self.providers or provider_name in self.disabled
 
     def summary(self) -> dict[str, Any]:
         """What the layer manages, for the config payload (no values)."""
         return {
             "revision": self.revision,
             "providers": sorted(self.providers),
+            "disabled": sorted(self.disabled),
             "model_params": self.model_params is not None,
             "defaults": sorted(self.defaults),
         }
@@ -101,7 +108,7 @@ def parse_layer(data: Any) -> TeamLayer:
         return TeamLayer()
     if not isinstance(data, dict):
         raise TeamLayerError("layer must be an object or null")
-    unknown = sorted(set(data) - {"revision", "providers", "model_params", "defaults"})
+    unknown = sorted(set(data) - {"revision", "providers", "disabled", "model_params", "defaults"})
     if unknown:
         raise TeamLayerError(f"unknown key(s): {', '.join(unknown)}")
     revision = data.get("revision", "")
@@ -128,6 +135,13 @@ def parse_layer(data: Any) -> TeamLayer:
             raise TeamLayerError(f"providers.{name}.enabled must be a boolean or null")
         providers[name] = {"api_key": api_key, "api_base": api_base, "models": list(models), "enabled": enabled}
 
+    disabled = data.get("disabled") or []
+    if not isinstance(disabled, list) or not all(isinstance(name, str) for name in disabled):
+        raise TeamLayerError("disabled must be a list of provider names")
+    for name in disabled:
+        if name not in known:
+            raise TeamLayerError(f"unknown provider: {name}")
+
     model_params = data.get("model_params")
     if model_params is not None:
         from mira_engine.config.ui_runtime import _normalize_model_param_rules
@@ -143,7 +157,8 @@ def parse_layer(data: Any) -> TeamLayer:
     unknown = sorted(set(defaults) - set(DEFAULT_FIELDS))
     if unknown:
         raise TeamLayerError(f"unknown default(s): {', '.join(unknown)}")
-    return TeamLayer(revision=revision, providers=providers, model_params=model_params, defaults=dict(defaults))
+    return TeamLayer(revision=revision, providers=providers, model_params=model_params, defaults=dict(defaults),
+                     disabled=tuple(sorted(set(disabled) - set(providers))))
 
 
 def set_team_layer(layer: TeamLayer) -> bool:
@@ -212,8 +227,12 @@ def apply_to_raw(data: dict[str, Any], layer: TeamLayer | None = None) -> TeamVa
     values = TeamValues(layer=layer)
     if layer.empty:
         return values
-    if layer.providers or layer.model_params is not None:
+    if layer.providers or layer.disabled or layer.model_params is not None:
         providers = _record(data, "providers")
+        for name in layer.disabled:
+            key, value = _pop_key(providers, name)
+            values.replaced[("providers", to_camel(name))] = (key, value)
+            providers[to_camel(name)] = {**(value if isinstance(value, dict) else {}), "enabled": False}
         for name, record in layer.providers.items():
             values.replaced[("providers", to_camel(name))] = _pop_key(providers, name)
             providers[to_camel(name)] = {
@@ -280,13 +299,17 @@ def _snake(alias: str) -> str:
 
 
 def managed_provider(config: "Config", provider_name: str) -> bool:
-    return provider_name in team_values(config).layer.providers
+    return team_values(config).layer.manages(provider_name)
 
 
 def check_provider_change(config: "Config", provider_name: str, update: dict[str, Any]) -> None:
-    """Raise :class:`TeamLockedError` when ``update`` changes a team provider."""
+    """Raise :class:`TeamLockedError` when ``update`` changes a team or team-disabled provider."""
     layer = team_values(config).layer
     record = layer.providers.get(provider_name)
+    if record is None and provider_name in layer.disabled:
+        current = getattr(config.providers, provider_name)
+        record = {"api_key": current.api_key, "api_base": current.api_base,
+                  "models": list(current.models), "enabled": False}
     if record is None:
         return
     for key in PROVIDER_KEYS:
@@ -303,8 +326,9 @@ def check_provider_change(config: "Config", provider_name: str, update: dict[str
         elif key == "models" and isinstance(requested, list):
             requested = [str(m).strip() for m in requested if str(m).strip()]
         if requested != current:
-            raise TeamLockedError(f"providers.{provider_name} is managed by the Team Server administrators "
-                                  "and cannot be changed here")
+            what = ("turned off by the Team Server administrators" if provider_name in layer.disabled
+                    else "managed by the Team Server administrators")
+            raise TeamLockedError(f"providers.{provider_name} is {what} and cannot be changed here")
 
 
 def check_model_params_change(config: "Config", rules: list[dict[str, Any]]) -> None:

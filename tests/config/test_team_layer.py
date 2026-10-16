@@ -192,9 +192,31 @@ def test_payload_marks_team_providers_and_hides_the_engine_token(config_path: Pa
     assert openai["managed_by"] == "team" and openai["api_key_configured"] is True
     assert openai["api_key_preview"] is None
     assert "managed_by" not in payload["providers"]["deepseek"]
-    assert payload["team"] == {"revision": "r1", "providers": ["openai"], "model_params": False,
+    assert payload["team"] == {"revision": "r1", "providers": ["openai"], "disabled": [], "model_params": False,
                                "defaults": ["model", "provider", "temperature"]}
     assert TOKEN not in json.dumps(payload)
+
+
+def test_team_disabled_provider_is_off_and_locked_and_the_users_key_kept(config_path: Path) -> None:
+    _write(config_path, {"providers": {"deepseek": {"apiKey": "sk-deep", "enabled": True}}})
+    team_layer.set_team_layer(_layer(disabled=["deepseek", "openai_codex"]))
+    config = load_config(config_path)
+    assert config.providers.deepseek.enabled is False and config.providers.openai_codex.enabled is False
+    payload = build_ui_runtime_payload(config, projects_root=config_path.parent, config_path=config_path,
+                                       persisted=False)
+    assert payload["providers"]["deepseek"]["managed_by"] == "team"
+    assert payload["providers"]["deepseek"]["enabled"] is False
+    with pytest.raises(team_layer.TeamLockedError, match="turned off"):
+        apply_ui_runtime_update(config, {"providers": {"deepseek": {"enabled": True}}},
+                                current_projects_root=config_path.parent)
+    # Re-sending what the page shows is no change.
+    apply_ui_runtime_update(config, {"providers": {"deepseek": {"enabled": False, "api_base": None}}},
+                            current_projects_root=config_path.parent)
+    save_config(config, config_path)
+    assert _read(config_path)["providers"]["deepseek"] == {"apiKey": "sk-deep", "enabled": True}
+
+    team_layer.set_team_layer(_layer())
+    assert load_config(config_path).providers.deepseek.enabled is True
 
 
 @pytest.mark.parametrize("data, message", [
@@ -204,6 +226,8 @@ def test_payload_marks_team_providers_and_hides_the_engine_token(config_path: Pa
     ({"providers": {"openai": {"api_key": 1}}}, "must be strings"),
     ({"providers": {"openai": {"secret": "x"}}}, "must be an object"),
     ({"defaults": {"workspace": "/tmp"}}, "unknown default"),
+    ({"disabled": "openai"}, "list of provider names"),
+    ({"disabled": ["nope"]}, "unknown provider"),
     ({"model_params": [{"pattern": 1}]}, "pattern"),
 ])
 def test_parse_layer_rejects_malformed_layers(data, message: str) -> None:
