@@ -537,9 +537,9 @@ ask_source() {
 		case $choice in
 		bundle | pypi | git) source=$choice ;;
 		dir) source=$(ui_input "Source directory (a mira checkout with pyproject.toml):" \
-			"$([[ $source == /* && $source != *.whl ]] && echo "$source" || true)") ;;
+			"$([[ $source == /* && $source != *.whl ]] && echo "$source")") ;;
 		wheel)
-			source=$(ui_input "mira_engine-*.whl file (absolute path):" "$([[ $source == *.whl ]] && echo "$source" || true)")
+			source=$(ui_input "mira_engine-*.whl file (absolute path):" "$([[ $source == *.whl ]] && echo "$source")")
 			wheels=$(ui_input "Directory with its dependency wheels, for hosts without PyPI access (empty: download them from PyPI):" \
 				"${OPT[wheels]:-${S_wheels:-}}")
 			ask_wheel_source "$source" "$wheels"
