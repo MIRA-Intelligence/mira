@@ -358,7 +358,7 @@ def main() -> int:
 
     step("team settings: an account only in mira-admins signs in but runs no engine")
     status, dave = client.login("dave")
-    check(status == 200 and dave["user"]["roles"] == ["admin"], f"dave login -> {status} {dave}")
+    check(status == 200 and dave["user"]["roles"] == ["admin"], f"dave login -> {status} {dave.get('user')}")
     dt = dave["access_token"]
     status, _, payload = client.request("GET", "/api/status", token=dt)
     check(status == 403 and payload["error"] == "no_engine", f"dave /api/status -> {status} {payload}")
