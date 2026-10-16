@@ -947,6 +947,7 @@ apply_engine() {
 	fi
 	UPGRADE=0
 	state_set need_restart 1
+	state_set restart_engines 1
 }
 
 check_accounts() {
@@ -1307,6 +1308,30 @@ apply_service() {
 		sleep 1
 	done
 	state_set need_restart 0
+	stop_outdated_engines
+}
+
+# Engines users already run keep the previous mira-engine in memory (and may
+# not understand what the new Mira Server sends them) until they stop.
+stop_outdated_engines() {
+	[[ ${S_restart_engines:-0} == 1 ]] || return 0
+	local users user
+	users=$(ps -eo user:64=,args= | awk -v py="$VENV/bin/python" 'index($0, py) && /mira_engine/ {print $1}' |
+		grep -vxF -e root -e "$SERVER_USER" | sort -u | tr '\n' ' ' || true)
+	users=${users% }
+	if [[ -n $users ]]; then
+		if ((!INTERACTIVE)) || ui_yesno "These users' engines still run the previous mira-engine: $users
+
+Stop them now? They start again with the new version the next time the user connects. Agent tasks running in them stop." yes; then
+			for user in $users; do
+				say "  stopping the engine of $user (previous mira-engine)"
+				(cd / && runuser -u "$user" -- "$LAUNCHER" stop) >>"$LOG_FILE" 2>&1 || warn "could not stop the engine of $user"
+			done
+		else
+			say "  engines still on the previous mira-engine until they stop: $users"
+		fi
+	fi
+	state_set restart_engines 0
 }
 
 check_clientca() {

@@ -307,6 +307,16 @@ jobs:
           sudo bash deploy/mira-server/install.sh -y | tee /tmp/rerun.txt
           test "$(grep -c ': ok, skipped$' /tmp/rerun.txt)" -eq 15
 
+      - name: "Upgrade: engines still on the previous version are stopped"
+        run: |
+          pid=$(sudo python3 -c 'import json; print(json.load(open("/home/alice/.mira/engine.lease"))["pid"])')
+          kill -0 "$pid"
+          sudo bash deploy/mira-server/install.sh -y --upgrade | tee /tmp/upgrade.txt
+          grep -q 'stopping the engine of alice (previous mira-engine)' /tmp/upgrade.txt
+          for i in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          if kill -0 "$pid" 2>/dev/null; then echo "alice's old engine still runs"; exit 1; fi
+          sudo grep -q '^S_restart_engines=0$' /var/lib/mira-server-installer/state
+
       - name: Uninstall (keeps config and data)
         run: |
           sudo /usr/local/sbin/mira-server-uninstall --yes | tee /tmp/uninstall.txt
