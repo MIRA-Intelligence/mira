@@ -5,6 +5,10 @@
 #   sudo bash install.sh           # interactive (whiptail dialogs)
 #   sudo bash install.sh --help    # options, unattended installs
 #
+# Hosts without access to GitHub or PyPI: build an offline bundle elsewhere with
+# make-offline-bundle.sh (next to this script), copy it over, unpack it and run
+# the install.sh inside it. It installs mira-engine from the bundled wheels.
+#
 # Every step first checks the host and skips what is already in place. After a
 # failure, fix the problem and run the installer again: it continues where it
 # stopped with the same answers. Run it again later (or `sudo mira-server-install`)
@@ -329,6 +333,9 @@ MIN_ENGINE_VERSION=0.3.5        # mira-ui refuses older engines (min_agent_for_u
 DEFAULT_PRETEND_VERSION=0.3.5.dev0
 GIT_URL=https://github.com/MIRA-Intelligence/mira.git
 DEFAULT_GIT_REF=feat/server-edition
+# An offline bundle (make-offline-bundle.sh) is this script next to wheels/,
+# and optionally python/ (Python 3.11 for Ubuntu 22.04) and debs/ (Caddy).
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 STEPS=(packages python engine accounts launcher pam config policy apparmor slice sssd caddy firewall service clientca)
 declare -A STEP_TITLE=(
 	[packages]="System packages"
@@ -365,8 +372,12 @@ options below (or the answers saved by an earlier run) are used.
   --domain NAME              Public domain (public mode)
   --email ADDRESS            ACME account e-mail (public mode, optional)
   --public-url URL           URL clients use (proxy mode)
-  --source pypi|git|DIR      Install mira-engine from PyPI (default), from git
-                             (--ref) or from a source directory
+  --source SOURCE            Where mira-engine comes from: pypi (default), git
+                             (--ref), a source directory, a mira_engine-*.whl
+                             file, or "bundle" (the offline bundle this script
+                             is in; the default when it is in one)
+  --wheels DIR               Install the wheel's dependencies from DIR only (no
+                             network); a bundle uses its wheels/ directory
   --version VERSION          PyPI version (default: latest)
   --ref REF                  Git branch or tag (default: $DEFAULT_GIT_REF)
   --pretend-version VERSION  Version for source installs (default: $DEFAULT_PRETEND_VERSION)
@@ -393,7 +404,7 @@ parse_args() {
 		-y | --non-interactive) INTERACTIVE=0 ;;
 		--upgrade) UPGRADE=1 ;;
 		-h | --help) usage; exit 0 ;;
-		--mode | --ip | --domain | --email | --public-url | --source | --version | --ref | --pretend-version | \
+		--mode | --ip | --domain | --email | --public-url | --source | --wheels | --version | --ref | --pretend-version | \
 			--users | --admins | --local-accounts | --sssd-gpo | --limits | --network | --ufw)
 			(($# >= 2)) || { printf 'Missing value for %s\n' "$1" >&2; exit 2; }
 			OPT[${1#--}]=$2
@@ -483,22 +494,69 @@ same_content() {
 tmpfile() { mktemp "${TMPDIR:-/tmp}/mira-install.XXXXXX"; }
 
 # ---- questions
+bundle_wheel() {
+	local found=("$SCRIPT_DIR"/wheels/mira_engine-*.whl)
+	[[ -f ${found[0]} ]] && printf '%s' "${found[-1]}"
+	return 0
+}
+
+# "mira_engine-0.3.5-py3-none-any.whl" -> "0.3.5"
+wheel_version() {
+	local name=${1##*/}
+	name=${name#mira_engine-}
+	printf '%s' "${name%%-*}"
+}
+
+ask_wheel_source() {
+	local wheel=$1 wheels=$2
+	[[ $wheel == /* && $wheel == *.whl && -f $wheel ]] || fail_input "'$wheel' is not a mira_engine-*.whl file (absolute path)"
+	[[ ${wheel##*/} == mira_engine-* ]] || fail_input "'$wheel' is not a mira-engine wheel"
+	[[ -z $wheels || ( $wheels == /* && -d $wheels ) ]] || fail_input "'$wheels' is not a directory (absolute path)"
+	state_set source "$wheel"
+	state_set wheels "$wheels"
+}
+
 ask_source() {
-	local source=${OPT[source]:-${S_source:-pypi}} choice
+	local bundled source choice answer wheels
+	bundled=$(bundle_wheel)
+	source=${OPT[source]:-${S_source:-$([[ -n $bundled ]] && echo bundle || echo pypi)}}
+	[[ -n $bundled && -z ${OPT[source]:-} && $source == "$bundled" ]] && source=bundle
 	if [[ -z ${OPT[source]:-} ]]; then
-		choice=$(ui_menu "Where should mira-engine (with Mira Server) be installed from?" \
-			"$([[ $source == pypi || $source == git ]] && echo "$source" || echo dir)" \
-			pypi "PyPI release (recommended)" \
-			git "Git branch or tag from GitHub" \
-			dir "A source directory on this host")
+		local items=()
+		[[ -n $bundled ]] && items+=(bundle "Offline bundle in $SCRIPT_DIR (mira-engine $(wheel_version "$bundled"), no network)")
+		items+=(pypi "PyPI release$([[ -z $bundled ]] && echo " (recommended)")"
+			git "Git branch or tag from GitHub"
+			dir "A source directory on this host"
+			wheel "A mira_engine wheel file on this host")
+		case $source in
+		bundle | pypi | git) choice=$source ;;
+		*.whl) choice=wheel ;;
+		*) choice=dir ;;
+		esac
+		choice=$(ui_menu "Where should mira-engine (with Mira Server) be installed from?" "$choice" "${items[@]}")
 		case $choice in
-		pypi | git) source=$choice ;;
+		bundle | pypi | git) source=$choice ;;
 		dir) source=$(ui_input "Source directory (a mira checkout with pyproject.toml):" \
-			"$([[ $source == /* ]] && echo "$source")") ;;
+			"$([[ $source == /* && $source != *.whl ]] && echo "$source")") ;;
+		wheel)
+			source=$(ui_input "mira_engine-*.whl file (absolute path):" "$([[ $source == *.whl ]] && echo "$source")")
+			wheels=$(ui_input "Directory with its dependency wheels, for hosts without PyPI access (empty: download them from PyPI):" \
+				"${OPT[wheels]:-${S_wheels:-}}")
+			ask_wheel_source "$source" "$wheels"
+			return
+			;;
 		esac
 	fi
-	local answer
 	case $source in
+	bundle)
+		[[ -n $bundled ]] || fail_input "--source bundle: no wheels/mira_engine-*.whl next to this script"
+		ask_wheel_source "$bundled" "$SCRIPT_DIR/wheels"
+		return
+		;;
+	*.whl)
+		ask_wheel_source "$source" "${OPT[wheels]:-${S_wheels:-}}"
+		return
+		;;
 	pypi)
 		answer=$(ui_input "mira-engine version on PyPI (empty: latest):" "${OPT[version]:-${S_version:-}}")
 		state_set version "$answer"
@@ -511,9 +569,10 @@ ask_source() {
 	/*)
 		[[ -f $source/pyproject.toml ]] || fail_input "$source has no pyproject.toml"
 		;;
-	*) fail_input "--source must be pypi, git or an absolute directory, not '$source'" ;;
+	*) fail_input "--source must be pypi, git, bundle, a directory or a .whl file (absolute paths), not '$source'" ;;
 	esac
 	state_set source "$source"
+	state_set wheels ""
 	if [[ $source != pypi ]]; then
 		state_set pretend_version "${OPT[pretend-version]:-${S_pretend_version:-$DEFAULT_PRETEND_VERSION}}"
 	fi
@@ -700,7 +759,7 @@ ask_all() {
 
 summary() {
 	cat <<EOF
-Install from:   $(case $S_source in pypi) echo "PyPI mira-engine${S_version:+==$S_version}" ;; git) echo "git $GIT_URL @ ${S_ref}" ;; *) echo "$S_source" ;; esac)
+Install from:   $(case $S_source in pypi) echo "PyPI mira-engine${S_version:+==$S_version}" ;; git) echo "git $GIT_URL @ ${S_ref}" ;; *) echo "$S_source${S_wheels:+ (dependencies from $S_wheels, no network)}" ;; esac)
 Clients use:    $S_public_url ($(case $S_mode in lan) echo "LAN, Caddy with its own CA" ;; public) echo "public, Caddy with Let's Encrypt" ;; *) echo "your own proxy or SSH tunnels" ;; esac))
 Users:          ${S_users:-(none yet)}
 Admins:         ${S_admins:-(none)}
@@ -757,11 +816,24 @@ apply_packages() {
 	if [[ " ${missing[*]} " == *" caddy "* ]]; then
 		state_set installed_caddy yes
 		if ! grep -q 'Candidate: [0-9]' <<<"$(apt-cache policy caddy 2>/dev/null || true)"; then
-			add_caddy_repo
+			local debs=("$(bundle_dir)"/debs/caddy_*.deb)
+			if [[ -n $(bundle_dir) && -f ${debs[0]} ]]; then
+				say "  installing Caddy from the bundle (${debs[-1]##*/})"
+				missing=("${missing[@]/caddy/${debs[-1]}}")
+			else
+				add_caddy_repo
+			fi
 		fi
 	fi
 	say "  installing: ${missing[*]}"
 	run apt-get install -y -q "${missing[@]}"
+}
+
+# The offline bundle the wheel came from, if any (it may hold python/ and debs/).
+bundle_dir() {
+	local dir=${S_wheels:-}
+	[[ -n $dir && ${dir##*/} == wheels ]] && printf '%s' "${dir%/wheels}"
+	return 0
 }
 
 check_python() { system_python_ok || [[ -n $(uv_python) ]]; }
@@ -773,6 +845,20 @@ apply_python() {
 	aarch64 | arm64) arch=aarch64 ;;
 	*) printf 'Unsupported architecture %s\n' "$(uname -m)" >>"$LOG_FILE"; return 1 ;;
 	esac
+	local bundled=("$(bundle_dir)"/python/cpython-3.11*-install_only*.tar.gz)
+	if [[ -n $(bundle_dir) && -f ${bundled[0]} ]]; then
+		local name=${bundled[-1]##*/}
+		say "  installing a root-owned Python 3.11 from the bundle (this Ubuntu has Python < 3.11)"
+		mkdir -p "$UV_PYTHON_DIR/${name%%+*}-bundle"
+		run tar -xzf "${bundled[-1]}" --strip-components 1 -C "$UV_PYTHON_DIR/${name%%+*}-bundle"
+		run chmod -R go+rX,go-w "$UV_PYTHON_DIR"
+		state_set created_uv yes
+		return
+	fi
+	if [[ -n ${S_wheels:-} ]]; then
+		printf 'This Ubuntu has Python < 3.11 and the bundle has no python/ directory; offline installs need one\n' >>"$LOG_FILE"
+		return 1
+	fi
 	say "  installing uv and a root-owned Python 3.11 (this Ubuntu has Python < 3.11)"
 	mkdir -p "$UV_DIR"
 	run bash -c "curl -fsSL https://github.com/astral-sh/uv/releases/latest/download/uv-$arch-unknown-linux-gnu.tar.gz | tar -xz --strip-components 1 -C $UV_DIR"
@@ -787,6 +873,7 @@ check_engine() {
 	[[ -x $VENV/bin/mira-server ]] && venv_python_ok || return 1
 	version=$(engine_version) || return 1
 	if [[ $S_source == pypi && -n ${S_version:-} && $version != "$S_version" ]]; then return 1; fi
+	if [[ $S_source == *.whl && $version != "$(wheel_version "$S_source")" ]]; then return 1; fi
 	version_ge "$version" "$MIN_ENGINE_VERSION" || return 1
 	deploy_dir >/dev/null 2>&1
 }
@@ -816,10 +903,14 @@ apply_engine() {
 			run python3 -m venv "$VENV"
 		else
 			base=$(uv_python)
-			run env UV_PYTHON_INSTALL_DIR="$UV_PYTHON_DIR" "$UV_DIR/uv" venv -q --seed --python "$base" "$VENV"
+			if [[ -x $UV_DIR/uv ]]; then
+				run env UV_PYTHON_INSTALL_DIR="$UV_PYTHON_DIR" "$UV_DIR/uv" venv -q --seed --python "$base" "$VENV"
+			else
+				run "$base" -m venv "$VENV"
+			fi
 		fi
 		state_set created_venv yes
-		run "$VENV/bin/python" -m pip install -q -U pip
+		[[ -n ${S_wheels:-} ]] || run "$VENV/bin/python" -m pip install -q -U pip
 	fi
 	case $S_source in
 	pypi) spec="mira-engine[server]${S_version:+==$S_version}" ;;
@@ -827,7 +918,12 @@ apply_engine() {
 	*) spec="${S_source}[server]" ;;
 	esac
 	say "  pip install $spec (a few minutes)"
-	if [[ $S_source == pypi ]]; then
+	if [[ $S_source == *.whl ]]; then
+		[[ -f $S_source ]] || { printf '%s is gone; run the installer from the bundle again\n' "$S_source" >>"$LOG_FILE"; return 1; }
+		local offline=()
+		[[ -n ${S_wheels:-} ]] && offline=(--no-index --find-links "$S_wheels")
+		run "$VENV/bin/python" -m pip install -q -U "${offline[@]}" "$spec"
+	elif [[ $S_source == pypi ]]; then
 		run "$VENV/bin/python" -m pip install -q -U "$spec"
 	else
 		run env SETUPTOOLS_SCM_PRETEND_VERSION="$S_pretend_version" "$VENV/bin/python" -m pip install -q -U "$spec"
@@ -1224,8 +1320,8 @@ apply_clientca() {
 step_hint() {
 	case $1 in
 	packages) echo "apt failed. If another apt/dpkg process is running (unattended-upgrades), wait for it. Check network access and any apt proxy (/etc/apt/apt.conf.d)." ;;
-	python) echo "Downloading uv or Python 3.11 failed. Check access to github.com and any HTTPS proxy (https_proxy)." ;;
-	engine) echo "Installing mira-engine failed. Check access to PyPI (or the --source path/ref) and pip settings in /etc/pip.conf. Until mira-engine with Mira Server is on PyPI, use --source git." ;;
+	python) echo "Downloading uv or Python 3.11 failed. Check access to github.com and any HTTPS proxy (https_proxy). Without network, use an offline bundle that includes python/ (make-offline-bundle.sh)." ;;
+	engine) echo "Installing mira-engine failed. Check access to PyPI (or the --source path/ref) and pip settings in /etc/pip.conf. Until mira-engine with Mira Server is on PyPI, use --source git. Offline: the bundle's wheels/ must match this host's Python version and CPU (make-offline-bundle.sh --python, --arch)." ;;
 	accounts) echo "Creating groups/accounts or adding users failed. Check the names with 'getent passwd <name>' (SSSD/LDAP must resolve them)." ;;
 	launcher) echo "The engine launcher or the sudoers rules could not be written (visudo checks them)." ;;
 	sssd) echo "SSSD did not restart: 'journalctl -u sssd'. The original is in $BACKUP_DIR." ;;
@@ -1490,12 +1586,24 @@ Every step can be re-run safely. Log: $LOG_FILE"
 	finish
 }
 
+# Running the install.sh of an offline bundle on an existing (or unfinished)
+# install: install from this bundle, so a newer bundle upgrades mira-engine.
+adopt_bundle() {
+	local bundled
+	bundled=$(bundle_wheel)
+	[[ -n $bundled && -z ${OPT[source]:-} && -n ${S_status:-} && ${S_source:-} != "$bundled" ]] || return 0
+	say "Installing mira-engine $(wheel_version "$bundled") from the bundle in $SCRIPT_DIR"
+	state_set source "$bundled"
+	state_set wheels "$SCRIPT_DIR/wheels"
+}
+
 main() {
 	parse_args "$@"
 	require_root
 	prepare_log "$@"
 	check_ubuntu
 	state_load
+	adopt_bundle
 	trap on_error ERR
 	case ${S_status:-} in
 	complete) existing_install ;;

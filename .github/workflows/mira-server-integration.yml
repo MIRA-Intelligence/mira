@@ -222,7 +222,7 @@ jobs:
       - name: Lint the scripts
         run: |
           command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          shellcheck deploy/mira-server/install.sh deploy/mira-server/uninstall.sh
+          shellcheck deploy/mira-server/install.sh deploy/mira-server/uninstall.sh deploy/mira-server/make-offline-bundle.sh
           diff <(awk '/^# ---- begin common/,/^# ---- end common ----/' deploy/mira-server/install.sh) \
                <(awk '/^# ---- begin common/,/^# ---- end common ----/' deploy/mira-server/uninstall.sh)
 
@@ -350,6 +350,39 @@ jobs:
           done
           if getent group mira-users; then echo "mira-users still there"; exit 1; fi
           sudo test -d /home/alice/.mira
+
+      - name: "Offline bundle: build it, then install with PyPI and GitHub unreachable"
+        run: |
+          py="${{ steps.py.outputs.python-path }}"
+          # Wheels for the Python the installer will use: the host's on 24.04,
+          # the bundled 3.11 on 22.04.
+          target=$(python3 -c 'import sys; v = sys.version_info; print(f"{v.major}.{v.minor}" if v >= (3, 11) else "3.11")')
+          PYTHON="$py" bash deploy/mira-server/make-offline-bundle.sh --python "$target" -o /tmp/bundle
+          tar -C /tmp/bundle -xzf /tmp/bundle/mira-server-offline-*.tar.gz
+          bundle=$(ls -d /tmp/bundle/mira-server-offline-*/)
+          ls -R "$bundle" | head -n 20
+          (cd "$bundle" && sha256sum -c --quiet SHA256SUMS)
+          # From here on only apt (the Ubuntu mirror) is reachable.
+          printf '127.0.0.1 %s\n' pypi.org files.pythonhosted.org github.com api.github.com \
+            objects.githubusercontent.com release-assets.githubusercontent.com dl.cloudsmith.io | sudo tee -a /etc/hosts
+          sudo bash "$bundle/install.sh" -y --mode lan --ip "$LAN_IP" --users alice \
+            --local-accounts yes --limits none --ufw no | tee /tmp/offline.txt
+          sudo grep -q "^S_source=${bundle}wheels/mira_engine-0.3.5.dev0-py3-none-any.whl$" /var/lib/mira-server-installer/state
+          sudo grep -q "^S_wheels=${bundle}wheels$" /var/lib/mira-server-installer/state
+          if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+            ls -d /opt/mira-python/cpython-3.11*-bundle
+            test ! -e /opt/mira-uv
+          fi
+          sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml | tee /tmp/check-offline.txt
+          grep -q 'All checks passed' /tmp/check-offline.txt
+          curl -fsS --cacert /etc/mira-server/client-ca.crt "https://$LAN_IP/server/info" | grep -q '"version": "0.3.5.dev0"'
+          # Running the bundle again changes nothing.
+          sudo bash "$bundle/install.sh" -y | tee /tmp/offline-rerun.txt
+          test "$(grep -c ': ok, skipped$' /tmp/offline-rerun.txt)" -eq 15
+          sudo /usr/local/sbin/mira-server-uninstall --yes --purge
+          for path in /opt/mira /opt/mira-python /etc/mira-server; do
+            if sudo test -e "$path"; then echo "still there: $path"; exit 1; fi
+          done
 
       - name: Diagnostics
         if: always()

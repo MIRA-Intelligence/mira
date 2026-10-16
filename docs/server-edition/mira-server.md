@@ -98,6 +98,29 @@ sudo bash install.sh --non-interactive --source git --mode lan --ip 192.168.1.10
 See `sudo bash install.sh --help`. The install log is
 `/var/log/mira-server-install.log`.
 
+**Hosts without access to GitHub or PyPI**: build an offline bundle on a
+machine that has access (Linux or macOS, Python 3.11+ with pip, a mira
+checkout with the skills submodule), copy it over and run the installer inside
+it:
+
+```sh
+deploy/mira-server/make-offline-bundle.sh            # x86_64; --arch aarch64 for ARM servers
+scp mira-server-offline-<version>-x86_64.tar.gz server:
+# on the server:
+tar -xzf mira-server-offline-<version>-x86_64.tar.gz
+cd mira-server-offline-<version>-x86_64 && sudo bash install.sh
+```
+
+The bundle holds the mira-engine wheel and all its dependencies for Python
+3.11 and 3.12 (`wheels/`, installed with `pip --no-index`), a Python 3.11 build
+for Ubuntu 22.04 (`python/`) and Caddy for 22.04 (`debs/`). The installer picks
+the bundle it is in; a newer bundle's `install.sh` upgrades mira-engine. apt is
+still used for a few Ubuntu packages (`sudo`, `bubblewrap`, `python3-venv`, and
+`caddy` on 24.04), so the host needs its Ubuntu mirror or those packages
+installed beforehand. A single wheel also works: `--source
+/path/mira_engine-<version>-py3-none-any.whl`, with `--wheels DIR` for its
+dependencies when PyPI is out of reach.
+
 **Uninstall** with `sudo mira-server-uninstall` (add `--yes` for no dialogs). It
 stops the users' engines and removes what the installer set up; the
 configuration, `/var/lib/mira-server` (audit log) and the groups stay unless
