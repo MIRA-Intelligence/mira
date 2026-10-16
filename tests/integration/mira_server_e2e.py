@@ -372,7 +372,8 @@ def main() -> int:
         "providers": {"custom": {"api_key": TEAM_KEY, "api_base": llm.base}},
         "runtime": {"provider": "custom", "model": "team-model"},
     })
-    check(status == 200 and payload["scope"] == "team", f"bob saves team settings -> {status} {payload}")
+    check(status == 200 and payload.get("scope") == "team",
+          f"bob saves team settings -> {status} {payload.get('error') if isinstance(payload, dict) else payload}")
     check(TEAM_KEY not in json.dumps(payload), "the team key is not sent back")
     status, _, payload = client.request("POST", "/api/providers/custom/test", token=bt, body={})
     check(status == 200 and payload.get("ok") is True, f"bob tests the team provider -> {payload}")
