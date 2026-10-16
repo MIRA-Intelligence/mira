@@ -197,6 +197,38 @@ def test_payload_marks_team_providers_and_hides_the_engine_token(config_path: Pa
     assert TOKEN not in json.dumps(payload)
 
 
+def test_team_named_custom_provider_is_added_locked_and_never_saved(config_path: Path) -> None:
+    _write(config_path, {"providers": {"customProviders": {"custom_mine": {"apiKey": "sk-mine", "apiBase": "https://mine/v1",
+                                                                           "name": "Mine"}}}})
+    team_layer.set_team_layer(_layer(providers={"custom_corp": {
+        "api_key": TOKEN, "api_base": f"{PROXY}/custom_corp", "models": ["corp-model"], "enabled": True,
+        "name": "Corp LLM"}}))
+    config = load_config(config_path)
+    corp = config.providers.custom_providers["custom_corp"]
+    assert (corp.api_key, corp.api_base, corp.name) == (TOKEN, f"{PROXY}/custom_corp", "Corp LLM")
+    assert config.providers.custom_providers["custom_mine"].api_key == "sk-mine"
+    payload = build_ui_runtime_payload(config, projects_root=config_path.parent, config_path=config_path,
+                                       persisted=False)
+    assert payload["providers"]["custom_corp"]["managed_by"] == "team"
+    for update in ({"api_key": "sk-x"}, {"name": "Renamed"}):
+        with pytest.raises(team_layer.TeamLockedError):
+            apply_ui_runtime_update(config, {"providers": {"custom_corp": update}},
+                                    current_projects_root=config_path.parent)
+    with pytest.raises(team_layer.TeamLockedError):
+        apply_ui_runtime_update(config, {"providers": {"custom_corp": None}}, current_projects_root=config_path.parent)
+    save_config(config, config_path)
+    saved = _read(config_path)["providers"]["customProviders"]
+    assert list(saved) == ["custom_mine"] and TOKEN not in config_path.read_text(encoding="utf-8")
+
+
+def test_the_apps_setup_placeholder_does_not_block_team_defaults(config_path: Path) -> None:
+    _write(config_path, {"agents": {"defaults": {"provider": "custom", "model": "custom/mira-ui-bundle-setup"}},
+                         "providers": {"custom": {"apiBase": "http://127.0.0.1:9/v1"}}})
+    team_layer.set_team_layer(_layer())
+    config = load_config(config_path)
+    assert (config.agents.defaults.provider, config.agents.defaults.model) == ("openai", "gpt-5")
+
+
 def test_team_disabled_provider_is_off_and_locked_and_the_users_key_kept(config_path: Path) -> None:
     _write(config_path, {"providers": {"deepseek": {"apiKey": "sk-deep", "enabled": True}}})
     team_layer.set_team_layer(_layer(disabled=["deepseek", "openai_codex"]))
@@ -221,18 +253,27 @@ def test_team_disabled_provider_is_off_and_locked_and_the_users_key_kept(config_
 
 @pytest.mark.parametrize("data, message", [
     ([], "object or null"),
-    ({"extra": 1}, "unknown key"),
-    ({"providers": {"nope": {}}}, "unknown provider"),
+    ({"providers": {"openai": "x"}}, "must be an object"),
     ({"providers": {"openai": {"api_key": 1}}}, "must be strings"),
-    ({"providers": {"openai": {"secret": "x"}}}, "must be an object"),
+    ({"providers": {"custom_x": {"name": 3}}}, "name must be a string"),
     ({"defaults": {"workspace": "/tmp"}}, "unknown default"),
     ({"disabled": "openai"}, "list of provider names"),
-    ({"disabled": ["nope"]}, "unknown provider"),
     ({"model_params": [{"pattern": 1}]}, "pattern"),
 ])
 def test_parse_layer_rejects_malformed_layers(data, message: str) -> None:
     with pytest.raises(team_layer.TeamLayerError, match=message):
         team_layer.parse_layer(data)
+
+
+def test_parse_layer_skips_what_a_newer_server_adds() -> None:
+    layer = team_layer.parse_layer({
+        "revision": "r9", "future_setting": {"x": 1},
+        "providers": {"openai": {"api_key": TOKEN, "api_base": f"{PROXY}/openai", "models": [], "enabled": None,
+                                 "future_field": 1},
+                      "provider_from_the_future": {"api_key": TOKEN}},
+        "disabled": ["deepseek", "another_future_one"],
+    })
+    assert list(layer.providers) == ["openai"] and layer.disabled == ("deepseek",)
 
 
 def test_parse_layer_null_clears() -> None:
@@ -277,7 +318,7 @@ async def test_endpoint_sets_the_layer_and_reconfigures(config_path: Path) -> No
     assert updated.await_count == 1
 
 
-@pytest.mark.parametrize("body", [[], {}, {"layer": {"bad": 1}}])
+@pytest.mark.parametrize("body", [[], {}, {"layer": []}, {"layer": {"providers": {"openai": 1}}}])
 async def test_endpoint_rejects_bad_bodies(body) -> None:
     channel = _channel(AsyncMock())
     response = await channel._handle_team_layer(_request(body))

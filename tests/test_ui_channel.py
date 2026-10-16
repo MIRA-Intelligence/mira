@@ -3083,6 +3083,51 @@ async def test_handle_provider_test_reports_failure(
     assert body["message"] == "unauthorized"
 
 
+async def test_handle_provider_models_and_test_accept_additional_custom_provider(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config.model_validate(
+        {"providers": {"customProviders": {"custom_gw": {"name": "Gateway", "apiBase": "https://gw.example/v1"}}}}
+    )
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod, "read_model_cache", lambda *_a, **_k: None)
+
+    async def fake_fetch_to_cache(cfg, provider, cfg_path):
+        return _model_cache(provider), tmp_path / "models" / f"{provider}.json"
+
+    captured: dict[str, Any] = {}
+
+    async def fake_fetch(cfg, provider):
+        captured["provider"] = provider
+        captured["api_base"] = cfg.providers.custom_providers["custom_gw"].api_base
+        return _model_cache(provider)
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_models_to_cache", fake_fetch_to_cache)
+    monkeypatch.setattr(ui_channel_mod, "fetch_provider_models", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "custom_gw"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+    assert resp.status == 200
+    assert json.loads(resp.text)["provider"] == "custom_gw"
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "custom_gw"}
+    req.json = AsyncMock(return_value={"api_base": "https://other.example/v1"})
+    resp = await ui_channel._handle_provider_test(req)
+    assert json.loads(resp.text)["ok"] is True
+    assert captured == {"provider": "custom_gw", "api_base": "https://other.example/v1"}
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "custom_missing"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+    assert resp.status == 400
+
+
 async def test_ws_handler_rejects_non_object_frames(
     ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:

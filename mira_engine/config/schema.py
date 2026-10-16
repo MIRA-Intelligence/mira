@@ -1,5 +1,6 @@
 """Configuration schema using Pydantic."""
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -437,6 +438,19 @@ class ProviderConfig(Base):
     # (has a credential/endpoint/model list, or is local/OAuth). ``True``/``False``
     # force the state regardless of configuration.
     enabled: bool | None = None
+    # User-chosen display name. Only custom (OpenAI-compatible) providers use it;
+    # names are labels, not identifiers, so two providers may share one.
+    name: str | None = None
+
+
+# Ids of additional custom providers under ``providers.customProviders``. The
+# built-in ``custom`` entry keeps its own id.
+CUSTOM_PROVIDER_ID_PATTERN = re.compile(r"^custom_[a-z0-9]{1,32}$")
+
+
+def is_custom_provider_id(name: str | None) -> bool:
+    """True for ``custom`` and for additional custom provider ids (``custom_<suffix>``)."""
+    return bool(name) and (name == "custom" or bool(CUSTOM_PROVIDER_ID_PATTERN.match(name)))
 
 
 class ModelParamRule(Base):
@@ -462,6 +476,8 @@ class ProvidersConfig(Base):
     # default; surfaced and edited from the Providers UI.
     model_params: list[ModelParamRule] = Field(default_factory=list)
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
+    # Additional OpenAI-compatible endpoints, keyed by a stable id ("custom_<suffix>").
+    custom_providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -489,6 +505,15 @@ class ProvidersConfig(Base):
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
+
+    def entry(self, name: str) -> ProviderConfig | None:
+        """Return the config for a provider id, including additional custom providers."""
+        if name in self.custom_providers:
+            return self.custom_providers[name]
+        if name in {"proxy", "model_params", "custom_providers"}:
+            return None
+        value = getattr(self, name, None)
+        return value if isinstance(value, ProviderConfig) else None
 
 
 class HeartbeatConfig(Base):
@@ -686,6 +711,8 @@ class Config(BaseSettings):
         else:
             forced = self.agents.defaults.provider
         if forced != "auto":
+            if forced in self.providers.custom_providers:
+                return self.providers.custom_providers[forced], forced
             forced_normalized = _normalized_provider_name(forced)
             spec = find_by_name(forced_normalized or forced)
             if spec:

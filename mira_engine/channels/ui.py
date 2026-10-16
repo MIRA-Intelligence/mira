@@ -42,7 +42,7 @@ from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.config import loader as config_loader
 from mira_engine.config import team_layer
 from mira_engine.config.paths import get_runtime_subdir, get_workspace_path
-from mira_engine.config.schema import Config, UiChannelConfig
+from mira_engine.config.schema import Config, UiChannelConfig, is_custom_provider_id
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
     build_ui_runtime_payload,
@@ -100,6 +100,16 @@ PLAN_FILENAME = "task_plan.json"
 # Sentinel session id used by the UI to manage globally-scoped skill plugins
 # without a selected project. Mirrors GLOBAL_SKILLS_SESSION_ID in the frontend.
 _GLOBAL_SKILLS_SESSION_ID = "__global__"
+
+
+def _resolve_ui_provider_name(config: Config, name: str) -> str | None:
+    """Map a provider id from the UI to its config name (additional custom ids included)."""
+    if not name:
+        return None
+    if name in config.providers.custom_providers:
+        return name
+    spec = find_by_name(name)
+    return spec.name if spec else None
 
 
 def host_policy_payload() -> dict[str, Any]:
@@ -2907,15 +2917,16 @@ class UiChannel(BaseChannel):
 
     async def _handle_provider_models(self, request: web.Request) -> web.Response:
         """Fetch (or read cached) available models for a provider."""
-        provider_name = request.match_info.get("name", "").strip()
-        spec = find_by_name(provider_name) if provider_name else None
-        if spec is None:
-            return web.json_response({"error": f"unknown provider: {provider_name}"}, status=400)
-        provider_name = spec.name
-
-        refresh = request.query.get("refresh", "").lower() in ("1", "true", "yes")
+        raw_provider_name = request.match_info.get("name", "").strip()
+        if not is_custom_provider_id(raw_provider_name) and find_by_name(raw_provider_name or "_") is None:
+            return web.json_response({"error": f"unknown provider: {raw_provider_name}"}, status=400)
         config_path = config_loader.get_config_path().expanduser().resolve()
         runtime_config = config_loader.load_config(config_path)
+        provider_name = _resolve_ui_provider_name(runtime_config, raw_provider_name)
+        if provider_name is None:
+            return web.json_response({"error": f"unknown provider: {raw_provider_name}"}, status=400)
+
+        refresh = request.query.get("refresh", "").lower() in ("1", "true", "yes")
 
         if not refresh:
             cache = read_model_cache(provider_name, config_path)
@@ -2938,11 +2949,7 @@ class UiChannel(BaseChannel):
 
     async def _handle_provider_test(self, request: web.Request) -> web.Response:
         """Validate provider connectivity using optional transient credentials."""
-        provider_name = request.match_info.get("name", "").strip()
-        spec = find_by_name(provider_name) if provider_name else None
-        if spec is None:
-            return web.json_response({"error": f"unknown provider: {provider_name}"}, status=400)
-        provider_name = spec.name
+        raw_provider_name = request.match_info.get("name", "").strip()
 
         try:
             body = await request.json()
@@ -2955,9 +2962,10 @@ class UiChannel(BaseChannel):
 
         config_path = config_loader.get_config_path().expanduser().resolve()
         runtime_config = config_loader.load_config(config_path)
-        provider_cfg = getattr(runtime_config.providers, provider_name, None)
-        if provider_cfg is None:
-            return web.json_response({"error": f"unknown provider: {provider_name}"}, status=400)
+        provider_name = _resolve_ui_provider_name(runtime_config, raw_provider_name)
+        provider_cfg = runtime_config.providers.entry(provider_name) if provider_name else None
+        if provider_name is None or provider_cfg is None:
+            return web.json_response({"error": f"unknown provider: {raw_provider_name}"}, status=400)
 
         # Apply transient overrides to the in-memory config only (never persisted).
         api_key = body.get("api_key")

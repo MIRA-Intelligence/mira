@@ -747,3 +747,152 @@ def test_save_ui_runtime_update_preserves_unknown_keys(tmp_path) -> None:
 
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["legacySection"] == {"kept": True}
+
+
+def _payload(cfg: Config) -> dict:
+    return build_ui_runtime_payload(
+        cfg,
+        projects_root=Path("/tmp/workspace"),
+        config_path=Path("/tmp/config.json"),
+        persisted=True,
+    )
+
+
+def test_build_ui_runtime_payload_lists_additional_custom_providers_after_custom() -> None:
+    cfg = Config.model_validate(
+        {
+            "providers": {
+                "custom": {"name": "Lab vLLM", "apiBase": "http://lab:8000/v1"},
+                "customProviders": {
+                    "custom_a1": {"name": "Team gateway", "apiBase": "https://gw.example/v1", "apiKey": "sk-team-1234"},
+                    "custom_b2": {"apiBase": "http://other:8000/v1"},
+                },
+            }
+        }
+    )
+
+    providers = _payload(cfg)["providers"]
+    names = list(providers)
+
+    assert names.index("custom_a1") == names.index("custom") + 1
+    assert names.index("custom_b2") == names.index("custom") + 2
+    assert providers["custom"]["display_name"] == "Lab vLLM"
+    assert providers["custom_a1"]["display_name"] == "Team gateway"
+    assert providers["custom_b2"]["display_name"] == "Custom"
+    assert providers["custom_a1"]["is_custom"] is True
+    assert providers["custom_a1"]["api_base_required"] is True
+    assert providers["custom_a1"]["api_key_required"] is False
+    assert providers["custom_a1"]["api_key_preview"] == "sk-t...34"
+    assert providers["deepseek"]["is_custom"] is False
+
+
+def test_apply_ui_runtime_update_creates_renames_and_deletes_custom_providers() -> None:
+    cfg = Config()
+    cfg.providers.custom_providers["custom_old"] = cfg.providers.custom.model_copy()
+
+    _, changed = apply_ui_runtime_update(
+        cfg,
+        {
+            "providers": {
+                "custom": {"name": "  Primary  "},
+                "custom_new1": {"name": "Gateway", "api_base": "https://gw.example/v1", "models": ["m1"]},
+                "custom_old": None,
+            },
+            "runtime": {"provider": "custom_new1", "model": "m1", "critic_provider": "custom_new1"},
+        },
+        current_projects_root=Path("/tmp/workspace"),
+    )
+
+    assert changed is True
+    assert cfg.providers.custom.name == "Primary"
+    assert set(cfg.providers.custom_providers) == {"custom_new1"}
+    created = cfg.providers.custom_providers["custom_new1"]
+    assert (created.name, created.api_base, created.models) == ("Gateway", "https://gw.example/v1", ["m1"])
+    assert cfg.agents.defaults.critic_provider == "custom_new1"
+    assert cfg.get_provider_name("m1") == "custom_new1"
+    assert cfg.get_api_base("m1") == "https://gw.example/v1"
+
+
+@pytest.mark.parametrize(
+    "providers",
+    [
+        # Two custom providers with the same name (case and spaces ignored).
+        {"custom": {"name": "Same"}, "custom_x": {"name": " same "}},
+        # A custom provider named like a built-in provider.
+        {"custom_x": {"name": "DeepSeek"}},
+        # An unnamed additional custom provider would show as "Custom".
+        {"custom_x": {"api_base": "http://x/v1"}},
+    ],
+)
+def test_apply_ui_runtime_update_rejects_duplicate_provider_names(providers) -> None:
+    with pytest.raises(ValueError, match="already in use"):
+        apply_ui_runtime_update(Config(), {"providers": providers}, current_projects_root=Path("/tmp/workspace"))
+
+
+def test_apply_ui_runtime_update_allows_swapping_custom_names() -> None:
+    cfg = Config.model_validate(
+        {"providers": {"custom": {"name": "A"}, "customProviders": {"custom_x": {"name": "B"}}}}
+    )
+    apply_ui_runtime_update(
+        cfg,
+        {"providers": {"custom": {"name": "B"}, "custom_x": {"name": "A"}}},
+        current_projects_root=Path("/tmp/workspace"),
+    )
+    assert (cfg.providers.custom.name, cfg.providers.custom_providers["custom_x"].name) == ("B", "A")
+
+
+@pytest.mark.parametrize(
+    "providers",
+    [
+        {"deepseek": {"name": "Mine"}},
+        {"custom_Bad!": {"name": "x"}},
+        {"custom_x": {"name": 3}},
+    ],
+)
+def test_apply_ui_runtime_update_rejects_invalid_custom_provider_updates(providers) -> None:
+    with pytest.raises(ValueError):
+        apply_ui_runtime_update(Config(), {"providers": providers}, current_projects_root=Path("/tmp/workspace"))
+
+
+def test_apply_ui_runtime_update_rejects_role_bound_to_deleted_custom_provider() -> None:
+    cfg = Config()
+    cfg.providers.custom_providers["custom_gone"] = cfg.providers.custom.model_copy()
+    with pytest.raises(ValueError, match="unsupported provider"):
+        apply_ui_runtime_update(
+            cfg,
+            {"providers": {"custom_gone": None}, "runtime": {"critic_provider": "custom_gone"}},
+            current_projects_root=Path("/tmp/workspace"),
+        )
+
+
+def test_save_ui_runtime_update_persists_custom_provider_changes(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "custom": {"apiBase": "http://lab:8000/v1"},
+                    "customProviders": {"custom_old": {"name": "Old", "apiBase": "http://old/v1"}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = {
+        "providers": {
+            "custom": {"name": "Lab"},
+            "custom_new": {"name": "New", "api_base": "http://new/v1", "api_key": "sk-new"},
+            "custom_old": None,
+        }
+    }
+    config = load_config(config_path)
+    apply_ui_runtime_update(config, payload, current_projects_root=tmp_path)
+    save_ui_runtime_update(config, payload, current_projects_root=tmp_path, config_path=config_path)
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))["providers"]
+    assert saved["custom"]["name"] == "Lab"
+    assert set(saved["customProviders"]) == {"custom_new"}
+    assert saved["customProviders"]["custom_new"]["apiBase"] == "http://new/v1"
+    assert saved["customProviders"]["custom_new"]["apiKey"] == "sk-new"
+    reloaded = load_config(config_path)
+    assert reloaded.providers.custom_providers["custom_new"].name == "New"

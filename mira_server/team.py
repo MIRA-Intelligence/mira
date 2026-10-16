@@ -58,7 +58,14 @@ class Upstream:
 
 
 def _provider_names() -> tuple[str, ...]:
-    return tuple(name for name in ProvidersConfig.model_fields if name not in {"proxy", "model_params"})
+    return tuple(name for name in ProvidersConfig.model_fields
+                 if name not in {"proxy", "model_params", "custom_providers"})
+
+
+def _custom_records(providers: dict[str, Any]) -> dict[str, Any]:
+    """Named custom providers (``custom_<id>``) in raw team settings."""
+    records = _get(providers, "custom_providers")
+    return records if isinstance(records, dict) else {}
 
 
 def _get(record: dict[str, Any], field_name: str, default: Any = None) -> Any:
@@ -150,7 +157,7 @@ class TeamConfig:
                                   for key in ("api_key", "api_base"))
             if spec is not None and spec.is_oauth and sets_credential:
                 raise TeamConfigError(f"{spec.label} signs in per user and cannot be a team provider")
-            record = getattr(config.providers, name, None)
+            record = config.providers.entry(name)
             if record is None or not (record.api_key or record.api_base):
                 continue
             if not upstream_base(name, record.api_base):
@@ -185,8 +192,9 @@ class TeamConfig:
         if not isinstance(providers, dict):
             return {}
         found: dict[str, dict[str, Any]] = {}
-        for name in _provider_names():
-            record = _get(providers, name)
+        named = [(name, _get(providers, name)) for name in _provider_names()]
+        named += list(_custom_records(providers).items())
+        for name, record in named:
             if not isinstance(record, dict):
                 continue
             spec = find_by_name(name)
@@ -198,6 +206,8 @@ class TeamConfig:
                 continue
             found[name] = {"api_key": api_key, "api_base": api_base,
                            "models": list(_get(record, "models", []) or []), "enabled": _get(record, "enabled")}
+            if name.startswith("custom_"):
+                found[name]["name"] = _get(record, "name")
         return found
 
     def disabled_providers(self) -> list[str]:
@@ -228,11 +238,12 @@ class TeamConfig:
 
     def layer_for(self, engine_token: str, proxy_base: str) -> dict[str, Any]:
         """The layer for one engine (``mira_engine.config.team_layer.parse_layer`` format)."""
-        providers = {
-            name: {"api_key": engine_token, "api_base": f"{proxy_base}/{name}",
-                   "models": record["models"], "enabled": record["enabled"]}
-            for name, record in self.team_providers().items()
-        }
+        providers = {}
+        for name, record in self.team_providers().items():
+            providers[name] = {"api_key": engine_token, "api_base": f"{proxy_base}/{name}",
+                               "models": record["models"], "enabled": record["enabled"]}
+            if "name" in record:
+                providers[name]["name"] = record["name"]
         layer: dict[str, Any] = {"revision": self.revision(), "providers": providers,
                                  "disabled": self.disabled_providers()}
         raw_providers = self._raw.get("providers")

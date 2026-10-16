@@ -9,6 +9,8 @@ keeps it in memory only and applies it to the user's raw ``config.json`` in
   and cannot be changed through the API (:class:`TeamLockedError`). Their
   endpoint is Mira Server's LLM proxy and their key is this engine's gateway
   token, so the team's real keys never reach the engine.
+- **Named custom providers** (``custom_<id>``) the team defines are added to
+  the user's ``providers.customProviders`` the same way, under the team's name.
 - **Disabled providers**: providers administrators turned off are off for the
   user too and cannot be turned on (the user's own key is kept, unused).
 - **model_params**, when the team sets them, replace the user's rules (locked).
@@ -25,6 +27,9 @@ layer never ends up in the user's config.json. A default the user leaves at
 the team value is not saved either, so it keeps following the team.
 
 Host policy (``/etc/mira/policy.toml``) is applied after the layer and wins.
+
+Parsing is lenient where a newer Mira Server may send more than this engine
+knows (keys, providers): those are skipped, so the rest of the layer applies.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
 from pydantic.alias_generators import to_camel
 
 from mira_engine.security.host_policy import PolicyLockedError
@@ -56,6 +62,9 @@ DEFAULT_GROUPS: tuple[tuple[str, ...], ...] = (
 )
 DEFAULT_FIELDS: tuple[str, ...] = tuple(name for group in DEFAULT_GROUPS for name in group)
 PROVIDER_KEYS = ("api_key", "api_base", "models", "enabled")
+CUSTOM_CONTAINER = "customProviders"
+# What the desktop app writes for an engine nobody set up yet: not a choice.
+_SETUP_PLACEHOLDER_MODEL = "custom/mira-ui-bundle-setup"
 
 _ABSENT = object()
 
@@ -110,7 +119,7 @@ def parse_layer(data: Any) -> TeamLayer:
         raise TeamLayerError("layer must be an object or null")
     unknown = sorted(set(data) - {"revision", "providers", "disabled", "model_params", "defaults"})
     if unknown:
-        raise TeamLayerError(f"unknown key(s): {', '.join(unknown)}")
+        logger.warning("Team layer: ignoring unknown key(s) {} (a newer Mira Server)", ", ".join(unknown))
     revision = data.get("revision", "")
     if not isinstance(revision, str):
         raise TeamLayerError("revision must be a string")
@@ -119,12 +128,24 @@ def parse_layer(data: Any) -> TeamLayer:
     raw_providers = data.get("providers") or {}
     if not isinstance(raw_providers, dict):
         raise TeamLayerError("providers must be an object")
-    known = set(ProvidersConfig.model_fields) - {"proxy", "model_params"}
+    from mira_engine.config.schema import CUSTOM_PROVIDER_ID_PATTERN
+
+    known = set(ProvidersConfig.model_fields) - {"proxy", "model_params", "custom_providers"}
+
+    def usable(name: str) -> bool:
+        if name in known or CUSTOM_PROVIDER_ID_PATTERN.match(name):
+            return True
+        logger.warning("Team layer: ignoring provider {} that this engine does not know", name)
+        return False
+
     for name, record in raw_providers.items():
-        if name not in known:
-            raise TeamLayerError(f"unknown provider: {name}")
-        if not isinstance(record, dict) or set(record) - set(PROVIDER_KEYS):
-            raise TeamLayerError(f"providers.{name} must be an object with {', '.join(PROVIDER_KEYS)}")
+        if not isinstance(record, dict):
+            raise TeamLayerError(f"providers.{name} must be an object")
+        if not usable(name):
+            continue
+        display = record.get("name")
+        if display is not None and not isinstance(display, str):
+            raise TeamLayerError(f"providers.{name}.name must be a string")
         api_key, api_base = record.get("api_key", ""), record.get("api_base")
         models, enabled = record.get("models", []), record.get("enabled")
         if not isinstance(api_key, str) or not (api_base is None or isinstance(api_base, str)):
@@ -134,13 +155,14 @@ def parse_layer(data: Any) -> TeamLayer:
         if enabled is not None and not isinstance(enabled, bool):
             raise TeamLayerError(f"providers.{name}.enabled must be a boolean or null")
         providers[name] = {"api_key": api_key, "api_base": api_base, "models": list(models), "enabled": enabled}
+        if CUSTOM_PROVIDER_ID_PATTERN.match(name):
+            providers[name]["name"] = display or None
 
     disabled = data.get("disabled") or []
     if not isinstance(disabled, list) or not all(isinstance(name, str) for name in disabled):
         raise TeamLayerError("disabled must be a list of provider names")
-    for name in disabled:
-        if name not in known:
-            raise TeamLayerError(f"unknown provider: {name}")
+    disabled = [name for name in disabled if name in known or usable(name)]
+    disabled = [name for name in disabled if not CUSTOM_PROVIDER_ID_PATTERN.match(name)]
 
     model_params = data.get("model_params")
     if model_params is not None:
@@ -210,12 +232,29 @@ def _record(parent: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _is_custom(name: str) -> bool:
+    from mira_engine.config.schema import CUSTOM_PROVIDER_ID_PATTERN
+
+    return bool(CUSTOM_PROVIDER_ID_PATTERN.match(name))
+
+
+def _provider_path(providers: dict[str, Any], name: str) -> tuple[tuple[str, ...], dict[str, Any], str]:
+    """(path under the config, container dict, key) where ``name``'s record lives."""
+    if not _is_custom(name):
+        return ("providers", to_camel(name)), providers, to_camel(name)
+    if "custom_providers" in providers and CUSTOM_CONTAINER not in providers:
+        providers[CUSTOM_CONTAINER] = providers.pop("custom_providers")
+    container = _record(providers, CUSTOM_CONTAINER)
+    return ("providers", CUSTOM_CONTAINER, name), container, name
+
+
 @dataclass
 class TeamValues:
     """The user's own values of what the layer changed (kept on the Config)."""
 
     layer: TeamLayer = field(default_factory=TeamLayer)
-    # ("providers", alias) / ("providers", "modelParams") -> (original key, value)
+    # path (e.g. ("providers", "openai"), ("providers", "customProviders", "custom_x"),
+    # ("providers", "modelParams")) -> (original key, value)
     replaced: dict[tuple[str, ...], tuple[str | None, Any]] = field(default_factory=dict)
     # AgentDefaults alias -> effective value after validation (filled defaults)
     filled: dict[str, Any] = field(default_factory=dict)
@@ -230,15 +269,23 @@ def apply_to_raw(data: dict[str, Any], layer: TeamLayer | None = None) -> TeamVa
     if layer.providers or layer.disabled or layer.model_params is not None:
         providers = _record(data, "providers")
         for name in layer.disabled:
-            key, value = _pop_key(providers, name)
-            values.replaced[("providers", to_camel(name))] = (key, value)
-            providers[to_camel(name)] = {**(value if isinstance(value, dict) else {}), "enabled": False}
+            path, container, key = _provider_path(providers, name)
+            original = _pop_key(container, name)
+            values.replaced[path] = original
+            value = original[1]
+            container[key] = {**(value if isinstance(value, dict) else {}), "enabled": False}
         for name, record in layer.providers.items():
-            values.replaced[("providers", to_camel(name))] = _pop_key(providers, name)
-            providers[to_camel(name)] = {
+            path, container, key = _provider_path(providers, name)
+            if _is_custom(name):
+                values.replaced[path] = (name, container.pop(name)) if name in container else (None, _ABSENT)
+            else:
+                values.replaced[path] = _pop_key(container, name)
+            container[key] = {
                 "apiKey": record["api_key"], "apiBase": record["api_base"],
                 "models": list(record["models"]), "enabled": record["enabled"],
             }
+            if record.get("name"):
+                container[key]["name"] = record["name"]
         if layer.model_params is not None:
             values.replaced[("providers", "modelParams")] = _pop_key(providers, "model_params")
             providers["modelParams"] = [dict(rule) for rule in layer.model_params]
@@ -246,7 +293,8 @@ def apply_to_raw(data: dict[str, Any], layer: TeamLayer | None = None) -> TeamVa
         defaults = _record(_record(data, "agents"), "defaults")
         for group in DEFAULT_GROUPS:
             present = [name for name in group if name in layer.defaults]
-            if not present or any(_user_chose(defaults, name) for name in group):
+            placeholder = group == ("provider", "model") and defaults.get("model") == _SETUP_PLACEHOLDER_MODEL
+            if not present or (not placeholder and any(_user_chose(defaults, name) for name in group)):
                 continue
             for name in present:
                 defaults.pop(name, None)
@@ -276,8 +324,10 @@ def restore_team_values(config: "Config", data: dict[str, Any]) -> dict[str, Any
     """
     values = team_values(config)
     for path, (key, value) in values.replaced.items():
-        parent = _record(data, path[0])
-        parent.pop(path[1], None)
+        parent = data
+        for part in path[:-1]:
+            parent = _record(parent, part)
+        parent.pop(path[-1], None)
         if key is not None:
             parent[key] = value
     if values.filled:
@@ -307,17 +357,20 @@ def check_provider_change(config: "Config", provider_name: str, update: dict[str
     layer = team_values(config).layer
     record = layer.providers.get(provider_name)
     if record is None and provider_name in layer.disabled:
-        current = getattr(config.providers, provider_name)
+        current = config.providers.entry(provider_name)
         record = {"api_key": current.api_key, "api_base": current.api_base,
                   "models": list(current.models), "enabled": False}
     if record is None:
         return
-    for key in PROVIDER_KEYS:
-        if key not in update:
+    for key in (*PROVIDER_KEYS, "name"):
+        if key not in update or (key == "name" and key not in record):
             continue
         requested = update[key]
         current = record[key]
-        if key == "api_key":
+        if key == "name":
+            requested = (requested or "").strip() if isinstance(requested, str) else requested
+            current = current or ""
+        elif key == "api_key":
             # The UI never has the key; an empty or unchanged value is no change.
             if not isinstance(requested, str) or not requested.strip() or requested.strip() == current:
                 continue

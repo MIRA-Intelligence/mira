@@ -193,6 +193,26 @@ async def test_invalid_team_changes_are_400(harness: Harness, body: dict, messag
     assert not harness.server.team.path.exists()
 
 
+async def test_named_custom_team_provider_reaches_engines_and_the_proxy(harness: Harness,
+                                                                         provider: FakeProvider) -> None:
+    base = await provider.start()
+    alice = await harness.login("alice")
+    await harness.wait_running(alice)
+    admin = await harness.login("bob")
+    status, data = await _team_config(harness, admin, {"providers": {"custom_corp": {
+        "name": "Corp LLM", "api_key": TEAM_KEY, "api_base": base, "models": ["corp-model"]}}})
+    assert status == 200 and data["providers"]["custom_corp"]["api_key_preview"] == "sk-t...ue", data
+    await harness.server.engines.drain()
+    layer = harness.spawner.logs["alice"].team_layers[-1]
+    token = harness.spawner.tokens["alice"]
+    assert layer["providers"]["custom_corp"] == {
+        "api_key": token, "api_base": f"{harness.server.llm_proxy_base}/custom_corp",
+        "models": ["corp-model"], "enabled": None, "name": "Corp LLM"}
+    resp = await harness.client.post("/llm/custom_corp/chat/completions", data=b"{}",
+                                     headers={"Authorization": f"Bearer {token}"})
+    assert resp.status == 200 and provider.requests[-1]["headers"]["Authorization"] == f"Bearer {TEAM_KEY}"
+
+
 async def test_admin_turns_providers_off_for_everyone(harness: Harness) -> None:
     alice = await harness.login("alice")
     await harness.wait_running(alice)
