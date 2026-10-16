@@ -639,7 +639,17 @@ EOF
 }
 
 remove_account() {
-	if id "$SERVER_USER" >/dev/null 2>&1; then run userdel "$SERVER_USER"; fi
+	id "$SERVER_USER" >/dev/null 2>&1 || return 0
+	# The service is stopped, but its systemd user manager or a sudo child can
+	# outlive it for a moment; userdel refuses while any process runs as it.
+	local i
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		pgrep -u "$SERVER_USER" >/dev/null || break
+		((i == 1)) && { loginctl terminate-user "$SERVER_USER" >/dev/null 2>&1 || true; }
+		((i == 5)) && { pkill -KILL -u "$SERVER_USER" || true; }
+		sleep 1
+	done
+	run userdel "$SERVER_USER"
 }
 
 remove_venv() { if [[ -n $U_VENV ]]; then remove_path "$U_VENV"; fi; }
