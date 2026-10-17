@@ -21,6 +21,31 @@ def strip_think(text: str) -> str:
     return text.strip()
 
 
+# Some OpenAI models emit their native citation markup, "\ue200cite\ue202ref\ue202ref\ue201",
+# instead of the tags they were given; the private-use delimiters render as nothing.
+_ENTITY_RE = re.compile("\ue200([^\ue201]*)\ue201")
+_UNCLOSED_ENTITY_RE = re.compile("\ue200[^\ue201]*$")
+_STRAY_ENTITY_CHARS_RE = re.compile("[\ue200-\ue202]")
+
+
+def _render_entity(match: re.Match[str]) -> str:
+    kind, *refs = match.group(1).split("\ue202")
+    refs = [ref.strip().strip("[]") for ref in refs if ref.strip().strip("[]")]
+    if "cite" in kind:
+        return "".join(f"[{ref}]" for ref in refs)
+    return " ".join(refs)
+
+
+def normalize_citations(text: str) -> str:
+    """Turn native citation markup into [ref] tags; drop an unclosed trailing one.
+
+    Dropping the unclosed tail keeps streamed text a prefix of the final text.
+    """
+    text = _ENTITY_RE.sub(_render_entity, text)
+    text = _UNCLOSED_ENTITY_RE.sub("", text)
+    return _STRAY_ENTITY_CHARS_RE.sub("", text)
+
+
 def detect_image_mime(data: bytes) -> str | None:
     """Detect image MIME type from magic bytes, ignoring file extension."""
     if data[:8] == b"\x89PNG\r\n\x1a\n":
