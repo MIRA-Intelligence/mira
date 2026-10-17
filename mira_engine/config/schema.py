@@ -505,6 +505,10 @@ class ApiConfig(Base):
     host: str = "127.0.0.1"  # Safer default: local-only bind.
     port: int = 8900
     timeout: float = 120.0  # Per-request timeout in seconds.
+    # Bearer keys for /v1; env MIRA_API_KEYS wins. Empty falls back to the gateway token.
+    keys: list[str] = Field(default_factory=list)
+    # Browser origins allowed to call /v1; requests with any other Origin get 403.
+    cors_origins: list[str] = Field(default_factory=list)
 
 
 class GatewayConfig(Base):
