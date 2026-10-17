@@ -33,6 +33,7 @@ class EngineLog:
     ws_frames: list[str] = field(default_factory=list)
     ws_sockets: list[web.WebSocketResponse] = field(default_factory=list)
     ws_paths: list[str] = field(default_factory=list)
+    team_layers: list[Any] = field(default_factory=list)
 
 
 def make_engine_app(token: str, log: EngineLog) -> web.Application:
@@ -81,6 +82,11 @@ def make_engine_app(token: str, log: EngineLog) -> web.Application:
         await resp.write_eof()
         return resp
 
+    async def team_layer(request: web.Request) -> web.Response:
+        body = await request.json()
+        log.team_layers.append(body["layer"])
+        return web.json_response({"ok": True, "revision": (body["layer"] or {}).get("revision", "")})
+
     async def ws(request: web.Request) -> web.WebSocketResponse:
         sock = web.WebSocketResponse()
         await sock.prepare(request)
@@ -101,6 +107,7 @@ def make_engine_app(token: str, log: EngineLog) -> web.Application:
     app.router.add_route("*", "/api/echo", echo)
     app.router.add_post("/api/upload", upload)
     app.router.add_get("/api/stream", stream)
+    app.router.add_put("/api/team/layer", team_layer)
     app.router.add_get("/ws", ws)
     app.router.add_get("/ws/workflow/v1", ws)
     return app
@@ -174,6 +181,8 @@ class FakeResolver:
         self.users: dict[str, Identity] = {
             "alice": Identity("alice", 1001, "/home/alice", "Alice A", ("user",)),
             "bob": Identity("bob", 1002, "/home/bob", "Bob B", ("user", "admin")),
+            # An administration account outside mira-users: no engine.
+            "dave": Identity("dave", 1004, "/home/dave", "Dave D", ("admin",)),
         }
         self.outsiders = {"carol"}
         self.calls = 0
@@ -196,7 +205,7 @@ class FakeBackend:
 
     async def verify(self, username: str, password: str) -> bool:
         self.calls += 1
-        return password == PASSWORD and username in {"alice", "bob", "carol"}
+        return password == PASSWORD and username in {"alice", "bob", "carol", "dave"}
 
 
 def ok_listener(port: int, uid: int, *, pid: int | None = None) -> ListenerCheck:
