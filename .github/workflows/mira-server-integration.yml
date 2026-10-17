@@ -1,0 +1,427 @@
+name: Mira Server integration
+
+# Acceptance test for Mira Server (#152): two real host accounts sign in through
+# PAM, each gets an engine running as their own uid through the sudo launcher,
+# and neither can reach the other's engine, files or config.
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - feat/server-edition
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-multiuser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Python (wheel build only)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip wheel . --no-deps -w dist
+          ls -l dist
+
+      - name: Create host accounts and groups
+        run: |
+          sudo groupadd mira-users
+          sudo groupadd mira-admins
+          for user in alice bob carol dave; do sudo useradd --create-home --shell /bin/bash "$user"; done
+          sudo usermod -aG mira-users alice
+          sudo usermod -aG mira-users,mira-admins bob   # carol stays outside mira-users
+          sudo usermod -aG mira-admins dave             # administration only: no engine
+          printf 'alice:alice-Pw-1\nbob:bob-Pw-2\ncarol:carol-Pw-3\ndave:dave-Pw-4\n' | sudo chpasswd
+          id alice; id bob; id carol; id dave
+
+      - name: Install the engine system-wide in /opt/mira
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-venv bubblewrap
+          sudo /usr/bin/python3 -m venv /opt/mira
+          sudo /opt/mira/bin/pip install --quiet --upgrade pip
+          sudo /opt/mira/bin/pip install --quiet "$(ls dist/mira_engine-*.whl)[server]"
+          /opt/mira/bin/mira-server --help >/dev/null
+
+      - name: Mira Server account, launcher, sudoers and PAM service
+        run: |
+          sudo useradd --system --home-dir /var/lib/mira-server --create-home --shell /usr/sbin/nologin mira-server
+          sudo chmod 700 /var/lib/mira-server
+          sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local --engine-python /opt/mira/bin/python \
+            | grep -E '^    (Cmnd_Alias|Defaults!|mira-server ALL=)' | sed 's/^    //' | sudo tee /etc/sudoers.d/mira-server
+          test "$(sudo grep -cE '^(Cmnd_Alias|Defaults!|mira-server ALL=)' /etc/sudoers.d/mira-server)" -eq 4
+          sudo chmod 0440 /etc/sudoers.d/mira-server
+          sudo visudo -cf /etc/sudoers.d/mira-server
+          sudo cp deploy/mira-server/pam.d-mira-server /etc/pam.d/mira-server
+          sudo cp deploy/mira-server/pam.d-mira-engine /etc/pam.d/mira-engine
+          # Per-user limits; the e2e test checks that engines get them.
+          sudo install -D -m 0644 deploy/mira-server/user-slice-mira.conf /etc/systemd/system/user-.slice.d/50-mira.conf
+          sudo sed -i 's/^TasksMax=.*/TasksMax=4321/' /etc/systemd/system/user-.slice.d/50-mira.conf
+          sudo systemctl daemon-reload
+          sudo install -D -o root -g root -m 0644 deploy/mira-server/policy.toml /etc/mira/policy.toml
+          sudo mkdir -p /etc/mira-server
+          sudo tee /etc/mira-server/mira-server.toml >/dev/null <<'EOF'
+          [server]
+          listen = "127.0.0.1:8740"
+          public_url = "http://127.0.0.1:8740"
+          data_dir = "/var/lib/mira-server"
+          # As the installer writes it behind Caddy: engines reach the LLM proxy from loopback too.
+          trusted_proxies = ["127.0.0.1", "::1"]
+          [auth]
+          group_recheck_interval = 0
+          [spawner]
+          idle_timeout = 0
+          EOF
+          ls -l /usr/local/libexec/mira/engine-launch /usr/sbin/unix_chkpwd
+
+      - name: "Probe: PAM as an unprivileged account without the shadow group"
+        run: |
+          sudo -u mira-server /opt/mira/bin/python -c "
+          import pam
+          p = pam.pam()
+          ok = p.authenticate('alice', 'alice-Pw-1', service='mira-server', resetcreds=False)
+          print('PAM for another user without shadow group:', ok, p.code, p.reason)
+          " || true
+
+      - name: Allow PAM (pam_unix) to verify local passwords
+        run: |
+          sudo usermod -aG shadow mira-server
+          sudo -u mira-server /opt/mira/bin/python -c "
+          import pam
+          p = pam.pam()
+          ok = p.authenticate('alice', 'alice-Pw-1', service='mira-server', resetcreds=False)
+          print('PAM for another user with shadow group:', ok, p.code, p.reason)
+          "
+
+      - name: Allow bwrap to create user namespaces (Ubuntu AppArmor)
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          ls /etc/apparmor.d /usr/share/apparmor/extra-profiles 2>/dev/null | grep -i bwrap || true
+          sudo install -m 0644 deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+          sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
+          bwrap --ro-bind / / --unshare-pid --proc /proc true && echo "bwrap works"
+
+      - name: mira-server check
+        run: |
+          sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml | tee /tmp/check.txt
+          grep -q '^ok    sudo allows `/usr/local/libexec/mira/engine-launch stop`' /tmp/check.txt
+          grep -q '^ok    bwrap sandbox works on this host' /tmp/check.txt
+          grep -q '^ok    engines start in a user session' /tmp/check.txt
+
+      - name: Start Mira Server as mira-server
+        run: |
+          sudo -u mira-server -H sh -c 'cd / && nohup /opt/mira/bin/mira-server serve --config /etc/mira-server/mira-server.toml >> /tmp/mira-server.log 2>&1 &'
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8740/server/info && break; sleep 0.5; done
+
+      - name: End-to-end checks
+        run: /opt/mira/bin/python tests/integration/mira_server_e2e.py --url http://127.0.0.1:8740 --expect-tasks-max 4321
+
+      - name: "nginx example: WebSocket works and the access log has no tokens"
+        run: |
+          sudo apt-get install -y -qq nginx
+          sudo mkdir -p /etc/ssl/mira-server
+          sudo openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=mira.example.com \
+            -keyout /etc/ssl/mira-server/privkey.pem -out /etc/ssl/mira-server/fullchain.pem 2>/dev/null
+          sed -e 's/listen 443 /listen 8443 /; s/listen \[::\]:443 /listen [::]:8443 /' \
+              -e 's/listen 80;/listen 8080;/; s/listen \[::\]:80;/listen [::]:8080;/' \
+              deploy/mira-server/nginx.conf | sudo tee /etc/nginx/conf.d/mira-server.conf >/dev/null
+          sudo nginx -t
+          sudo systemctl restart nginx
+          base=https://127.0.0.1:8443
+          curl -fsSk "$base/server/info"
+          token=$(curl -fsSk -H 'Content-Type: application/json' \
+            -d '{"username":"alice","password":"alice-Pw-1","client":"desktop"}' \
+            "$base/server/auth/login" | /opt/mira/bin/python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+          for i in $(seq 1 60); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "$base/api/status?access_token=$token")
+            [ "$code" = 200 ] && break; sleep 2
+          done
+          test "$code" = 200
+          MIRA_TOKEN="$token" /opt/mira/bin/python - <<'EOF'
+          import asyncio, os
+          import aiohttp
+
+          async def main():
+              url = "wss://127.0.0.1:8443/ws?access_token=" + os.environ["MIRA_TOKEN"]
+              async with aiohttp.ClientSession() as session:
+                  async with session.ws_connect(url, ssl=False, headers={"Origin": "null"}) as ws:
+                      print("WebSocket through nginx: connected", ws.protocol)
+
+          asyncio.run(main())
+          EOF
+          log=/var/log/nginx/mira-server.access.log
+          sudo cat "$log"
+          sudo grep -q '"GET /api/status HTTP/1.1" 200' "$log"
+          sudo grep -q '"GET /ws HTTP/1.1" 101' "$log"
+          if sudo grep -q 'access_token' "$log"; then echo "access token in the nginx access log"; exit 1; fi
+
+      - name: "Agent isolation: bob's sandbox cannot reach his secrets, alice's home or her engine"
+        run: |
+          # The nginx step above left alice's engine running.
+          port=$(sudo /opt/mira/bin/python -c "import json; print(json.load(open('/home/alice/.mira/engine.lease'))['port'])")
+          sudo install -m 0644 tests/integration/sandbox_check.py /tmp/sandbox_check.py
+          sudo -u bob -H /opt/mira/bin/python /tmp/sandbox_check.py --other-home /home/alice --other-port "$port"
+
+      - name: "Caddy example: config is valid and drops access_token from the log"
+        run: |
+          curl -fsSL -o /tmp/caddy.tar.gz \
+            https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz
+          tar -xzf /tmp/caddy.tar.gz -C /tmp caddy
+          sudo mkdir -p /var/log/caddy
+          sudo /tmp/caddy validate --config deploy/mira-server/Caddyfile --adapter caddyfile
+          /tmp/caddy adapt --config deploy/mira-server/Caddyfile --adapter caddyfile > /tmp/caddy.json
+          grep -q '"access_token"' /tmp/caddy.json
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          echo "--- mira-server.log"; sudo cat /tmp/mira-server.log || true
+          for user in alice bob; do
+            echo "--- $user engine logs"
+            sudo find "/home/$user/.mira" -name '*.log' -exec sh -c 'echo "== $1"; tail -n 60 "$1"' _ {} \; || true
+          done
+          echo "--- processes"; ps -eo user,pid,args | grep -E 'mira|gateway' | grep -v grep || true
+          echo "--- auth log"; sudo tail -n 40 /var/log/auth.log 2>/dev/null || sudo journalctl -n 40 --no-pager || true
+
+  # The Ubuntu installer and uninstaller (deploy/mira-server/install.sh): a LAN
+  # install that fails on purpose and is resumed, an idempotent re-run, a real
+  # sign-in and engine start through Caddy, uninstall, and the uninstaller's
+  # detection of a Mira Server set up by hand from the guide.
+  installer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # Only for building the wheel of the hand-made install; the installer
+      # itself uses the host's Python (24.04) or installs 3.11 with uv (22.04).
+      - name: Set up Python 3.11
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Lint the scripts
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck deploy/mira-server/install.sh deploy/mira-server/uninstall.sh deploy/mira-server/make-offline-bundle.sh
+          diff <(awk '/^# ---- begin common/,/^# ---- end common ----/' deploy/mira-server/install.sh) \
+               <(awk '/^# ---- begin common/,/^# ---- end common ----/' deploy/mira-server/uninstall.sh)
+
+      - name: Test account and LAN address
+        run: |
+          sudo useradd --create-home --shell /bin/bash alice
+          printf 'alice:alice-Pw-1\n' | sudo chpasswd
+          ip=$(ip -4 -o addr show scope global | awk '{split($4, a, "/"); print a[1]; exit}')
+          echo "LAN_IP=$ip" >> "$GITHUB_ENV"
+          echo "LAN address: $ip"
+
+      - name: "Install: fails on purpose at the launcher step"
+        run: |
+          set +e
+          sudo env MIRA_INSTALLER_FAIL_AT=launcher bash deploy/mira-server/install.sh -y \
+            --source "$PWD" --mode lan --ip "$LAN_IP" --users alice --admins alice \
+            --local-accounts yes --limits 8G,200%,3210 --ufw no
+          code=$?
+          set -e
+          test "$code" -ne 0
+          sudo grep -q '^S_failed_step=launcher$' /var/lib/mira-server-installer/state
+          sudo grep -q '^S_status=in_progress$' /var/lib/mira-server-installer/state
+          test ! -e /etc/sudoers.d/mira-server
+
+      - name: "Install: resume with the saved answers"
+        run: |
+          sudo bash deploy/mira-server/install.sh -y | tee /tmp/resume.txt
+          grep -q 'Mira engine and Mira Server in /opt/mira: ok, skipped' /tmp/resume.txt
+          grep -q '^\[5/15\] Engine launcher and sudoers rules$' /tmp/resume.txt
+          sudo grep -q '^S_status=complete$' /var/lib/mira-server-installer/state
+          test -x /usr/local/sbin/mira-server-uninstall
+
+      - name: Check the installed server
+        run: |
+          sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml | tee /tmp/check.txt
+          grep -q 'All checks passed' /tmp/check.txt
+          grep -q '^ok    engines start in a user session' /tmp/check.txt
+          grep -q '^ok    bwrap sandbox works on this host' /tmp/check.txt
+          /opt/mira/bin/mira-server deploy-dir | grep -q 'site-packages/mira_server/deploy$'
+          curl -fsS --cacert /etc/mira-server/client-ca.crt "https://$LAN_IP/server/info" | tee /tmp/info.json
+          grep -q '"version": "0.3.5.dev0"' /tmp/info.json
+          cat /etc/mira-server/CLIENT-SETUP.txt
+
+      - name: Sign in through Caddy and start alice's engine
+        run: |
+          /opt/mira/bin/python - <<'EOF'
+          import json, os, ssl, subprocess, time, urllib.request
+
+          base = "https://" + os.environ["LAN_IP"]
+          ctx = ssl.create_default_context(cafile="/etc/mira-server/client-ca.crt")
+
+          def call(method, path, body=None, token=None):
+              headers = {"Content-Type": "application/json"}
+              if token:
+                  headers["Authorization"] = "Bearer " + token
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(base + path, data, headers, method=method)
+              with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+                  return json.load(resp)
+
+          login = call("POST", "/server/auth/login", {"username": "alice", "password": "alice-Pw-1", "client": "ci"})
+          assert login["user"]["name"] == "alice" and "admin" in login["user"]["roles"], login["user"]
+          token = login["access_token"]
+          call("POST", "/server/engine/start", {}, token)
+          for _ in range(90):
+              engine = call("GET", "/server/me", token=token)["engine"]
+              if engine["state"] == "running":
+                  break
+              time.sleep(1)
+          assert engine["state"] == "running", engine
+          lease = json.loads(subprocess.check_output(["sudo", "cat", "/home/alice/.mira/engine.lease"]))
+          cgroup = open(f"/proc/{lease['pid']}/cgroup").read().strip()
+          uid = int(subprocess.check_output(["id", "-u", "alice"]))
+          assert f"/user-{uid}.slice/" in cgroup, cgroup
+          pids_max = open(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/pids.max").read().strip()
+          assert pids_max == "3210", pids_max
+          print("alice's engine runs in", cgroup, "pids.max", pids_max)
+          EOF
+
+      - name: "Re-run: everything is already in place"
+        run: |
+          sudo bash deploy/mira-server/install.sh -y | tee /tmp/rerun.txt
+          test "$(grep -c ': ok, skipped$' /tmp/rerun.txt)" -eq 15
+
+      - name: "Upgrade: engines still on the previous version are stopped"
+        run: |
+          pid=$(sudo python3 -c 'import json; print(json.load(open("/home/alice/.mira/engine.lease"))["pid"])')
+          test -d "/proc/$pid"
+          sudo bash deploy/mira-server/install.sh -y --upgrade | tee /tmp/upgrade.txt
+          grep -q 'stopping the engine of alice (previous mira-engine)' /tmp/upgrade.txt
+          for i in $(seq 1 20); do test -d "/proc/$pid" || break; sleep 1; done
+          if test -d "/proc/$pid"; then echo "alice's old engine still runs"; exit 1; fi
+          sudo grep -q '^S_restart_engines=0$' /var/lib/mira-server-installer/state
+
+      - name: Uninstall (keeps config and data)
+        run: |
+          sudo /usr/local/sbin/mira-server-uninstall --yes | tee /tmp/uninstall.txt
+          for path in /opt/mira /etc/sudoers.d/mira-server /etc/pam.d/mira-server /etc/pam.d/mira-engine \
+              /usr/local/libexec/mira/engine-launch /etc/mira/policy.toml /etc/systemd/system/mira-server.service \
+              /etc/systemd/system/user-.slice.d/50-mira.conf /usr/local/sbin/mira-server-uninstall \
+              /var/lib/mira-server-installer/state; do
+            if sudo test -e "$path"; then echo "still there: $path"; exit 1; fi
+          done
+          if id mira-server 2>/dev/null; then echo "mira-server account still there"; exit 1; fi
+          for i in $(seq 1 20); do pgrep -u alice -f 'mira_engine|engine-launch' >/dev/null || break; sleep 1; done
+          if pgrep -a -u alice -f 'mira_engine|engine-launch'; then echo "alice's engine still runs"; exit 1; fi
+          if dpkg -s caddy 2>/dev/null | grep -q '^Status: install ok installed'; then echo "caddy still installed"; exit 1; fi
+          sudo test -f /etc/mira-server/mira-server.toml
+          sudo test -d /var/lib/mira-server
+          getent group mira-users
+          sudo test -d /home/alice/.mira
+
+      - name: "Uninstall a Mira Server set up by hand (no install record)"
+        run: |
+          py="${{ steps.py.outputs.python-path }}"
+          "$py" -m pip install -q build
+          SETUPTOOLS_SCM_PRETEND_VERSION=0.3.5.dev0 "$py" -m build -q --wheel -o /tmp/dist .
+          sudo "$py" -m venv /opt/mira-manual
+          sudo /opt/mira-manual/bin/pip install -q "$(ls /tmp/dist/mira_engine-*.whl)[server]"
+          sudo useradd --system --home-dir /var/lib/mira-server --shell /usr/sbin/nologin mira-server
+          sudo /opt/mira-manual/bin/mira-server install-launcher --engine-python /opt/mira-manual/bin/python \
+            --sudoers-file /etc/sudoers.d/mira-server
+          dir=$(/opt/mira-manual/bin/mira-server deploy-dir)
+          sudo cp "$dir/pam.d-mira-server" /etc/pam.d/mira-server
+          sudo cp "$dir/pam.d-mira-engine" /etc/pam.d/mira-engine
+          sudo install -D -m 0644 "$dir/policy.toml" /etc/mira/policy.toml
+          sed 's#/opt/mira/bin/#/opt/mira-manual/bin/#' "$dir/mira-server.service" | sudo tee /etc/systemd/system/mira-server.service >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl start mira-server
+          sudo bash deploy/mira-server/uninstall.sh --yes --purge | tee /tmp/uninstall-manual.txt
+          grep -q 'mira-engine and Mira Server (/opt/mira-manual)' /tmp/uninstall-manual.txt
+          for path in /opt/mira-manual /etc/sudoers.d/mira-server /etc/pam.d/mira-server /etc/mira/policy.toml \
+              /etc/systemd/system/mira-server.service /etc/mira-server /var/lib/mira-server /var/lib/mira-server-installer; do
+            if sudo test -e "$path"; then echo "still there: $path"; exit 1; fi
+          done
+          if getent group mira-users; then echo "mira-users still there"; exit 1; fi
+          sudo test -d /home/alice/.mira
+
+      - name: "Offline bundle: build it, then install with PyPI and GitHub unreachable"
+        run: |
+          py="${{ steps.py.outputs.python-path }}"
+          # Wheels for the Python the installer will use: the host's on 24.04,
+          # the bundled 3.11 on 22.04.
+          target=$(/usr/bin/python3 -c 'import sys; v = sys.version_info; print(f"{v.major}.{v.minor}" if v >= (3, 11) else "3.11")')
+          PYTHON="$py" bash deploy/mira-server/make-offline-bundle.sh --python "$target" -o /tmp/bundle
+          tar -C /tmp/bundle -xzf /tmp/bundle/mira-server-offline-*.tar.gz
+          bundle=$(ls -d /tmp/bundle/mira-server-offline-*/)
+          ls -R "$bundle" | head -n 20
+          (cd "$bundle" && sha256sum -c --quiet SHA256SUMS)
+          # A newer "release" for the upgrade below, on a local package index.
+          mkdir /tmp/index && cp "$bundle"wheels/*.whl /tmp/index/
+          SETUPTOOLS_SCM_PRETEND_VERSION=0.99.0 "$py" -m pip wheel -q --no-deps -w /tmp/index .
+          # From here on only apt (the Ubuntu mirror) is reachable.
+          printf '127.0.0.1 %s\n' pypi.org files.pythonhosted.org github.com api.github.com \
+            objects.githubusercontent.com release-assets.githubusercontent.com dl.cloudsmith.io | sudo tee -a /etc/hosts
+          sudo bash "$bundle/install.sh" -y --mode lan --ip "$LAN_IP" --users alice \
+            --local-accounts yes --limits none --ufw no | tee /tmp/offline.txt
+          sudo grep -q "^S_source=${bundle}wheels/mira_engine-0.3.5.dev0-py3-none-any.whl$" /var/lib/mira-server-installer/state
+          sudo grep -q "^S_wheels=${bundle}wheels$" /var/lib/mira-server-installer/state
+          if ! /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+            ls -d /opt/mira-python/cpython-3.11*-bundle
+            test ! -e /opt/mira-uv
+          fi
+          sudo -u mira-server /opt/mira/bin/mira-server check --config /etc/mira-server/mira-server.toml | tee /tmp/check-offline.txt
+          grep -q 'All checks passed' /tmp/check-offline.txt
+          curl -fsS --cacert /etc/mira-server/client-ca.crt "https://$LAN_IP/server/info" | grep -q '"version": "0.3.5.dev0"'
+          # Running the bundle again changes nothing.
+          sudo bash "$bundle/install.sh" -y | tee /tmp/offline-rerun.txt
+          test "$(grep -c ': ok, skipped$' /tmp/offline-rerun.txt)" -eq 15
+          # Later upgrades come from PyPI (here the local index pip is pointed at), run
+          # by the installer without a bundle; the bundle mira-engine came from is gone.
+          sudo mv "$bundle" /tmp/bundle-gone
+          index=(env PIP_NO_INDEX=1 PIP_FIND_LINKS=/tmp/index)
+          sudo "${index[@]}" bash deploy/mira-server/install.sh -y --upgrade | tee /tmp/pypi-upgrade.txt
+          grep -q 'upgrading from PyPI' /tmp/pypi-upgrade.txt
+          grep -q 'installed mira-engine 0.99.0' /tmp/pypi-upgrade.txt
+          sudo grep -q '^S_source=pypi$' /var/lib/mira-server-installer/state
+          for i in $(seq 1 30); do
+            curl -fsS --cacert /etc/mira-server/client-ca.crt "https://$LAN_IP/server/info" | grep -q '"version": "0.99.0"' && break
+            sleep 1
+          done
+          curl -fsS --cacert /etc/mira-server/client-ca.crt "https://$LAN_IP/server/info" | grep -q '"version": "0.99.0"'
+          # Nothing newer: nothing is restarted.
+          sudo "${index[@]}" bash deploy/mira-server/install.sh -y --upgrade | tee /tmp/pypi-upgrade2.txt
+          grep -q 'mira-engine 0.99.0 is already installed; nothing to restart' /tmp/pypi-upgrade2.txt
+          sudo grep -q '^S_restart_engines=0$' /var/lib/mira-server-installer/state
+          sudo /usr/local/sbin/mira-server-uninstall --yes --purge
+          for path in /opt/mira /opt/mira-python /etc/mira-server; do
+            if sudo test -e "$path"; then echo "still there: $path"; exit 1; fi
+          done
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          echo "--- install log"; sudo cat /var/log/mira-server-install.log 2>/dev/null | tail -n 200 || true
+          echo "--- state"; sudo cat /var/lib/mira-server-installer/state 2>/dev/null || true
+          echo "--- mira-server"; sudo journalctl -u mira-server -n 80 --no-pager || true
+          echo "--- caddy"; sudo journalctl -u caddy -n 60 --no-pager || true
+          echo "--- Caddyfile"; sudo cat /etc/caddy/Caddyfile 2>/dev/null || true

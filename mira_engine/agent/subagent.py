@@ -237,11 +237,20 @@ class SubagentManager:
         if _permitted("glob"):
             tools.register(GlobTool(workspace=run_workspace, allowed_dir=allowed_dir, read_paths=read_paths))
         if self.exec_config.enable and _permitted("exec"):
+            sandbox_dirs: list[Path] = []
+            if self.exec_config.sandbox:
+                from mira_engine.agent.skills import skill_access_dirs
+
+                sandbox_dirs = [*skill_access_dirs(run_workspace), *(Path(p) for p in read_paths)]
             tools.register(ExecTool(
                 working_dir=str(run_workspace),
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
+                sandbox=self.exec_config.sandbox or None,
+                sandbox_network=self.exec_config.sandbox_network,
+                sandbox_read_only_paths=self.exec_config.sandbox_read_only_paths,
+                sandbox_extra_dirs=sandbox_dirs,
                 python_runtime=self.exec_config.python,
             ))
         if _permitted("web_search"):
