@@ -69,6 +69,7 @@ from mira_engine.modules.tools import (
 from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
+from mira_engine.utils.helpers import normalize_citations
 
 if TYPE_CHECKING:
     from mira_engine.config.schema import ChannelsConfig, ExecToolConfig, KnowledgeConfig
@@ -567,12 +568,12 @@ class BaseAgentLoop:
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
-        """Remove <think>…</think> blocks that some models embed in content."""
+        """Remove <think>…</think> blocks and normalize native citation markup."""
         if not text:
             return None
         cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
         cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
-        return cleaned.strip() or None
+        return normalize_citations(cleaned).strip() or None
 
     @staticmethod
     async def _emit_activity_ping(on_progress: Callable[..., Awaitable[None]]) -> None:

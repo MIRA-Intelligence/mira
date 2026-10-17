@@ -138,3 +138,15 @@ def test_zip_single_folder_is_unwrapped(tmp_path: Path) -> None:
     assert root.name == "repo"
     docs = extract_tree(root, max_files=10, max_file_bytes=10_000)
     assert [(d.path, is_code) for d, is_code in docs] == [("src/main.py", True)]
+
+
+def test_normalize_citations_keeps_streamed_text_a_prefix():
+    from mira_engine.utils.helpers import normalize_citations
+
+    full = "Acite[KB/x.pdf#p.1] B navlistItem"
+    assert normalize_citations(full) == "A[KB/x.pdf#p.1] B Item"
+    previous = ""
+    for end in range(1, len(full) + 1):
+        current = normalize_citations(full[:end])
+        assert current.startswith(previous)
+        previous = current
