@@ -1,4 +1,4 @@
-"""``mira-server`` command line: serve, hash-password, install-launcher, check."""
+"""``mira-server`` command line: serve, hash-password, install-launcher, check, deploy-dir."""
 
 from __future__ import annotations
 
@@ -113,14 +113,19 @@ def install_launcher_command(
                                       help="Interpreter of the system-wide engine install (e.g. /opt/mira/bin/python)"),
     server_user: str = typer.Option("mira-server", "--server-user", help="Account Mira Server runs as"),
     users_group: str = typer.Option("mira-users", "--users-group", help="Group allowed to use Mira Server"),
+    sudoers_file: Path | None = typer.Option(None, "--sudoers-file",
+                                             help="Also write the rules to this sudoers drop-in after "
+                                                  "`visudo -cf` accepts them (e.g. /etc/sudoers.d/mira-server)"),
+    visudo: str = typer.Option("visudo", "--visudo", hidden=True, help="visudo binary (tests)"),
     no_root_check: bool = typer.Option(False, "--no-root-check", hidden=True,
                                        help="Write without root (tests only; the result is not safe)"),
 ) -> None:
-    """Write the root-owned engine launcher and print the sudoers rule."""
+    """Write the root-owned engine launcher and print (or install) the sudoers rules."""
     from mira_server.spawner.launcher import (
         LauncherInstallError,
         default_launcher_path,
         install_launcher,
+        install_sudoers,
         sudoers_rules,
     )
 
@@ -132,13 +137,21 @@ def install_launcher_command(
         raise typer.Exit(1) from None
     rules = sudoers_rules(path, server_user=server_user, users_group=users_group)
     typer.echo(f"Wrote {path} (engine: {engine_python}).\n")
-    typer.echo("Add these sudoers rules (for example: visudo -f /etc/sudoers.d/mira-server):\n")
+    if sudoers_file is not None:
+        try:
+            install_sudoers(sudoers_file, rules, visudo=visudo, require_root=not no_root_check)
+        except (LauncherInstallError, OSError) as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(1) from None
+        typer.echo(f"Wrote {sudoers_file} (checked with visudo):\n")
+    else:
+        typer.echo("Add these sudoers rules (for example: visudo -f /etc/sudoers.d/mira-server):\n")
     for rule in rules:
         typer.echo(f"    {rule}")
     typer.echo("")
     typer.echo("Notes:")
     typer.echo("- Cmnd_Alias/Defaults run `start` through the mira-engine PAM service (install")
-    typer.echo("  deploy/mira-server/pam.d-mira-engine as /etc/pam.d/mira-engine first): engines then run in")
+    typer.echo("  $(mira-server deploy-dir)/pam.d-mira-engine as /etc/pam.d/mira-engine first): engines then run in")
     typer.echo("  the user's user-<uid>.slice, where per-user systemd limits apply.")
     typer.echo(f"- The first rule starts, inspects and stops engines of {users_group} members. The second only")
     typer.echo(f"  stops engines, for people removed from {users_group} (their engine would keep running otherwise).")
@@ -175,7 +188,7 @@ def _check_pam(cfg: ServerConfig, report: _Report) -> None:
     if service.exists():
         report.ok(f"PAM service {service} exists")
     else:
-        report.fail(f"PAM service file {service} is missing (see deploy/mira-server/pam.d-mira-server)")
+        report.fail(f"PAM service file {service} is missing (see $(mira-server deploy-dir)/pam.d-mira-server)")
     shadow = Path("/etc/shadow")
     if shadow.exists() and not os.access(shadow, os.R_OK):
         report.warn("cannot read /etc/shadow: pam_unix (local passwords) only verifies other users' "
@@ -239,7 +252,7 @@ def _check_engine_session(sudo_list: str, report: _Report) -> None:
                     "(see `install-launcher`)")
     elif not pam_file.exists():
         report.fail(f"sudoers uses PAM service {PAM_SESSION_SERVICE} but {pam_file} is missing, so engines "
-                    "cannot start (copy deploy/mira-server/pam.d-mira-engine)")
+                    "cannot start (copy $(mira-server deploy-dir)/pam.d-mira-engine)")
     else:
         report.ok(f"engines start in a user session (PAM service {pam_file})")
 
@@ -252,7 +265,7 @@ def _check_host_policy(report: _Report) -> None:
     path = host_policy.POLICY_PATH
     if not path.exists():
         report.warn(f"no host policy at {path}: agents run shell commands without the sandbox and may "
-                    "leave their project; copy deploy/mira-server/policy.toml there")
+                    "leave their project; copy $(mira-server deploy-dir)/policy.toml there")
         return
     try:
         policy = host_policy.parse_policy(path.read_text(encoding="utf-8"), path, groups=set())
@@ -324,6 +337,18 @@ def check(config: Path | None = ConfigOption) -> None:
         typer.echo(f"\n{report.errors} problem(s) found.")
         raise typer.Exit(1)
     typer.echo("\nAll checks passed.")
+
+
+@app.command("deploy-dir")
+def deploy_dir_command() -> None:
+    """Print the directory with the deployment files (PAM services, unit, policy, installer)."""
+    from mira_server.deploy_files import DeployFilesMissingError, deploy_dir
+
+    try:
+        typer.echo(str(deploy_dir()))
+    except DeployFilesMissingError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from None
 
 
 def main() -> None:

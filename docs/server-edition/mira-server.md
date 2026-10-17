@@ -58,7 +58,91 @@ desktop app ──HTTPS──> TLS proxy ──> mira-server (user mira-server, 
 - bubblewrap (`bwrap`) and unprivileged user namespaces for the agent sandbox.
 - The users' home directories hold their Mira data (`~/.mira`), as with SSH.
 
-## Install
+## Quick install (Ubuntu 22.04 and 24.04)
+
+[`deploy/mira-server/install.sh`](../../deploy/mira-server/install.sh) does
+every step below in a dialog-driven installer:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/MIRA-Intelligence/mira/feat/server-edition/deploy/mira-server/install.sh
+sudo bash install.sh
+```
+
+(`curl | sudo bash` does not work: the dialogs need a terminal.) It asks:
+
+- **Where to install mira-engine from**: PyPI (default), a git branch or tag,
+  or a source directory. Until a release with Mira Server is on PyPI, choose
+  *git* (`feat/server-edition`).
+- **How clients connect**:
+  - *Local network* (default): Caddy serves HTTPS on the host's IP address with
+    its own certificate authority, so no domain name is needed. Each client
+    trusts that CA once; the installer writes the commands to
+    `/etc/mira-server/CLIENT-SETUP.txt` and the CA to
+    `/etc/mira-server/client-ca.crt`.
+  - *Internet*: Caddy gets a Let's Encrypt certificate for your domain.
+  - *Own reverse proxy or SSH tunnels*: no Caddy.
+- **Accounts**: whether local `/etc/shadow` accounts sign in, the SSSD AD GPO
+  rule when SSSD uses `access_provider = ad`, and the users and admins (local
+  or LDAP/AD accounts; they are added to the groups with `gpasswd`).
+- **Per-user limits**, and whether agents' shell commands get network access.
+
+Every step first checks the host and skips what is already in place. If a step
+fails, the installer says why; fix it and run it again: it continues with the
+same answers. Run `sudo mira-server-install` later to upgrade, change the
+settings or add and remove users. Unattended installs (CI, configuration
+management) use options, for example:
+
+```sh
+sudo bash install.sh --non-interactive --source git --mode lan --ip 192.168.1.10 \
+     --users alice,bob --admins alice
+```
+
+**Upgrades** (`sudo mira-server-install`, then *Upgrade*; unattended:
+`--non-interactive --upgrade`) install the newest mira-engine release from PyPI
+(or the package index pip is configured for), also when an earlier version was
+pinned; the installer shows the installed and the newest version and takes
+another one if you enter it (`--version`). Running the `install.sh` of an
+offline bundle upgrades from that bundle instead; an install that came from a
+bundle that is no longer there upgrades from PyPI. When the version changes,
+Mira Server is restarted and engines still running the previous version are
+stopped (they start again, on the new version, when their users reconnect);
+when it does not, nothing is restarted.
+
+See `sudo bash install.sh --help`. The install log is
+`/var/log/mira-server-install.log`.
+
+**Hosts without access to GitHub or PyPI**: build an offline bundle on a
+machine that has access (Linux or macOS, Python 3.11+ with pip, a mira
+checkout with the skills submodule), copy it over and run the installer inside
+it:
+
+```sh
+deploy/mira-server/make-offline-bundle.sh            # x86_64; --arch aarch64 for ARM servers
+scp mira-server-offline-<version>-x86_64.tar.gz server:
+# on the server:
+tar -xzf mira-server-offline-<version>-x86_64.tar.gz
+cd mira-server-offline-<version>-x86_64 && sudo bash install.sh
+```
+
+The bundle holds the mira-engine wheel and all its dependencies for Python
+3.11 and 3.12 (`wheels/`, installed with `pip --no-index`), a Python 3.11 build
+for Ubuntu 22.04 (`python/`) and Caddy for 22.04 (`debs/`). The installer picks
+the bundle it is in; a newer bundle's `install.sh` upgrades mira-engine. apt is
+still used for a few Ubuntu packages (`sudo`, `bubblewrap`, `python3-venv`, and
+`caddy` on 24.04), so the host needs its Ubuntu mirror or those packages
+installed beforehand. A single wheel also works: `--source
+/path/mira_engine-<version>-py3-none-any.whl`, with `--wheels DIR` for its
+dependencies when PyPI is out of reach.
+
+**Uninstall** with `sudo mira-server-uninstall` (add `--yes` for no dialogs). It
+stops the users' engines and removes what the installer set up; the
+configuration, `/var/lib/mira-server` (audit log) and the groups stay unless
+you select them or pass `--purge`. For a Mira Server set up by hand with the
+steps below, run `sudo bash "$(/opt/mira/bin/mira-server deploy-dir)/uninstall.sh"`
+(or the script from the repository): it finds the usual files and lets you
+choose. Users' home directories and `~/.mira` are never touched.
+
+## Install by hand
 
 The commands assume Debian/Ubuntu; adjust package names elsewhere.
 
@@ -86,10 +170,32 @@ user's engine runs from it.
 ```sh
 sudo python3 -m venv /opt/mira
 sudo /opt/mira/bin/pip install 'mira-engine[server]'
+DEPLOY=$(/opt/mira/bin/mira-server deploy-dir)
 ```
 
-The venv must stay writable by root only: the launcher runs its interpreter as
-each user.
+The package ships the deployment files (PAM services, systemd unit, host policy,
+AppArmor profile, example configs, the installer); `mira-server deploy-dir`
+prints where they are, and the steps below copy them from `$DEPLOY`.
+
+**From source** (until a release with Mira Server is on PyPI):
+
+```sh
+sudo git clone --depth 1 -b feat/server-edition \
+     --recurse-submodules=mira_engine/skills --shallow-submodules \
+     https://github.com/MIRA-Intelligence/mira.git /opt/mira-src
+sudo python3 -m venv /opt/mira
+sudo env SETUPTOOLS_SCM_PRETEND_VERSION=0.3.5.dev0 \
+     /opt/mira/bin/pip install '/opt/mira-src[server]'
+DEPLOY=$(/opt/mira/bin/mira-server deploy-dir)
+```
+
+The package version comes from git tags, which a shallow checkout of this
+branch does not have; without `SETUPTOOLS_SCM_PRETEND_VERSION` the engine
+reports `0.0.x` and the desktop app refuses it as older than its minimum engine
+version (`min_agent_for_ui` in mira-ui's `compatibility.json`).
+
+The virtual environment (and a source checkout) must stay writable by root
+only: the launcher runs the venv's interpreter as each user.
 
 ### 3. The mira-server account
 
@@ -101,26 +207,26 @@ sudo chmod 700 /var/lib/mira-server
 
 ### 4. Launcher, sudoers rules and engine sessions
 
+Install the `mira-engine` PAM service first, because the sudoers rules refer
+to it. Then write the launcher and the rules:
+
 ```sh
+sudo cp "$DEPLOY/pam.d-mira-engine" /etc/pam.d/mira-engine
 sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local \
-     --engine-python /opt/mira/bin/python
+     --engine-python /opt/mira/bin/python --sudoers-file /etc/sudoers.d/mira-server
 ```
 
 This writes `/usr/local/libexec/mira/engine-launch` (root-owned, mode 0755) and
-prints the sudoers lines Mira Server needs. Install the `mira-engine` PAM
-service first, because the sudoers lines refer to it:
+`/etc/sudoers.d/mira-server` (mode 0440, only after `visudo -cf` accepts it):
 
-```sh
-sudo cp deploy/mira-server/pam.d-mira-engine /etc/pam.d/mira-engine
-sudo tee /etc/sudoers.d/mira-server >/dev/null <<'EOF'
+```text
 Cmnd_Alias MIRA_ENGINE_START = /usr/local/libexec/mira/engine-launch start
 Defaults!MIRA_ENGINE_START pam_service=mira-engine
 mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch
 mira-server ALL=(ALL,!root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop
-EOF
-sudo chmod 0440 /etc/sudoers.d/mira-server
-sudo visudo -cf /etc/sudoers.d/mira-server
 ```
+
+Without `--sudoers-file` it only prints the rules.
 
 - `Cmnd_Alias`/`Defaults` run `engine-launch start` through the PAM service
   [`mira-engine`](../../deploy/mira-server/pam.d-mira-engine). Its session
@@ -160,8 +266,14 @@ Re-run `install-launcher` after moving the engine install.
 
 ### 5. PAM service
 
-Copy [`deploy/mira-server/pam.d-mira-server`](../../deploy/mira-server/pam.d-mira-server)
-to `/etc/pam.d/mira-server`:
+Install [`deploy/mira-server/pam.d-mira-server`](../../deploy/mira-server/pam.d-mira-server)
+as `/etc/pam.d/mira-server`:
+
+```sh
+sudo cp "$DEPLOY/pam.d-mira-server" /etc/pam.d/mira-server
+```
+
+It contains:
 
 ```text
 @include common-auth
@@ -196,9 +308,14 @@ host's password policy strong and Mira Server patched.
 
 ### 6. Configuration
 
-Copy [`deploy/mira-server/mira-server.toml`](../../deploy/mira-server/mira-server.toml)
-to `/etc/mira-server/mira-server.toml` and set at least `public_url`. Every
+Install [`deploy/mira-server/mira-server.toml`](../../deploy/mira-server/mira-server.toml)
+as `/etc/mira-server/mira-server.toml` and set at least `public_url`. Every
 setting is documented in that file. Unknown keys are rejected.
+
+```sh
+sudo install -D -m 0644 "$DEPLOY/mira-server.toml" /etc/mira-server/mira-server.toml
+sudo editor /etc/mira-server/mira-server.toml
+```
 
 | Section | Key | Default | Meaning |
 |---|---|---|---|
@@ -224,7 +341,7 @@ setting is documented in that file. Unknown keys are rejected.
 
 ```sh
 sudo apt-get install bubblewrap
-sudo install -D -o root -g root -m 0644 deploy/mira-server/policy.toml /etc/mira/policy.toml
+sudo install -D -o root -g root -m 0644 "$DEPLOY/policy.toml" /etc/mira/policy.toml
 ```
 
 [`deploy/mira-server/policy.toml`](../../deploy/mira-server/policy.toml) keeps
@@ -239,7 +356,7 @@ namespaces for bwrap only, with
 (or the distribution's own bwrap profile, if it ships one):
 
 ```sh
-sudo install -m 0644 deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+sudo install -m 0644 "$DEPLOY/apparmor-bwrap" /etc/apparmor.d/mira-bwrap
 sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
 ```
 
@@ -260,7 +377,7 @@ Keep `KillMode=process`: user engines are started through sudo and must survive
 a Mira Server restart. Mira Server refuses to run as root.
 
 ```sh
-sudo cp deploy/mira-server/mira-server.service /etc/systemd/system/
+sudo cp "$DEPLOY/mira-server.service" /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now mira-server
 ```
 
@@ -315,7 +432,7 @@ one budget per person. Set them for all users with a drop-in such as
 [`deploy/mira-server/user-slice-mira.conf`](../../deploy/mira-server/user-slice-mira.conf):
 
 ```sh
-sudo install -D -m 0644 deploy/mira-server/user-slice-mira.conf \
+sudo install -D -m 0644 "$DEPLOY/user-slice-mira.conf" \
      /etc/systemd/system/user-.slice.d/50-mira.conf
 sudo systemctl daemon-reload
 ```
