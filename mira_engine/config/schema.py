@@ -485,14 +485,19 @@ class ProvidersConfig(Base):
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     nvidia: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
+    xai: ProviderConfig = Field(default_factory=ProviderConfig)  # xAI (Grok)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
+    zhipu_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # GLM Coding Plan (智谱 / Z.ai)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)
+    dashscope_token_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # Bailian Token Plan (阿里云百炼)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
     ovms: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenVINO Model Server (OVMS)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
+    kimi_code: ProviderConfig = Field(default_factory=ProviderConfig)  # Kimi Code (Kimi membership)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    minimax_token_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # MiniMax Token Plan
     mistral: ProviderConfig = Field(default_factory=ProviderConfig)
     stepfun: ProviderConfig = Field(default_factory=ProviderConfig)  # Step Fun (阶跃星辰)
     xiaomi_mimo: ProviderConfig = Field(default_factory=ProviderConfig)  # Xiaomi MIMO (小米)
@@ -500,6 +505,7 @@ class ProvidersConfig(Base):
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
     volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Coding Plan
+    volcengine_agent_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Agent Plan
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
