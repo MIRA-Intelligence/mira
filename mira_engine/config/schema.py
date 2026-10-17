@@ -651,6 +651,15 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
 
+class KnowledgeConfig(Base):
+    """User-level knowledge bases (~/.mira/knowledge) searchable by the agent."""
+
+    enabled: bool = True
+    max_upload_mb: int = 200  # per uploaded file
+    max_code_files: int = 20000  # per code source (zip, directory or git repo)
+    max_file_kb: int = 1024  # code files larger than this are skipped
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -659,6 +668,7 @@ class ToolsConfig(Base):
     restrict_to_workspace: bool = False  # restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
 
 
 class Config(BaseSettings):
