@@ -10,6 +10,9 @@ from mira_engine.workflows import JsonWorkflowRepository, WorkflowError, Workflo
 from mira_engine.workflows.experiments import project_experiments
 
 
+CONTINUE = {"action": "continue", "rationale": "Result matches the plan"}
+
+
 def make_service(tmp_path: Path, module_type: str = "experiment", **data):
     service = WorkflowService(JsonWorkflowRepository(tmp_path, "test"))
     run_id = service.create_run(command_id="create", module_type=module_type, enqueue=True,
@@ -141,7 +144,7 @@ def test_manual_mode_blocks_parallel_experiments_and_unconfirmed_continuation(tm
         record(service, run_id, command_id="parallel", id="Exp002")
     with pytest.raises(WorkflowError, match="resetting"):
         record(service, run_id, command_id="reset", status="pending")
-    record(service, run_id, command_id="finish", status=terminal)
+    record(service, run_id, command_id="finish", status=terminal, replan=CONTINUE)
     boundary = service.repository.load_run(run_id).module_data["_manual_experiment_boundary"]
     record(service, run_id, command_id="edit-result", status=terminal, conclusion="Clarified result")
     assert service.repository.load_run(run_id).module_data["_manual_experiment_boundary"] == boundary
@@ -159,7 +162,7 @@ def test_manual_mode_blocks_parallel_experiments_and_unconfirmed_continuation(tm
 def test_auto_and_legacy_runs_do_not_add_manual_boundaries(tmp_path, mode):
     service, run_id = make_service(tmp_path, **({"experiment_execution_mode": mode} if mode else {}))
     record(service, run_id)
-    record(service, run_id, command_id="finish", status="completed")
+    record(service, run_id, command_id="finish", status="completed", replan=CONTINUE)
     record(service, run_id, command_id="next", id="Exp002")
     assert "_manual_experiment_boundary" not in service.repository.load_run(run_id).module_data
 
@@ -168,3 +171,41 @@ def test_auto_and_legacy_runs_do_not_add_manual_boundaries(tmp_path, mode):
 def test_invalid_experiment_mode_rejected(tmp_path, mode):
     with pytest.raises(WorkflowError, match="auto or manual"):
         make_service(tmp_path, experiment_execution_mode=mode)
+
+
+def test_next_experiment_requires_replan_and_children_run_depth_first(tmp_path):
+    service, run_id = make_service(tmp_path)
+    record(service, run_id)
+    record(service, run_id, command_id="pending-2", id="Exp002", status="pending")
+    record(service, run_id, command_id="finish", status="completed")
+    with pytest.raises(WorkflowError, match="replan decision on Exp001"):
+        record(service, run_id, command_id="early", id="Exp002")
+    with pytest.raises(WorkflowError, match="requires existing parent Exp001"):
+        record(service, run_id, command_id="orphan", id="Exp001.a", status="pending")
+    record(service, run_id, command_id="child", id="Exp001.a", parent="Exp001", status="pending")
+    record(service, run_id, command_id="replan", status="completed", replan={
+        "action": "branch", "rationale": "Unexpected gain", "children": ["Exp001.a"], "next": "Exp001.a",
+    })
+    record(service, run_id, command_id="start-child", id="Exp001.a", parent="Exp001")
+    item = next(i for i in project_experiments(service.repository) if i["experiment_id"] == "Exp001.a")
+    assert item["parent"] == f"workflow:{run_id}:Exp001"
+
+
+def test_branch_depth_is_capped(tmp_path):
+    service, run_id = make_service(tmp_path, automation_policy={"maxBranchDepth": 1})
+    record(service, run_id, status="pending")
+    record(service, run_id, command_id="child", id="Exp001.a", parent="Exp001", status="pending")
+    with pytest.raises(WorkflowError, match="depth"):
+        record(service, run_id, command_id="grandchild", id="Exp001.a.a", parent="Exp001.a", status="pending")
+
+
+def test_unexecuted_skips_are_final_and_free_budget(tmp_path):
+    service, run_id = make_service(tmp_path, automation_policy={"maxExperiments": 2})
+    record(service, run_id, status="pending")
+    record(service, run_id, command_id="plan-2", id="Exp002", status="pending")
+    record(service, run_id, command_id="skip-2", id="Exp002", status="skipped", conclusion="Made moot by Exp001")
+    with pytest.raises(WorkflowError, match="final"):
+        record(service, run_id, command_id="reopen", id="Exp002", status="pending")
+    record(service, run_id, command_id="child", id="Exp001.a", parent="Exp001", status="pending")
+    with pytest.raises(WorkflowError, match="maxExperiments"):
+        record(service, run_id, command_id="extra", id="Exp003", status="pending")

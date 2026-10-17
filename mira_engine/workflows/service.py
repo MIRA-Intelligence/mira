@@ -13,7 +13,15 @@ from pydantic import ValidationError
 from mira_engine.task_plan.guardrails import validate_experiment_contract
 
 from .confirmations import confirmation_approved, confirmation_required
-from .experiments import ExperimentRecord, experiment_boundary_decision, experiment_contract, manual_experiments
+from .experiments import (
+    ExperimentRecord,
+    experiment_boundary_decision,
+    experiment_contract,
+    experiment_depth,
+    manual_experiments,
+    max_branch_depth,
+    parent_id_of,
+)
 from .input_paths import normalize_input_paths
 from .journals import normalize_journal_selection
 from .models import (
@@ -782,10 +790,34 @@ class WorkflowService:
                 raise WorkflowError("invalid_experiment", "a completed Run accepts only terminal experiment records", status=409)
             if record["status"] != "pending" and confirmation_required(run) and not confirmation_approved(run):
                 raise WorkflowError("confirmation_required", "approve the experiment scope first", status=409)
+            parent_id = parent_id_of(record["id"])
+            if parent_id:
+                if record["parent"] != parent_id or not any(item["id"] == parent_id for item in records):
+                    raise WorkflowError("invalid_experiment", f"child {record['id']} requires existing parent {parent_id}", status=422)
+                if experiment_depth(record["id"]) > max_branch_depth(run):
+                    raise WorkflowError("invalid_experiment", "experiment branch depth limit reached", status=422)
+            if previous.get("status") == "skipped" and record["status"] != "skipped":
+                raise WorkflowError("invalid_experiment", "skipped experiments are final; register a new id instead", status=409)
+            # Proposals skipped before execution do not consume the experiment budget.
+            unexecuted = set(run.module_data.get("_unexecuted_skips") or [])
+            if record["status"] == "skipped" and previous.get("status", "pending") == "pending":
+                unexecuted.add(record["id"])
             policy = run.module_data.get("automation_policy") or {}
             limit = policy.get("maxExperiments") if isinstance(policy, dict) else None
-            if not previous and isinstance(limit, int) and limit > 0 and len(records) >= limit:
+            used = sum(item["id"] not in unexecuted for item in records)
+            if not previous and isinstance(limit, int) and limit > 0 and used >= limit:
                 raise WorkflowError("experiment_limit", "maxExperiments limit reached", status=409)
+            if record["status"] == "running" and previous.get("status") != "running":
+                unplanned = [
+                    item["id"] for item in records
+                    if item["id"] != record["id"] and item["status"] in {"completed", "failed"} and not item.get("replan")
+                ]
+                if unplanned:
+                    raise WorkflowError(
+                        "replan_required",
+                        f"record a replan decision on {', '.join(unplanned)} before starting another experiment",
+                        status=409,
+                    )
             paths = record["results"].get("artifacts", [])
             if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
                 raise WorkflowError("invalid_experiment", "results.artifacts must be an array of project-relative paths", status=422)
@@ -812,6 +844,8 @@ class WorkflowService:
                     run.module_data["_manual_experiment_boundary"] = {
                         "interaction_id": new_id(), "experiment_id": record["id"], "title": record["title"],
                     }
+            if unexecuted:
+                run.module_data["_unexecuted_skips"] = sorted(unexecuted)
             # Replace in place: retries and progress updates do not add duplicates.
             run.module_data["experiments"] = [
                 record if item["id"] == record["id"] else item for item in records
