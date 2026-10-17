@@ -237,6 +237,25 @@ def test_team_name_of_the_first_custom_provider_replaces_the_users(config_path: 
     assert _read(config_path)["providers"]["custom"] == {"apiKey": "sk-mine", "name": "Mine"}
 
 
+def test_users_add_their_own_custom_providers_next_to_the_teams(config_path: Path) -> None:
+    team_layer.set_team_layer(_layer(providers={"custom": {
+        "api_key": TOKEN, "api_base": f"{PROXY}/custom", "models": [], "enabled": True, "name": "ECNU"}}))
+    config = load_config(config_path)
+    apply_ui_runtime_update(config, {"providers": {"custom_mine": {
+        "api_key": "sk-mine", "api_base": "https://mine/v1", "enabled": True, "name": "My gateway"}}},
+        current_projects_root=config_path.parent)
+    save_config(config, config_path)
+    config = load_config(config_path)
+    payload = build_ui_runtime_payload(config, projects_root=config_path.parent, config_path=config_path,
+                                       persisted=False)
+    assert payload["providers"]["custom"]["managed_by"] == "team"
+    assert "managed_by" not in payload["providers"]["custom_mine"]
+    assert payload["providers"]["custom_mine"]["display_name"] == "My gateway"
+    saved = _read(config_path)["providers"]
+    assert saved["customProviders"]["custom_mine"]["apiKey"] == "sk-mine"
+    assert TOKEN not in config_path.read_text(encoding="utf-8")
+
+
 def test_the_apps_setup_placeholder_does_not_block_team_defaults(config_path: Path) -> None:
     _write(config_path, {"agents": {"defaults": {"provider": "custom", "model": "custom/mira-ui-bundle-setup"}},
                          "providers": {"custom": {"apiBase": "http://127.0.0.1:9/v1"}}})
