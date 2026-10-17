@@ -95,6 +95,17 @@ sudo bash install.sh --non-interactive --source git --mode lan --ip 192.168.1.10
      --users alice,bob --admins alice
 ```
 
+**Upgrades** (`sudo mira-server-install`, then *Upgrade*; unattended:
+`--non-interactive --upgrade`) install the newest mira-engine release from PyPI
+(or the package index pip is configured for), also when an earlier version was
+pinned; the installer shows the installed and the newest version and takes
+another one if you enter it (`--version`). Running the `install.sh` of an
+offline bundle upgrades from that bundle instead; an install that came from a
+bundle that is no longer there upgrades from PyPI. When the version changes,
+Mira Server is restarted and engines still running the previous version are
+stopped (they start again, on the new version, when their users reconnect);
+when it does not, nothing is restarted.
+
 See `sudo bash install.sh --help`. The install log is
 `/var/log/mira-server-install.log`.
 

@@ -388,7 +388,8 @@ options below (or the answers saved by an earlier run) are used.
   --limits MEM,CPU,TASKS     Per-user limits, e.g. 16G,400%,4096; "none" to skip
   --network full|none        Network access for agents' shell commands
   --ufw yes|no               Open the HTTPS port(s) when ufw is active
-  --upgrade                  Upgrade an existing install
+  --upgrade                  Upgrade an existing install: from a bundle next to this script,
+                             else the newest PyPI release (or --version, --source)
   --help                     This text
 
 Log: $LOG_FILE    State: $STATE_FILE
@@ -437,6 +438,14 @@ venv_python_ok() {
 
 engine_version() {
 	"$VENV/bin/python" -c 'import importlib.metadata as m; print(m.version("mira-engine"))' 2>/dev/null
+}
+
+# Newest mira-engine release on the package index pip is configured for (PyPI
+# unless pip.conf or PIP_* say otherwise); empty when it cannot be reached.
+pypi_latest() {
+	[[ -x $VENV/bin/python ]] || return 0
+	"$VENV/bin/python" -m pip index versions mira-engine --disable-pip-version-check --timeout 10 --retries 0 2>/dev/null |
+		sed -n 's/^mira-engine (\(.*\))$/\1/p' || true
 }
 
 deploy_dir() { "$VENV/bin/mira-server" deploy-dir; }
@@ -894,7 +903,8 @@ sync_git_source() {
 }
 
 apply_engine() {
-	local spec version base
+	local spec version base before
+	before=$(engine_version || true)
 	if [[ -d $VENV ]] && ! venv_python_ok; then
 		say "  $VENV has no usable Python 3.11+; recreating it"
 		run rm -rf "$VENV"
@@ -946,6 +956,12 @@ apply_engine() {
 		return 1
 	fi
 	UPGRADE=0
+	# A release or wheel with the version already installed is the same code; a
+	# source directory or git checkout may have changed under the same version.
+	if [[ $version == "$before" && ($S_source == pypi || $S_source == *.whl) ]]; then
+		say "  mira-engine $version is already installed; nothing to restart"
+		return 0
+	fi
 	state_set need_restart 1
 	state_set restart_engines 1
 }
@@ -1553,6 +1569,39 @@ uninstall_now() {
 	exec bash "$script"
 }
 
+# Upgrade: where the new mira-engine comes from. A bundle next to this script
+# was adopted already (adopt_bundle); a PyPI install installs the latest
+# release unless a version is given, also when an earlier version was pinned.
+ask_upgrade_source() {
+	local latest answer
+	if [[ $S_source == *.whl && ! -f $S_source && -z ${OPT[source]:-} ]]; then
+		# Installed from a bundle that is gone: PyPI unless the administrator picks another source.
+		state_set source pypi
+		state_set wheels ""
+		state_set version ""
+		((INTERACTIVE)) || say "The bundle mira-engine came from is gone; upgrading from PyPI"
+		ask_source
+		return
+	fi
+	if [[ -n ${OPT[source]:-} && ${OPT[source]} != "$S_source" ]]; then
+		ask_source
+		return
+	fi
+	case $S_source in
+	pypi)
+		latest=$(pypi_latest)
+		answer=$(ui_input "Installed: mira-engine $(engine_version || echo '?'). Newest on PyPI: ${latest:-unknown (no access?)}.
+Version to install (empty: the newest):" "${OPT[version]:-}")
+		state_set version "$answer"
+		;;
+	git)
+		answer=$(ui_input "Git branch or tag of $GIT_URL:" "${OPT[ref]:-$S_ref}")
+		[[ -n $answer ]] || fail_input "a git branch or tag is needed"
+		state_set ref "$answer"
+		;;
+	esac
+}
+
 existing_install() {
 	local choice=upgrade
 	if ((INTERACTIVE)); then
@@ -1567,7 +1616,7 @@ What do you want to do?" upgrade \
 		choice=reconfigure
 	fi
 	case $choice in
-	upgrade) UPGRADE=1; run_steps ;;
+	upgrade) UPGRADE=1; ask_upgrade_source; run_steps ;;
 	reconfigure) ask_all; confirm_answers; run_steps ;;
 	users) manage_users; return 0 ;;
 	uninstall) uninstall_now ;;

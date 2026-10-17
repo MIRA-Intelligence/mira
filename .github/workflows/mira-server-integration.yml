@@ -372,6 +372,9 @@ jobs:
           bundle=$(ls -d /tmp/bundle/mira-server-offline-*/)
           ls -R "$bundle" | head -n 20
           (cd "$bundle" && sha256sum -c --quiet SHA256SUMS)
+          # A newer "release" for the upgrade below, on a local package index.
+          mkdir /tmp/index && cp "$bundle"wheels/*.whl /tmp/index/
+          SETUPTOOLS_SCM_PRETEND_VERSION=0.99.0 "$py" -m pip wheel -q --no-deps -w /tmp/index .
           # From here on only apt (the Ubuntu mirror) is reachable.
           printf '127.0.0.1 %s\n' pypi.org files.pythonhosted.org github.com api.github.com \
             objects.githubusercontent.com release-assets.githubusercontent.com dl.cloudsmith.io | sudo tee -a /etc/hosts
@@ -389,6 +392,23 @@ jobs:
           # Running the bundle again changes nothing.
           sudo bash "$bundle/install.sh" -y | tee /tmp/offline-rerun.txt
           test "$(grep -c ': ok, skipped$' /tmp/offline-rerun.txt)" -eq 15
+          # Later upgrades come from PyPI (here the local index pip is pointed at), run
+          # by the installer without a bundle; the bundle mira-engine came from is gone.
+          sudo mv "$bundle" /tmp/bundle-gone
+          index=(env PIP_NO_INDEX=1 PIP_FIND_LINKS=/tmp/index)
+          sudo "${index[@]}" bash deploy/mira-server/install.sh -y --upgrade | tee /tmp/pypi-upgrade.txt
+          grep -q 'upgrading from PyPI' /tmp/pypi-upgrade.txt
+          grep -q 'installed mira-engine 0.99.0' /tmp/pypi-upgrade.txt
+          sudo grep -q '^S_source=pypi$' /var/lib/mira-server-installer/state
+          for i in $(seq 1 30); do
+            curl -fsS --cacert /etc/mira-server/client-ca.crt "https://$LAN_IP/server/info" | grep -q '"version": "0.99.0"' && break
+            sleep 1
+          done
+          curl -fsS --cacert /etc/mira-server/client-ca.crt "https://$LAN_IP/server/info" | grep -q '"version": "0.99.0"'
+          # Nothing newer: nothing is restarted.
+          sudo "${index[@]}" bash deploy/mira-server/install.sh -y --upgrade | tee /tmp/pypi-upgrade2.txt
+          grep -q 'mira-engine 0.99.0 is already installed; nothing to restart' /tmp/pypi-upgrade2.txt
+          sudo grep -q '^S_restart_engines=0$' /var/lib/mira-server-installer/state
           sudo /usr/local/sbin/mira-server-uninstall --yes --purge
           for path in /opt/mira /opt/mira-python /etc/mira-server; do
             if sudo test -e "$path"; then echo "still there: $path"; exit 1; fi
