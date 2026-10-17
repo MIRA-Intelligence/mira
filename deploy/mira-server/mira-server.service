@@ -1,0 +1,26 @@
+# systemd unit for Mira Server. Install as /etc/systemd/system/mira-server.service.
+[Unit]
+Description=Mira Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mira-server
+Group=mira-server
+# Local (pam_unix) accounts on Debian/Ubuntu: add the account to the "shadow"
+# group (usermod -aG shadow mira-server); systemd applies it through User=.
+# It is not set here because hosts without that group (RHEL, LDAP/SSSD-only)
+# would fail to start the unit.
+ExecStart=/opt/mira/bin/mira-server serve --config /etc/mira-server/mira-server.toml
+Restart=on-failure
+# Engines are started through sudo and keep running across Mira Server restarts;
+# only the Mira Server process itself is stopped.
+KillMode=process
+StateDirectory=mira-server
+StateDirectoryMode=0700
+UMask=0077
+# sudo needs to gain privileges, so NoNewPrivileges must stay off.
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

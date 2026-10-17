@@ -488,3 +488,29 @@ class SkillsLoader:
             if re.search(prefix + re.escape(alias_lc) + suffix, query_lc):
                 score += 6
         return score
+
+def skill_access_dirs(workspace: Path) -> list[Path]:
+    """Skill directories tools may read besides ``workspace`` (and the sandbox mounts)."""
+    dirs: list[Path] = []
+    workspace = workspace.resolve()
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            return
+        if resolved != workspace and resolved not in dirs:
+            dirs.append(resolved)
+
+    loader = SkillsLoader(workspace)
+    for root in loader.workspace_skills_roots:
+        add(root)
+    if loader.builtin_skills:
+        add(loader.builtin_skills)
+    for skill in loader.list_skills(filter_unavailable=False):
+        skill_path = Path(skill["path"])
+        add(skill_path.parent)
+        parent = skill_path.parent.parent
+        if parent != skill_path.parent:
+            add(parent)
+    return dirs

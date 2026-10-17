@@ -48,13 +48,39 @@ docker compose --profile self-hosted exec mira-engine mira gateway-token
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:18790/api/status
 ```
 
-Enter the token in the UI's engine connection settings. The engine container
-listens on `0.0.0.0` inside the container; publish port 18790 only to networks
-you trust, and terminate TLS in front of it for remote access.
+Enter the token in the UI's engine connection settings. The engine listens on
+`0.0.0.0` inside the container, but compose publishes ports 18790 (engine) and
+8080 (UI) on the host's **loopback only** (`127.0.0.1`).
 
-UI default URL:
+UI default URL (on the Docker host):
 
 - `http://127.0.0.1:8080`
+
+## 3a) Access from another machine
+
+Direct plaintext access to the engine port from other machines is deprecated
+(see [remote-access.md](remote-access.md#deprecation-timeline)); do not change
+the published ports to `0.0.0.0`. Use one of:
+
+- **SSH tunnel (recommended).** The web UI's browser code calls the engine
+  directly, so forward both ports:
+
+  ```bash
+  ssh -N -L 8080:127.0.0.1:8080 -L 18790:127.0.0.1:18790 user@docker-host
+  ```
+
+  Then open `http://localhost:8080`. The default `MIRA_API_URL`, `MIRA_WS_URL`
+  and `MIRA_GATEWAY_ALLOWED_ORIGINS` already match this setup. The desktop app
+  only needs the `18790` forward (API URL `http://127.0.0.1:18790/api`,
+  WebSocket URL `ws://127.0.0.1:18790/ws`).
+
+- **TLS reverse proxy on the Docker host.** Proxy `127.0.0.1:18790` (and the UI)
+  behind HTTPS, set `MIRA_API_URL` / `MIRA_WS_URL` to the `https://` / `wss://`
+  addresses, and add the UI's browser origin to `MIRA_GATEWAY_ALLOWED_ORIGINS`.
+  A minimal Caddy example is in [remote-access.md](remote-access.md#if-the-engine-must-be-reachable-over-a-network-tls-only).
+
+For teams, the long-term replacement for this stack is the Mira Server
+deployment (#159).
 
 ## 4) Upgrade
 

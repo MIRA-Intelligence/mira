@@ -17,12 +17,13 @@ WORKDIR /app
 
 # Install Python dependencies first (cached layer)
 COPY pyproject.toml README.md LICENSE ./
-RUN mkdir -p mira_engine bridge && touch mira_engine/__init__.py && \
+RUN mkdir -p mira_engine mira_server bridge && touch mira_engine/__init__.py mira_server/__init__.py && \
     uv pip install --system --no-cache . && \
-    rm -rf mira_engine bridge
+    rm -rf mira_engine mira_server bridge
 
 # Copy the full source and install
 COPY mira_engine/ mira_engine/
+COPY mira_server/ mira_server/
 COPY bridge/ bridge/
 RUN uv pip install --system --no-cache .
 

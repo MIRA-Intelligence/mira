@@ -35,7 +35,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Mira Server runs from a pip install on Linux hosts, never from the desktop bundle.
+    excludes=['mira_server', 'pam'],
     noarchive=False,
     optimize=0,
 )

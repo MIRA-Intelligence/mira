@@ -327,29 +327,7 @@ class BaseAgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        skill_access_dirs: list[Path] = []
-        if self.restrict_to_workspace:
-            from mira_engine.agent.skills import SkillsLoader
-
-            def _add_skill_dir(path: Path) -> None:
-                try:
-                    resolved = path.resolve()
-                except Exception:
-                    return
-                if resolved != self.workspace and resolved not in skill_access_dirs:
-                    skill_access_dirs.append(resolved)
-
-            skills_loader = SkillsLoader(self.workspace)
-            for root in skills_loader.workspace_skills_roots:
-                _add_skill_dir(root)
-            if skills_loader.builtin_skills:
-                _add_skill_dir(skills_loader.builtin_skills)
-            for skill in skills_loader.list_skills(filter_unavailable=False):
-                skill_path = Path(skill["path"])
-                _add_skill_dir(skill_path.parent)
-                parent = skill_path.parent.parent
-                if parent != skill_path.parent:
-                    _add_skill_dir(parent)
+        skill_access_dirs = self._skill_access_dirs_for_workspace(self.workspace)
 
         supports_vision = self.provider.supports_vision(self.model)
         self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs, supports_vision=supports_vision))
@@ -376,6 +354,10 @@ class BaseAgentLoop:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
+                sandbox=self.exec_config.sandbox or None,
+                sandbox_network=self.exec_config.sandbox_network,
+                sandbox_read_only_paths=self.exec_config.sandbox_read_only_paths,
+                sandbox_extra_dirs=skill_access_dirs,
                 background_registry=self._bg_registry,
                 enable_background=True,
                 python_runtime=self.exec_config.python,
@@ -399,9 +381,11 @@ class BaseAgentLoop:
             self.tools.register(cron_tool)
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
-        skill_access_dirs: list[Path] = []
-        if not self.restrict_to_workspace:
-            return skill_access_dirs
+        if not (self.restrict_to_workspace or self.exec_config.sandbox):
+            return []
+        from mira_engine.agent.skills import skill_access_dirs
+
+        return skill_access_dirs(workspace)
 
         from mira_engine.agent.skills import SkillsLoader
 

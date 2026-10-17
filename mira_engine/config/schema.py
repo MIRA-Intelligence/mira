@@ -1,9 +1,10 @@
 """Configuration schema using Pydantic."""
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -437,6 +438,19 @@ class ProviderConfig(Base):
     # (has a credential/endpoint/model list, or is local/OAuth). ``True``/``False``
     # force the state regardless of configuration.
     enabled: bool | None = None
+    # User-chosen display name. Only custom (OpenAI-compatible) providers use it;
+    # names are labels, not identifiers, so two providers may share one.
+    name: str | None = None
+
+
+# Ids of additional custom providers under ``providers.customProviders``. The
+# built-in ``custom`` entry keeps its own id.
+CUSTOM_PROVIDER_ID_PATTERN = re.compile(r"^custom_[a-z0-9]{1,32}$")
+
+
+def is_custom_provider_id(name: str | None) -> bool:
+    """True for ``custom`` and for additional custom provider ids (``custom_<suffix>``)."""
+    return bool(name) and (name == "custom" or bool(CUSTOM_PROVIDER_ID_PATTERN.match(name)))
 
 
 class ModelParamRule(Base):
@@ -462,6 +476,8 @@ class ProvidersConfig(Base):
     # default; surfaced and edited from the Providers UI.
     model_params: list[ModelParamRule] = Field(default_factory=list)
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
+    # Additional OpenAI-compatible endpoints, keyed by a stable id ("custom_<suffix>").
+    custom_providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -469,14 +485,19 @@ class ProvidersConfig(Base):
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     nvidia: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
+    xai: ProviderConfig = Field(default_factory=ProviderConfig)  # xAI (Grok)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
+    zhipu_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # GLM Coding Plan (智谱 / Z.ai)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)
+    dashscope_token_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # Bailian Token Plan (阿里云百炼)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
     ovms: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenVINO Model Server (OVMS)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
+    kimi_code: ProviderConfig = Field(default_factory=ProviderConfig)  # Kimi Code (Kimi membership)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    minimax_token_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # MiniMax Token Plan
     mistral: ProviderConfig = Field(default_factory=ProviderConfig)
     stepfun: ProviderConfig = Field(default_factory=ProviderConfig)  # Step Fun (阶跃星辰)
     xiaomi_mimo: ProviderConfig = Field(default_factory=ProviderConfig)  # Xiaomi MIMO (小米)
@@ -484,11 +505,21 @@ class ProvidersConfig(Base):
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
     volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Coding Plan
+    volcengine_agent_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Agent Plan
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
+
+    def entry(self, name: str) -> ProviderConfig | None:
+        """Return the config for a provider id, including additional custom providers."""
+        if name in self.custom_providers:
+            return self.custom_providers[name]
+        if name in {"proxy", "model_params", "custom_providers"}:
+            return None
+        value = getattr(self, name, None)
+        return value if isinstance(value, ProviderConfig) else None
 
 
 class HeartbeatConfig(Base):
@@ -601,6 +632,10 @@ class ExecToolConfig(Base):
     timeout: int = 60
     path_append: str = ""
     sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
+    sandbox_network: Literal["full", "none"] = "full"  # "none": no network inside the sandbox
+    # Extra host paths visible read-only inside the sandbox (e.g. a conda
+    # install). Paths inside the Mira home (config, tokens) are never mounted.
+    sandbox_read_only_paths: list[str] = Field(default_factory=list)
     python: PythonRuntimeConfig = Field(default_factory=PythonRuntimeConfig)
 
 
@@ -635,6 +670,14 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+
+    # The user's own values of settings the host policy overrides
+    # (security/host_policy.py), keyed by config.json path; save_config writes
+    # these instead of the enforced values.
+    _policy_user_values: dict[tuple[str, ...], Any] = PrivateAttr(default_factory=dict)
+    # What the Mira Server team layer changed (config/team_layer.py), so
+    # save_config can take it back out.
+    _team_values: Any = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _enable_channel_builtin_access(self) -> "Config":
@@ -676,6 +719,8 @@ class Config(BaseSettings):
         else:
             forced = self.agents.defaults.provider
         if forced != "auto":
+            if forced in self.providers.custom_providers:
+                return self.providers.custom_providers[forced], forced
             forced_normalized = _normalized_provider_name(forced)
             spec = find_by_name(forced_normalized or forced)
             if spec:
