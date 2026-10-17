@@ -545,6 +545,39 @@ cannot be team providers; a provider without a known default endpoint needs an
 API Base in the team settings; engines older than this feature ignore the team
 settings (logged as `team.push_unsupported`).
 
+## Token usage and quotas
+
+Mira Server meters the **team providers**: every call goes through its LLM
+proxy, which reads the token counts from the provider's response (OpenAI
+`usage`, also in streams; Responses API; Anthropic, with cache reads and writes
+counted as input; Gemini `usageMetadata`) and adds them up per user, day,
+provider and model in `mira-server.sqlite3`. Only counts are kept, never
+prompts or replies. A call whose response reports no usage is counted as
+`unreported_calls`. Providers users set up with their own keys are not metered
+or limited.
+
+**Quotas** are in tokens, per user, daily and monthly: a team default, and
+overrides for single users. In the default, `null` or `0` means unlimited; in
+an override, `null` follows the default and `0` is unlimited for that user.
+Days and months follow the server's local time. The quota is checked before a
+call is forwarded, so a call already running can go over by at most its own
+size. Once a quota is used up, the proxy answers `429` with
+`insufficient_quota` and a message saying when it resets; the engine does not
+retry and the user sees the message. `warn_percent` (default 80) is where the
+app starts warning users.
+
+Administrators manage quotas through the API (below; changes are audited as
+`team.quotas_changed`) or on the server, as the `mira-server` account:
+
+```sh
+sudo -u mira-server /opt/mira/bin/mira-server quota set --daily 2M --monthly 40M
+sudo -u mira-server /opt/mira/bin/mira-server quota set --user alice --daily 5M   # or unlimited, default
+sudo -u mira-server /opt/mira/bin/mira-server quota show
+sudo -u mira-server /opt/mira/bin/mira-server usage --by user,model             # --from, --to, --csv
+```
+
+Changes apply to the next call; Mira Server does not need a restart.
+
 ## Dev mode (UI development only)
 
 For working on the desktop client without a Linux host or real accounts:
@@ -593,6 +626,9 @@ response carries `X-Mira-Request-Id`.
 | `POST /server/engine/stop` | bearer | Stops the engine; returns the `engine` object |
 | `/api/*` | bearer (or `?access_token=` on GET/HEAD) | Proxied to the caller's engine; for administrators the settings endpoints answer from the [team settings](#team-settings) (`"scope": "team"`) |
 | `/llm/<provider>/*` | an engine's token (loopback only) | The [LLM proxy](#team-settings) for team providers |
+| `GET /server/usage` | bearer | The caller's team-provider usage: `today`, `month`, `by_model` (this month) and `quota` (per period: `limit`, `used`, `remaining`, `warn`, `exceeded`, `resets_at`) |
+| `GET /server/admin/usage` | bearer, administrator | Everyone's usage: `?from=&to=` (dates, default this month), `?group_by=` (`user`, `day`, `month`, `provider`, `model`; default `user`, which adds each user's `quota`), `?format=csv` |
+| `GET`, `PUT /server/admin/quotas` | bearer, administrator | `{"default": {"daily", "monthly"}, "users": {"alice": {"daily", "monthly"}}, "warn_percent"}`; `PUT` replaces all of it |
 | `GET /ws`, `GET /ws/*` | bearer or `?access_token=` | WebSocket proxy to the same path on the engine (`/ws`, `/ws/workflow/v1`) |
 
 Token response:
@@ -656,7 +692,8 @@ The `audit` table in `mira-server.sqlite3` records metadata only: sign-ins
 (`login.ok`, `login.failed`, `login.denied`, `login.rate_limited`), `logout`,
 `access.revoked`, engine `started`/`attached`/`stopped`/`start_failed`/
 `stop_failed`/`forgotten`/`unhealthy`/`revoked`, team settings
-(`team.config_changed`, `team.push_failed`, `team.push_unsupported`), and security events
+(`team.config_changed`, `team.push_failed`, `team.push_unsupported`), quotas
+(`team.quotas_changed`), and security events
 (`security.refresh_reuse`, `security.listener_mismatch`). It never contains
 passwords, tokens, prompts or request bodies.
 
@@ -667,8 +704,7 @@ passwords, tokens, prompts or request bodies.
   `nohup` outside any session gets none.
 - **MCP servers** run outside the sandbox; disable them with `tools.mcp = false`
   where that matters.
-- **Usage metering and quotas** for team providers (#157), and personal keys
-  encrypted at rest.
+- **Personal keys encrypted at rest**, and cost (rather than token) quotas.
 - **Local passwords on RHEL/Fedora**: there is no `shadow` group, so only
   LDAP/SSSD accounts can sign in until a privileged password helper exists.
 - **`Origin: null`**: the packaged desktop app sends `Origin: null`, which any

@@ -214,7 +214,10 @@ async def ws_chat(base: str, token: str, session_id: str) -> str:
                 frame = json.loads(msg.data)
                 if frame.get("type") == "stream_delta":
                     reply += str(frame.get("content") or frame.get("delta") or "")
-                elif frame.get("type") in ("stream_end", "response", "error"):
+                elif frame.get("type") == "stream_end" and reply:
+                    break
+                elif frame.get("type") in ("response", "error"):
+                    # Nothing streamed (e.g. the provider refused the call): the reply comes whole.
                     reply = reply or str(frame.get("content") or "")
                     break
     return reply
@@ -415,6 +418,28 @@ def main() -> int:
     status, _, _ = client.request("POST", "/llm/custom/chat/completions", body={},
                                   headers={"Authorization": f"Bearer {alice_token}", "X-Forwarded-For": "10.1.2.3"})
     check(status == 403, "the LLM proxy refuses requests that came through a TLS proxy")
+
+    step("token usage: the LLM proxy meters alice's calls; a used-up quota stops them")
+    status, _, payload = client.request("GET", "/server/usage", token=at)
+    check(status == 200 and payload["today"]["total_tokens"] >= 7 and payload["today"]["calls"] >= 1,
+          f"alice's usage today: {payload.get('today') if isinstance(payload, dict) else payload}")
+    status, _, payload = client.request("GET", "/server/admin/usage", token=bt)
+    users = {row["user"]: row["total_tokens"] for row in payload.get("rows", [])} if status == 200 else {}
+    check(users.get("alice", 0) >= 7, f"bob sees everyone's usage: {users}")
+    status, _, _ = client.request("GET", "/server/admin/usage", token=at)
+    check(status == 403, "alice cannot see everyone's usage")
+    status, _, payload = client.request("PUT", "/server/admin/quotas", token=bt,
+                                        body={"users": {"alice": {"daily": 1}}})
+    check(status == 200, f"bob limits alice to 1 token a day -> {status} {payload}")
+    llm.seen.clear()
+    reply = asyncio.run(ws_chat(args.url, at, "quota-e2e"))
+    check("quota is used up" in reply.lower() and not llm.seen,
+          f"alice's next chat is refused before it reaches the provider: {reply[:200]!r}")
+    status, _, _ = client.request("PUT", "/server/admin/quotas", token=bt, body={})
+    check(status == 200, "bob removes the quota")
+    report = sudo(args.mira_server, "usage", "--config", args.config, user="mira-server").stdout
+    check(any(line.split()[:1] == ["alice"] for line in report.splitlines()),
+          f"mira-server usage lists alice:\n{report}")
 
     step("logout revokes the session")
     status, _, _ = client.request("POST", "/server/auth/logout", token=at)
