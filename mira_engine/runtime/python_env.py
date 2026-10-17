@@ -303,7 +303,7 @@ def ensure_python_interpreter(
         Optional process environment for the subprocess. When ``None``,
         ``os.environ`` is inherited.
     """
-    if _interpreter_installed(uv, version, env=env):
+    if _interpreter_installed(uv, version, env=env, wrap=wrap):
         logger.debug("uv: python %s already installed", version)
         return
     logger.info("uv: installing python %s (one-time)", version)
@@ -321,8 +321,12 @@ def _interpreter_installed(
     version: str,
     *,
     env: dict[str, str] | None,
+    wrap: Wrap | None = None,
 ) -> bool:
     """True iff ``uv python list --only-installed`` mentions ``version``.
+
+    ``wrap`` is the sandbox the install would run in, so both see the same
+    interpreters.
 
     The output format is one entry per line, e.g.::
 
@@ -331,9 +335,10 @@ def _interpreter_installed(
     We do a substring match on the major.minor (or full) version so the
     check works for both ``"3.11"`` and ``"3.11.10"`` callers.
     """
+    args = [str(uv.path), "python", "list", "--only-installed"]
     try:
         result = subprocess.run(
-            [str(uv.path), "python", "list", "--only-installed"],
+            wrap(args) if wrap is not None else args,
             env=env if env is not None else os.environ.copy(),
             capture_output=True,
             text=True,
