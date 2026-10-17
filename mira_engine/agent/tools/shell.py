@@ -235,6 +235,9 @@ class ExecTool(Tool):
         # to mean "bootstrap was attempted and failed; do not retry"). Keeps
         # the bootstrap subprocess off the hot path for repeated commands.
         self._venv_cache: dict[str, Path | None] = {}
+        # Why bootstrap failed for a cwd; surfaced to the agent so it does not
+        # go hunting for an interpreter on its own.
+        self._venv_errors: dict[str, str] = {}
         self._venv_cache_lock = asyncio.Lock()
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
@@ -491,6 +494,16 @@ class ExecTool(Tool):
 
             result = "\n".join(output_parts) if output_parts else "(no output)"
 
+            bootstrap_error = self._venv_errors.get(cwd)
+            if bootstrap_error and _is_python_command(command):
+                result += (
+                    "\n\nNOTE: the managed Python environment could not be "
+                    f"created ({bootstrap_error}). Do NOT search the filesystem "
+                    "for a Python interpreter (no `where python`, `ls C:/...`, "
+                    "glob). Tell the user to install uv "
+                    "(https://docs.astral.sh/uv/) or Python >= 3.11, then retry."
+                )
+
             # Truncate very long output
             max_len = self._MAX_OUTPUT
             if len(result) > max_len:
@@ -579,6 +592,7 @@ class ExecTool(Tool):
                     exc,
                 )
                 self._venv_cache[cwd] = None
+                self._venv_errors[cwd] = str(exc)
                 return None
 
             self._venv_cache[cwd] = venv

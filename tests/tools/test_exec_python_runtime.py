@@ -22,7 +22,6 @@ from mira_engine.agent.tools import shell as shell_module
 from mira_engine.agent.tools.shell import ExecTool, _is_python_command
 from mira_engine.config.schema import PythonRuntimeConfig
 
-
 # ---------------------------------------------------------------------------
 # _is_python_command
 # ---------------------------------------------------------------------------
@@ -242,6 +241,32 @@ class TestExecuteUsesVenv:
         assert captured_env.get("PATH", "").startswith(
             str(venv / "bin") + ":"
         ) or captured_env.get("PATH", "") == str(venv / "bin")
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_failure_explains_recovery_without_interpreter_hunting(
+        self, tmp_path: Path
+    ) -> None:
+        cfg = PythonRuntimeConfig(manager="uv")
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"python not found", b"")
+        mock_proc.returncode = 127
+
+        with (
+            patch("mira_engine.agent.tools.shell._IS_WINDOWS", False),
+            patch.object(
+                ExecTool,
+                "_bootstrap_venv_sync",
+                side_effect=RuntimeError("uv missing"),
+            ),
+            patch.object(ExecTool, "_spawn", return_value=mock_proc),
+            patch.object(ExecTool, "_guard_command", return_value=None),
+        ):
+            tool = ExecTool(python_runtime=cfg, working_dir=str(tmp_path))
+            result = await tool.execute(command="python --version")
+
+        assert "managed Python environment could not be created (uv missing)" in result
+        assert "Do NOT search the filesystem for a Python interpreter" in result
+        assert "install uv" in result
 
     @pytest.mark.asyncio
     async def test_subprocess_env_unchanged_for_non_python_command(
