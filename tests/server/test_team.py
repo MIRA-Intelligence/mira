@@ -226,14 +226,15 @@ async def test_renaming_a_custom_team_provider_reaches_engines(harness: Harness,
         assert harness.spawner.logs["alice"].team_layers[-1]["providers"][provider_id]["name"] == name
 
 
-async def test_admin_turns_providers_off_for_everyone(harness: Harness) -> None:
+async def test_providers_administrators_turn_off_stay_the_users(harness: Harness) -> None:
     alice = await harness.login("alice")
     await harness.wait_running(alice)
     admin = await harness.login("bob")
-    # What the Providers page sends when an OAuth provider and a plain one are switched off.
+    # What the Providers page sends when an OAuth provider, a plain one and a configured one are switched off.
     status, data = await _team_config(harness, admin, {"providers": {
         "openai_codex": {"api_base": None, "models": [], "enabled": False},
         "deepseek": {"api_base": None, "models": [], "enabled": False},
+        "openrouter": {"api_key": TEAM_KEY, "models": [], "enabled": False},
     }})
     assert status == 200 and data["persisted"] is True, data
     assert data["providers"]["openai_codex"]["enabled"] is False
@@ -241,7 +242,8 @@ async def test_admin_turns_providers_off_for_everyone(harness: Harness) -> None:
         ["providers"]["deepseek"]["enabled"] is False  # kept for the next visit
     await harness.server.engines.drain()
     layer = harness.spawner.logs["alice"].team_layers[-1]
-    assert layer["disabled"] == ["deepseek", "openai_codex"] and layer["providers"] == {}
+    assert layer["providers"] == {} and "disabled" not in layer
+    assert harness.server.team.upstream("openrouter") is None
 
 
 async def test_admin_tests_and_lists_models_with_the_team_key(harness: Harness, provider: FakeProvider) -> None:

@@ -397,9 +397,12 @@ them (its usage counts for that account).
 What the team settings do in each user's engine:
 
 - **Team providers** (a provider with an API key or endpoint in the team
-  settings) replace the user's own entry for that provider. Users see them as
-  managed by the team and cannot change them (`403 locked_by_team`). Providers
-  the team does not configure stay available for users' own keys.
+  settings, and turned on) replace the user's own entry for that provider. Users
+  see them as managed by the team and cannot change them (`403 locked_by_team`).
+  For custom providers this is per provider: users can still add their own.
+- Providers the team does not configure, or turns off, stay each user's own,
+  to use with their own key. Turning a provider off on the administrator's
+  Providers page does not turn it off for users.
 - **Defaults** (provider and model, reasoning effort, temperature, iteration
   limits, team-role models) apply until a user picks their own value.
 - **Model parameter rules**, if the team sets any, replace the users' rules.
@@ -411,7 +414,7 @@ team settings when the engine starts (or Mira Server attaches to it) and again
 after every change, with each team provider pointing at Mira Server's LLM
 proxy, `http://127.0.0.1:8740/llm/<provider>`, and the engine's own token as
 its API key. The proxy accepts only loopback requests that did not come through
-the TLS proxy (no `X-Forwarded-For`) and that carry the token of an engine Mira
+the TLS proxy (no `X-Forwarded-For` or other forwarding header) and that carry the token of an engine Mira
 Server runs for a current `mira-users` member. It replaces that token, in
 whichever header the provider client sent it, with the team key and streams
 the provider's answer back. The provider must be reachable from the Mira Server

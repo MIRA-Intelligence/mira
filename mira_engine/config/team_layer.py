@@ -11,8 +11,9 @@ keeps it in memory only and applies it to the user's raw ``config.json`` in
   token, so the team's real keys never reach the engine.
 - **Named custom providers** (``custom_<id>``) the team defines are added to
   the user's ``providers.customProviders`` the same way, under the team's name.
-- **Disabled providers**: providers administrators turned off are off for the
-  user too and cannot be turned on (the user's own key is kept, unused).
+- Providers the team does not configure stay the user's own: administrators
+  turning one off on their own Providers page does not affect users, who may
+  still use it with their own key.
 - **model_params**, when the team sets them, replace the user's rules (locked).
 - **Defaults** (provider and model, reasoning effort, ...) apply only where the
   user has not chosen a value: the key is missing from config.json or still
@@ -85,21 +86,19 @@ class TeamLayer:
     providers: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_params: list[dict[str, Any]] | None = None
     defaults: dict[str, Any] = field(default_factory=dict)
-    disabled: tuple[str, ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not self.providers and self.model_params is None and not self.defaults and not self.disabled
+        return not self.providers and self.model_params is None and not self.defaults
 
     def manages(self, provider_name: str) -> bool:
-        return provider_name in self.providers or provider_name in self.disabled
+        return provider_name in self.providers
 
     def summary(self) -> dict[str, Any]:
         """What the layer manages, for the config payload (no values)."""
         return {
             "revision": self.revision,
             "providers": sorted(self.providers),
-            "disabled": sorted(self.disabled),
             "model_params": self.model_params is not None,
             "defaults": sorted(self.defaults),
         }
@@ -117,7 +116,7 @@ def parse_layer(data: Any) -> TeamLayer:
         return TeamLayer()
     if not isinstance(data, dict):
         raise TeamLayerError("layer must be an object or null")
-    unknown = sorted(set(data) - {"revision", "providers", "disabled", "model_params", "defaults"})
+    unknown = sorted(set(data) - {"revision", "providers", "model_params", "defaults"})
     if unknown:
         logger.warning("Team layer: ignoring unknown key(s) {} (a newer Mira Server)", ", ".join(unknown))
     revision = data.get("revision", "")
@@ -158,12 +157,6 @@ def parse_layer(data: Any) -> TeamLayer:
         if is_custom_provider_id(name):
             providers[name]["name"] = display or None
 
-    disabled = data.get("disabled") or []
-    if not isinstance(disabled, list) or not all(isinstance(name, str) for name in disabled):
-        raise TeamLayerError("disabled must be a list of provider names")
-    disabled = [name for name in disabled if name in known or usable(name)]
-    disabled = [name for name in disabled if not CUSTOM_PROVIDER_ID_PATTERN.match(name)]
-
     model_params = data.get("model_params")
     if model_params is not None:
         from mira_engine.config.ui_runtime import _normalize_model_param_rules
@@ -179,8 +172,7 @@ def parse_layer(data: Any) -> TeamLayer:
     unknown = sorted(set(defaults) - set(DEFAULT_FIELDS))
     if unknown:
         raise TeamLayerError(f"unknown default(s): {', '.join(unknown)}")
-    return TeamLayer(revision=revision, providers=providers, model_params=model_params, defaults=dict(defaults),
-                     disabled=tuple(sorted(set(disabled) - set(providers))))
+    return TeamLayer(revision=revision, providers=providers, model_params=model_params, defaults=dict(defaults))
 
 
 def set_team_layer(layer: TeamLayer) -> bool:
@@ -266,14 +258,8 @@ def apply_to_raw(data: dict[str, Any], layer: TeamLayer | None = None) -> TeamVa
     values = TeamValues(layer=layer)
     if layer.empty:
         return values
-    if layer.providers or layer.disabled or layer.model_params is not None:
+    if layer.providers or layer.model_params is not None:
         providers = _record(data, "providers")
-        for name in layer.disabled:
-            path, container, key = _provider_path(providers, name)
-            original = _pop_key(container, name)
-            values.replaced[path] = original
-            value = original[1]
-            container[key] = {**(value if isinstance(value, dict) else {}), "enabled": False}
         for name, record in layer.providers.items():
             path, container, key = _provider_path(providers, name)
             if _is_custom(name):
@@ -353,13 +339,8 @@ def managed_provider(config: "Config", provider_name: str) -> bool:
 
 
 def check_provider_change(config: "Config", provider_name: str, update: dict[str, Any]) -> None:
-    """Raise :class:`TeamLockedError` when ``update`` changes a team or team-disabled provider."""
-    layer = team_values(config).layer
-    record = layer.providers.get(provider_name)
-    if record is None and provider_name in layer.disabled:
-        current = config.providers.entry(provider_name)
-        record = {"api_key": current.api_key, "api_base": current.api_base,
-                  "models": list(current.models), "enabled": False}
+    """Raise :class:`TeamLockedError` when ``update`` changes a team provider."""
+    record = team_values(config).layer.providers.get(provider_name)
     if record is None:
         return
     for key in (*PROVIDER_KEYS, "name"):
@@ -379,9 +360,8 @@ def check_provider_change(config: "Config", provider_name: str, update: dict[str
         elif key == "models" and isinstance(requested, list):
             requested = [str(m).strip() for m in requested if str(m).strip()]
         if requested != current:
-            what = ("turned off by the Team Server administrators" if provider_name in layer.disabled
-                    else "managed by the Team Server administrators")
-            raise TeamLockedError(f"providers.{provider_name} is {what} and cannot be changed here")
+            raise TeamLockedError(f"providers.{provider_name} is managed by the Team Server administrators "
+                                  "and cannot be changed here")
 
 
 def check_model_params_change(config: "Config", rules: list[dict[str, Any]]) -> None:

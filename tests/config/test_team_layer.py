@@ -192,7 +192,7 @@ def test_payload_marks_team_providers_and_hides_the_engine_token(config_path: Pa
     assert openai["managed_by"] == "team" and openai["api_key_configured"] is True
     assert openai["api_key_preview"] is None
     assert "managed_by" not in payload["providers"]["deepseek"]
-    assert payload["team"] == {"revision": "r1", "providers": ["openai"], "disabled": [], "model_params": False,
+    assert payload["team"] == {"revision": "r1", "providers": ["openai"], "model_params": False,
                                "defaults": ["model", "provider", "temperature"]}
     assert TOKEN not in json.dumps(payload)
 
@@ -245,26 +245,20 @@ def test_the_apps_setup_placeholder_does_not_block_team_defaults(config_path: Pa
     assert (config.agents.defaults.provider, config.agents.defaults.model) == ("openai", "gpt-5")
 
 
-def test_team_disabled_provider_is_off_and_locked_and_the_users_key_kept(config_path: Path) -> None:
+def test_providers_the_team_does_not_configure_stay_the_users(config_path: Path) -> None:
+    # An earlier Mira Server also sent the providers administrators turned off; that is ignored.
     _write(config_path, {"providers": {"deepseek": {"apiKey": "sk-deep", "enabled": True}}})
-    team_layer.set_team_layer(_layer(disabled=["deepseek", "openai_codex"]))
+    team_layer.set_team_layer(team_layer.parse_layer({"revision": "r1", "providers": {},
+                                                      "disabled": ["deepseek", "ollama"]}))
     config = load_config(config_path)
-    assert config.providers.deepseek.enabled is False and config.providers.openai_codex.enabled is False
+    assert (config.providers.deepseek.api_key, config.providers.deepseek.enabled) == ("sk-deep", True)
     payload = build_ui_runtime_payload(config, projects_root=config_path.parent, config_path=config_path,
                                        persisted=False)
-    assert payload["providers"]["deepseek"]["managed_by"] == "team"
-    assert payload["providers"]["deepseek"]["enabled"] is False
-    with pytest.raises(team_layer.TeamLockedError, match="turned off"):
-        apply_ui_runtime_update(config, {"providers": {"deepseek": {"enabled": True}}},
-                                current_projects_root=config_path.parent)
-    # Re-sending what the page shows is no change.
-    apply_ui_runtime_update(config, {"providers": {"deepseek": {"enabled": False, "api_base": None}}},
+    assert "managed_by" not in payload["providers"]["deepseek"]
+    assert "managed_by" not in payload["providers"]["ollama"]
+    apply_ui_runtime_update(config, {"providers": {"ollama": {"enabled": True, "api_base": "http://localhost:11434"}}},
                             current_projects_root=config_path.parent)
-    save_config(config, config_path)
-    assert _read(config_path)["providers"]["deepseek"] == {"apiKey": "sk-deep", "enabled": True}
-
-    team_layer.set_team_layer(_layer())
-    assert load_config(config_path).providers.deepseek.enabled is True
+    assert config.providers.ollama.enabled is True
 
 
 @pytest.mark.parametrize("data, message", [
@@ -273,7 +267,6 @@ def test_team_disabled_provider_is_off_and_locked_and_the_users_key_kept(config_
     ({"providers": {"openai": {"api_key": 1}}}, "must be strings"),
     ({"providers": {"custom_x": {"name": 3}}}, "name must be a string"),
     ({"defaults": {"workspace": "/tmp"}}, "unknown default"),
-    ({"disabled": "openai"}, "list of provider names"),
     ({"model_params": [{"pattern": 1}]}, "pattern"),
 ])
 def test_parse_layer_rejects_malformed_layers(data, message: str) -> None:
@@ -287,9 +280,8 @@ def test_parse_layer_skips_what_a_newer_server_adds() -> None:
         "providers": {"openai": {"api_key": TOKEN, "api_base": f"{PROXY}/openai", "models": [], "enabled": None,
                                  "future_field": 1},
                       "provider_from_the_future": {"api_key": TOKEN}},
-        "disabled": ["deepseek", "another_future_one"],
     })
-    assert list(layer.providers) == ["openai"] and layer.disabled == ("deepseek",)
+    assert list(layer.providers) == ["openai"]
 
 
 def test_parse_layer_null_clears() -> None:

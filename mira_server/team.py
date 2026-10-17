@@ -187,7 +187,7 @@ class TeamConfig:
     # ── what engines get ──────────────────────────────────────────────
 
     def team_providers(self) -> dict[str, dict[str, Any]]:
-        """Providers administrators configured (a key or an endpoint), by name."""
+        """Providers administrators configured (a key or an endpoint) and left on, by name."""
         providers = self._raw.get("providers")
         if not isinstance(providers, dict):
             return {}
@@ -202,23 +202,15 @@ class TeamConfig:
                 continue
             api_key = (_get(record, "api_key", "") or "").strip()
             api_base = (_get(record, "api_base") or "") or None
-            if not api_key and not api_base:
+            # Only providers administrators turned on: one they turned off (or never
+            # configured) stays each user's own, to use with their own key.
+            if (not api_key and not api_base) or _get(record, "enabled") is False:
                 continue
             found[name] = {"api_key": api_key, "api_base": api_base,
                            "models": list(_get(record, "models", []) or []), "enabled": _get(record, "enabled")}
             if is_custom_provider_id(name):
                 found[name]["name"] = _get(record, "name")
         return found
-
-    def disabled_providers(self) -> list[str]:
-        """Providers administrators turned off (other than team providers): off for every user."""
-        providers = self._raw.get("providers")
-        if not isinstance(providers, dict):
-            return []
-        team = self.team_providers()
-        return [name for name in _provider_names()
-                if name not in team and isinstance(_get(providers, name), dict)
-                and _get(_get(providers, name), "enabled") is False]
 
     def upstream(self, name: str) -> Upstream | None:
         record = self.team_providers().get(name)
@@ -244,8 +236,7 @@ class TeamConfig:
                                "models": record["models"], "enabled": record["enabled"]}
             if "name" in record:
                 providers[name]["name"] = record["name"]
-        layer: dict[str, Any] = {"revision": self.revision(), "providers": providers,
-                                 "disabled": self.disabled_providers()}
+        layer: dict[str, Any] = {"revision": self.revision(), "providers": providers}
         raw_providers = self._raw.get("providers")
         if isinstance(raw_providers, dict):
             rules = _get(raw_providers, "model_params")
