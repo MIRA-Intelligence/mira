@@ -25,7 +25,7 @@ from typing import Any
 from pydantic.alias_generators import to_camel
 
 from mira_engine.config import team_layer
-from mira_engine.config.schema import Config, ProvidersConfig
+from mira_engine.config.schema import Config, ProvidersConfig, is_custom_provider_id
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
     apply_ui_runtime_update_to_raw_data,
@@ -206,7 +206,7 @@ class TeamConfig:
                 continue
             found[name] = {"api_key": api_key, "api_base": api_base,
                            "models": list(_get(record, "models", []) or []), "enabled": _get(record, "enabled")}
-            if name.startswith("custom_"):
+            if is_custom_provider_id(name):
                 found[name]["name"] = _get(record, "name")
         return found
 

@@ -128,7 +128,7 @@ def parse_layer(data: Any) -> TeamLayer:
     raw_providers = data.get("providers") or {}
     if not isinstance(raw_providers, dict):
         raise TeamLayerError("providers must be an object")
-    from mira_engine.config.schema import CUSTOM_PROVIDER_ID_PATTERN
+    from mira_engine.config.schema import CUSTOM_PROVIDER_ID_PATTERN, is_custom_provider_id
 
     known = set(ProvidersConfig.model_fields) - {"proxy", "model_params", "custom_providers"}
 
@@ -155,7 +155,7 @@ def parse_layer(data: Any) -> TeamLayer:
         if enabled is not None and not isinstance(enabled, bool):
             raise TeamLayerError(f"providers.{name}.enabled must be a boolean or null")
         providers[name] = {"api_key": api_key, "api_base": api_base, "models": list(models), "enabled": enabled}
-        if CUSTOM_PROVIDER_ID_PATTERN.match(name):
+        if is_custom_provider_id(name):
             providers[name]["name"] = display or None
 
     disabled = data.get("disabled") or []

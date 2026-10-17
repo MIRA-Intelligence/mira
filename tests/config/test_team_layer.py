@@ -221,6 +221,22 @@ def test_team_named_custom_provider_is_added_locked_and_never_saved(config_path:
     assert list(saved) == ["custom_mine"] and TOKEN not in config_path.read_text(encoding="utf-8")
 
 
+def test_team_name_of_the_first_custom_provider_replaces_the_users(config_path: Path) -> None:
+    _write(config_path, {"providers": {"custom": {"apiKey": "sk-mine", "name": "Mine"}}})
+    team_layer.set_team_layer(_layer(providers={"custom": {
+        "api_key": TOKEN, "api_base": f"{PROXY}/custom", "models": [], "enabled": None, "name": "Corp LLM"}}))
+    config = load_config(config_path)
+    assert config.providers.custom.name == "Corp LLM"
+    payload = build_ui_runtime_payload(config, projects_root=config_path.parent, config_path=config_path,
+                                       persisted=False)
+    assert payload["providers"]["custom"]["display_name"] == "Corp LLM"
+    with pytest.raises(team_layer.TeamLockedError):
+        apply_ui_runtime_update(config, {"providers": {"custom": {"name": "Renamed"}}},
+                                current_projects_root=config_path.parent)
+    save_config(config, config_path)
+    assert _read(config_path)["providers"]["custom"] == {"apiKey": "sk-mine", "name": "Mine"}
+
+
 def test_the_apps_setup_placeholder_does_not_block_team_defaults(config_path: Path) -> None:
     _write(config_path, {"agents": {"defaults": {"provider": "custom", "model": "custom/mira-ui-bundle-setup"}},
                          "providers": {"custom": {"apiBase": "http://127.0.0.1:9/v1"}}})

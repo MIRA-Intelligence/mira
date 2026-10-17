@@ -390,6 +390,18 @@ def main() -> int:
     status, _, payload = client.request("POST", "/api/config", token=at,
                                         body={"providers": {"custom": {"api_key": "sk-mine"}}})
     check(status == 403 and payload.get("code") == "locked_by_team", f"alice cannot change it -> {status}")
+    for name in ("Corp LLM", "Corp LLM (EU)"):
+        status, _, _ = client.request("POST", "/api/config", token=bt,
+                                      body={"providers": {"custom": {"name": name}}})
+        check(status == 200, f"bob names the team provider {name!r} -> {status}")
+        shown = None
+        for _ in range(20):
+            time.sleep(0.25)
+            payload, _ = client.api_until_ready("/api/config", at)
+            shown = payload["providers"]["custom"].get("display_name")
+            if shown == name:
+                break
+        check(shown == name, f"alice sees the team provider as {name!r}: {shown!r}")
     llm.seen.clear()
     reply = asyncio.run(ws_chat(args.url, at, "team-e2e"))
     check(TEAM_REPLY in reply, f"alice's chat is answered by the team provider: {reply!r}")

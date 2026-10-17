@@ -213,6 +213,19 @@ async def test_named_custom_team_provider_reaches_engines_and_the_proxy(harness:
     assert resp.status == 200 and provider.requests[-1]["headers"]["Authorization"] == f"Bearer {TEAM_KEY}"
 
 
+@pytest.mark.parametrize("provider_id", ["custom", "custom_corp"])
+async def test_renaming_a_custom_team_provider_reaches_engines(harness: Harness, provider_id: str) -> None:
+    alice = await harness.login("alice")
+    await harness.wait_running(alice)
+    admin = await harness.login("bob")
+    for name in ("Corp LLM", "Corp LLM (EU)"):
+        status, data = await _team_config(harness, admin, {"providers": {provider_id: {
+            "name": name, "api_key": TEAM_KEY, "api_base": "https://llm.example/v1"}}})
+        assert status == 200 and data["providers"][provider_id]["display_name"] == name, data
+        await harness.server.engines.drain()
+        assert harness.spawner.logs["alice"].team_layers[-1]["providers"][provider_id]["name"] == name
+
+
 async def test_admin_turns_providers_off_for_everyone(harness: Harness) -> None:
     alice = await harness.login("alice")
     await harness.wait_running(alice)
