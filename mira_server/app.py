@@ -68,6 +68,7 @@ _MAX_LOGIN_BODY = 16 * 1024
 _MAX_CONFIG_BODY = 1024 * 1024
 # LLM requests are sent with a Content-Length (some gateways refuse chunked
 # request bodies), so they are read whole; images make them large.
+_FORWARDING_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "X-Real-IP")
 _MAX_LLM_BODY = 64 * 1024 * 1024
 TEAM_PUSH_TIMEOUT_S = 10.0
 # Engine API paths Mira Server answers itself for administrators (the team layer).
@@ -564,10 +565,16 @@ class MiraServer:
     # ── /llm/<provider>/* (engines → team providers) ─────────────────
 
     def _local_engine_request(self, request: web.Request) -> bool:
-        """Only engines on this host, never a client through the TLS proxy."""
-        peer = request.remote or ""
-        if peer in self.trusted_proxies or "X-Forwarded-For" in request.headers or "Forwarded" in request.headers:
+        """Only engines on this host, never a client through the TLS proxy.
+
+        The TLS proxy also connects from loopback (and is usually listed in
+        ``trusted_proxies``), so the peer address alone cannot tell them apart:
+        what can is the forwarding headers every reverse proxy adds, and which
+        engines never send.
+        """
+        if any(header in request.headers for header in _FORWARDING_HEADERS):
             return False
+        peer = request.remote or ""
         try:
             return ipaddress.ip_address(peer).is_loopback
         except ValueError:

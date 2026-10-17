@@ -79,6 +79,8 @@ jobs:
           listen = "127.0.0.1:8740"
           public_url = "http://127.0.0.1:8740"
           data_dir = "/var/lib/mira-server"
+          # As the installer writes it behind Caddy: engines reach the LLM proxy from loopback too.
+          trusted_proxies = ["127.0.0.1", "::1"]
           [auth]
           group_recheck_interval = 0
           [spawner]

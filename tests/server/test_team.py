@@ -334,11 +334,24 @@ async def test_llm_proxy_needs_a_running_engines_token(harness: Harness, provide
     assert provider.requests == [] or provider.requests[-1]["path"] != "/v1/chat/completions"
 
 
-async def test_llm_proxy_refuses_requests_through_the_tls_proxy(harness: Harness, provider: FakeProvider) -> None:
+@pytest.mark.parametrize("header", ["X-Forwarded-For", "X-Forwarded-Proto", "Forwarded", "X-Real-IP"])
+async def test_llm_proxy_refuses_requests_through_the_tls_proxy(harness_factory, provider: FakeProvider,
+                                                                header: str) -> None:
+    harness = await harness_factory(server={"trusted_proxies": ["127.0.0.1", "::1"]})
     token = await _proxy_setup(harness, provider)
     resp = await harness.client.post("/llm/custom/chat/completions", data=b"{}",
-                                     headers={"Authorization": f"Bearer {token}", "X-Forwarded-For": "10.0.0.9"})
+                                     headers={"Authorization": f"Bearer {token}", header: "10.0.0.9"})
     assert resp.status == 403
+
+
+async def test_llm_proxy_serves_engines_when_the_tls_proxy_is_on_loopback(harness_factory,
+                                                                          provider: FakeProvider) -> None:
+    # Caddy on the same host: loopback is a trusted proxy, and engines connect from loopback too.
+    harness = await harness_factory(server={"trusted_proxies": ["127.0.0.1", "::1"]})
+    token = await _proxy_setup(harness, provider)
+    resp = await harness.client.post("/llm/custom/chat/completions", data=b"{}",
+                                     headers={"Authorization": f"Bearer {token}"})
+    assert resp.status == 200
 
 
 async def test_llm_proxy_only_serves_team_providers(harness: Harness, provider: FakeProvider) -> None:
