@@ -8,7 +8,9 @@ and ``docs/server-edition/mira-server.md``. All errors are
 from __future__ import annotations
 
 import asyncio
+import csv
 import hmac
+import io
 import ipaddress
 import json
 import logging
@@ -17,6 +19,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -54,8 +57,19 @@ from mira_server.proxy import (
     strip_token_query,
 )
 from mira_server.spawner.base import EngineHandle
-from mira_server.store import Store
+from mira_server.store import USAGE_COLUMNS, USAGE_GROUPS, Store
 from mira_server.team import TEAM_FILENAME, TeamConfig, TeamConfigError
+from mira_server.usage import (
+    PERIODS,
+    QuotaError,
+    Quotas,
+    UsageMeter,
+    local_day,
+    parse_quotas,
+    period_start,
+    quota_status,
+    request_model,
+)
 
 log = logging.getLogger("mira_server")
 
@@ -128,6 +142,7 @@ class MiraServer:
         start_grace: float = START_GRACE_S,
         dev: bool = False,
         team: TeamConfig | None = None,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config
         self.store = store
@@ -148,6 +163,7 @@ class MiraServer:
         self.sweep_interval = sweep_interval
         self.start_grace = start_grace
         self._clock = clock
+        self._wall_clock = wall_clock
         self._identities: dict[str, tuple[Identity, float]] = {}
         self._nss = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mira-nss")
         self._background: list[asyncio.Task] = []
@@ -627,8 +643,10 @@ class MiraServer:
             query = "&".join([*kept, f"key={quote(upstream.api_key, safe='')}"])
         target = URL(upstream.base + tail + (f"?{query}" if query else ""), encoded=True)
 
-        drop = HOP_BY_HOP | {"host", "cookie", "origin", "content-length"}
+        drop = HOP_BY_HOP | {"host", "cookie", "origin", "content-length", "accept-encoding"}
         headers = {k: v for k, v in request.headers.items() if k.lower() not in drop}
+        # Uncompressed, so the token counts can be read from the response.
+        headers["Accept-Encoding"] = "identity"
         if where != "?key":
             for key in [k for k in headers if k.lower() == where]:
                 headers[key] = f"{prefix}{upstream.api_key}"
@@ -641,6 +659,12 @@ class MiraServer:
                     raise ApiError(413, "payload_too_large", "request body is too large")
                 chunks.append(chunk)
             data = b"".join(chunks)
+        # Model calls are POSTs; listing models and the like is neither limited nor counted.
+        call = request.method == "POST"
+        day = local_day(self._wall_clock())
+        if call and (refused := self._quota_refusal(identity.name, day)) is not None:
+            return refused
+        model = request_model(data, tail) if call else ""
         self.engines.begin_request(engine)
         try:
             try:
@@ -652,20 +676,157 @@ class MiraServer:
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 log.warning("LLM proxy to %s for %s failed: %s", provider, identity.name, type(exc).__name__)
                 raise ApiError(502, "bad_gateway", f"cannot reach {provider}: {type(exc).__name__}") from None
-            async with upstream_resp:
-                response = web.StreamResponse(status=upstream_resp.status, reason=upstream_resp.reason,
-                                              headers=forward_response_headers(upstream_resp.headers))
-                await response.prepare(request)
-                try:
-                    async for chunk in upstream_resp.content.iter_any():
-                        await response.write(chunk)
-                except (aiohttp.ClientPayloadError, aiohttp.ClientConnectionError):
-                    response.force_close()
+            metered = call and 200 <= upstream_resp.status < 300
+            meter = UsageMeter(upstream_resp.headers.get("Content-Type", ""))
+            try:
+                async with upstream_resp:
+                    response = web.StreamResponse(status=upstream_resp.status, reason=upstream_resp.reason,
+                                                  headers=forward_response_headers(upstream_resp.headers))
+                    await response.prepare(request)
+                    try:
+                        async for chunk in upstream_resp.content.iter_any():
+                            if metered:
+                                meter.feed(chunk)
+                            await response.write(chunk)
+                    except (aiohttp.ClientPayloadError, aiohttp.ClientConnectionError):
+                        response.force_close()
+                        return response
+                    await response.write_eof()
                     return response
-                await response.write_eof()
-                return response
+            finally:
+                # Also when the engine went away mid-stream: the provider counts those tokens too.
+                if metered:
+                    self._record_usage(identity.name, day, provider, model, meter)
         finally:
             self.engines.end_request(engine)
+
+    def _record_usage(self, username: str, day: str, provider: str, model: str, meter: UsageMeter) -> None:
+        try:
+            self.store.record_usage(username, day, provider, model, meter.result())
+        except Exception as exc:  # noqa: BLE001 - metering must never break a model call
+            log.error("cannot record token usage for %s: %s", username, exc)
+
+    # ── token usage and quotas ───────────────────────────────────────
+
+    @property
+    def quotas(self) -> Quotas:
+        """Read on every check, so ``mira-server quota set`` applies without a restart."""
+        return self._load_quotas()
+
+    def _load_quotas(self) -> Quotas:
+        try:
+            return parse_quotas(self.store.get_setting("quotas") or {})
+        except (QuotaError, ValueError) as exc:
+            log.error("ignoring invalid saved quotas: %s", exc)
+            return Quotas()
+
+    def _period_usage(self, username: str, day: str) -> dict[str, int]:
+        return {period: self.store.tokens_used(username, period_start(period, day)) for period in PERIODS}
+
+    def _quota_refusal(self, username: str, day: str) -> web.Response | None:
+        """A provider-style 429 when the user has used up a team quota, else ``None``.
+
+        ``insufficient_quota`` and ``x-should-retry: false`` tell the engine not
+        to retry; the message reaches the user as the provider's error.
+        """
+        quotas = self.quotas
+        limits = quotas.for_user(username)
+        if limits.daily is None and limits.monthly is None:
+            return None
+        status = quota_status(limits, self._period_usage(username, day), quotas.warn_percent, day)
+        for period, label in (("daily", "Today's"), ("monthly", "This month's")):
+            if status[period]["exceeded"]:
+                info = status[period]
+                resets = datetime.fromisoformat(info["resets_at"]).strftime("%Y-%m-%d %H:%M")
+                message = (f"{label} team token quota is used up ({info['used']:,} of {info['limit']:,} tokens); "
+                           f"it resets at {resets} (server time). Ask your Mira Server administrators for more, "
+                           "or use a provider with your own key.")
+                log.info("token quota (%s) of %s is used up", period, username)
+                # The engine shows the provider's error object: the message first.
+                return web.json_response(
+                    {"type": "error",
+                     "error": {"message": message, "type": "insufficient_quota", "code": "insufficient_quota"}},
+                    status=429, headers={"x-should-retry": "false"})
+        return None
+
+    def _require_admin(self, identity: Identity) -> None:
+        if not identity.is_admin:
+            raise ApiError(403, "forbidden", f"only members of {self.config.auth.admins_group} can do this")
+
+    async def handle_usage(self, request: web.Request) -> web.Response:
+        """The caller's own team-provider usage and quotas."""
+        ctx = await self.authenticate(request)
+        name = ctx.identity.name
+        quotas = self.quotas
+        day = local_day(self._wall_clock())
+        month = period_start("monthly", day)
+        totals = self.store.usage_summary(since_day=month, until_day=day, group_by=["day"], username=name)
+        today = next((row for row in totals if row["day"] == day), None)
+        return web.json_response({
+            "user": name,
+            "day": day,
+            "today": _usage_totals([today] if today else []),
+            "month": _usage_totals(totals),
+            "by_model": self.store.usage_summary(since_day=month, until_day=day, group_by=["provider", "model"],
+                                                 username=name),
+            "quota": quota_status(quotas.for_user(name), self._period_usage(name, day), quotas.warn_percent, day),
+            "warn_percent": quotas.warn_percent,
+        })
+
+    async def handle_admin_usage(self, request: web.Request) -> web.StreamResponse:
+        """Everyone's usage over ``from``..``to``, grouped by ``group_by`` (JSON or ``format=csv``)."""
+        ctx = await self.authenticate(request)
+        self._require_admin(ctx.identity)
+        day = local_day(self._wall_clock())
+        since = _day_param(request, "from", period_start("monthly", day))
+        until = _day_param(request, "to", day)
+        if since > until:
+            raise ApiError(400, "bad_request", "from must not be after to")
+        group_by = [g for g in request.query.get("group_by", "user").split(",") if g]
+        unknown = [g for g in group_by if g not in USAGE_GROUPS]
+        if unknown or len(set(group_by)) != len(group_by):
+            raise ApiError(400, "bad_request",
+                           f"group_by takes distinct values of: {', '.join(USAGE_GROUPS)}")
+        rows = self.store.usage_summary(since_day=since, until_day=until, group_by=group_by)
+        if request.query.get("format") == "csv":
+            out = io.StringIO()
+            writer = csv.writer(out)
+            writer.writerow([*group_by, *USAGE_COLUMNS])
+            for row in rows:
+                writer.writerow([row[key] for key in (*group_by, *USAGE_COLUMNS)])
+            return web.Response(text=out.getvalue(), content_type="text/csv", headers={
+                "Content-Disposition": f'attachment; filename="mira-usage-{since}-{until}.csv"'})
+        if group_by == ["user"]:
+            quotas = self.quotas
+            for row in rows:
+                row["quota"] = quota_status(quotas.for_user(row["user"]), self._period_usage(row["user"], day),
+                                            quotas.warn_percent, day)
+        return web.json_response({"from": since, "to": until, "group_by": group_by, "rows": rows,
+                                  "totals": _usage_totals(rows)})
+
+    async def handle_get_quotas(self, request: web.Request) -> web.Response:
+        ctx = await self.authenticate(request)
+        self._require_admin(ctx.identity)
+        return web.json_response(self.quotas.as_json())
+
+    async def handle_put_quotas(self, request: web.Request) -> web.Response:
+        """Replace the quota settings (``{"default", "users", "warn_percent"}``)."""
+        ctx = await self.authenticate(request)
+        self._require_admin(ctx.identity)
+        body = await self._config_body(request)
+        try:
+            quotas = parse_quotas(body, valid_user=valid_username)
+        except QuotaError as exc:
+            raise ApiError(400, "bad_request", str(exc)) from None
+        before, after = self.quotas.as_json(), quotas.as_json()
+        self.store.put_setting("quotas", after)
+        if after != before:
+            users = sorted(name for name in {*before["users"], *after["users"]}
+                           if before["users"].get(name) != after["users"].get(name))
+            self.store.audit("team.quotas_changed", username=ctx.identity.name, client_ip=self.client_ip(request),
+                             default=after["default"], users=users, warn_percent=quotas.warn_percent)
+            log.info("token quotas changed by %s", ctx.identity.name)
+        return web.json_response(quotas.as_json())
 
     # ── /ws ──────────────────────────────────────────────────────────
 
@@ -853,6 +1014,10 @@ class MiraServer:
         app.router.add_get("/server/me", self.handle_me)
         app.router.add_post("/server/engine/start", self.handle_engine_start)
         app.router.add_post("/server/engine/stop", self.handle_engine_stop)
+        app.router.add_get("/server/usage", self.handle_usage)
+        app.router.add_get("/server/admin/usage", self.handle_admin_usage)
+        app.router.add_get("/server/admin/quotas", self.handle_get_quotas)
+        app.router.add_put("/server/admin/quotas", self.handle_put_quotas)
         app.router.add_get("/ws", self.handle_ws)
         app.router.add_get("/ws/{tail:.+}", self.handle_ws)
         app.router.add_route("*", "/api", self.handle_api)
@@ -860,6 +1025,18 @@ class MiraServer:
         app.router.add_route("*", "/llm/{provider}", self.handle_llm)
         app.router.add_route("*", "/llm/{provider}/{tail:.*}", self.handle_llm)
         return app
+
+
+def _usage_totals(rows: list[dict[str, Any]]) -> dict[str, int]:
+    return {column: sum(row[column] or 0 for row in rows) for column in USAGE_COLUMNS}
+
+
+def _day_param(request: web.Request, name: str, default: str) -> str:
+    value = request.query.get(name) or default
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise ApiError(400, "bad_request", f"{name} must be a date (YYYY-MM-DD)") from None
 
 
 def _local_url(host: str, port: int) -> str:
