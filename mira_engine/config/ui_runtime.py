@@ -85,6 +85,7 @@ def _provider_metadata(provider_name: str) -> dict[str, Any]:
             "default_api_base": None,
             "is_oauth": False,
             "is_local": False,
+            "is_subscription": False,
         }
 
     spec = find_by_name(provider_name)
@@ -96,6 +97,7 @@ def _provider_metadata(provider_name: str) -> dict[str, Any]:
             "default_api_base": None,
             "is_oauth": False,
             "is_local": False,
+            "is_subscription": False,
         }
 
     api_key_required = not (spec.is_oauth or spec.is_local or provider_name == "custom")
@@ -109,6 +111,7 @@ def _provider_metadata(provider_name: str) -> dict[str, Any]:
         "default_api_base": spec.default_api_base or None,
         "is_oauth": bool(spec.is_oauth),
         "is_local": bool(spec.is_local),
+        "is_subscription": bool(spec.is_subscription),
     }
 
 
