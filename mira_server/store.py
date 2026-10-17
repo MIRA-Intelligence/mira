@@ -1,9 +1,10 @@
-"""SQLite store: users, sessions and hashed tokens, engine records and the audit log.
+"""SQLite store: users, sessions and hashed tokens, engine records, the audit log and token usage.
 
 The database lives in ``data_dir`` (mode 0700) as ``mira-server.sqlite3``
 (mode 0600). It never holds passwords or raw tokens; tokens are stored as
 SHA-256 hashes. The audit log records metadata only (event, user, client IP,
-small structured details), never request bodies, prompts or tokens.
+small structured details), never request bodies, prompts or tokens. Token
+usage of team providers is kept as counts per user, day, provider and model.
 
 All access happens on the event loop thread; each statement is short.
 """
@@ -72,7 +73,26 @@ CREATE TABLE IF NOT EXISTS audit (
     detail TEXT
 );
 CREATE INDEX IF NOT EXISTS audit_by_ts ON audit(ts);
+CREATE TABLE IF NOT EXISTS usage (
+    day TEXT NOT NULL,
+    username TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    calls INTEGER NOT NULL DEFAULT 0,
+    unreported_calls INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (username, day, provider, model)
+);
+CREATE INDEX IF NOT EXISTS usage_by_day ON usage(day);
 """
+
+USAGE_COLUMNS = ("input_tokens", "output_tokens", "cached_tokens", "total_tokens", "calls", "unreported_calls")
+# What usage can be grouped by, and the column for each.
+USAGE_GROUPS = {"user": "username", "day": "day", "month": "substr(day, 1, 7)", "provider": "provider",
+                "model": "model"}
 
 
 @dataclass(frozen=True)
@@ -265,3 +285,49 @@ class Store:
             data["detail"] = json.loads(data["detail"]) if data["detail"] else {}
             result.append(data)
         return result
+
+    # ── token usage and quotas ───────────────────────────────────────
+
+    def record_usage(self, username: str, day: str, provider: str, model: str, counts: Any | None) -> None:
+        """Add one call (``counts`` None: the provider reported no usage)."""
+        values = [getattr(counts, column) for column in USAGE_COLUMNS[:4]] if counts is not None else [0, 0, 0, 0]
+        values += [1, 0 if counts is not None else 1]
+        self._db.execute(
+            f"""INSERT INTO usage(day, username, provider, model, {", ".join(USAGE_COLUMNS)})
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(username, day, provider, model) DO UPDATE SET
+                {", ".join(f"{column} = {column} + excluded.{column}" for column in USAGE_COLUMNS)}""",
+            (day, username, provider, model, *values),
+        )
+
+    def tokens_used(self, username: str, since_day: str) -> int:
+        row = self._db.execute(
+            "SELECT COALESCE(SUM(total_tokens), 0) FROM usage WHERE username = ? AND day >= ?",
+            (username, since_day),
+        ).fetchone()
+        return int(row[0])
+
+    def usage_summary(self, *, since_day: str, until_day: str, group_by: list[str],
+                      username: str | None = None) -> list[dict[str, Any]]:
+        """Usage summed over ``[since_day, until_day]``, one row per group (``USAGE_GROUPS`` keys)."""
+        keys = [f"{USAGE_GROUPS[group]} AS {group}" for group in group_by]
+        sums = [f"SUM({column}) AS {column}" for column in USAGE_COLUMNS]
+        where, args = "day >= ? AND day <= ?", [since_day, until_day]
+        if username is not None:
+            where += " AND username = ?"
+            args.append(username)
+        sql = f"SELECT {', '.join(keys + sums)} FROM usage WHERE {where}"
+        if group_by:
+            sql += f" GROUP BY {', '.join(group_by)} ORDER BY {', '.join(group_by)}"
+        return [dict(row) for row in self._db.execute(sql, args).fetchall()
+                if row["calls"] is not None]
+
+    def get_setting(self, key: str) -> Any:
+        row = self._db.execute("SELECT value FROM meta WHERE key = ?", (f"setting:{key}",)).fetchone()
+        return json.loads(row["value"]) if row is not None else None
+
+    def put_setting(self, key: str, value: Any) -> None:
+        self._db.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (f"setting:{key}", json.dumps(value, sort_keys=True)),
+        )

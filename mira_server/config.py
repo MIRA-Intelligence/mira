@@ -147,6 +147,8 @@ class ServerSection(_Section):
 class DevUser(_Section):
     name: str
     password_hash: str
+    # Member of users_group (runs an engine) and/or admins_group (team settings).
+    user: bool = True
     admin: bool = False
     display_name: str = ""
 
@@ -198,6 +200,9 @@ class AuthSection(_Section):
         names = [u.name for u in self.dev_users]
         if len(names) != len(set(names)):
             raise ValueError("auth.dev_users contains duplicate names")
+        for user in self.dev_users:
+            if not user.user and not user.admin:
+                raise ValueError(f"auth.dev_users {user.name!r} needs user or admin")
         if self.backend == "dev" and not self.dev_users:
             raise ValueError("auth.backend = 'dev' needs at least one [[auth.dev_users]] entry")
         return self

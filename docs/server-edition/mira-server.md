@@ -21,12 +21,14 @@ desktop app ──HTTPS──> TLS proxy ──> mira-server (user mira-server, 
 - **Sign-in**: username and password are checked through the PAM service
   `mira-server`, so local accounts, LDAP/SSSD, password policy, expiry and
   lockouts apply as for SSH. Mira Server stores no passwords.
-- **Access**: members of `mira-users` (primary or supplementary group, through
-  NSS) may sign in; members of `mira-admins` also get the `admin` role. Both
-  names are configurable. Group membership is re-read at least every
-  `group_recheck_interval` seconds and on every token refresh. Someone removed
-  from `mira-users` loses all sessions at the next check, and Mira Server stops
-  their engine (through the `stop`-only sudo rule, see step 4).
+- **Access**: two independent groups (primary or supplementary, through NSS;
+  both names are configurable). Members of `mira-users` get the `user` role: an
+  engine. Members of `mira-admins` get the `admin` role: they manage the
+  [team settings](#team-settings). Either one lets an account sign in. Group
+  membership is re-read at least every `group_recheck_interval` seconds and on
+  every token refresh. Someone removed from both groups loses all sessions at
+  the next check; someone removed from `mira-users` loses their engine. Mira
+  Server stops it through the `stop`-only sudo rule (see step 4).
 - **Engines**: Mira Server runs the root-owned launcher through sudo:
   `sudo -n -u alice /usr/local/libexec/mira/engine-launch start`. The launcher
   runs `mira remote attach --json` as alice (the same command the desktop app
@@ -56,7 +58,91 @@ desktop app ──HTTPS──> TLS proxy ──> mira-server (user mira-server, 
 - bubblewrap (`bwrap`) and unprivileged user namespaces for the agent sandbox.
 - The users' home directories hold their Mira data (`~/.mira`), as with SSH.
 
-## Install
+## Quick install (Ubuntu 22.04 and 24.04)
+
+[`deploy/mira-server/install.sh`](../../deploy/mira-server/install.sh) does
+every step below in a dialog-driven installer:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/MIRA-Intelligence/mira/feat/server-edition/deploy/mira-server/install.sh
+sudo bash install.sh
+```
+
+(`curl | sudo bash` does not work: the dialogs need a terminal.) It asks:
+
+- **Where to install mira-engine from**: PyPI (default), a git branch or tag,
+  or a source directory. Until a release with Mira Server is on PyPI, choose
+  *git* (`feat/server-edition`).
+- **How clients connect**:
+  - *Local network* (default): Caddy serves HTTPS on the host's IP address with
+    its own certificate authority, so no domain name is needed. Each client
+    trusts that CA once; the installer writes the commands to
+    `/etc/mira-server/CLIENT-SETUP.txt` and the CA to
+    `/etc/mira-server/client-ca.crt`.
+  - *Internet*: Caddy gets a Let's Encrypt certificate for your domain.
+  - *Own reverse proxy or SSH tunnels*: no Caddy.
+- **Accounts**: whether local `/etc/shadow` accounts sign in, the SSSD AD GPO
+  rule when SSSD uses `access_provider = ad`, and the users and admins (local
+  or LDAP/AD accounts; they are added to the groups with `gpasswd`).
+- **Per-user limits**, and whether agents' shell commands get network access.
+
+Every step first checks the host and skips what is already in place. If a step
+fails, the installer says why; fix it and run it again: it continues with the
+same answers. Run `sudo mira-server-install` later to upgrade, change the
+settings or add and remove users. Unattended installs (CI, configuration
+management) use options, for example:
+
+```sh
+sudo bash install.sh --non-interactive --source git --mode lan --ip 192.168.1.10 \
+     --users alice,bob --admins alice
+```
+
+**Upgrades** (`sudo mira-server-install`, then *Upgrade*; unattended:
+`--non-interactive --upgrade`) install the newest mira-engine release from PyPI
+(or the package index pip is configured for), also when an earlier version was
+pinned; the installer shows the installed and the newest version and takes
+another one if you enter it (`--version`). Running the `install.sh` of an
+offline bundle upgrades from that bundle instead; an install that came from a
+bundle that is no longer there upgrades from PyPI. When the version changes,
+Mira Server is restarted and engines still running the previous version are
+stopped (they start again, on the new version, when their users reconnect);
+when it does not, nothing is restarted.
+
+See `sudo bash install.sh --help`. The install log is
+`/var/log/mira-server-install.log`.
+
+**Hosts without access to GitHub or PyPI**: build an offline bundle on a
+machine that has access (Linux or macOS, Python 3.11+ with pip, a mira
+checkout with the skills submodule), copy it over and run the installer inside
+it:
+
+```sh
+deploy/mira-server/make-offline-bundle.sh            # x86_64; --arch aarch64 for ARM servers
+scp mira-server-offline-<version>-x86_64.tar.gz server:
+# on the server:
+tar -xzf mira-server-offline-<version>-x86_64.tar.gz
+cd mira-server-offline-<version>-x86_64 && sudo bash install.sh
+```
+
+The bundle holds the mira-engine wheel and all its dependencies for Python
+3.11 and 3.12 (`wheels/`, installed with `pip --no-index`), a Python 3.11 build
+for Ubuntu 22.04 (`python/`) and Caddy for 22.04 (`debs/`). The installer picks
+the bundle it is in; a newer bundle's `install.sh` upgrades mira-engine. apt is
+still used for a few Ubuntu packages (`sudo`, `bubblewrap`, `python3-venv`, and
+`caddy` on 24.04), so the host needs its Ubuntu mirror or those packages
+installed beforehand. A single wheel also works: `--source
+/path/mira_engine-<version>-py3-none-any.whl`, with `--wheels DIR` for its
+dependencies when PyPI is out of reach.
+
+**Uninstall** with `sudo mira-server-uninstall` (add `--yes` for no dialogs). It
+stops the users' engines and removes what the installer set up; the
+configuration, `/var/lib/mira-server` (audit log) and the groups stay unless
+you select them or pass `--purge`. For a Mira Server set up by hand with the
+steps below, run `sudo bash "$(/opt/mira/bin/mira-server deploy-dir)/uninstall.sh"`
+(or the script from the repository): it finds the usual files and lets you
+choose. Users' home directories and `~/.mira` are never touched.
+
+## Install by hand
 
 The commands assume Debian/Ubuntu; adjust package names elsewhere.
 
@@ -65,20 +151,33 @@ The commands assume Debian/Ubuntu; adjust package names elsewhere.
 ```sh
 sudo groupadd mira-users
 sudo groupadd mira-admins          # optional
-sudo usermod -aG mira-users alice
-sudo usermod -aG mira-users,mira-admins bob
+sudo gpasswd -a alice mira-users
+sudo gpasswd -a admin-bob mira-admins        # administration account
+sudo gpasswd -a admin-bob mira-users         # optional: lets it try the team settings
 ```
 
 LDAP/SSSD groups work the same way, as long as `getent group mira-users` and
-`id alice` show the membership.
+`id alice` show the membership (use `gpasswd -a`; `usermod -aG` fails for
+directory accounts). Give administrators a separate account for administration
+(`admin-bob` next to their everyday `bob`): what an administrator changes in the
+app's settings applies to everyone.
 
-### 2. Source and engine, system-wide
+### 2. The engine, system-wide
 
-Check out the Mira source to `/opt/mira-src`. The install steps below copy
-their files (PAM services, config, host policy, systemd units) from
-`/opt/mira-src/deploy/mira-server/`. Then install the engine and Mira Server
-from it into a root-owned virtual environment. Every user's engine runs from
-it.
+Install the engine and Mira Server into a root-owned virtual environment. Every
+user's engine runs from it.
+
+```sh
+sudo python3 -m venv /opt/mira
+sudo /opt/mira/bin/pip install 'mira-engine[server]'
+DEPLOY=$(/opt/mira/bin/mira-server deploy-dir)
+```
+
+The package ships the deployment files (PAM services, systemd unit, host policy,
+AppArmor profile, example configs, the installer); `mira-server deploy-dir`
+prints where they are, and the steps below copy them from `$DEPLOY`.
+
+**From source** (until a release with Mira Server is on PyPI):
 
 ```sh
 sudo git clone --depth 1 -b feat/server-edition \
@@ -87,16 +186,16 @@ sudo git clone --depth 1 -b feat/server-edition \
 sudo python3 -m venv /opt/mira
 sudo env SETUPTOOLS_SCM_PRETEND_VERSION=0.3.5.dev0 \
      /opt/mira/bin/pip install '/opt/mira-src[server]'
+DEPLOY=$(/opt/mira/bin/mira-server deploy-dir)
 ```
 
 The package version comes from git tags, which a shallow checkout of this
 branch does not have; without `SETUPTOOLS_SCM_PRETEND_VERSION` the engine
-reports `0.0.0` and the desktop app refuses it as older than its minimum engine
+reports `0.0.x` and the desktop app refuses it as older than its minimum engine
 version (`min_agent_for_ui` in mira-ui's `compatibility.json`).
 
-Both directories must stay writable by root only: the launcher runs the venv's
-interpreter as each user. To upgrade, `sudo git -C /opt/mira-src pull` and run
-the `pip install` again.
+The virtual environment (and a source checkout) must stay writable by root
+only: the launcher runs the venv's interpreter as each user.
 
 ### 3. The mira-server account
 
@@ -108,26 +207,26 @@ sudo chmod 700 /var/lib/mira-server
 
 ### 4. Launcher, sudoers rules and engine sessions
 
+Install the `mira-engine` PAM service first, because the sudoers rules refer
+to it. Then write the launcher and the rules:
+
 ```sh
+sudo cp "$DEPLOY/pam.d-mira-engine" /etc/pam.d/mira-engine
 sudo /opt/mira/bin/mira-server install-launcher --prefix /usr/local \
-     --engine-python /opt/mira/bin/python
+     --engine-python /opt/mira/bin/python --sudoers-file /etc/sudoers.d/mira-server
 ```
 
 This writes `/usr/local/libexec/mira/engine-launch` (root-owned, mode 0755) and
-prints the sudoers lines Mira Server needs. Install the `mira-engine` PAM
-service first, because the sudoers lines refer to it:
+`/etc/sudoers.d/mira-server` (mode 0440, only after `visudo -cf` accepts it):
 
-```sh
-sudo cp /opt/mira-src/deploy/mira-server/pam.d-mira-engine /etc/pam.d/mira-engine
-sudo tee /etc/sudoers.d/mira-server >/dev/null <<'EOF'
+```text
 Cmnd_Alias MIRA_ENGINE_START = /usr/local/libexec/mira/engine-launch start
 Defaults!MIRA_ENGINE_START pam_service=mira-engine
 mira-server ALL=(%mira-users) NOPASSWD: /usr/local/libexec/mira/engine-launch
 mira-server ALL=(ALL,!root) NOPASSWD: /usr/local/libexec/mira/engine-launch stop
-EOF
-sudo chmod 0440 /etc/sudoers.d/mira-server
-sudo visudo -cf /etc/sudoers.d/mira-server
 ```
+
+Without `--sudoers-file` it only prints the rules.
 
 - `Cmnd_Alias`/`Defaults` run `engine-launch start` through the PAM service
   [`mira-engine`](../../deploy/mira-server/pam.d-mira-engine). Its session
@@ -171,7 +270,7 @@ Install [`deploy/mira-server/pam.d-mira-server`](../../deploy/mira-server/pam.d-
 as `/etc/pam.d/mira-server`:
 
 ```sh
-sudo cp /opt/mira-src/deploy/mira-server/pam.d-mira-server /etc/pam.d/mira-server
+sudo cp "$DEPLOY/pam.d-mira-server" /etc/pam.d/mira-server
 ```
 
 It contains:
@@ -214,7 +313,7 @@ as `/etc/mira-server/mira-server.toml` and set at least `public_url`. Every
 setting is documented in that file. Unknown keys are rejected.
 
 ```sh
-sudo install -D -m 0644 /opt/mira-src/deploy/mira-server/mira-server.toml /etc/mira-server/mira-server.toml
+sudo install -D -m 0644 "$DEPLOY/mira-server.toml" /etc/mira-server/mira-server.toml
 sudo editor /etc/mira-server/mira-server.toml
 ```
 
@@ -242,7 +341,7 @@ sudo editor /etc/mira-server/mira-server.toml
 
 ```sh
 sudo apt-get install bubblewrap
-sudo install -D -o root -g root -m 0644 /opt/mira-src/deploy/mira-server/policy.toml /etc/mira/policy.toml
+sudo install -D -o root -g root -m 0644 "$DEPLOY/policy.toml" /etc/mira/policy.toml
 ```
 
 [`deploy/mira-server/policy.toml`](../../deploy/mira-server/policy.toml) keeps
@@ -257,7 +356,7 @@ namespaces for bwrap only, with
 (or the distribution's own bwrap profile, if it ships one):
 
 ```sh
-sudo install -m 0644 /opt/mira-src/deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+sudo install -m 0644 "$DEPLOY/apparmor-bwrap" /etc/apparmor.d/mira-bwrap
 sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
 ```
 
@@ -278,7 +377,7 @@ Keep `KillMode=process`: user engines are started through sudo and must survive
 a Mira Server restart. Mira Server refuses to run as root.
 
 ```sh
-sudo cp /opt/mira-src/deploy/mira-server/mira-server.service /etc/systemd/system/
+sudo cp "$DEPLOY/mira-server.service" /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now mira-server
 ```
 
@@ -333,7 +432,7 @@ one budget per person. Set them for all users with a drop-in such as
 [`deploy/mira-server/user-slice-mira.conf`](../../deploy/mira-server/user-slice-mira.conf):
 
 ```sh
-sudo install -D -m 0644 /opt/mira-src/deploy/mira-server/user-slice-mira.conf \
+sudo install -D -m 0644 "$DEPLOY/user-slice-mira.conf" \
      /etc/systemd/system/user-.slice.d/50-mira.conf
 sudo systemctl daemon-reload
 ```
@@ -393,6 +492,92 @@ attach` checks that the engine's port is held by the engine process before it
 sends the token, so another account squatting the port receives nothing
 (`listener_mismatch`).
 
+## Team settings
+
+Administrators (`mira-admins`) set up model access for everyone from the
+desktop app: they sign in to the Team Server and use the usual settings pages.
+For an administrator's session Mira Server answers the settings requests
+(`/api/config`, `/api/providers/{name}/models` and `/test`) itself, against the
+**team settings** in `/var/lib/mira-server/team-config.json` (mode 0600, owned
+by `mira-server`), instead of the administrator's own config.
+
+| Groups | Engine | The settings pages change |
+|---|---|---|
+| `mira-users` | yes | the user's own `~/.mira/config.json` |
+| `mira-users` and `mira-admins` | yes | the team settings |
+| `mira-admins` | no (other pages answer 403 `no_engine`) | the team settings |
+
+An administration account that is also in `mira-users` has an engine like
+everyone else, so the administrator can try the team settings the way users get
+them (its usage counts for that account).
+
+What the team settings do in each user's engine:
+
+- **Team providers** (a provider with an API key or endpoint in the team
+  settings, and turned on) replace the user's own entry for that provider. Users
+  see them as managed by the team and cannot change them (`403 locked_by_team`).
+  For custom providers this is per provider: users can still add their own.
+- Providers the team does not configure, or turns off, stay each user's own,
+  to use with their own key. Turning a provider off on the administrator's
+  Providers page does not turn it off for users.
+- **Defaults** (provider and model, reasoning effort, temperature, iteration
+  limits, team-role models) apply until a user picks their own value.
+- **Model parameter rules**, if the team sets any, replace the users' rules.
+- The host policy (`/etc/mira/policy.toml`) still applies on top. The projects
+  folder and `restrict_to_workspace` are not team settings.
+
+**Team keys never reach users' engines.** Mira Server gives each engine the
+team settings when the engine starts (or Mira Server attaches to it) and again
+after every change, with each team provider pointing at Mira Server's LLM
+proxy, `http://127.0.0.1:8740/llm/<provider>`, and the engine's own token as
+its API key. The proxy accepts only loopback requests that did not come through
+the TLS proxy (no `X-Forwarded-For` or other forwarding header) and that carry the token of an engine Mira
+Server runs for a current `mira-users` member. It replaces that token, in
+whichever header the provider client sent it, with the team key and streams
+the provider's answer back. The provider must be reachable from the Mira Server
+host (`providers.proxy` in the team settings is used for these requests).
+
+Changes are recorded in the audit log as `team.config_changed` with the
+account and the changed settings (never values).
+
+Limitations: providers that sign in per user (OpenAI Codex, GitHub Copilot)
+cannot be team providers; a provider without a known default endpoint needs an
+API Base in the team settings; engines older than this feature ignore the team
+settings (logged as `team.push_unsupported`).
+
+## Token usage and quotas
+
+Mira Server meters the **team providers**: every call goes through its LLM
+proxy, which reads the token counts from the provider's response (OpenAI
+`usage`, also in streams; Responses API; Anthropic, with cache reads and writes
+counted as input; Gemini `usageMetadata`) and adds them up per user, day,
+provider and model in `mira-server.sqlite3`. Only counts are kept, never
+prompts or replies. A call whose response reports no usage is counted as
+`unreported_calls`. Providers users set up with their own keys are not metered
+or limited.
+
+**Quotas** are in tokens, per user, daily and monthly: a team default, and
+overrides for single users. In the default, `null` or `0` means unlimited; in
+an override, `null` follows the default and `0` is unlimited for that user.
+Days and months follow the server's local time. The quota is checked before a
+call is forwarded, so a call already running can go over by at most its own
+size. Once a quota is used up, the proxy answers `429` with
+`insufficient_quota` and a message saying when it resets; the engine does not
+retry and the user sees the message. `warn_percent` (default 80) is where the
+app starts warning users.
+
+Administrators manage quotas through the API (below; changes are audited as
+`team.quotas_changed`) or on the server, as the `mira-server` account:
+
+```sh
+sudo -u mira-server /opt/mira/bin/mira-server quota set --daily 2M --monthly 40M
+sudo -u mira-server /opt/mira/bin/mira-server quota set --user alice --daily 5M   # or unlimited, default
+sudo -u mira-server /opt/mira/bin/mira-server quota show
+sudo -u mira-server /opt/mira/bin/mira-server usage --by user,model             # --from, --to, --csv
+```
+
+Changes apply to the next call; Mira Server does not need a restart.
+
 ## Dev mode (UI development only)
 
 For working on the desktop client without a Linux host or real accounts:
@@ -408,7 +593,7 @@ backend = "dev"
 [[auth.dev_users]]
 name = "alice"
 password_hash = "scrypt$16384$8$1$..."   # mira-server hash-password
-admin = true
+admin = true          # team settings; add `user = false` for no engine
 
 [spawner]
 backend = "local"
@@ -439,7 +624,11 @@ response carries `X-Mira-Request-Id`.
 | `GET /server/me` | bearer | `{"user": {...}, "engine": {"state", "version", "message"}}` |
 | `POST /server/engine/start` | bearer | Starts the engine; returns the `engine` object (state may still be `starting`) |
 | `POST /server/engine/stop` | bearer | Stops the engine; returns the `engine` object |
-| `/api/*` | bearer (or `?access_token=` on GET/HEAD) | Proxied to the caller's engine |
+| `/api/*` | bearer (or `?access_token=` on GET/HEAD) | Proxied to the caller's engine; for administrators the settings endpoints answer from the [team settings](#team-settings) (`"scope": "team"`) |
+| `/llm/<provider>/*` | an engine's token (loopback only) | The [LLM proxy](#team-settings) for team providers |
+| `GET /server/usage` | bearer | The caller's team-provider usage: `today`, `month`, `by_model` (this month) and `quota` (per period: `limit`, `used`, `remaining`, `warn`, `exceeded`, `resets_at`) |
+| `GET /server/admin/usage` | bearer, administrator | Everyone's usage: `?from=&to=` (dates, default this month), `?group_by=` (`user`, `day`, `month`, `provider`, `model`; default `user`, which adds each user's `quota`), `?format=csv` |
+| `GET`, `PUT /server/admin/quotas` | bearer, administrator | `{"default": {"daily", "monthly"}, "users": {"alice": {"daily", "monthly"}}, "warn_percent"}`; `PUT` replaces all of it |
 | `GET /ws`, `GET /ws/*` | bearer or `?access_token=` | WebSocket proxy to the same path on the engine (`/ws`, `/ws/workflow/v1`) |
 
 Token response:
@@ -456,7 +645,8 @@ Engine states: `stopped`, `starting`, `running`, `error`, `conflict`.
 |---|---|---|
 | 400 | `bad_request` | Malformed body. |
 | 401 | `unauthorized` | Missing, invalid or expired token; wrong username or password. |
-| 403 | `forbidden` | Not in `mira-users` (or removed from it; all sessions are revoked). |
+| 403 | `forbidden` | In neither `mira-users` nor `mira-admins` (or removed; all sessions are revoked). |
+| 403 | `no_engine` | An account only in `mira-admins` asked for an engine. |
 | 403 | `origin_not_allowed` | A browser `Origin` that is not allowed. |
 | 409 | `engine_conflict` | The engine lease is held by an engine Mira Server cannot attach to. |
 | 429 | `too_many_attempts` | Login rate limit; see `Retry-After`. |
@@ -501,7 +691,9 @@ Details:
 The `audit` table in `mira-server.sqlite3` records metadata only: sign-ins
 (`login.ok`, `login.failed`, `login.denied`, `login.rate_limited`), `logout`,
 `access.revoked`, engine `started`/`attached`/`stopped`/`start_failed`/
-`stop_failed`/`forgotten`/`unhealthy`, and security events
+`stop_failed`/`forgotten`/`unhealthy`/`revoked`, team settings
+(`team.config_changed`, `team.push_failed`, `team.push_unsupported`), quotas
+(`team.quotas_changed`), and security events
 (`security.refresh_reuse`, `security.listener_mismatch`). It never contains
 passwords, tokens, prompts or request bodies.
 
@@ -512,7 +704,7 @@ passwords, tokens, prompts or request bodies.
   `nohup` outside any session gets none.
 - **MCP servers** run outside the sandbox; disable them with `tools.mcp = false`
   where that matters.
-- **Team keys and the LLM proxy (#154)**.
+- **Personal keys encrypted at rest**, and cost (rather than token) quotas.
 - **Local passwords on RHEL/Fedora**: there is no `shadow` group, so only
   LDAP/SSSD accounts can sign in until a privileged password helper exists.
 - **`Origin: null`**: the packaged desktop app sends `Origin: null`, which any

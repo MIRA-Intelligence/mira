@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -229,6 +230,48 @@ def sudoers_rules(path: Path, *, server_user: str, users_group: str) -> list[str
     return [*sudoers_session_lines(path),
             sudoers_line(path, server_user=server_user, users_group=users_group),
             sudoers_stop_line(path, server_user=server_user)]
+
+
+SUDOERS_HEADER = "# Mira Server engine launcher. Written by `mira-server install-launcher --sudoers-file`."
+
+
+def render_sudoers(rules: list[str]) -> str:
+    return "\n".join([SUDOERS_HEADER, *rules]) + "\n"
+
+
+def install_sudoers(path: Path, rules: list[str], *, visudo: str = "visudo", require_root: bool = True) -> Path:
+    """Write a sudoers drop-in atomically after ``visudo -cf`` accepts it (mode 0440).
+
+    The temporary file name contains a dot, which sudo ignores in
+    ``/etc/sudoers.d``, so a half-written file is never read.
+    """
+    if require_root and os.geteuid() != 0:
+        raise LauncherInstallError("writing sudoers needs root (use --no-root-check only for testing)")
+    path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(render_sudoers(rules))
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o440)
+            if os.geteuid() == 0:
+                os.fchown(handle.fileno(), 0, 0)
+            os.fsync(handle.fileno())
+        try:
+            result = subprocess.run([visudo, "-cf", tmp], capture_output=True, text=True, timeout=30)
+        except OSError as exc:
+            raise LauncherInstallError(f"cannot run {visudo} to validate the sudoers rules: {exc}") from None
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise LauncherInstallError(f"visudo rejected the sudoers rules: {detail}")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def granted_launcher_rules(sudo_list: str, path: Path) -> tuple[bool, bool]:

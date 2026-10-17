@@ -1,4 +1,4 @@
-"""``mira-server`` command line: serve, hash-password, install-launcher, check."""
+"""``mira-server`` command line: serve, hash-password, install-launcher, check, deploy-dir, usage, quota."""
 
 from __future__ import annotations
 
@@ -113,14 +113,19 @@ def install_launcher_command(
                                       help="Interpreter of the system-wide engine install (e.g. /opt/mira/bin/python)"),
     server_user: str = typer.Option("mira-server", "--server-user", help="Account Mira Server runs as"),
     users_group: str = typer.Option("mira-users", "--users-group", help="Group allowed to use Mira Server"),
+    sudoers_file: Path | None = typer.Option(None, "--sudoers-file",
+                                             help="Also write the rules to this sudoers drop-in after "
+                                                  "`visudo -cf` accepts them (e.g. /etc/sudoers.d/mira-server)"),
+    visudo: str = typer.Option("visudo", "--visudo", hidden=True, help="visudo binary (tests)"),
     no_root_check: bool = typer.Option(False, "--no-root-check", hidden=True,
                                        help="Write without root (tests only; the result is not safe)"),
 ) -> None:
-    """Write the root-owned engine launcher and print the sudoers rule."""
+    """Write the root-owned engine launcher and print (or install) the sudoers rules."""
     from mira_server.spawner.launcher import (
         LauncherInstallError,
         default_launcher_path,
         install_launcher,
+        install_sudoers,
         sudoers_rules,
     )
 
@@ -132,13 +137,21 @@ def install_launcher_command(
         raise typer.Exit(1) from None
     rules = sudoers_rules(path, server_user=server_user, users_group=users_group)
     typer.echo(f"Wrote {path} (engine: {engine_python}).\n")
-    typer.echo("Add these sudoers rules (for example: visudo -f /etc/sudoers.d/mira-server):\n")
+    if sudoers_file is not None:
+        try:
+            install_sudoers(sudoers_file, rules, visudo=visudo, require_root=not no_root_check)
+        except (LauncherInstallError, OSError) as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(1) from None
+        typer.echo(f"Wrote {sudoers_file} (checked with visudo):\n")
+    else:
+        typer.echo("Add these sudoers rules (for example: visudo -f /etc/sudoers.d/mira-server):\n")
     for rule in rules:
         typer.echo(f"    {rule}")
     typer.echo("")
     typer.echo("Notes:")
     typer.echo("- Cmnd_Alias/Defaults run `start` through the mira-engine PAM service (install")
-    typer.echo("  /opt/mira-src/deploy/mira-server/pam.d-mira-engine as /etc/pam.d/mira-engine first): engines then run in")
+    typer.echo("  $(mira-server deploy-dir)/pam.d-mira-engine as /etc/pam.d/mira-engine first): engines then run in")
     typer.echo("  the user's user-<uid>.slice, where per-user systemd limits apply.")
     typer.echo(f"- The first rule starts, inspects and stops engines of {users_group} members. The second only")
     typer.echo(f"  stops engines, for people removed from {users_group} (their engine would keep running otherwise).")
@@ -175,7 +188,7 @@ def _check_pam(cfg: ServerConfig, report: _Report) -> None:
     if service.exists():
         report.ok(f"PAM service {service} exists")
     else:
-        report.fail(f"PAM service file {service} is missing (see /opt/mira-src/deploy/mira-server/pam.d-mira-server)")
+        report.fail(f"PAM service file {service} is missing (see $(mira-server deploy-dir)/pam.d-mira-server)")
     shadow = Path("/etc/shadow")
     if shadow.exists() and not os.access(shadow, os.R_OK):
         report.warn("cannot read /etc/shadow: pam_unix (local passwords) only verifies other users' "
@@ -239,7 +252,7 @@ def _check_engine_session(sudo_list: str, report: _Report) -> None:
                     "(see `install-launcher`)")
     elif not pam_file.exists():
         report.fail(f"sudoers uses PAM service {PAM_SESSION_SERVICE} but {pam_file} is missing, so engines "
-                    "cannot start (copy /opt/mira-src/deploy/mira-server/pam.d-mira-engine)")
+                    "cannot start (copy $(mira-server deploy-dir)/pam.d-mira-engine)")
     else:
         report.ok(f"engines start in a user session (PAM service {pam_file})")
 
@@ -252,7 +265,7 @@ def _check_host_policy(report: _Report) -> None:
     path = host_policy.POLICY_PATH
     if not path.exists():
         report.warn(f"no host policy at {path}: agents run shell commands without the sandbox and may "
-                    "leave their project; copy /opt/mira-src/deploy/mira-server/policy.toml there")
+                    "leave their project; copy $(mira-server deploy-dir)/policy.toml there")
         return
     try:
         policy = host_policy.parse_policy(path.read_text(encoding="utf-8"), path, groups=set())
@@ -324,6 +337,162 @@ def check(config: Path | None = ConfigOption) -> None:
         typer.echo(f"\n{report.errors} problem(s) found.")
         raise typer.Exit(1)
     typer.echo("\nAll checks passed.")
+
+
+@app.command("deploy-dir")
+def deploy_dir_command() -> None:
+    """Print the directory with the deployment files (PAM services, unit, policy, installer)."""
+    from mira_server.deploy_files import DeployFilesMissingError, deploy_dir
+
+    try:
+        typer.echo(str(deploy_dir()))
+    except DeployFilesMissingError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from None
+
+
+# ── token usage and quotas ───────────────────────────────────────────
+
+quota_app = typer.Typer(help="Token quotas for team providers (run as the mira-server account).",
+                        no_args_is_help=True, add_completion=False, rich_markup_mode=None)
+app.add_typer(quota_app, name="quota")
+
+_SUFFIXES = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
+
+
+def _open_store(config: Path | None):
+    import sqlite3
+
+    from mira_server.store import Store
+
+    cfg = _load(_config_path(config))
+    if not cfg.db_path.exists():
+        typer.echo(f"Error: {cfg.db_path} does not exist (has Mira Server run yet?)", err=True)
+        raise typer.Exit(1)
+    try:
+        return Store(cfg.db_path)
+    except (OSError, sqlite3.Error) as exc:
+        typer.echo(f"Error: cannot open {cfg.db_path}: {exc} (run as the mira-server account)", err=True)
+        raise typer.Exit(1) from None
+
+
+def _tokens(value: str, *, override: bool) -> int | None:
+    """``2M``, ``500k``, ``1000``; ``unlimited`` (0); ``default`` (an override follows the team default)."""
+    text = value.strip().lower().replace(",", "").replace("_", "")
+    if text in {"unlimited", "none", "0"}:
+        return 0
+    if text == "default":
+        if not override:
+            raise typer.BadParameter("'default' only applies to --user")
+        return None
+    factor = _SUFFIXES.get(text[-1:], 1)
+    number = text[:-1] if text[-1:] in _SUFFIXES else text
+    try:
+        amount = float(number) * factor
+    except ValueError:
+        raise typer.BadParameter(f"{value!r} is not a number of tokens (e.g. 2M, 500k, unlimited)") from None
+    if amount < 0 or amount != int(amount):
+        raise typer.BadParameter(f"{value!r} is not a whole number of tokens")
+    return int(amount)
+
+
+def _fmt(limit: int | None) -> str:
+    return "unlimited" if not limit else f"{limit:,}"
+
+
+@app.command()
+def usage(
+    since: str = typer.Option("", "--from", help="First day, YYYY-MM-DD (default: the 1st of this month)"),
+    until: str = typer.Option("", "--to", help="Last day, YYYY-MM-DD (default: today)"),
+    by: str = typer.Option("user", "--by", help="Group by: user, day, month, provider, model (comma-separated)"),
+    as_csv: bool = typer.Option(False, "--csv", help="CSV instead of a table"),
+    config: Path | None = ConfigOption,
+) -> None:
+    """Token usage of team providers (run as the mira-server account)."""
+    import csv
+    from datetime import date
+
+    from mira_server.store import USAGE_COLUMNS, USAGE_GROUPS
+    from mira_server.usage import local_day, period_start
+
+    today = local_day()
+    try:
+        since = date.fromisoformat(since or period_start("monthly", today)).isoformat()
+        until = date.fromisoformat(until or today).isoformat()
+    except ValueError:
+        raise typer.BadParameter("--from and --to take dates as YYYY-MM-DD") from None
+    group_by = [group.strip() for group in by.split(",") if group.strip()]
+    if any(group not in USAGE_GROUPS for group in group_by) or len(set(group_by)) != len(group_by):
+        raise typer.BadParameter(f"--by takes distinct values of: {', '.join(USAGE_GROUPS)}")
+    store = _open_store(config)
+    rows = store.usage_summary(since_day=since, until_day=until, group_by=group_by)
+    columns = [*group_by, *USAGE_COLUMNS]
+    if as_csv:
+        writer = csv.writer(sys.stdout)
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow([row[column] for column in columns])
+        return
+    typer.echo(f"Team-provider token usage, {since} to {until}")
+    if not rows:
+        typer.echo("(none)")
+        return
+    cells = [[str(row[c]) if c in group_by else f"{row[c]:,}" for c in columns] for row in rows]
+    widths = [max(len(column), *(len(line[i]) for line in cells)) for i, column in enumerate(columns)]
+    typer.echo("  ".join(column.ljust(widths[i]) for i, column in enumerate(columns)))
+    for line in cells:
+        typer.echo("  ".join(value.ljust(widths[i]) if i < len(group_by) else value.rjust(widths[i])
+                             for i, value in enumerate(line)))
+
+
+@quota_app.command("show")
+def quota_show(config: Path | None = ConfigOption) -> None:
+    """Show the token quotas."""
+    from mira_server.usage import parse_quotas
+
+    quotas = parse_quotas(_open_store(config).get_setting("quotas") or {})
+    typer.echo(f"Default per user: daily {_fmt(quotas.default.daily)}, monthly {_fmt(quotas.default.monthly)}")
+    typer.echo(f"Warn at: {quotas.warn_percent}%")
+    for name, limits in sorted((quotas.users or {}).items()):
+        daily = "default" if limits.daily is None else _fmt(limits.daily)
+        monthly = "default" if limits.monthly is None else _fmt(limits.monthly)
+        typer.echo(f"  {name}: daily {daily}, monthly {monthly}")
+
+
+@quota_app.command("set")
+def quota_set(
+    user: str = typer.Option("", "--user", "-u", help="Change this user's override instead of the team default"),
+    daily: str = typer.Option("", "--daily", help="Daily tokens: 2M, 500k, unlimited; with --user also default"),
+    monthly: str = typer.Option("", "--monthly", help="Monthly tokens, as --daily"),
+    warn: int = typer.Option(0, "--warn", help="Warn users at this percentage of a quota (1-100)"),
+    config: Path | None = ConfigOption,
+) -> None:
+    """Change the team default, a user's override, or the warning threshold. Applies at once."""
+    from mira_server.config import valid_username
+    from mira_server.usage import QuotaError, parse_quotas
+
+    if not (daily or monthly or warn):
+        raise typer.BadParameter("give --daily, --monthly and/or --warn")
+    store = _open_store(config)
+    data = parse_quotas(store.get_setting("quotas") or {}).as_json()
+    if user:
+        entry = data["users"].setdefault(user, {"daily": None, "monthly": None})
+    else:
+        entry = data["default"]
+    for period, value in (("daily", daily), ("monthly", monthly)):
+        if value:
+            entry[period] = _tokens(value, override=bool(user))
+    if warn:
+        data["warn_percent"] = warn
+    try:
+        quotas = parse_quotas(data, valid_user=valid_username)
+    except QuotaError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(2) from None
+    store.put_setting("quotas", quotas.as_json())
+    store.audit("team.quotas_changed", username=f"cli:{getpass.getuser()}", default=quotas.default.as_json(),
+                users=[user] if user else [], warn_percent=quotas.warn_percent)
+    quota_show(config)
 
 
 def main() -> None:
