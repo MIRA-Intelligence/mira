@@ -134,7 +134,7 @@ with zipfile.ZipFile(wheel) as zf:
 PY
 )
 if [[ -n $sdist_reqs ]]; then
-	say "building wheels for sdist-only dependencies: $(echo $sdist_reqs)"
+	say "building wheels for sdist-only dependencies: $(tr '\n' ' ' <<<"$sdist_reqs")"
 	echo "$sdist_reqs" > "$WORK/sdist-only.txt"
 	"$PYTHON" -m pip wheel -q --disable-pip-version-check --no-deps -w "$DEST/wheels" -r "$WORK/sdist-only.txt"
 fi
