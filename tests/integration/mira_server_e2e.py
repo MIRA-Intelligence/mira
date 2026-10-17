@@ -214,7 +214,10 @@ async def ws_chat(base: str, token: str, session_id: str) -> str:
                 frame = json.loads(msg.data)
                 if frame.get("type") == "stream_delta":
                     reply += str(frame.get("content") or frame.get("delta") or "")
-                elif frame.get("type") in ("stream_end", "response", "error"):
+                elif frame.get("type") == "stream_end" and reply:
+                    break
+                elif frame.get("type") in ("response", "error"):
+                    # Nothing streamed (e.g. the provider refused the call): the reply comes whole.
                     reply = reply or str(frame.get("content") or "")
                     break
     return reply
