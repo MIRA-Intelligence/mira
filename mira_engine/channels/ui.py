@@ -46,7 +46,7 @@ from mira_engine.config.schema import Config, KnowledgeConfig, UiChannelConfig, 
 from mira_engine.knowledge import PROJECT_META_KEY, clean_kb_ids
 from mira_engine.knowledge.api import KnowledgeHttpApi
 from mira_engine.knowledge.service import KnowledgeService
-from mira_engine.utils.slide_decks import deck_response, is_deck
+from mira_engine.utils.slide_decks import deck_response, is_deck_file
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
     build_ui_runtime_payload,
@@ -4061,7 +4061,7 @@ class UiChannel(BaseChannel):
         if not candidate.is_file():
             return web.json_response({"error": "artifact not found"}, status=404)
 
-        if is_deck(candidate.name):
+        if is_deck_file(candidate):
             return deck_response(candidate, edit=request.query.get("mode") == "edit")
         return web.FileResponse(candidate)
 

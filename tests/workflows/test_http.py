@@ -242,12 +242,17 @@ async def test_slide_deck_content_is_sandboxed_and_editable_on_request(workflow_
         json={
             "command_id": "cmd-deck",
             "source_path": "slides.bento.html",
-            "artifact_type": "deliverable",
+            # Stored as payload.html under a label without an extension, as the
+            # Slides deliverable does: the deck must be recognised by content.
+            "label": "科学结果幻灯片",
+            "artifact_type": "slides",
             "media_type": "text/html",
         },
     )
     assert imported.status == 201
-    url = f"/api/workflow/v1/projects/PRJ-api/artifacts/{(await imported.json())['artifact']['artifact_id']}/content"
+    artifact = (await imported.json())["artifact"]
+    assert artifact["payload_ref"].endswith("payload.html")
+    url = f"/api/workflow/v1/projects/PRJ-api/artifacts/{artifact['artifact_id']}/content"
 
     preview = await workflow_client.get(url)
     assert preview.status == 200

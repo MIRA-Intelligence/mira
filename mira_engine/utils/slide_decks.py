@@ -28,8 +28,29 @@ _SANDBOX = "sandbox allow-scripts allow-downloads allow-modals allow-popups allo
 _EDIT_CSP = f"{_SANDBOX}; connect-src data: blob:"
 
 
+_HTML_SUFFIXES = (".html", ".htm")
+_SNIFF_BYTES = 16 * 1024
+# Both sit near the top of a deck: the app's generator tag and its document block.
+_DECK_MARKERS = (b'id="bento-doc"', b'content="bento-slides"')
+
+
 def is_deck(name: str) -> bool:
     return name.lower().endswith(DECK_SUFFIXES)
+
+
+def is_deck_file(path: Path) -> bool:
+    """Whether ``path`` is a deck, by name or, for stored payloads such as
+    ``payload.html``, by the markers at the top of the file."""
+    if is_deck(path.name):
+        return True
+    if not path.name.lower().endswith(_HTML_SUFFIXES):
+        return False
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(_SNIFF_BYTES)
+    except OSError:
+        return False
+    return any(marker in head for marker in _DECK_MARKERS)
 
 
 def editable_deck(html: str) -> str | None:

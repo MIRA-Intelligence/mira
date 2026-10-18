@@ -11,7 +11,7 @@ from uuid import uuid4
 from aiohttp import WSMsgType, web
 
 from mira_engine.projects import ProjectRegistry
-from mira_engine.utils.slide_decks import deck_response, is_deck
+from mira_engine.utils.slide_decks import deck_response, is_deck_file
 
 from .journals import PROFILE_VERSION, journal_catalog
 from .models import WORKFLOW_CONTRACT_VERSION, WorkflowEvent
@@ -321,7 +321,7 @@ class WorkflowHttpApi:
             repository = self._service(request.match_info["project_id"]).repository
             artifact = repository.load_artifact(request.match_info["artifact_id"])
             path = repository.artifact_content_path(artifact)
-            if is_deck(path.name) or is_deck(artifact.label):
+            if is_deck_file(path):
                 return deck_response(
                     path, edit=request.query.get("mode") == "edit", content_type=artifact.media_type,
                 )

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
-from mira_engine.utils.slide_decks import editable_deck, is_deck
+from mira_engine.utils.slide_decks import editable_deck, is_deck, is_deck_file
 
 DECK = (
     '<html><body><script type="application/bento+json" id="bento-doc">\n'
@@ -37,3 +38,15 @@ def test_is_deck() -> None:
     assert is_deck("result/exports/slides.bento.html")
     assert is_deck("Deck.MIRA.HTML")
     assert not is_deck("report.html")
+
+
+def test_is_deck_file_sniffs_stored_payloads(tmp_path: Path) -> None:
+    payload = tmp_path / "payload.html"
+    payload.write_text(DECK, encoding="utf-8")
+    report = tmp_path / "report.html"
+    report.write_text("<html><body>report</body></html>", encoding="utf-8")
+    data = tmp_path / "payload.csv"
+    data.write_text(DECK, encoding="utf-8")
+    assert is_deck_file(payload)
+    assert not is_deck_file(report)
+    assert not is_deck_file(data)
