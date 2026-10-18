@@ -85,5 +85,5 @@ cannot open `/ws`. Upgrade mira-ui together with the engine (see
 MIRA-Intelligence/mira-ui#68). The service manager (`mira-engine status`)
 reads the local token automatically.
 
-The OpenAI-compatible API server (`mira serve`, port 8900) is not covered here;
-see issue #160.
+The OpenAI-compatible API server (`mira serve`, port 8900) has its own keys and
+origin policy; see [api-auth.md](api-auth.md).
