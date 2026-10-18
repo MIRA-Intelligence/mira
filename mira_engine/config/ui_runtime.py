@@ -8,8 +8,17 @@ from typing import Any
 
 from pydantic.alias_generators import to_camel
 
-from mira_engine.config.schema import AgentDefaults, Config, ProvidersConfig
+from mira_engine.config import team_layer
+from mira_engine.config.schema import (
+    CUSTOM_PROVIDER_ID_PATTERN,
+    AgentDefaults,
+    Config,
+    ProviderConfig,
+    ProvidersConfig,
+    is_custom_provider_id,
+)
 from mira_engine.providers.registry import find_by_name
+from mira_engine.security.host_policy import RESTRICT_PATH, check_runtime_change
 
 _ALLOWED_REASONING_EFFORTS = {"low", "medium", "high", "adaptive"}
 # ``team`` profile roles, each bindable to its own provider + model.
@@ -31,8 +40,30 @@ def _mask_secret(value: str) -> str | None:
 def _provider_field_names() -> tuple[str, ...]:
     # ProvidersConfig also contains global settings (`proxy`, `model_params`).
     # The UI provider map below only serializes concrete ProviderConfig entries.
-    _non_provider = {"proxy", "model_params"}
+    _non_provider = {"proxy", "model_params", "custom_providers"}
     return tuple(name for name in ProvidersConfig.model_fields.keys() if name not in _non_provider)
+
+
+def _provider_entries(config: Config) -> list[tuple[str, ProviderConfig]]:
+    """Every provider the UI can configure; additional custom providers follow ``custom``."""
+    entries: list[tuple[str, ProviderConfig]] = []
+    for provider_name in _provider_field_names():
+        entries.append((provider_name, getattr(config.providers, provider_name)))
+        if provider_name == "custom":
+            entries.extend(config.providers.custom_providers.items())
+    return entries
+
+
+def _is_additional_custom_id(name: str) -> bool:
+    return bool(CUSTOM_PROVIDER_ID_PATTERN.match(name))
+
+
+def _clean_provider_display_name(value: Any, provider_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"providers.{provider_name}.name must be a string or null")
+    return value.strip() or None
 
 
 def _provider_display_name(provider_name: str) -> str:
@@ -45,6 +76,8 @@ def _provider_display_name(provider_name: str) -> str:
 
 
 def _provider_metadata(provider_name: str) -> dict[str, Any]:
+    if _is_additional_custom_id(provider_name):
+        provider_name = "custom"
     if provider_name == "auto":
         return {
             "display_name": _provider_display_name(provider_name),
@@ -53,6 +86,7 @@ def _provider_metadata(provider_name: str) -> dict[str, Any]:
             "default_api_base": None,
             "is_oauth": False,
             "is_local": False,
+            "is_subscription": False,
         }
 
     spec = find_by_name(provider_name)
@@ -64,6 +98,7 @@ def _provider_metadata(provider_name: str) -> dict[str, Any]:
             "default_api_base": None,
             "is_oauth": False,
             "is_local": False,
+            "is_subscription": False,
         }
 
     api_key_required = not (spec.is_oauth or spec.is_local or provider_name == "custom")
@@ -77,6 +112,7 @@ def _provider_metadata(provider_name: str) -> dict[str, Any]:
         "default_api_base": spec.default_api_base or None,
         "is_oauth": bool(spec.is_oauth),
         "is_local": bool(spec.is_local),
+        "is_subscription": bool(spec.is_subscription),
     }
 
 
@@ -158,9 +194,11 @@ def _build_provider_payload(config: Config) -> dict[str, dict[str, Any]]:
             **_provider_metadata("auto"),
         }
     }
-    for provider_name in _provider_field_names():
-        provider_cfg = getattr(config.providers, provider_name)
+    for provider_name, provider_cfg in _provider_entries(config):
         meta = _provider_metadata(provider_name)
+        is_custom = is_custom_provider_id(provider_name)
+        if is_custom and provider_cfg.name:
+            meta["display_name"] = provider_cfg.name
         api_key_configured = bool(provider_cfg.api_key)
         models = list(provider_cfg.models)
         # "Configured" means the provider has enough to be usable: a
@@ -183,8 +221,13 @@ def _build_provider_payload(config: Config) -> dict[str, dict[str, Any]]:
             "models": models,
             "configured": configured,
             "enabled": enabled,
+            "is_custom": is_custom,
             **meta,
         }
+        if team_layer.managed_provider(config, provider_name):
+            # The key is this engine's token for Mira Server's LLM proxy, not a team key.
+            providers[provider_name]["api_key_preview"] = None
+            providers[provider_name]["managed_by"] = "team"
     return providers
 
 
@@ -289,7 +332,7 @@ def build_ui_runtime_payload(
         runtime[f"{role}_provider"] = defaults.role_provider(role)
         runtime[f"{role}_model"] = getattr(defaults, f"{role}_model", None)
 
-    return {
+    payload: dict[str, Any] = {
         "projects_root": str(resolved_projects_root),
         "config_path": str(config_path),
         "persisted": persisted,
@@ -301,6 +344,10 @@ def build_ui_runtime_payload(
             for rule in config.providers.model_params
         ],
     }
+    layer = team_layer.team_values(config).layer
+    if not layer.empty:
+        payload["team"] = layer.summary()
+    return payload
 
 
 def _normalize_model_param_rules(raw: Any) -> list[dict[str, Any]]:
@@ -327,6 +374,43 @@ def _normalize_model_param_rules(raw: Any) -> list[dict[str, Any]]:
             raise ValueError(f"model_params[{index}].params must be an object")
         rules.append({"pattern": pattern, "params": dict(params)})
     return rules
+
+
+def _provider_label(provider_name: str, provider_cfg: ProviderConfig) -> str:
+    if is_custom_provider_id(provider_name) and provider_cfg.name:
+        return provider_cfg.name
+    return str(_provider_metadata(provider_name)["display_name"])
+
+
+def _check_unique_provider_names(config: Config, touched: list[str]) -> None:
+    """Reject an update that leaves a created or renamed custom provider sharing a name."""
+    if not touched:
+        return
+    owners: dict[str, list[str]] = {}
+    for name, provider_cfg in _provider_entries(config):
+        owners.setdefault(_provider_label(name, provider_cfg).strip().lower(), []).append(name)
+    for name in touched:
+        provider_cfg = config.providers.entry(name)
+        if provider_cfg is None:
+            continue
+        label = _provider_label(name, provider_cfg)
+        if len(owners[label.strip().lower()]) > 1:
+            raise ValueError(f'provider name "{label}" is already in use; choose a different name')
+
+
+def _known_provider_names(config: Config, payload: dict[str, Any]) -> set[str]:
+    """Provider ids a runtime binding may reference, counting custom providers this update creates."""
+    names = {name for name, _ in _provider_entries(config)}
+    providers_payload = payload.get("providers")
+    if isinstance(providers_payload, dict):
+        for name, update in providers_payload.items():
+            if not _is_additional_custom_id(str(name)):
+                continue
+            if update is None:
+                names.discard(str(name))
+            else:
+                names.add(str(name))
+    return names
 
 
 def _workspace_payload_value(raw_workspace: str, projects_root: Path) -> str:
@@ -455,10 +539,27 @@ def apply_ui_runtime_update_to_raw_data(
                 changed = True
                 continue
 
-            if not isinstance(provider_update, dict):
-                continue
-
-            provider_cfg = _provider_config_record(providers, str(provider_name))
+            provider_name = str(provider_name)
+            if _is_additional_custom_id(provider_name):
+                custom_records = _provider_config_record(providers, "custom_providers")
+                if provider_update is None:
+                    if custom_records.pop(provider_name, None) is not None:
+                        changed = True
+                    continue
+                if not isinstance(provider_update, dict):
+                    continue
+                provider_cfg = custom_records.get(provider_name)
+                if not isinstance(provider_cfg, dict):
+                    provider_cfg = {}
+                    custom_records[provider_name] = provider_cfg
+                    changed = True
+            else:
+                if not isinstance(provider_update, dict):
+                    continue
+                provider_cfg = _provider_config_record(providers, provider_name)
+            if "name" in provider_update and is_custom_provider_id(provider_name):
+                _set_alias_value(provider_cfg, "name", _clean_provider_display_name(provider_update["name"], provider_name))
+                changed = True
             if "api_key" in provider_update:
                 _set_alias_value(provider_cfg, "api_key", str(provider_update["api_key"]).strip(), alias="apiKey")
                 changed = True
@@ -530,6 +631,7 @@ def save_ui_runtime_update(
         payload,
         current_projects_root=current_projects_root,
     )
+    team_layer.restore_team_values(config, data)
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -643,6 +745,7 @@ def apply_ui_runtime_update(
             restrict_to_workspace = runtime_payload["restrict_to_workspace"]
             if not isinstance(restrict_to_workspace, bool):
                 raise ValueError("runtime.restrict_to_workspace must be a boolean")
+            check_runtime_change(RESTRICT_PATH, config.tools.restrict_to_workspace, restrict_to_workspace)
             if config.tools.restrict_to_workspace != restrict_to_workspace:
                 config.tools.restrict_to_workspace = restrict_to_workspace
                 changed = True
@@ -655,7 +758,7 @@ def apply_ui_runtime_update(
                 if not isinstance(provider, str) or not provider.strip():
                     raise ValueError(f"runtime.{provider_key} must be a non-empty string")
                 provider = provider.strip()
-                if provider != "auto" and provider not in _provider_field_names():
+                if provider != "auto" and provider not in _known_provider_names(config, payload):
                     raise ValueError(f"unsupported provider: {provider}")
                 if getattr(config.agents.defaults, provider_key) != provider:
                     setattr(config.agents.defaults, provider_key, provider)
@@ -685,6 +788,7 @@ def apply_ui_runtime_update(
         from mira_engine.providers.registry import set_user_model_param_rules
 
         rules = _normalize_model_param_rules(payload.get("model_params"))
+        team_layer.check_model_params_change(config, rules)
         next_rules = [ModelParamRule(pattern=r["pattern"], params=r["params"]) for r in rules]
         current = [
             {"pattern": r.pattern, "params": dict(r.params)}
@@ -712,12 +816,42 @@ def apply_ui_runtime_update(
                     changed = True
                 continue
 
-            if provider_name not in _provider_field_names():
-                raise ValueError(f"unsupported provider: {provider_name}")
-            if not isinstance(provider_update, dict):
-                raise ValueError(f"providers.{provider_name} must be an object")
+            if _is_additional_custom_id(provider_name):
+                custom_providers = config.providers.custom_providers
+                if provider_update is None:
+                    if team_layer.managed_provider(config, provider_name):
+                        raise team_layer.TeamLockedError(
+                            f"providers.{provider_name} is managed by the Team Server administrators "
+                            "and cannot be deleted here")
+                    if custom_providers.pop(provider_name, None) is not None:
+                        changed = True
+                    continue
+                if not isinstance(provider_update, dict):
+                    raise ValueError(f"providers.{provider_name} must be an object")
+                team_layer.check_provider_change(config, provider_name, provider_update)
+                if team_layer.managed_provider(config, provider_name):
+                    continue  # unchanged (checked above); an empty api_key must not clear the proxy token
+                if provider_name not in custom_providers:
+                    custom_providers[provider_name] = ProviderConfig()
+                    changed = True
+                provider_cfg = custom_providers[provider_name]
+            else:
+                if provider_name not in _provider_field_names():
+                    raise ValueError(f"unsupported provider: {provider_name}")
+                if not isinstance(provider_update, dict):
+                    raise ValueError(f"providers.{provider_name} must be an object")
+                team_layer.check_provider_change(config, provider_name, provider_update)
+                if team_layer.managed_provider(config, provider_name):
+                    continue  # unchanged (checked above); an empty api_key must not clear the proxy token
+                provider_cfg = getattr(config.providers, provider_name)
 
-            provider_cfg = getattr(config.providers, provider_name)
+            if "name" in provider_update:
+                if not is_custom_provider_id(provider_name):
+                    raise ValueError(f"providers.{provider_name}.name is only supported for custom providers")
+                next_name = _clean_provider_display_name(provider_update["name"], provider_name)
+                if provider_cfg.name != next_name:
+                    provider_cfg.name = next_name
+                    changed = True
             if "api_key" in provider_update:
                 api_key = provider_update["api_key"]
                 if not isinstance(api_key, str):
@@ -755,5 +889,11 @@ def apply_ui_runtime_update(
                 if provider_cfg.enabled != enabled:
                     provider_cfg.enabled = enabled
                     changed = True
+
+        _check_unique_provider_names(
+            config,
+            [str(name) for name, update in providers_payload.items()
+             if update is not None and is_custom_provider_id(str(name))],
+        )
 
     return projects_root, changed

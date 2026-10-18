@@ -40,6 +40,7 @@ from rich.text import Text
 from loguru import logger
 
 from mira_engine import __logo__, __version__
+from mira_engine.cli.remote import remote_app
 from mira_engine.cli.workflow import workflow_app
 from mira_engine.config.paths import get_workspace_path
 from mira_engine.config.schema import Config
@@ -53,6 +54,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(workflow_app, name="workflow")
+app.add_typer(remote_app, name="remote")
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
@@ -140,6 +142,11 @@ _PROVIDER_MODEL_EXAMPLES: dict[str, tuple[str, ...]] = {
     "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
     "dashscope": ("qwen-plus", "qwen-max"),
     "moonshot": ("kimi-k2.5", "moonshot-v1-8k"),
+    "kimi_code": ("kimi-for-coding", "k3"),
+    "zhipu_coding_plan": ("glm-5.3",),
+    "minimax_token_plan": ("MiniMax-M3",),
+    "volcengine_agent_plan": ("ark-code-latest",),
+    "xai": ("grok-4.5",),
     "mistral": ("mistral-large-latest", "ministral-8b-latest"),
     "groq": ("llama-3.3-70b-versatile", "mixtral-8x7b-32768"),
     "ollama": ("llama3.2", "qwen2.5"),
@@ -727,7 +734,10 @@ def main(
     ),
 ):
     """mira - Personal AI Assistant."""
-    pass
+    from mira_engine.cli.launcher import ensure_launcher
+
+    # Keeps <MIRA_HOME>/bin/mira pointing at a working install for Remote-SSH.
+    ensure_launcher()
 
 
 # ============================================================================
@@ -1419,6 +1429,9 @@ def gateway(
     gateway_host = config.gateway.host
     gateway_port = config.gateway.port
 
+    _refuse_exposed_remote_engine(gateway_host)
+    engine_lease = _acquire_engine_lease_or_exit(gateway_host, gateway_port)
+    _free_gateway_port_or_exit(gateway_host, gateway_port)
     _gateway_failsafe_check(gateway_host, gateway_port, verbose)
 
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
@@ -1447,6 +1460,7 @@ def gateway(
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        knowledge_config=config.tools.knowledge,
         cron_service=cron,
         timezone=default_tz,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -1596,6 +1610,7 @@ def gateway(
             brave_api_key=next_config.tools.web.search.api_key or None,
             web_proxy=next_config.tools.web.proxy or None,
             exec_config=next_config.tools.exec,
+            knowledge_config=next_config.tools.knowledge,
             timezone=next_tz,
             channels_config=next_config.channels,
             context_window_tokens=next_config.agents.defaults.context_window_tokens,
@@ -1640,31 +1655,101 @@ def gateway(
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
+    from mira_engine.cli.gateway_shutdown import GatewayShutdown, run_bounded
+
+    shutdown = GatewayShutdown(on_force_exit=engine_lease.release)
+
     async def run():
+        loop = asyncio.get_running_loop()
         if diagnostics is not None:
-            diagnostics.install_asyncio_handler(asyncio.get_running_loop())
+            diagnostics.install_asyncio_handler(loop)
+        stop_requested = shutdown.bind(loop)
         emit_event("gateway.starting", host=gateway_host, port=gateway_port)
+        main: asyncio.Future | None = None
+        stop_wait = asyncio.create_task(stop_requested.wait())
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            main = asyncio.gather(agent.run(), channels.start_all())
+            done, _ = await asyncio.wait({main, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if main in done:
+                main.result()
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         except Exception as exc:
             emit_event("gateway.failed", level="CRITICAL", exception=exc)
             raise
         finally:
-            await agent.close_mcp()
+            stop_wait.cancel()
+            # Leave a margin inside the watchdog budget for asyncio's own teardown.
+            deadline = loop.time() + max(1.0, shutdown.timeout_s - 2.0)
+            # Stop accepting connections and close WebSockets first, so no new work arrives.
+            await run_bounded("channels", channels.stop_all(), deadline)
             heartbeat.stop()
             cron.stop()
             agent.stop()
-            await channels.stop_all()
-            emit_event("gateway.stopped")
+            await run_bounded("MCP servers", agent.close_mcp(), deadline)
+            if main is not None and not main.done():
+                main.cancel()
+                await run_bounded("agent loop", asyncio.gather(main, return_exceptions=True), deadline)
+            engine_lease.release()
+            emit_event("gateway.stopped", signal=shutdown.signum)
 
-    asyncio.run(run())
+    shutdown.install()
+    try:
+        asyncio.run(run())
+    finally:
+        shutdown.restore()
+        engine_lease.release()
+
+
+def _refuse_exposed_remote_engine(gateway_host: str) -> None:
+    """Remote-SSH engines are reached through an SSH tunnel and must never listen publicly."""
+    from mira_engine.cli.remote import LAUNCH_MODE_ENV, REMOTE_LAUNCH_MODE
+    from mira_engine.security.gateway_auth import is_loopback_host
+
+    if os.environ.get(LAUNCH_MODE_ENV) == REMOTE_LAUNCH_MODE and not is_loopback_host(gateway_host):
+        typer.echo(f"Error: a Remote-SSH engine must bind a loopback address, not {gateway_host}.", err=True)
+        raise typer.Exit(2)
+
+
+def _acquire_engine_lease_or_exit(gateway_host: str, gateway_port: int):
+    """Take the single-engine lease for MIRA_HOME before touching its data."""
+    import atexit
+
+    from mira_engine.cli.engine_lease import (
+        LEASE_CONFLICT_EXIT_CODE,
+        LeaseConflictError,
+        acquire_engine_lease,
+    )
+
+    try:
+        lease = acquire_engine_lease(host=gateway_host, port=gateway_port)
+    except LeaseConflictError as exc:
+        typer.echo(f"Error: {exc}.", err=True)
+        typer.echo("Inspect it with `mira remote status`. Stop it with `mira remote stop`, "
+                   "or `mira-engine stop` for the system service.", err=True)
+        raise typer.Exit(LEASE_CONFLICT_EXIT_CODE) from None
+    # Covers exits before the event loop starts; release() is idempotent.
+    atexit.register(lease.release)
+    return lease
+
+
+def _free_gateway_port_or_exit(gateway_host: str, gateway_port: int) -> None:
+    """Stop only a provably stale engine for this MIRA_HOME on our port; refuse anything else."""
+    from mira_engine.cli.port_guard import (
+        PORT_IN_USE_EXIT_CODE,
+        PortInUseError,
+        free_port_from_stale_engine,
+    )
+
+    try:
+        free_port_from_stale_engine(gateway_host, gateway_port)
+    except PortInUseError as exc:
+        typer.echo(f"Error: {exc}.", err=True)
+        typer.echo("Mira only stops a leftover engine for this MIRA_HOME. Stop that process, "
+                   "or start the gateway on another port with --port.", err=True)
+        raise typer.Exit(PORT_IN_USE_EXIT_CODE) from None
 
 
 @app.command("gateway-token")
@@ -1733,6 +1818,7 @@ def serve(
         brave_api_key=cfg.tools.web.search.api_key or None,
         web_proxy=cfg.tools.web.proxy or None,
         exec_config=cfg.tools.exec,
+        knowledge_config=cfg.tools.knowledge,
         timezone=default_tz,
         restrict_to_workspace=cfg.tools.restrict_to_workspace,
         session_manager=SessionManager(cfg.workspace_path),
@@ -1814,6 +1900,7 @@ def _build_agent_loop_kwargs(
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        knowledge_config=config.tools.knowledge,
         cron_service=cron_service,
         timezone=default_tz,
         restrict_to_workspace=config.tools.restrict_to_workspace,

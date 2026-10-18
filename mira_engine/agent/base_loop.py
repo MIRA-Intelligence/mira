@@ -41,6 +41,7 @@ from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
 from mira_engine.agent.tools.consult import ConsultRoleTool
 from mira_engine.agent.tools.cron import CronTool
+from mira_engine.agent.tools.knowledge import KnowledgeReadTool, KnowledgeScope, KnowledgeSearchTool
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
@@ -68,9 +69,10 @@ from mira_engine.modules.tools import (
 from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
+from mira_engine.utils.helpers import normalize_citations
 
 if TYPE_CHECKING:
-    from mira_engine.config.schema import ChannelsConfig, ExecToolConfig
+    from mira_engine.config.schema import ChannelsConfig, ExecToolConfig, KnowledgeConfig
     from mira_engine.cron.service import CronService
 
 UNIFIED_SESSION_KEY = "unified:default"
@@ -114,6 +116,7 @@ class BaseAgentLoop:
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        knowledge_config: KnowledgeConfig | None = None,
         cron_service: CronService | None = None,
         timezone: str | None = None,
         restrict_to_workspace: bool = False,
@@ -127,7 +130,7 @@ class BaseAgentLoop:
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
     ):
-        from mira_engine.config.schema import ExecToolConfig
+        from mira_engine.config.schema import ExecToolConfig, KnowledgeConfig
         self.bus = bus
         self.channels_config = channels_config
         self.provider_factory = provider_factory
@@ -145,6 +148,8 @@ class BaseAgentLoop:
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.knowledge_config = knowledge_config or KnowledgeConfig()
+        self._knowledge_scope: KnowledgeScope | None = None
         self.cron_service = cron_service
         self.timezone = timezone
         self.restrict_to_workspace = restrict_to_workspace
@@ -258,6 +263,7 @@ class BaseAgentLoop:
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        knowledge_config: KnowledgeConfig | None = None,
         timezone: str | None = None,
         channels_config: ChannelsConfig | None = None,
         context_window_tokens: int | None = None,
@@ -288,6 +294,8 @@ class BaseAgentLoop:
             self.web_proxy = web_proxy
             if exec_config is not None:
                 self.exec_config = exec_config
+            if knowledge_config is not None:
+                self.knowledge_config = knowledge_config
             self.timezone = timezone
             self.restrict_to_workspace = restrict_to_workspace
             if channels_config is not None:
@@ -327,29 +335,7 @@ class BaseAgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        skill_access_dirs: list[Path] = []
-        if self.restrict_to_workspace:
-            from mira_engine.agent.skills import SkillsLoader
-
-            def _add_skill_dir(path: Path) -> None:
-                try:
-                    resolved = path.resolve()
-                except Exception:
-                    return
-                if resolved != self.workspace and resolved not in skill_access_dirs:
-                    skill_access_dirs.append(resolved)
-
-            skills_loader = SkillsLoader(self.workspace)
-            for root in skills_loader.workspace_skills_roots:
-                _add_skill_dir(root)
-            if skills_loader.builtin_skills:
-                _add_skill_dir(skills_loader.builtin_skills)
-            for skill in skills_loader.list_skills(filter_unavailable=False):
-                skill_path = Path(skill["path"])
-                _add_skill_dir(skill_path.parent)
-                parent = skill_path.parent.parent
-                if parent != skill_path.parent:
-                    _add_skill_dir(parent)
+        skill_access_dirs = self._skill_access_dirs_for_workspace(self.workspace)
 
         supports_vision = self.provider.supports_vision(self.model)
         self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs, supports_vision=supports_vision))
@@ -376,6 +362,10 @@ class BaseAgentLoop:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
+                sandbox=self.exec_config.sandbox or None,
+                sandbox_network=self.exec_config.sandbox_network,
+                sandbox_read_only_paths=self.exec_config.sandbox_read_only_paths,
+                sandbox_extra_dirs=skill_access_dirs,
                 background_registry=self._bg_registry,
                 enable_background=True,
                 python_runtime=self.exec_config.python,
@@ -384,6 +374,10 @@ class BaseAgentLoop:
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(PubMedSearchTool(proxy=self.web_proxy))
+        self._knowledge_scope = KnowledgeScope() if self.knowledge_config.enabled else None
+        if self._knowledge_scope is not None:
+            self.tools.register(KnowledgeSearchTool(self._knowledge_scope))
+            self.tools.register(KnowledgeReadTool(self._knowledge_scope))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SetPlanTool())
         self.tools.register(WorkflowInteractionTool())
@@ -399,9 +393,11 @@ class BaseAgentLoop:
             self.tools.register(cron_tool)
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
-        skill_access_dirs: list[Path] = []
-        if not self.restrict_to_workspace:
-            return skill_access_dirs
+        if not (self.restrict_to_workspace or self.exec_config.sandbox):
+            return []
+        from mira_engine.agent.skills import skill_access_dirs
+
+        return skill_access_dirs(workspace)
 
         from mira_engine.agent.skills import SkillsLoader
 
@@ -572,12 +568,12 @@ class BaseAgentLoop:
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
-        """Remove <think>…</think> blocks that some models embed in content."""
+        """Remove <think>…</think> blocks and normalize native citation markup."""
         if not text:
             return None
         cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
         cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
-        return cleaned.strip() or None
+        return normalize_citations(cleaned).strip() or None
 
     @staticmethod
     async def _emit_activity_ping(on_progress: Callable[..., Awaitable[None]]) -> None:
@@ -690,6 +686,19 @@ class BaseAgentLoop:
         ) or ""
         sections = [chunk for chunk in (python_hint, base, notice) if chunk]
         return "\n\n".join(sections) if sections else None
+
+    def _with_knowledge(
+        self,
+        extra_system: str | None,
+        meta: dict[str, Any],
+        project_ref: ProjectRef | None,
+    ) -> str | None:
+        """Scope the kb tools to this turn's knowledge bases and describe them."""
+        scope = self._knowledge_scope
+        if scope is None:
+            return extra_system
+        section = scope.begin_turn(meta, project_ref.project_dir if project_ref else None)
+        return "\n\n".join(part for part in (extra_system, section) if part) or None
 
     def _get_model_runtime(self, session_key: str, *, role: str | None = None) -> RoutedProviderManager:
         """Return the session-local model runtime, creating it on demand."""
@@ -1519,6 +1528,7 @@ class BaseAgentLoop:
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
         )
+        extra_system = self._with_knowledge(extra_system, meta, project_ref)
 
         raw_selected_skills = meta.get("selected_skill_ids")
         selected_skills = [

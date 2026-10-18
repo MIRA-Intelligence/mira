@@ -7,9 +7,12 @@ from pathlib import Path
 
 from loguru import logger
 
+from mira_engine.config import team_layer
 from mira_engine.config.schema import Config
 from mira_engine.providers.registry import set_user_model_param_rules
 from mira_engine.security.gateway_auth import ALLOWED_ORIGINS_ENV, DEFAULT_ALLOWED_ORIGINS
+from mira_engine.security.host_policy import enforce as enforce_host_policy
+from mira_engine.security.host_policy import restore_user_values
 from mira_engine.security.network import configure_ssrf_whitelist
 
 
@@ -73,17 +76,24 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             data = _migrate_config(data)
+            team_values = team_layer.apply_to_raw(data)
             cfg = Config.model_validate(data)
+            team_layer.attach(cfg, team_values)
             configure_ssrf_whitelist(cfg.tools.ssrf_whitelist)
             _apply_runtime_registry_config(cfg)
+            enforce_host_policy(cfg)
             return cfg
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
 
-    cfg = Config()
+    data = {}
+    team_values = team_layer.apply_to_raw(data)
+    cfg = Config.model_validate(data)
+    team_layer.attach(cfg, team_values)
     configure_ssrf_whitelist(cfg.tools.ssrf_whitelist)
     _apply_runtime_registry_config(cfg)
+    enforce_host_policy(cfg)
     return cfg
 
 
@@ -98,7 +108,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path = config_path or get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    data = config.model_dump(by_alias=True)
+    data = restore_user_values(config, config.model_dump(by_alias=True))
+    data = team_layer.restore_team_values(config, data)
 
     # config.json is shared across all instances; serialize concurrent writes
     # and replace atomically so a crashed/racing writer never leaves a partial

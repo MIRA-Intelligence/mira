@@ -73,6 +73,11 @@ so put it behind TLS when it leaves a trusted network. Configs written by older
 versions may still contain `"host": "0.0.0.0"`; change it to `127.0.0.1` for
 desktop-only use.
 
+Connecting clients directly to a non-loopback gateway over plain `http`/`ws` is
+deprecated. To use an engine on another machine, keep it on loopback and use an
+SSH tunnel (Remote-SSH mode once released), or a TLS reverse proxy; see
+[remote-access.md](remote-access.md).
+
 ## Upgrading clients (breaking change)
 
 Clients that do not send the token receive `401` from every `/api/*` route and

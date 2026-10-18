@@ -75,6 +75,7 @@ class Mira:
             max_iterations=defaults.max_tool_iterations,
             context_window_tokens=defaults.context_window_tokens,
             exec_config=config.tools.exec,
+            knowledge_config=config.tools.knowledge,
             restrict_to_workspace=config.tools.restrict_to_workspace,
             mcp_servers=config.tools.mcp_servers,
             timezone=defaults.timezone,

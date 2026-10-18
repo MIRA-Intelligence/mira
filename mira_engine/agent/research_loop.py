@@ -1418,6 +1418,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
         )
+        extra_system = self._with_knowledge(extra_system, meta, project_ref)
 
         raw_selected_skills = meta.get("selected_skill_ids")
         selected_skills = [

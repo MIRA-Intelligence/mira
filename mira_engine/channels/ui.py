@@ -29,18 +29,23 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, WSCloseCode, web
 from loguru import logger
 
 from mira_engine import __version__
 from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
+from mira_engine.agent.tools.sandbox import sandbox_status
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.config import loader as config_loader
+from mira_engine.config import team_layer
 from mira_engine.config.paths import get_runtime_subdir, get_workspace_path
-from mira_engine.config.schema import Config, UiChannelConfig
+from mira_engine.config.schema import Config, KnowledgeConfig, UiChannelConfig, is_custom_provider_id
+from mira_engine.knowledge import PROJECT_META_KEY, clean_kb_ids
+from mira_engine.knowledge.api import KnowledgeHttpApi
+from mira_engine.knowledge.service import KnowledgeService
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
     build_ui_runtime_payload,
@@ -79,6 +84,12 @@ from mira_engine.security.gateway_auth import (
     token_matches,
     warn_if_exposed,
 )
+from mira_engine.security.host_policy import (
+    LOCKED_ERROR_CODE,
+    HostPolicyError,
+    PolicyLockedError,
+    load_host_policy,
+)
 from mira_engine.session.manager import SessionManager
 from mira_engine.task_plan.guardrails import (
     get_task_plan_contract,
@@ -92,6 +103,61 @@ PLAN_FILENAME = "task_plan.json"
 # Sentinel session id used by the UI to manage globally-scoped skill plugins
 # without a selected project. Mirrors GLOBAL_SKILLS_SESSION_ID in the frontend.
 _GLOBAL_SKILLS_SESSION_ID = "__global__"
+
+
+def _resolve_ui_provider_name(config: Config, name: str) -> str | None:
+    """Map a provider id from the UI to its config name (additional custom ids included)."""
+    if not name:
+        return None
+    if name in config.providers.custom_providers:
+        return name
+    spec = find_by_name(name)
+    return spec.name if spec else None
+
+
+def host_policy_payload() -> dict[str, Any]:
+    """The host policy summary for clients (locked settings, source)."""
+    try:
+        return load_host_policy().summary()
+    except HostPolicyError as exc:
+        return {"source": None, "groups": [], "locked": [], "plugin_install": False, "error": str(exc)}
+
+
+def sandbox_status_payload() -> dict[str, Any]:
+    try:
+        exec_config = config_loader.load_config().tools.exec
+    except Exception as exc:  # noqa: BLE001 - status must not fail
+        return {"mode": None, "available": False, "reason": str(exc)}
+    return sandbox_status(exec_config.sandbox, network=exec_config.sandbox_network)
+
+
+def _knowledge_config() -> KnowledgeConfig:
+    try:
+        return config_loader.load_config().tools.knowledge
+    except Exception:  # noqa: BLE001 - fall back to defaults on a broken config
+        return KnowledgeConfig()
+
+
+def _web_proxy() -> str | None:
+    try:
+        return config_loader.load_config().tools.web.proxy or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def plugin_install_refusal() -> web.Response | None:
+    """403 when the host policy forbids installing or removing skill plugins."""
+    try:
+        policy = load_host_policy()
+    except HostPolicyError as exc:
+        return web.json_response({"error": str(exc), "code": LOCKED_ERROR_CODE}, status=403)
+    if policy.plugin_install_disabled:
+        return web.json_response(
+            {"error": f"installing skill plugins is disabled by the host policy ({policy.source})",
+             "code": LOCKED_ERROR_CODE},
+            status=403,
+        )
+    return None
 _ASSETS_DIR = Path(__file__).parent / "ui_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".mira") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
@@ -860,6 +926,10 @@ def _merge_recovered_results(existing: Any, recovered_metrics: Any, artifacts: l
     return results
 
 
+_WS_CLOSE_TIMEOUT_S = 2.0
+_HTTP_SHUTDOWN_TIMEOUT_S = 3.0
+
+
 class UiChannel(BaseChannel):
     """WebSocket + REST channel for frontend clients (desktop/browser UI)."""
 
@@ -925,12 +995,19 @@ class UiChannel(BaseChannel):
         self._engine_identity: dict[str, Any] = _current_engine_identity()
         self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
+        # Every open WebSocket, bound to a session or not, so shutdown can close them all.
+        self._sockets: set[web.WebSocketResponse] = set()
         self._client_project_dirs: dict[str, Path | None] = {}
         # Accumulates streamed assistant text per session so the final turn can
         # be persisted to the UI history log on stream end.
         self._stream_buffers: dict[str, str] = {}
         self._app: web.Application | None = None
         self._workflow_api = WorkflowHttpApi(self.project_registry)
+        self._knowledge = KnowledgeService(config=_knowledge_config, proxy=_web_proxy)
+        self._knowledge_api = KnowledgeHttpApi(
+            self._knowledge,
+            audit=lambda action, details: self._audit(source="ui", action=action, details=details),
+        )
         self._workflow_executor_id = uuid4().hex
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -1161,34 +1238,15 @@ class UiChannel(BaseChannel):
 
     # ── lifecycle ────────────────────────────────────────────────────
 
-    def _kill_stale_listener(self) -> None:
-        """Kill any leftover process occupying our port before binding."""
-        import os
-        import signal
-        import subprocess
+    def _free_port_from_stale_engine(self) -> None:
+        """Before binding, stop a leftover engine for this MIRA_HOME that still holds our port.
 
-        my_pid = os.getpid()
-        try:
-            result = subprocess.run(
-                ["lsof", "-ti", f":{self.bind_port}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            pids = {
-                int(p) for p in result.stdout.split() if p.strip()
-            } - {my_pid}
-        except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
-            return
+        Raises :class:`~mira_engine.cli.port_guard.PortInUseError` when anything
+        else holds it; such a process is never signalled.
+        """
+        from mira_engine.cli.port_guard import free_port_from_stale_engine
 
-        for pid in pids:
-            try:
-                logger.warning("Killing stale process {} on port {}", pid, self.bind_port)
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
-
-        if pids:
-            import time
-            time.sleep(0.5)
+        free_port_from_stale_engine(self.bind_host, self.bind_port)
 
     def _build_app(self) -> web.Application:
         from mira_engine.observability import request_middleware
@@ -1225,6 +1283,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/config", self._handle_config)
         self._app.router.add_get("/api/providers/{name}/models", self._handle_provider_models)
         self._app.router.add_post("/api/providers/{name}/test", self._handle_provider_test)
+        self._app.router.add_put("/api/team/layer", self._handle_team_layer)
         self._app.router.add_get("/api/feedback/config", self._handle_feedback_config)
         self._app.router.add_post("/api/feedback", self._handle_feedback)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
@@ -1255,14 +1314,21 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
         self._app.router.add_delete("/api/projects/{session_id}/skill-plugins/{plugin_id}", self._handle_skill_plugins_uninstall)
         self._workflow_api.add_routes(self._app)
+        if _knowledge_config().enabled:
+            self._knowledge_api.add_routes(self._app)
+            self._app.router.add_get("/api/projects/{session_id}/knowledge", self._handle_project_knowledge)
+            self._app.router.add_put("/api/projects/{session_id}/knowledge", self._handle_project_knowledge)
         return self._app
 
     async def start(self) -> None:
-        self._kill_stale_listener()
+        self._free_port_from_stale_engine()
         self._build_app()
+        if _knowledge_config().enabled:
+            self._knowledge.start()  # resume sources interrupted by the last shutdown
 
         # The access log would record request lines, including ?access_token=.
-        self._runner = web.AppRunner(self._app, access_log=None)
+        # A short shutdown_timeout keeps in-flight requests from stalling engine shutdown.
+        self._runner = web.AppRunner(self._app, access_log=None, shutdown_timeout=_HTTP_SHUTDOWN_TIMEOUT_S)
         await self._runner.setup()
         self._site = web.TCPSite(
             self._runner, self.bind_host, self.bind_port,
@@ -1287,12 +1353,17 @@ class UiChannel(BaseChannel):
     async def stop(self) -> None:
         self._running = False
 
-        await self._close_active_clients()
-        await self._workflow_api.close()
-
+        # Stop accepting connections first, then tell clients the engine is going away.
         if self._site:
             await self._site.stop()
             self._site = None
+        sockets = {*self._sockets, *self._clients.values()}
+        self._clients.clear()
+        self._client_project_dirs.clear()
+        await self._close_sockets(sockets, code=WSCloseCode.GOING_AWAY, message=b"engine shutting down")
+        await self._workflow_api.close()
+        await self._knowledge.close()
+
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -1300,10 +1371,25 @@ class UiChannel(BaseChannel):
         logger.info("UI channel stopped")
 
     async def _close_active_clients(self) -> None:
-        for _sid, ws in list(self._clients.items()):
-            await ws.close()
+        clients = set(self._clients.values())
         self._clients.clear()
         self._client_project_dirs.clear()
+        await self._close_sockets(clients)
+
+    @staticmethod
+    async def _close_sockets(
+        sockets: set[web.WebSocketResponse], *, code: int = WSCloseCode.OK, message: bytes = b"",
+    ) -> None:
+        if not sockets:
+            return
+        # Close in parallel and bounded: an unresponsive client must not hold up the rest.
+        closing = asyncio.gather(
+            *(ws.close(code=code, message=message) for ws in sockets), return_exceptions=True,
+        )
+        try:
+            await asyncio.wait_for(closing, _WS_CLOSE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning("Some WebSocket clients did not acknowledge close within {}s", _WS_CLOSE_TIMEOUT_S)
 
     def _stream_history_dir(
         self, chat_id: str, metadata: dict[str, Any]
@@ -1779,6 +1865,7 @@ class UiChannel(BaseChannel):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         emit_event("websocket.connected", connection_id=connection_id)
+        self._sockets.add(ws)
 
         session_id: str | None = None
 
@@ -2095,6 +2182,9 @@ class UiChannel(BaseChannel):
                     }
                     if wants_stream:
                         metadata["_wants_stream"] = True
+                    if isinstance(data.get("selected_kb_ids"), list):
+                        # An explicit choice (even empty) overrides the project's bases.
+                        metadata["selected_kb_ids"] = clean_kb_ids(data["selected_kb_ids"])
                     if project_dir is not None:
                         metadata["project_id"] = session_id
                         metadata["project_dir"] = project_dir
@@ -2356,6 +2446,7 @@ class UiChannel(BaseChannel):
         finally:
             # Runs on errors too, so a crashed loop cannot leave a stale client bound.
             emit_event("websocket.disconnected", connection_id=connection_id, code=getattr(ws, "close_code", None))
+            self._sockets.discard(ws)
             if session_id and self._clients.get(session_id) is ws:
                 del self._clients[session_id]
                 self._client_project_dirs.pop(session_id, None)
@@ -2408,6 +2499,8 @@ class UiChannel(BaseChannel):
             "connected_clients": len(self._clients),
             "uptime_host": f"{self.bind_host}:{self.bind_port}",
             "projects_root": str(self.projects_root),
+            "policy": host_policy_payload(),
+            "sandbox": sandbox_status_payload(),
         })
 
     async def _handle_sessions(self, _request: web.Request) -> web.Response:
@@ -2711,6 +2804,7 @@ class UiChannel(BaseChannel):
             persisted=False,
         )
         payload["project_location"] = self._project_location_payload()
+        payload["policy"] = host_policy_payload()
         return web.json_response(payload)
 
     async def _handle_config(self, request: web.Request) -> web.Response:
@@ -2743,6 +2837,8 @@ class UiChannel(BaseChannel):
                 body,
                 current_projects_root=previous_root,
             )
+        except PolicyLockedError as exc:
+            return web.json_response({"error": str(exc), "code": exc.code}, status=403)
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
@@ -2808,6 +2904,31 @@ class UiChannel(BaseChannel):
         payload["project_location"] = self._project_location_payload()
         return web.json_response(payload)
 
+    async def _handle_team_layer(self, request: web.Request) -> web.Response:
+        """Mira Server pushes the team layer (config/team_layer.py) here."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict) or "layer" not in body:
+            return web.json_response({"error": "body must be {\"layer\": object or null}"}, status=400)
+        try:
+            layer = team_layer.parse_layer(body["layer"])
+        except team_layer.TeamLayerError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if team_layer.set_team_layer(layer):
+            self._audit(source="ui", action="api_team_layer_updated", details=layer.summary())
+            logger.info("Team layer updated (revision {})", layer.revision or "-")
+            if self._on_runtime_config_updated is not None:
+                config_path = config_loader.get_config_path().expanduser().resolve()
+                runtime_config = config_loader.load_config(config_path)
+                try:
+                    await self._on_runtime_config_updated(runtime_config, self.projects_root)
+                except Exception as exc:
+                    logger.exception("Failed to apply the team layer")
+                    return web.json_response({"error": f"failed to apply the team layer: {exc}"}, status=500)
+        return web.json_response({"ok": True, "revision": layer.revision})
+
     @staticmethod
     def _provider_models_response(cache: ModelCache) -> dict[str, Any]:
         return {
@@ -2828,15 +2949,16 @@ class UiChannel(BaseChannel):
 
     async def _handle_provider_models(self, request: web.Request) -> web.Response:
         """Fetch (or read cached) available models for a provider."""
-        provider_name = request.match_info.get("name", "").strip()
-        spec = find_by_name(provider_name) if provider_name else None
-        if spec is None:
-            return web.json_response({"error": f"unknown provider: {provider_name}"}, status=400)
-        provider_name = spec.name
-
-        refresh = request.query.get("refresh", "").lower() in ("1", "true", "yes")
+        raw_provider_name = request.match_info.get("name", "").strip()
+        if not is_custom_provider_id(raw_provider_name) and find_by_name(raw_provider_name or "_") is None:
+            return web.json_response({"error": f"unknown provider: {raw_provider_name}"}, status=400)
         config_path = config_loader.get_config_path().expanduser().resolve()
         runtime_config = config_loader.load_config(config_path)
+        provider_name = _resolve_ui_provider_name(runtime_config, raw_provider_name)
+        if provider_name is None:
+            return web.json_response({"error": f"unknown provider: {raw_provider_name}"}, status=400)
+
+        refresh = request.query.get("refresh", "").lower() in ("1", "true", "yes")
 
         if not refresh:
             cache = read_model_cache(provider_name, config_path)
@@ -2859,11 +2981,7 @@ class UiChannel(BaseChannel):
 
     async def _handle_provider_test(self, request: web.Request) -> web.Response:
         """Validate provider connectivity using optional transient credentials."""
-        provider_name = request.match_info.get("name", "").strip()
-        spec = find_by_name(provider_name) if provider_name else None
-        if spec is None:
-            return web.json_response({"error": f"unknown provider: {provider_name}"}, status=400)
-        provider_name = spec.name
+        raw_provider_name = request.match_info.get("name", "").strip()
 
         try:
             body = await request.json()
@@ -2876,9 +2994,10 @@ class UiChannel(BaseChannel):
 
         config_path = config_loader.get_config_path().expanduser().resolve()
         runtime_config = config_loader.load_config(config_path)
-        provider_cfg = getattr(runtime_config.providers, provider_name, None)
-        if provider_cfg is None:
-            return web.json_response({"error": f"unknown provider: {provider_name}"}, status=400)
+        provider_name = _resolve_ui_provider_name(runtime_config, raw_provider_name)
+        provider_cfg = runtime_config.providers.entry(provider_name) if provider_name else None
+        if provider_name is None or provider_cfg is None:
+            return web.json_response({"error": f"unknown provider: {raw_provider_name}"}, status=400)
 
         # Apply transient overrides to the in-memory config only (never persisted).
         api_key = body.get("api_key")
@@ -3821,6 +3940,35 @@ class UiChannel(BaseChannel):
             "extracted": extracted,
         })
 
+    async def _handle_project_knowledge(self, request: web.Request) -> web.Response:
+        """Read or replace the knowledge bases attached to a project."""
+        session_id = request.match_info.get("session_id", "").strip()
+        project_dir = self._resolve_project_dir(session_id) if session_id else None
+        if project_dir is None or not self._is_project_dir(project_dir):
+            return web.json_response({"error": "project not found"}, status=404)
+        meta = self._ensure_project_meta(project_dir)
+        if request.method == "PUT":
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, TypeError):
+                return web.json_response({"error": "invalid JSON"}, status=400)
+            raw = body.get("knowledge_bases") if isinstance(body, dict) else None
+            if not isinstance(raw, list):
+                return web.json_response({"error": "knowledge_bases must be a list"}, status=400)
+            kb_ids = clean_kb_ids(raw)
+            known = {kb.id for kb in self._knowledge.store.list()}
+            unknown = [kb_id for kb_id in kb_ids if kb_id not in known]
+            if unknown:
+                return web.json_response({"error": f"unknown knowledge bases: {', '.join(unknown)}"}, status=400)
+            meta[PROJECT_META_KEY] = kb_ids
+            meta["updated_at"] = f"{datetime.utcnow().isoformat()}Z"
+            self._write_project_meta(project_dir, meta)
+            self._audit(
+                source="ui", action="project_knowledge_updated", session_id=session_id,
+                project_dir=project_dir, details={"knowledge_bases": kb_ids},
+            )
+        return web.json_response({"session_id": session_id, "knowledge_bases": clean_kb_ids(meta.get(PROJECT_META_KEY))})
+
     async def _handle_attach_chat_context(self, request: web.Request) -> web.Response:
         """Save a Quick Chat transcript as a readable project context file."""
         session_id = request.match_info.get("session_id", "").strip()
@@ -3937,6 +4085,8 @@ class UiChannel(BaseChannel):
         session_id = request.match_info.get("session_id", "").strip()
         if not session_id:
             return web.json_response({"error": "session_id required"}, status=400)
+        if refusal := plugin_install_refusal():
+            return refusal
         manager = self._skill_plugin_manager(session_id)
 
         content_type = request.headers.get("Content-Type", "").lower()
@@ -4031,6 +4181,8 @@ class UiChannel(BaseChannel):
             return web.json_response({"error": "session_id required"}, status=400)
         if not plugin_id:
             return web.json_response({"error": "plugin_id required"}, status=400)
+        if refusal := plugin_install_refusal():
+            return refusal
 
         manager = self._skill_plugin_manager(session_id)
         try:

@@ -360,7 +360,7 @@ class OpenAICompatProvider(LLMProvider):
             if spec.name == "dashscope":
                 extra = {"enable_thinking": thinking_enabled}
             elif spec.name in (
-                "volcengine", "volcengine_coding_plan",
+                "volcengine", "volcengine_coding_plan", "volcengine_agent_plan",
                 "byteplus", "byteplus_coding_plan",
                 "deepseek",
             ):
