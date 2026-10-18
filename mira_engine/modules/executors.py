@@ -241,7 +241,8 @@ class ExperimentExecutor(NativeModuleExecutor):
         "methods and evidence in Run-local files or immutable Artifacts; never "
         "update the legacy task_plan workflow. Honor configuration.automation_policy: "
         "maxExperiments is a hard cap, maxTokens is a token budget, and goals are "
-        "stopping conditions combined by its AND/OR logic."
+        "stopping conditions combined by its AND/OR logic. Re-plan after every "
+        "finished experiment: branch, revise, skip, continue or finish based on its result."
     )
 
     def system_instructions(self, context: ModuleExecutionContext) -> str:

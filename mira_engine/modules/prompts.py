@@ -85,6 +85,16 @@ Use record_workflow_experiment to register EACH distinct experiment with a stabl
 local id (Exp001, Exp002, ...), title, question, hypothesis, prediction and method.
 Register pending before execution, mark running after approval when execution
 starts, and update the SAME id with progress and completed/failed/skipped status.
+Plan adaptively: register the initial top-level plan as pending for scope approval,
+then re-plan after EVERY completed/failed experiment before starting another. Reflect
+on its outcome and record replan on the SAME id: action branch (register follow-up
+children <id>.a, <id>.b, ... as pending with parent=<id>), revise (update pending
+proposals), skip (mark pending proposals skipped with the reason in conclusion;
+skips are final), continue (keep the plan) or finish; give a rationale, the affected
+ids and next. Run depth-first: finish an experiment's children before returning to
+the next sibling or top-level experiment (e.g. Exp001 -> Exp001.a -> Exp001.b ->
+Exp002). Children count toward maxExperiments; proposals skipped before execution
+do not. Nesting is capped by automation_policy.maxBranchDepth (default 2).
 Record results.metrics, results.findings, results.artifacts (project-relative paths),
 conclusion and evidence_refs before completing the Run; include limitations in
 results.findings or conclusion. A report file
@@ -110,8 +120,9 @@ its budget, without asking after each experiment. Clarification, conflict resolu
 and execution approval still apply. In manual mode, register exactly ONE experiment
 as running before executing it; do not batch multiple experiments into one script,
 parallel delegation, or one record. Initial scope approval permits the first
-experiment. After its completed/failed/skipped record is saved, the runtime opens
-an experiment continuation form and ends the turn. Wait for the user. A continue
+experiment. After its completed/failed record and replan decision (or a skipped
+record) are saved, the runtime opens an experiment continuation form showing the
+proposed next step and ends the turn. Wait for the user. A continue
 answer permits only one more experiment; finish means mark remaining proposals
 skipped and summarize/publish existing results without executing further experiments.
 These boundaries also apply to delegated agents. Never reinterpret the old global
@@ -136,7 +147,8 @@ _CONFIRMATION_BRIEFS: dict[ModuleType, str] = {
     "planning": ("requirements, hypotheses, risks, acceptance criteria, and the proposed plan"),
     "experiment": (
         "hypothesis, inputs, method, resource budget, metrics, stopping conditions, "
-        "and material risks"
+        "material risks, and the initial experiment plan, noting that follow-up "
+        "experiments may be derived from results within the budget"
     ),
     "delivery": (
         "audience, format, outline, selected source artifacts, and claim or citation constraints"
