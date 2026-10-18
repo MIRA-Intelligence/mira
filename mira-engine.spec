@@ -21,6 +21,7 @@ a = Analysis(
     binaries=_extra_binaries,
     datas=(
         collect_data_files('litellm')
+        + collect_data_files('jieba')
         + collect_data_files(
             'mira_engine',
             includes=[

@@ -42,7 +42,10 @@ from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.config import loader as config_loader
 from mira_engine.config import team_layer
 from mira_engine.config.paths import get_runtime_subdir, get_workspace_path
-from mira_engine.config.schema import Config, UiChannelConfig, is_custom_provider_id
+from mira_engine.config.schema import Config, KnowledgeConfig, UiChannelConfig, is_custom_provider_id
+from mira_engine.knowledge import PROJECT_META_KEY, clean_kb_ids
+from mira_engine.knowledge.api import KnowledgeHttpApi
+from mira_engine.knowledge.service import KnowledgeService
 from mira_engine.config.ui_runtime import (
     apply_ui_runtime_update,
     build_ui_runtime_payload,
@@ -126,6 +129,20 @@ def sandbox_status_payload() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - status must not fail
         return {"mode": None, "available": False, "reason": str(exc)}
     return sandbox_status(exec_config.sandbox, network=exec_config.sandbox_network)
+
+
+def _knowledge_config() -> KnowledgeConfig:
+    try:
+        return config_loader.load_config().tools.knowledge
+    except Exception:  # noqa: BLE001 - fall back to defaults on a broken config
+        return KnowledgeConfig()
+
+
+def _web_proxy() -> str | None:
+    try:
+        return config_loader.load_config().tools.web.proxy or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def plugin_install_refusal() -> web.Response | None:
@@ -986,6 +1003,11 @@ class UiChannel(BaseChannel):
         self._stream_buffers: dict[str, str] = {}
         self._app: web.Application | None = None
         self._workflow_api = WorkflowHttpApi(self.project_registry)
+        self._knowledge = KnowledgeService(config=_knowledge_config, proxy=_web_proxy)
+        self._knowledge_api = KnowledgeHttpApi(
+            self._knowledge,
+            audit=lambda action, details: self._audit(source="ui", action=action, details=details),
+        )
         self._workflow_executor_id = uuid4().hex
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -1292,11 +1314,17 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
         self._app.router.add_delete("/api/projects/{session_id}/skill-plugins/{plugin_id}", self._handle_skill_plugins_uninstall)
         self._workflow_api.add_routes(self._app)
+        if _knowledge_config().enabled:
+            self._knowledge_api.add_routes(self._app)
+            self._app.router.add_get("/api/projects/{session_id}/knowledge", self._handle_project_knowledge)
+            self._app.router.add_put("/api/projects/{session_id}/knowledge", self._handle_project_knowledge)
         return self._app
 
     async def start(self) -> None:
         self._free_port_from_stale_engine()
         self._build_app()
+        if _knowledge_config().enabled:
+            self._knowledge.start()  # resume sources interrupted by the last shutdown
 
         # The access log would record request lines, including ?access_token=.
         # A short shutdown_timeout keeps in-flight requests from stalling engine shutdown.
@@ -1334,6 +1362,7 @@ class UiChannel(BaseChannel):
         self._client_project_dirs.clear()
         await self._close_sockets(sockets, code=WSCloseCode.GOING_AWAY, message=b"engine shutting down")
         await self._workflow_api.close()
+        await self._knowledge.close()
 
         if self._runner:
             await self._runner.cleanup()
@@ -2153,6 +2182,9 @@ class UiChannel(BaseChannel):
                     }
                     if wants_stream:
                         metadata["_wants_stream"] = True
+                    if isinstance(data.get("selected_kb_ids"), list):
+                        # An explicit choice (even empty) overrides the project's bases.
+                        metadata["selected_kb_ids"] = clean_kb_ids(data["selected_kb_ids"])
                     if project_dir is not None:
                         metadata["project_id"] = session_id
                         metadata["project_dir"] = project_dir
@@ -3907,6 +3939,35 @@ class UiChannel(BaseChannel):
             "uploaded": uploaded,
             "extracted": extracted,
         })
+
+    async def _handle_project_knowledge(self, request: web.Request) -> web.Response:
+        """Read or replace the knowledge bases attached to a project."""
+        session_id = request.match_info.get("session_id", "").strip()
+        project_dir = self._resolve_project_dir(session_id) if session_id else None
+        if project_dir is None or not self._is_project_dir(project_dir):
+            return web.json_response({"error": "project not found"}, status=404)
+        meta = self._ensure_project_meta(project_dir)
+        if request.method == "PUT":
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, TypeError):
+                return web.json_response({"error": "invalid JSON"}, status=400)
+            raw = body.get("knowledge_bases") if isinstance(body, dict) else None
+            if not isinstance(raw, list):
+                return web.json_response({"error": "knowledge_bases must be a list"}, status=400)
+            kb_ids = clean_kb_ids(raw)
+            known = {kb.id for kb in self._knowledge.store.list()}
+            unknown = [kb_id for kb_id in kb_ids if kb_id not in known]
+            if unknown:
+                return web.json_response({"error": f"unknown knowledge bases: {', '.join(unknown)}"}, status=400)
+            meta[PROJECT_META_KEY] = kb_ids
+            meta["updated_at"] = f"{datetime.utcnow().isoformat()}Z"
+            self._write_project_meta(project_dir, meta)
+            self._audit(
+                source="ui", action="project_knowledge_updated", session_id=session_id,
+                project_dir=project_dir, details={"knowledge_bases": kb_ids},
+            )
+        return web.json_response({"session_id": session_id, "knowledge_bases": clean_kb_ids(meta.get(PROJECT_META_KEY))})
 
     async def _handle_attach_chat_context(self, request: web.Request) -> web.Response:
         """Save a Quick Chat transcript as a readable project context file."""

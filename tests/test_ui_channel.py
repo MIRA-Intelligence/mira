@@ -3208,3 +3208,28 @@ async def test_config_update_cannot_turn_off_an_enforced_setting(ui_channel: UiC
     resp = await ui_channel._handle_config(req)
     assert resp.status == 403
     assert json.loads(resp.text)["code"] == "locked_by_policy"
+
+
+async def test_handle_project_knowledge_attaches_existing_bases(ui_channel: UiChannel) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-KB"
+    project_dir.mkdir(parents=True)
+    kb = ui_channel._knowledge.store.create("Specs")
+
+    def request(method: str, body: object = None) -> MagicMock:
+        req = MagicMock(spec=web.Request)
+        req.method = method
+        req.match_info = {"session_id": "PRJ-KB"}
+        req.json = AsyncMock(return_value=body)
+        return req
+
+    resp = await ui_channel._handle_project_knowledge(request("PUT", {"knowledge_bases": ["kb_000000000000"]}))
+    assert resp.status == 400
+
+    resp = await ui_channel._handle_project_knowledge(request("PUT", {"knowledge_bases": [kb.id, kb.id]}))
+    assert resp.status == 200
+    assert json.loads(resp.text)["knowledge_bases"] == [kb.id]
+    meta = json.loads((project_dir / ".mira" / "project.json").read_text(encoding="utf-8"))
+    assert meta["knowledge_bases"] == [kb.id]
+
+    resp = await ui_channel._handle_project_knowledge(request("GET"))
+    assert json.loads(resp.text)["knowledge_bases"] == [kb.id]

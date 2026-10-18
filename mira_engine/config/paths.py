@@ -115,3 +115,8 @@ def get_bridge_install_dir() -> Path:
 def get_legacy_sessions_dir() -> Path:
     """Return the legacy global session directory used for migration fallback."""
     return get_home_dir() / "sessions"
+
+
+def get_knowledge_dir() -> Path:
+    """Return the root of the user's knowledge bases."""
+    return get_runtime_subdir("knowledge")

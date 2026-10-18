@@ -116,10 +116,34 @@ mkdir -p "$DEST/wheels"
 cp "$WHEEL" "$DEST/wheels/"
 say "mira-engine $VERSION"
 
+# ---- pure-Python dependencies that PyPI ships only as an sdist
+# --only-binary below cannot fetch them, so build each into a py3-none-any
+# wheel first; --find-links lets the download pick it up. The requirement
+# comes from the mira-engine wheel, so its version range stays in one place.
+SDIST_ONLY="jieba"
+sdist_reqs=$("$PYTHON" - "$WHEEL" $SDIST_ONLY <<'PY'
+import re, sys, zipfile
+wheel, names = sys.argv[1], set(sys.argv[2:])
+with zipfile.ZipFile(wheel) as zf:
+    meta = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
+    for line in zf.read(meta).decode().splitlines():
+        if line.startswith("Requires-Dist:"):
+            req = line.split(":", 1)[1].split(";")[0].strip()
+            if re.split(r"[\s\[<>=!~(]", req, maxsplit=1)[0].lower() in names:
+                print(req)
+PY
+)
+if [[ -n $sdist_reqs ]]; then
+	say "building wheels for sdist-only dependencies: $(tr '\n' ' ' <<<"$sdist_reqs")"
+	echo "$sdist_reqs" > "$WORK/sdist-only.txt"
+	"$PYTHON" -m pip wheel -q --disable-pip-version-check --no-deps -w "$DEST/wheels" -r "$WORK/sdist-only.txt"
+fi
+
 # ---- dependencies, for each Python version
 for py in $PYTHONS; do
 	say "downloading the dependencies for Python $py on $ARCH"
 	"$PYTHON" -m pip download -q --disable-pip-version-check --dest "$DEST/wheels" \
+		--find-links "$DEST/wheels" \
 		--only-binary=:all: --implementation cp --python-version "$py" \
 		--abi "cp${py/./}" --abi abi3 --abi none \
 		--platform "manylinux_2_28_$ARCH" --platform "manylinux_2_17_$ARCH" \
