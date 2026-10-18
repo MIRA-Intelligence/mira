@@ -224,3 +224,40 @@ async def test_project_policy_and_structured_interaction_routes(
     )
     assert checkpoint.status == 200
     assert (await checkpoint.json())["state"] == {"step": 2}
+
+
+async def test_slide_deck_content_is_sandboxed_and_editable_on_request(workflow_client: TestClient) -> None:
+    route = next(
+        route for route in workflow_client.server.app.router.routes()
+        if route.resource.canonical == "/api/workflow/v1/projects/{project_id}"
+    )
+    ref = route.handler.__self__.registry.resolve("PRJ-api")
+    deck = (
+        '<html><script type="application/bento+json" id="bento-doc">'
+        '{"format": "bento/slides", "readonly": true}</script></html>'
+    )
+    (ref.project_dir / "slides.bento.html").write_text(deck, encoding="utf-8")
+    imported = await workflow_client.post(
+        "/api/workflow/v1/projects/PRJ-api/artifacts",
+        json={
+            "command_id": "cmd-deck",
+            "source_path": "slides.bento.html",
+            "artifact_type": "deliverable",
+            "media_type": "text/html",
+        },
+    )
+    assert imported.status == 201
+    url = f"/api/workflow/v1/projects/PRJ-api/artifacts/{(await imported.json())['artifact']['artifact_id']}/content"
+
+    preview = await workflow_client.get(url)
+    assert preview.status == 200
+    assert preview.headers["Content-Security-Policy"].startswith("sandbox allow-scripts")
+    assert '"readonly": true' in await preview.text()
+
+    edit = await workflow_client.get(f"{url}?mode=edit")
+    assert edit.status == 200
+    csp = edit.headers["Content-Security-Policy"]
+    assert "sandbox allow-scripts" in csp and "allow-same-origin" not in csp
+    assert "connect-src data: blob:" in csp
+    assert "readonly" not in await edit.text()
+    assert '"readonly": true' in (ref.project_dir / "slides.bento.html").read_text(encoding="utf-8")
