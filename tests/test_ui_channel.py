@@ -1940,6 +1940,40 @@ async def test_handle_list_project_files_returns_project_tree(ui_channel: UiChan
     assert "task_plan.json" in paths
     assert "experiments/exp001/metrics.json" in paths
     assert "ui.jsonl" not in paths
+    assert body["truncated"] is False
+
+
+async def test_handle_list_project_files_skips_links_outside_project(
+    ui_channel: UiChannel, tmp_path: Path,
+) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
+    (project_dir / "data").mkdir(parents=True)
+    (project_dir / "data" / "a.csv").write_text("x", encoding="utf-8")
+    (project_dir / "data" / "alias.csv").symlink_to(project_dir / "data" / "a.csv")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("x", encoding="utf-8")
+    (project_dir / "leak.txt").symlink_to(outside / "secret.txt")
+    (project_dir / "linked_dir").symlink_to(outside, target_is_directory=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+
+    body = json.loads((await ui_channel._handle_list_project_files(req)).text)
+    assert [item["path"] for item in body["files"]] == ["data/a.csv", "data/alias.csv"]
+
+
+def test_collect_project_file_entries_truncates_at_limit(tmp_path: Path) -> None:
+    for i in range(5):
+        (tmp_path / f"f{i}.txt").write_text("x", encoding="utf-8")
+
+    entries, truncated = ui_channel_mod._collect_project_file_entries(tmp_path, limit=3)
+    assert [e["path"] for e in entries] == ["f0.txt", "f1.txt", "f2.txt"]
+    assert truncated is True
+
+    entries, truncated = ui_channel_mod._collect_project_file_entries(tmp_path, limit=5)
+    assert len(entries) == 5
+    assert truncated is False
 
 
 async def test_handle_upload_project_files_invalid_multipart(ui_channel: UiChannel) -> None:
@@ -2296,6 +2330,22 @@ async def test_handle_project_artifact_serves_file(ui_channel: UiChannel) -> Non
     assert isinstance(resp, web.FileResponse)
     assert resp.status == 200
     assert Path(resp._path) == artifact
+
+
+async def test_handle_project_artifact_download_sets_attachment(ui_channel: UiChannel) -> None:
+    artifact = ui_channel.projects_root / "PRJ-0001" / "报告 v1.pdf"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"pdf")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {"path": "报告 v1.pdf", "download": "1"}
+
+    resp = await ui_channel._handle_project_artifact(req)
+    assert isinstance(resp, web.FileResponse)
+    disposition = resp.headers["Content-Disposition"]
+    assert disposition.startswith('attachment; filename="__ v1.pdf"')
+    assert "filename*=UTF-8''%E6%8A%A5%E5%91%8A%20v1.pdf" in disposition
 
 
 async def test_handle_project_artifact_serves_editable_deck(ui_channel: UiChannel) -> None:

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import quote
 from uuid import uuid4
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, WSCloseCode, web
@@ -830,31 +831,51 @@ def _resolve_upload_destination(
 
 
 _PROJECT_FILE_LIST_SKIP_DIRS = frozenset({".mira", "__pycache__", ".git", "node_modules"})
+_PROJECT_FILE_LIST_LIMIT = 5000
 
 
-def _collect_project_file_entries(project_dir: Path) -> list[dict[str, Any]]:
-    """Walk a project directory and return file rows for the UI explorer."""
+def _collect_project_file_entries(
+    project_dir: Path,
+    limit: int = _PROJECT_FILE_LIST_LIMIT,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Walk a project directory and return file rows for the UI explorer.
+
+    Skipped directories are pruned rather than walked, symlinked directories are
+    not followed, and files that resolve outside the project are left out because
+    the artifacts endpoint would refuse to serve them. Returns the rows and
+    whether *limit* cut the listing short.
+    """
+    root = project_dir.resolve()
     entries: list[dict[str, Any]] = []
-    for path in sorted(project_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(project_dir).as_posix()
-        if any(part in _PROJECT_FILE_LIST_SKIP_DIRS for part in rel.split("/")):
-            continue
-        if path.name == ".DS_Store":
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        entries.append({
-            "name": path.name,
-            "path": rel,
-            "size": stat.st_size,
-            "mtime": int(stat.st_mtime),
-            "is_dir": False,
-        })
-    return entries
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _PROJECT_FILE_LIST_SKIP_DIRS)
+        current = Path(dirpath)
+        for name in sorted(filenames):
+            if name == ".DS_Store":
+                continue
+            path = current / name
+            try:
+                if path.is_symlink():
+                    path.resolve().relative_to(root)
+                stat = path.stat()
+            except (OSError, ValueError):
+                continue
+            if len(entries) >= limit:
+                return entries, True
+            entries.append({
+                "name": name,
+                "path": path.relative_to(root).as_posix(),
+                "size": stat.st_size,
+                "mtime": int(stat.st_mtime),
+                "is_dir": False,
+            })
+    return entries, False
+
+
+def _attachment_disposition(filename: str) -> str:
+    """Content-Disposition for a download, keeping non-ASCII names intact (RFC 6266)."""
+    fallback = "".join(ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_" for ch in filename)
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
 
 
 def _next_available_dir(base_dir: Path, dirname: str) -> Path:
@@ -3857,9 +3878,11 @@ class UiChannel(BaseChannel):
         if project_dir is None or not project_dir.is_dir():
             return web.json_response({"error": "project not found"}, status=404)
 
+        files, truncated = await asyncio.to_thread(_collect_project_file_entries, project_dir)
         return web.json_response({
             "session_id": session_id,
-            "files": _collect_project_file_entries(project_dir),
+            "files": files,
+            "truncated": truncated,
         })
 
     async def _handle_upload_project_files(self, request: web.Request) -> web.Response:
@@ -4105,6 +4128,13 @@ class UiChannel(BaseChannel):
         if not candidate.is_file():
             return web.json_response({"error": "artifact not found"}, status=404)
 
+        if request.query.get("download") == "1":
+            # The UI and engine are usually different origins, where the
+            # browser ignores <a download>, so the header has to ask for it.
+            return web.FileResponse(
+                candidate,
+                headers={"Content-Disposition": _attachment_disposition(candidate.name)},
+            )
         if is_deck_file(candidate):
             return deck_response(candidate, edit=request.query.get("mode") == "edit")
         return web.FileResponse(candidate)
