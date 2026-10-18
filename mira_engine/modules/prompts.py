@@ -85,8 +85,12 @@ Use record_workflow_experiment to register EACH distinct experiment with a stabl
 local id (Exp001, Exp002, ...), title, question, hypothesis, prediction and method.
 Register pending before execution, mark running after approval when execution
 starts, and update the SAME id with progress and completed/failed/skipped status.
-Plan adaptively: register the initial top-level plan as pending for scope approval,
-then re-plan after EVERY completed/failed experiment before starting another. Reflect
+Plan up front, then adapt: before scope approval, register as pending the COMPLETE
+set of top-level experiments needed to answer the objective (e.g. Exp001-Exp005:
+baseline, controls, ablations, alternative methods), not only a first experiment.
+Size it to the question and maxExperiments; never pad it. Then re-plan after EVERY
+completed/failed experiment before starting another; re-planning refines this plan
+and does not replace planning it. Reflect
 on its outcome and record replan on the SAME id: action branch (register follow-up
 children <id>.a, <id>.b, ... as pending with parent=<id>), revise (update pending
 proposals), skip (mark pending proposals skipped with the reason in conclusion;
@@ -147,8 +151,9 @@ _CONFIRMATION_BRIEFS: dict[ModuleType, str] = {
     "planning": ("requirements, hypotheses, risks, acceptance criteria, and the proposed plan"),
     "experiment": (
         "hypothesis, inputs, method, resource budget, metrics, stopping conditions, "
-        "material risks, and the initial experiment plan, noting that follow-up "
-        "experiments may be derived from results within the budget"
+        "material risks, and the full initial experiment plan listing every planned "
+        "top-level experiment (id, purpose, method), noting that results may add "
+        "follow-up child experiments or revise or skip planned ones within the budget"
     ),
     "delivery": (
         "audience, format, outline, selected source artifacts, and claim or citation constraints"

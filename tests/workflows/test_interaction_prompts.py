@@ -24,3 +24,16 @@ def test_research_outcome_clarification_and_actionable_synthesis_contract():
         "overview/comparison", "only start a\nseparate downstream Run",
     ):
         assert requirement in prompt
+
+
+def test_experiment_plans_a_full_initial_set_before_adapting():
+    prompt = module_system_instructions("experiment", "test")
+    for requirement in (
+        "COMPLETE\nset of top-level experiments", "not only a first experiment",
+        "never pad it", "re-planning refines this plan",
+    ):
+        assert requirement in prompt
+    brief = module_confirmation_instructions(
+        "experiment", required=True, approved=False, interaction_type="approve_experiment_plan",
+    )
+    assert "full initial experiment plan listing every planned" in brief
