@@ -2275,6 +2275,30 @@ async def test_handle_project_artifact_serves_file(ui_channel: UiChannel) -> Non
     assert Path(resp._path) == artifact
 
 
+async def test_handle_project_artifact_serves_editable_deck(ui_channel: UiChannel) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
+    deck = project_dir / "result" / "exports" / "slides.bento.html"
+    deck.parent.mkdir(parents=True)
+    deck.write_text(
+        '<html><script type="application/bento+json" id="bento-doc">'
+        '{"format": "bento/slides", "readonly": true}</script></html>',
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {"path": "result/exports/slides.bento.html"}
+    preview = await ui_channel._handle_project_artifact(req)
+    assert isinstance(preview, web.FileResponse)
+    assert "allow-same-origin" not in preview.headers["Content-Security-Policy"]
+
+    req.query = {"path": "result/exports/slides.bento.html", "mode": "edit"}
+    edit = await ui_channel._handle_project_artifact(req)
+    assert edit.status == 200
+    assert "readonly" not in edit.text
+    assert "connect-src data: blob:" in edit.headers["Content-Security-Policy"]
+
+
 async def test_handle_project_artifact_blocks_traversal(ui_channel: UiChannel, tmp_path: Path) -> None:
     project_dir = ui_channel.projects_root / "PRJ-0001"
     project_dir.mkdir(parents=True)
