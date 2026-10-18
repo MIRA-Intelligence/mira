@@ -240,6 +240,9 @@ def test_static_helper_methods(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)
     assert BaseAgentLoop._strip_think("<think>x</think>hello") == "hello"
     assert BaseAgentLoop._strip_think(None) is None
+    cited = "See\ue200cite\ue202KB/a.pdf#p.3\ue202KB/b.md#L1-4\ue201 and done."
+    assert BaseAgentLoop._strip_think(cited) == "See[KB/a.pdf#p.3][KB/b.md#L1-4] and done."
+    assert BaseAgentLoop._strip_think("Hi\ue200cite\ue202KB/a.p") == "Hi"
     assert BaseAgentLoop._extract_read_file_path({"path": "/tmp/a"}) == "/tmp/a"
     assert BaseAgentLoop._extract_read_file_path({"bad": "x"}) is None
     assert BaseAgentLoop._extract_skill_name_from_path("/a/skills/research/SKILL.md") == "research"
