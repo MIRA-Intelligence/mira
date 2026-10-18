@@ -18,6 +18,7 @@ from mira_engine.api.server import (
     handle_chat_completions,
 )
 from mira_engine.projects import ProjectRegistry
+from mira_engine.security import api_auth
 
 try:
     from aiohttp.test_utils import TestClient, TestServer
@@ -27,6 +28,9 @@ except ImportError:
     HAS_AIOHTTP = False
 
 pytest_plugins = ("pytest_asyncio",)
+
+TEST_KEY = "test-key"
+AUTH = {"Authorization": f"Bearer {TEST_KEY}"}
 
 
 def _make_mock_agent(response_text: str = "mock response") -> MagicMock:
@@ -44,15 +48,17 @@ def mock_agent():
 
 @pytest.fixture
 def app(mock_agent):
-    return create_app(mock_agent, model_name="test-model", request_timeout=10.0)
+    return create_app(
+        mock_agent, model_name="test-model", request_timeout=10.0, api_keys=[TEST_KEY],
+    )
 
 
 @pytest_asyncio.fixture
 async def aiohttp_client():
     clients: list[TestClient] = []
 
-    async def _make_client(app):
-        client = TestClient(TestServer(app))
+    async def _make_client(app, headers: dict[str, str] | None = AUTH):
+        client = TestClient(TestServer(app), headers=headers)
         await client.start_server()
         clients.append(client)
         return client
@@ -183,7 +189,7 @@ async def test_single_user_message_must_have_user_role() -> None:
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
 async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_agent) -> None:
-    app = create_app(mock_agent, model_name="test-model")
+    app = create_app(mock_agent, model_name="test-model", api_keys=[TEST_KEY])
     client = await aiohttp_client(app)
     resp = await client.post(
         "/v1/chat/completions",
@@ -204,7 +210,7 @@ async def test_successful_request_uses_fixed_api_session(aiohttp_client, mock_ag
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
 async def test_project_dir_requires_registered_project_id(aiohttp_client, mock_agent, tmp_path) -> None:
-    app = create_app(mock_agent, model_name="m")
+    app = create_app(mock_agent, model_name="m", api_keys=[TEST_KEY])
     client = await aiohttp_client(app)
     resp = await client.post(
         "/v1/chat/completions",
@@ -229,7 +235,7 @@ async def test_registered_project_metadata_is_forwarded(aiohttp_client, mock_age
         legacy_index_path=tmp_path / "project-dirs.json",
     )
     ref = registry.create_project(project_id="alpha", display_name="Alpha")
-    app = create_app(mock_agent, model_name="m", project_registry=registry)
+    app = create_app(mock_agent, model_name="m", project_registry=registry, api_keys=[TEST_KEY])
     client = await aiohttp_client(app)
 
     resp = await client.post(
@@ -260,7 +266,7 @@ async def test_project_dir_must_match_registry(aiohttp_client, mock_agent, tmp_p
         legacy_index_path=tmp_path / "project-dirs.json",
     )
     registry.create_project(project_id="alpha", display_name="Alpha")
-    app = create_app(mock_agent, model_name="m", project_registry=registry)
+    app = create_app(mock_agent, model_name="m", project_registry=registry, api_keys=[TEST_KEY])
     client = await aiohttp_client(app)
 
     resp = await client.post(
@@ -292,7 +298,7 @@ async def test_followup_requests_share_same_session_key(aiohttp_client) -> None:
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
 
-    app = create_app(agent, model_name="m")
+    app = create_app(agent, model_name="m", api_keys=[TEST_KEY])
     client = await aiohttp_client(app)
 
     r1 = await client.post(
@@ -325,7 +331,7 @@ async def test_fixed_session_requests_are_serialized(aiohttp_client) -> None:
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
 
-    app = create_app(agent, model_name="m")
+    app = create_app(agent, model_name="m", api_keys=[TEST_KEY])
     client = await aiohttp_client(app)
 
     async def send(msg: str):
@@ -368,7 +374,7 @@ async def test_health_endpoint(aiohttp_client, app) -> None:
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not installed")
 @pytest.mark.asyncio
 async def test_multimodal_content_extracts_text(aiohttp_client, mock_agent) -> None:
-    app = create_app(mock_agent, model_name="m")
+    app = create_app(mock_agent, model_name="m", api_keys=[TEST_KEY])
     client = await aiohttp_client(app)
     resp = await client.post(
         "/v1/chat/completions",
@@ -410,7 +416,7 @@ async def test_empty_response_retry_then_success(aiohttp_client) -> None:
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
 
-    app = create_app(agent, model_name="m")
+    app = create_app(agent, model_name="m", api_keys=[TEST_KEY])
     client = await aiohttp_client(app)
     resp = await client.post(
         "/v1/chat/completions",
@@ -439,7 +445,7 @@ async def test_empty_response_falls_back(aiohttp_client) -> None:
     agent._connect_mcp = AsyncMock()
     agent.close_mcp = AsyncMock()
 
-    app = create_app(agent, model_name="m")
+    app = create_app(agent, model_name="m", api_keys=[TEST_KEY])
     client = await aiohttp_client(app)
     resp = await client.post(
         "/v1/chat/completions",
@@ -449,3 +455,111 @@ async def test_empty_response_falls_back(aiohttp_client) -> None:
     body = await resp.json()
     assert body["choices"][0]["message"]["content"] == EMPTY_FINAL_RESPONSE_MESSAGE
     assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+def test_create_app_requires_a_key(mock_agent) -> None:
+    with pytest.raises(ValueError):
+        create_app(mock_agent, api_keys=[])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [None, {"Authorization": "Bearer wrong"}, {"Authorization": f"Basic {TEST_KEY}"}],
+)
+@pytest.mark.parametrize(
+    ("method", "path"), [("POST", "/v1/chat/completions"), ("GET", "/v1/models")],
+)
+async def test_v1_requires_valid_key(aiohttp_client, app, headers, method, path) -> None:
+    client = await aiohttp_client(app, headers=headers)
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    resp = await client.request(method, path, json=body)
+    assert resp.status == 401
+    assert resp.headers["WWW-Authenticate"] == "Bearer"
+    error = (await resp.json())["error"]
+    assert error["type"] == "authentication_error"
+
+
+@pytest.mark.asyncio
+async def test_query_string_key_is_not_accepted(aiohttp_client, app) -> None:
+    client = await aiohttp_client(app, headers=None)
+    resp = await client.get(f"/v1/models?access_token={TEST_KEY}")
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_any_configured_key_is_accepted(aiohttp_client, mock_agent) -> None:
+    app = create_app(mock_agent, api_keys=["first", "second"])
+    client = await aiohttp_client(app, headers={"Authorization": "Bearer second"})
+    assert (await client.get("/v1/models")).status == 200
+
+
+@pytest.mark.asyncio
+async def test_health_needs_no_key(aiohttp_client, app) -> None:
+    client = await aiohttp_client(app, headers={"Origin": "https://evil.example"})
+    resp = await client.get("/health")
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_browser_origin_rejected_by_default(aiohttp_client, app, mock_agent) -> None:
+    client = await aiohttp_client(app, headers={**AUTH, "Origin": "https://evil.example"})
+    resp = await client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status == 403
+    assert "Access-Control-Allow-Origin" not in resp.headers
+    mock_agent.process_direct.assert_not_called()
+
+    preflight = await client.options(
+        "/v1/chat/completions",
+        headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"},
+    )
+    assert preflight.status == 403
+    assert "Access-Control-Allow-Origin" not in preflight.headers
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_origin_gets_cors(aiohttp_client, mock_agent) -> None:
+    origin = "http://localhost:3000"
+    app = create_app(mock_agent, api_keys=[TEST_KEY], allowed_origins=[origin])
+    client = await aiohttp_client(app, headers={"Origin": origin})
+
+    preflight = await client.options(
+        "/v1/chat/completions",
+        headers={"Access-Control-Request-Method": "POST",
+                 "Access-Control-Request-Headers": "authorization, content-type"},
+    )
+    assert preflight.status == 204
+    assert preflight.headers["Access-Control-Allow-Origin"] == origin
+    assert "Authorization" in preflight.headers["Access-Control-Allow-Headers"]
+
+    unauthorized = await client.get("/v1/models")
+    assert unauthorized.status == 401
+    assert unauthorized.headers["Access-Control-Allow-Origin"] == origin
+
+    ok = await client.get("/v1/models", headers=AUTH)
+    assert ok.status == 200
+    assert ok.headers["Access-Control-Allow-Origin"] == origin
+
+
+def test_resolve_api_keys_precedence(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(api_auth.API_KEYS_ENV, " env-a, env-b ,env-a")
+    assert api_auth.resolve_api_keys(["cfg"]) == (["env-a", "env-b"], api_auth.API_KEYS_ENV)
+
+    monkeypatch.delenv(api_auth.API_KEYS_ENV)
+    assert api_auth.resolve_api_keys([" cfg ", ""]) == (["cfg"], "api.keys")
+
+    monkeypatch.setenv("MIRA_GATEWAY_TOKEN", "gw-token")
+    assert api_auth.resolve_api_keys([]) == (["gw-token"], "gateway token")
+
+
+def test_api_allowed_origins_has_no_defaults(monkeypatch) -> None:
+    monkeypatch.delenv(api_auth.API_ALLOWED_ORIGINS_ENV, raising=False)
+    assert api_auth.api_allowed_origins([]) == []
+    monkeypatch.setenv(api_auth.API_ALLOWED_ORIGINS_ENV, "http://a, http://b")
+    assert api_auth.api_allowed_origins(["http://a"]) == ["http://a", "http://b"]

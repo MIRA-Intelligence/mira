@@ -1792,8 +1792,9 @@ def serve(
     from aiohttp import web
 
     from mira_engine.agent.loop import AgentLoop
-    from mira_engine.api.server import create_app
+    from mira_engine.api.server import create_app, warn_if_exposed
     from mira_engine.bus.queue import MessageBus
+    from mira_engine.security.api_auth import api_allowed_origins, resolve_api_keys
     from mira_engine.session.manager import SessionManager
 
     cfg = _load_runtime_config(config, workspace)
@@ -1832,10 +1833,16 @@ def serve(
     api_host = host if host is not None else cfg.api.host
     api_port = port if port is not None else cfg.api.port
     request_timeout = timeout if timeout is not None else cfg.api.timeout
+    api_keys, key_source = resolve_api_keys(cfg.api.keys, cfg.gateway.auth_token)
+    origins = api_allowed_origins(cfg.api.cors_origins)
+    logger.info("API server accepts {} key(s) from {}", len(api_keys), key_source)
+    warn_if_exposed(api_host, origins)
     api_app = create_app(
         agent_loop=agent_loop,
         model_name=cfg.agents.defaults.primary_model,
         request_timeout=request_timeout,
+        api_keys=api_keys,
+        allowed_origins=origins,
     )
     if diagnostics is not None:
         async def configure_api_diagnostics(_app):
