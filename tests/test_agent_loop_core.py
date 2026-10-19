@@ -205,6 +205,71 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
     assert read_tool._allowed_dir == new_workspace
 
 
+def _reconfigure_kwargs(workspace: Path, provider: LLMProvider, **overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = dict(
+        provider=provider,
+        model="custom/new-model",
+        provider_factory=None,
+        workspace=workspace,
+        max_iterations=64,
+        max_tokens=2048,
+        reasoning_effort="high",
+        restrict_to_workspace=True,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+async def test_reconfigure_during_a_turn_applies_limits_now_and_swaps_after(tmp_path: Path) -> None:
+    """Saving settings must not block behind a long turn that holds the lock."""
+    loop = _make_real_loop(tmp_path)
+    old_provider = loop.provider
+    first, second = _NoopProvider(), _NoopProvider()
+
+    await loop._processing_lock.acquire()  # a non-streaming turn is running
+    try:
+        await asyncio.wait_for(
+            loop.reconfigure_runtime(**_reconfigure_kwargs(tmp_path, first, max_iterations=7, temperature=0.4)),
+            timeout=1,
+        )
+        await asyncio.wait_for(
+            loop.reconfigure_runtime(**_reconfigure_kwargs(tmp_path, second, max_iterations=9)),
+            timeout=1,
+        )
+        # Limits are live for the running turn; the provider swap waits for it.
+        assert loop.max_iterations == 9
+        assert loop.temperature == 0.4
+        assert loop.max_tokens == 2048
+        assert loop.provider is old_provider
+    finally:
+        loop._processing_lock.release()
+
+    await asyncio.wait_for(loop._runtime_swap_task, timeout=1)
+    assert loop.provider is second  # newest save wins
+    assert loop._pending_runtime_swap is None
+
+
+async def test_reconfigure_when_idle_swaps_before_returning(tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+    provider = _NoopProvider()
+    await loop.reconfigure_runtime(**_reconfigure_kwargs(tmp_path, provider, temperature=None))
+    assert loop.provider is provider
+    assert loop.temperature is None
+    assert loop._runtime_swap_task is None
+
+
+async def test_reconfigure_updates_research_auto_round_limit(tmp_path: Path) -> None:
+    from mira_engine.agent.research_loop import ResearchAgentLoop
+
+    loop = ResearchAgentLoop(
+        bus=MessageBus(), provider=_NoopProvider(), workspace=tmp_path, model="dummy/default",
+        channels_config=ChannelsConfig(), exec_config=ExecToolConfig(timeout=5),
+        session_manager=SessionManager(tmp_path), auto_max_rounds=100,
+    )
+    await loop.reconfigure_runtime(**_reconfigure_kwargs(tmp_path, _NoopProvider(), auto_max_rounds=12))
+    assert loop._auto_round_limit() == 12
+
+
 def test_restrict_workspace_allows_nested_workspace_mira_skills_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
@@ -405,11 +470,82 @@ async def test_run_agent_loop_error_and_max_iterations(tmp_path: Path) -> None:
             )
         ]
     )
-    final2, _, _ = await loop._run_agent_loop(
+    final2, _, messages2 = await loop._run_agent_loop(
         [{"role": "user", "content": "go"}],
         model_runtime=runtime_max,
     )
-    assert "maximum number of tool call iterations" in final2
+    assert "limit of 1 tool calls" in final2
+    # The transcript ends on the notice, not on a bare tool result.
+    assert messages2[-1] == {"role": "assistant", "content": final2}
+
+
+async def test_run_agent_loop_reports_whether_final_text_was_streamed(tmp_path: Path) -> None:
+    from mira_engine.agent.base_loop import _final_content_streamed
+
+    async def _noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    loop = _make_loop(tmp_path)
+    streamed = _RuntimeStub([LLMResponse(content="all done")], stream_deltas=["all ", "done"])
+    final, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=streamed,
+        on_stream=_noop,
+        on_stream_end=_noop,
+    )
+    assert final == "all done"
+    assert _final_content_streamed.get() is True
+
+    # The iteration-limit notice is written by the engine, never streamed.
+    loop.max_iterations = 1
+    limited = _RuntimeStub(
+        [LLMResponse(content="", tool_calls=[ToolCallRequest(id="c1", name="echo", arguments={"value": 1})])],
+        stream_deltas=["checking"],
+    )
+    final2, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "go"}],
+        model_runtime=limited,
+        on_stream=_noop,
+        on_stream_end=_noop,
+    )
+    assert "limit of 1 tool calls" in final2
+    assert _final_content_streamed.get() is False
+
+
+async def test_run_agent_loop_records_why_the_turn_ended(tmp_path: Path) -> None:
+    from mira_engine.agent.base_loop import _turn_stop_reason
+
+    loop = _make_loop(tmp_path)
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=_RuntimeStub([LLMResponse(content="done")]),
+    )
+    assert _turn_stop_reason.get() == "completed"
+
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=_RuntimeStub([LLMResponse(content="half an ans", finish_reason="length")]),
+    )
+    assert _turn_stop_reason.get() == "max_tokens"
+
+    async def _needs_input() -> str | None:
+        return "Waiting for your approval."
+
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=_RuntimeStub([LLMResponse(content="done")]),
+        turn_stop_guard=_needs_input,
+    )
+    assert _turn_stop_reason.get() == "waiting_input"
+
+    loop.max_iterations = 1
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "go"}],
+        model_runtime=_RuntimeStub([
+            LLMResponse(content="", tool_calls=[ToolCallRequest(id="c1", name="echo", arguments={"value": 1})]),
+        ]),
+    )
+    assert _turn_stop_reason.get() == "max_iterations"
 
 
 async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
@@ -432,8 +568,14 @@ async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
 
     loop._process_message = _ok
     await loop._dispatch(msg)
+    started = await loop.bus.consume_outbound()
     dispatched = await loop.bus.consume_outbound()
+    finished = await loop.bus.consume_outbound()
+    assert started.metadata["_turn_event"] == "started"
     assert dispatched.content == "ok"
+    assert finished.metadata["_turn_event"] == "finished"
+    assert finished.metadata["stop_reason"] == "completed"
+    assert finished.metadata["turn_id"] == started.metadata["turn_id"]
 
     async def _none(_msg):
         return None
@@ -449,7 +591,11 @@ async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
 
     loop._process_message = _boom
     await loop._dispatch(msg)
+    assert (await loop.bus.consume_outbound()).metadata["_turn_event"] == "started"
     err = await loop.bus.consume_outbound()
+    failed = await loop.bus.consume_outbound()
+    assert failed.metadata["_turn_event"] == "finished"
+    assert failed.metadata["stop_reason"] == "error"
     assert err.content.startswith("Sorry, I ran into a problem")
     assert "RuntimeError: kaboom detail" in err.content
     assert err.metadata.get("_error") is True

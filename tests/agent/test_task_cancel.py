@@ -32,6 +32,21 @@ def _make_loop(*, exec_config=None):
     return loop, bus
 
 
+async def _drain(bus) -> list:
+    """Everything published so far, in order."""
+    out = []
+    while not bus.outbound.empty():
+        out.append(await bus.consume_outbound())
+    return out
+
+
+def _turn_events(messages) -> list[tuple[str, str | None]]:
+    return [
+        (m.metadata["_turn_event"], m.metadata.get("stop_reason"))
+        for m in messages if m.metadata.get("_turn_event")
+    ]
+
+
 class TestHandleStop:
     @pytest.mark.asyncio
     async def test_stop_no_active_task(self):
@@ -159,6 +174,116 @@ class TestDispatch:
         assert second.metadata["_stream_end"] is True
 
     @pytest.mark.asyncio
+    async def test_dispatch_publishes_unstreamed_final_after_streamed_text(self):
+        """A turn that streamed earlier text but ended on a synthesized notice
+        (e.g. the tool-call limit) must still deliver it, or the UI keeps thinking."""
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui", sender_id="u1", chat_id="c1", content="go",
+            metadata={"_wants_stream": True},
+        )
+
+        async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
+            await on_stream("Let me run the experiments.")
+            await on_stream_end(resuming=False)
+            return OutboundMessage(channel="ui", chat_id="c1", content="limit reached")
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        started, delta, end, final, finished = await _drain(bus)
+        assert started.metadata["_turn_event"] == "started"
+        assert delta.metadata["_stream_delta"] is True
+        assert end.metadata["_stream_end"] is True
+        assert final.content == "limit reached"
+        assert finished.metadata["_turn_event"] == "finished"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_skips_final_already_streamed(self):
+        from mira_engine.agent import base_loop
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui", sender_id="u1", chat_id="c1", content="hi",
+            metadata={"_wants_stream": True},
+        )
+
+        async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
+            await on_stream("hello there")
+            await on_stream_end(resuming=False)
+            base_loop._final_content_streamed.set(True)
+            return OutboundMessage(channel="ui", chat_id="c1", content="hello there")
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        published = await _drain(bus)
+        assert [m.content for m in published if not m.metadata.get("_turn_event")] == ["hello there", ""]
+        assert published[-1].metadata["_turn_event"] == "finished"
+
+    @pytest.mark.asyncio
+    async def test_ui_turn_reports_why_it_ended(self):
+        from mira_engine.agent import base_loop
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui", sender_id="u1", chat_id="c1", content="go",
+            metadata={"turn_id": "turn-abc", "workflow_run_id": "run-1"},
+        )
+
+        async def fake_process(_msg, **kwargs):
+            base_loop.set_turn_stop_reason(base_loop.TURN_MAX_ITERATIONS)
+            return OutboundMessage(channel="ui", chat_id="c1", content="limit reached")
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        started, reply, finished = await _drain(bus)
+        assert started.metadata["turn_id"] == "turn-abc"
+        assert reply.content == "limit reached"
+        assert finished.metadata["turn_id"] == "turn-abc"
+        assert finished.metadata["workflow_run_id"] == "run-1"
+        assert finished.metadata["stop_reason"] == "max_iterations"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_ui_turn_still_finishes_as_stopped(self):
+        from mira_engine.bus.events import InboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(channel="ui", sender_id="u1", chat_id="c1", content="go")
+        entered = asyncio.Event()
+
+        async def slow_process(_msg, **kwargs):
+            entered.set()
+            await asyncio.sleep(60)
+
+        loop._process_message = slow_process
+        task = asyncio.create_task(loop._dispatch(msg))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert _turn_events(await _drain(bus)) == [("started", None), ("finished", "stopped")]
+
+    @pytest.mark.asyncio
+    async def test_other_channels_get_no_turn_events(self):
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="hi")
+        loop._process_message = AsyncMock(
+            return_value=OutboundMessage(channel="telegram", chat_id="c1", content="hello")
+        )
+        await loop._dispatch(msg)
+
+        assert [m.content for m in await _drain(bus)] == ["hello"]
+
+    @pytest.mark.asyncio
     async def test_dispatch_buffers_streamed_skill_fallback_marker(self):
         from mira_engine.bus.events import InboundMessage, OutboundMessage
 
@@ -185,11 +310,9 @@ class TestDispatch:
         loop._process_message = fake_process
         await loop._dispatch(msg)
 
-        first = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-        second = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        _started, first, second, _finished = await _drain(bus)
         assert first.metadata["_stream_end"] is True
         assert second.metadata["_skill_fallback_required"] is True
-        assert bus.outbound.empty()
 
     @pytest.mark.asyncio
     async def test_processing_lock_serializes(self):
