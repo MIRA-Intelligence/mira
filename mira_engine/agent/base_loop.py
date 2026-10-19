@@ -207,7 +207,10 @@ class BaseAgentLoop:
             role_provider_factory=role_provider_factory,
         )
         self._session_model_runtimes: dict[str, RoutedProviderManager] = {}
-        self._hook = CompositeHook(list(hooks)) if hooks else None
+        # Plugin hooks (mira#206) run after the caller's, each behind its
+        # plugin's circuit breaker; observe hooks only ever see a snapshot.
+        all_hooks = [*(hooks or []), *self._plugin_hooks()]
+        self._hook = CompositeHook(all_hooks) if all_hooks else None
 
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -457,6 +460,23 @@ class BaseAgentLoop:
 
         logger.info("Agent runtime reconfigured: model={}, workspace={}", self.model, self.workspace)
 
+    @staticmethod
+    def _plugin_hooks() -> list[AgentHook]:
+        from mira_engine.plugins import get_runtime
+
+        return get_runtime().hooks()
+
+    def _register_plugin_tools(self) -> None:
+        """Register tools from loaded plugins (mira#206). A plugin can never
+        replace a built-in tool: name clashes are skipped and logged."""
+        from mira_engine.plugins import get_runtime
+
+        for tool in get_runtime().tools():
+            if self.tools.has(tool.name):
+                logger.warning("plugin tool {} ignored: the name is already taken", tool.name)
+                continue
+            self.tools.register(tool)
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
@@ -516,6 +536,7 @@ class BaseAgentLoop:
             cron_tool = CronTool(self.cron_service)
             setattr(cron_tool, "_default_timezone", self.timezone)
             self.tools.register(cron_tool)
+        self._register_plugin_tools()
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
         if not (self.restrict_to_workspace or self.exec_config.sandbox):

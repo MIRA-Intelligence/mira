@@ -64,6 +64,13 @@ def discover_all() -> dict[str, type[BaseChannel]]:
             logger.debug("Skipping built-in channel '{}': {}", modname, e)
 
     external = discover_plugins()
+    # Channels from mira plugins (mira#206): same priority rule as entry points.
+    try:
+        from mira_engine.plugins import get_runtime
+
+        external = {**get_runtime().channels(), **external}
+    except Exception as e:  # noqa: BLE001 - channels must come up without plugins
+        logger.warning("Could not load plugin channels: {}", e)
     shadowed = set(external) & set(builtin)
     if shadowed:
         logger.warning("Plugin(s) shadowed by built-in channels (ignored): {}", shadowed)
