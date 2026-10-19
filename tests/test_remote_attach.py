@@ -61,10 +61,16 @@ def spawned(monkeypatch):
     state = {"mode": "serve"}
     env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
 
+    logs: list[Path] = []
+
     def fake_spawn(port: int) -> subprocess.Popen:
-        proc = subprocess.Popen([sys.executable, "-c", _FAKE_GATEWAY, str(port), state["mode"]],
-                                env={**env, **{k: os.environ[k] for k in ("MIRA_HOME", "MIRA_RUNTIME_DIR")}},
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Keep the child's output: when it dies early, a failure should say why.
+        log = Path(os.environ["MIRA_HOME"]).parent / f"fake-gateway-{len(logs)}.log"
+        logs.append(log)
+        with log.open("wb") as out:
+            proc = subprocess.Popen([sys.executable, "-c", _FAKE_GATEWAY, str(port), state["mode"]],
+                                    env={**env, **{k: os.environ[k] for k in ("MIRA_HOME", "MIRA_RUNTIME_DIR")}},
+                                    stdout=out, stderr=subprocess.STDOUT)
         children.append(proc)
         return proc
 
@@ -74,6 +80,9 @@ def spawned(monkeypatch):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+    for log in logs:  # pytest shows this only for failing tests
+        print(f"--- {log.name} (exit {children[logs.index(log)].returncode}) ---")
+        print(log.read_text(encoding="utf-8", errors="replace") if log.exists() else "(no log)")
 
 
 def _free_port() -> int:
