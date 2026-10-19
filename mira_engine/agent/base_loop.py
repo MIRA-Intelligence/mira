@@ -378,7 +378,7 @@ class BaseAgentLoop:
             cron_tool = CronTool(self.cron_service)
             setattr(cron_tool, "_default_timezone", self.timezone)
             self.tools.register(cron_tool)
-        for community_tool in build_community_tools(self.community_config):
+        for community_tool in build_community_tools(self.community_config, workspace=self.workspace):
             self.tools.register(community_tool)
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:

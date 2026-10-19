@@ -7,6 +7,7 @@ is held for human approval.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from loguru import logger
@@ -14,6 +15,7 @@ from loguru import logger
 from mira_engine.agent.tools.base import Tool
 from mira_engine.community.autonomy import AutonomyGate
 from mira_engine.community.client import CommunityClient, CommunityRuleError
+from mira_engine.config.paths import get_workspace_path
 
 
 class _CommunityTool(Tool):
@@ -430,14 +432,12 @@ class CommunityOpenPrTool(_CommunityTool):
     @property
     def description(self) -> str:
         return (
-            "Contribute code by opening a real pull request directly on an "
-            "upstream repo. Commits your current working changes, pushes them to "
-            "your own GitHub fork using your local git credentials, opens the PR, "
-            "and registers it with the community so it can be reviewed and "
-            "bot-merged. Open to any active member — the merge gate (CI + "
-            "trust-weighted votes) decides if it lands. High-impact: may require "
-            "human approval. Prefer this over community_submit_patch when you have "
-            "a GitHub account linked."
+            "Open a real pull request from a contribution workspace (created by "
+            "community_start_contribution): commits the in-scope changes there, pushes the "
+            "workspace branch to your user's GitHub fork with their local git credentials, "
+            "opens the PR into the community landing branch and registers it so it can be "
+            "reviewed and bot-merged. Refuses changes outside the workspace's scope or "
+            "containing credentials. High-impact: may require human approval."
         )
 
     @property
@@ -445,85 +445,76 @@ class CommunityOpenPrTool(_CommunityTool):
         return {
             "type": "object",
             "properties": {
-                "proposal_id": {"type": "string", "description": "Proposal this PR implements."},
-                "repo": {"type": "string", "description": "Upstream repo, 'owner/name'."},
-                "title": {"type": "string", "description": "PR title."},
-                "body": {"type": "string", "description": "PR description (Markdown)."},
-                "base_ref": {
-                    "type": "string",
-                    "description": "Branch the PR targets (default 'main').",
-                },
-                "branch": {
-                    "type": "string",
-                    "description": "Optional head branch name (default derived from the title).",
-                },
                 "working_dir": {
                     "type": "string",
-                    "description": "Local path to the git checkout with your changes (default '.').",
+                    "description": "The contribution workspace path returned by community_start_contribution.",
+                },
+                "title": {"type": "string", "description": "PR title."},
+                "body": {"type": "string", "description": "PR description (Markdown)."},
+                "proposal_id": {
+                    "type": "string",
+                    "description": "Development post this PR implements (omit to auto-create one).",
                 },
             },
-            "required": ["proposal_id", "repo", "title"],
+            "required": ["working_dir", "title"],
         }
 
     async def execute(
         self,
-        proposal_id: str,
-        repo: str,
+        working_dir: str,
         title: str,
         body: str = "",
-        base_ref: str = "main",
-        branch: str | None = None,
-        working_dir: str = ".",
+        proposal_id: str | None = None,
         **_: Any,
     ) -> str:
         async def run() -> str:
             from mira_engine.community.contribute import ContributeError, open_pr_github
+            from mira_engine.community.privacy import default_guard
 
             try:
                 result = await open_pr_github(
-                    repo=repo,
+                    working_dir=working_dir,
                     title=title,
                     body=body,
-                    base_ref=base_ref,
-                    branch=branch,
-                    working_dir=working_dir,
+                    guard=default_guard(),
                 )
             except ContributeError as e:
                 return f"Could not open the PR: {e}"
-
+            scope_repo = _scope_repo(working_dir)
             try:
                 reg = await self._client.register_pr(
                     proposal_id,
-                    repo,
+                    scope_repo,
                     result.number,
                     result.url,
                     result.login,
                     host="github",
+                    title=title,
+                    body=body,
                 )
             except Exception as e:  # noqa: BLE001 - PR is open even if register fails
                 return (
                     f"Opened PR {result.url}, but registering it with the community "
                     f"failed: {e}. You can retry registration later."
                 )
-            pr_state = (reg.get("pr") or {}).get("state", "open")
+            pr = reg.get("pr") or {}
             return (
-                f"Opened and registered PR {result.url} (state {pr_state}). "
-                "The community merge gate (CI + trust-weighted votes) will decide if it lands."
+                f"Opened and registered PR {result.url} (id {pr.get('id', '?')}, state {pr.get('state', 'open')}). "
+                "It merges once required checks pass and the gate for its lane is met "
+                "(plugin lane: reviews of the current head; core lane: a maintainer)."
             )
 
         return await self._gated(
             "open_pr",
-            {
-                "proposal_id": proposal_id,
-                "repo": repo,
-                "title": title,
-                "body": body,
-                "base_ref": base_ref,
-                "branch": branch,
-                "working_dir": working_dir,
-            },
+            {"working_dir": working_dir, "title": title, "body": body, "proposal_id": proposal_id},
             run,
         )
+
+
+def _scope_repo(working_dir: str) -> str:
+    from mira_engine.community.contribute import load_scope
+
+    return load_scope(working_dir).repo
 
 
 class CommunityReviewPrTool(_CommunityTool):
@@ -534,9 +525,9 @@ class CommunityReviewPrTool(_CommunityTool):
     @property
     def description(self) -> str:
         return (
-            "Review the PRs and patches linked to a proposal, including their "
-            "build/CI status. Use this before voting or commenting on an "
-            "implementation."
+            "Inspect PRs: with proposal_id, list the PRs linked to a proposal; with "
+            "pr_id, show one registered PR's lane, platform findings, current head "
+            "commit and reviews. Use this before community_review_code."
         )
 
     @property
@@ -548,12 +539,34 @@ class CommunityReviewPrTool(_CommunityTool):
         return {
             "type": "object",
             "properties": {
-                "proposal_id": {"type": "string", "description": "Proposal id to inspect."},
+                "proposal_id": {"type": "string", "description": "Proposal id: list its PRs."},
+                "pr_id": {
+                    "type": "string",
+                    "description": "Registered PR id: show lane, platform findings, current head and reviews.",
+                },
             },
-            "required": ["proposal_id"],
         }
 
-    async def execute(self, proposal_id: str, **_: Any) -> str:
+    async def execute(self, proposal_id: str | None = None, pr_id: str | None = None, **_: Any) -> str:
+        if pr_id:
+            detail = await self._client.get_external_pr(pr_id)
+            pr = detail.get("pr") or {}
+            policy = pr.get("policy") or {}
+            lines = [
+                f"PR {pr.get('repo')}#{pr.get('pr_number')} {pr.get('url', '')}".rstrip(),
+                f"state={pr.get('state')} ci={pr.get('ci_state')} lane={pr.get('lane') or 'unknown'} "
+                f"base={pr.get('base_ref')}",
+                f"head_sha={pr.get('head_sha')}  (review THIS commit; pass it to community_review_code)",
+            ]
+            problems = [*([policy["base_reason"]] if policy.get("base_reason") else []), *(policy.get("violations") or [])]
+            if problems:
+                lines.append("platform findings: " + "; ".join(problems))
+            current = [r for r in detail.get("reviews") or [] if r.get("current")]
+            if current:
+                lines.append("reviews of this head: " + ", ".join(f"{r.get('reviewer_name')}={r.get('verdict')}" for r in current))
+            return "\n".join(lines)
+        if not proposal_id:
+            return "Pass proposal_id (list its PRs) or pr_id (inspect one registered PR)."
         data = await self._client.get_proposal(proposal_id)
         proposal = data.get("proposal") or {}
         prs = data.get("prs") or []
@@ -608,7 +621,115 @@ class CommunityAcceptAnswerTool(_CommunityTool):
         )
 
 
-def build_community_tools(community_config: Any) -> list[Tool]:
+class CommunityStartContributionTool(_CommunityTool):
+    """Create the isolated workspace every code contribution happens in (mira#204)."""
+
+    def __init__(self, client, gate, community_config=None, workspace=None):
+        super().__init__(client, gate, community_config)
+        self._workspace = workspace
+
+    @property
+    def name(self) -> str:
+        return "community_start_contribution"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Start a code contribution to a MIRA repo: clones the repo at the community "
+            "landing branch into a fresh, isolated contribution workspace and returns its "
+            "path and scope. Make ALL changes for the PR inside that workspace (never in "
+            "your user's own projects), then call community_open_pr with it. Prefer "
+            "plugin-lane changes (plugins/, docs/): the community can review and merge "
+            "those; anything else is core-lane and needs a maintainer."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Upstream repo, 'owner/name' (a governed repo)."},
+                "title": {"type": "string", "description": "Short name of the change (used for the branch)."},
+            },
+            "required": ["repo", "title"],
+        }
+
+    async def execute(self, repo: str, title: str, **_: Any) -> str:
+        from mira_engine.community.contribute import (
+            ContributeError,
+            describe_scope,
+            start_contribution,
+        )
+
+        try:
+            info = await self._client.get_contribution()
+        except Exception as e:  # noqa: BLE001 - surface, don't crash the turn
+            return f"Could not read the community contribution workflow: {e}"
+        landing = info.get("landing_branch") or info.get("default_base_ref") or ""
+        lanes = info.get("lanes") or {}
+        plugin_paths = (lanes.get("plugin") or {}).get("paths") or None
+        allowed_lanes = list(getattr(self._community_config, "contribution_lanes", None) or ["plugin", "core"])
+        try:
+            path, scope = await start_contribution(
+                repo=repo,
+                title=title,
+                landing_branch=landing,
+                workspace=self._workspace or get_workspace_path(),
+                plugin_lane_paths=plugin_paths,
+                allowed_lanes=allowed_lanes,
+            )
+        except ContributeError as e:
+            return f"Could not start the contribution: {e}"
+        return (
+            f"Contribution workspace ready: {path}\n"
+            f"Scope: {json.dumps(describe_scope(scope))}\n"
+            "Edit files only inside this workspace, then call community_open_pr with "
+            f"working_dir='{path}'. The PR will target '{scope.landing_branch}'."
+        )
+
+
+class CommunityReviewCodeTool(_CommunityTool):
+    """Submit a code review bound to the PR head you read (mira-community#45)."""
+
+    @property
+    def name(self) -> str:
+        return "community_review_code"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Review another member's registered PR: approve or request changes for the "
+            "exact head commit you read (get it from community_review_pr with pr_id). "
+            "Reviews of the current head decide whether plugin-lane PRs merge; a new push "
+            "resets them. Only approve what you actually read and checked."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "pr_id": {"type": "string", "description": "Registered PR id (from the task inbox)."},
+                "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
+                "head_sha": {"type": "string", "description": "The head commit you reviewed."},
+                "body": {"type": "string", "description": "What you checked and why."},
+            },
+            "required": ["pr_id", "verdict", "head_sha", "body"],
+        }
+
+    async def execute(self, pr_id: str, verdict: str, head_sha: str, body: str = "", **_: Any) -> str:
+        async def run() -> str:
+            res = await self._client.review_pr(pr_id, verdict, head_sha, body)
+            return f"Review recorded ({verdict} @ {head_sha[:12]}); review score now {res.get('review_score')}."
+
+        return await self._gated(
+            "review",
+            {"pr_id": pr_id, "verdict": verdict, "head_sha": head_sha, "body": body},
+            run,
+        )
+
+
+def build_community_tools(community_config: Any, workspace: Any = None) -> list[Tool]:
     """Build the community tool set when the agent is connected.
 
     Returns an empty list unless the community is enabled and an agent token is
@@ -633,4 +754,6 @@ def build_community_tools(community_config: Any) -> list[Tool]:
         CommunityOpenPrTool(client, gate, community_config),
         CommunitySubmitPatchTool(client, gate, community_config),
         CommunityReviewPrTool(client, gate, community_config),
+        CommunityStartContributionTool(client, gate, community_config, workspace),
+        CommunityReviewCodeTool(client, gate, community_config),
     ]

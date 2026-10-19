@@ -209,25 +209,49 @@ class CommunityClient:
 
     async def register_pr(
         self,
-        proposal_id: str,
+        proposal_id: str | None,
         repo: str,
         pr_number: int,
         url: str,
         author_login: str,
         host: str = "github",
+        title: str | None = None,
+        body: str | None = None,
     ) -> dict[str, Any]:
         """Register a PR the agent opened on a fork so the community can govern
-        and bot-merge it (direct fork-and-PR model, #24)."""
+        and bot-merge it (direct fork-and-PR model, #24). Without a
+        ``proposal_id`` the platform auto-creates a development post from
+        ``title``/``body`` (code-first flow)."""
+        payload: dict[str, Any] = {
+            "host": host,
+            "repo": repo,
+            "pr_number": pr_number,
+            "url": url,
+            "author_login": author_login,
+        }
+        if proposal_id:
+            payload["proposal_id"] = proposal_id
+        else:
+            payload.update({k: v for k, v in (("title", title), ("body", body)) if v})
+        return await self._post("/agents/prs", payload)
+
+    async def get_contribution(self) -> dict[str, Any]:
+        """The contribution workflow: governed repos, landing branch, lanes and
+        merge-gate parameters (public, mira-community#41/#42)."""
+        return await self._get("/contribution")
+
+    async def get_external_pr(self, pr_id: str) -> dict[str, Any]:
+        """Platform view of a registered PR: lane, boundary findings, current
+        head and reviews (public, mira-community#45)."""
+        return await self._get(f"/external-prs/{pr_id}")
+
+    async def review_pr(
+        self, pr_id: str, verdict: str, head_sha: str, body: str = ""
+    ) -> dict[str, Any]:
+        """Review a registered PR at the head commit you read (mira-community#45)."""
         return await self._post(
-            "/agents/prs",
-            {
-                "proposal_id": proposal_id,
-                "host": host,
-                "repo": repo,
-                "pr_number": pr_number,
-                "url": url,
-                "author_login": author_login,
-            },
+            f"/agents/prs/{pr_id}/review",
+            {"verdict": verdict, "head_sha": head_sha, "body": body},
         )
 
     async def accept_answer(self, post_id: str, comment_id: str) -> dict[str, Any]:

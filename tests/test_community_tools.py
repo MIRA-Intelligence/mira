@@ -104,6 +104,8 @@ def test_build_returns_full_set_when_connected():
         "community_open_pr",
         "community_submit_patch",
         "community_review_pr",
+        "community_start_contribution",
+        "community_review_code",
     }
 
 
@@ -325,3 +327,68 @@ async def test_review_pr_lists_prs():
     assert "Dark mode" in out
     assert "github" in out
     assert "passed" in out
+
+
+class _ContribClient:
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    async def get_contribution(self):
+        return {"landing_branch": "contrib", "lanes": {"plugin": {"paths": ["plugins/**"]}}}
+
+    async def review_pr(self, pr_id, verdict, head_sha, body=""):
+        self.calls.append(("review_pr", pr_id, verdict, head_sha, body))
+        return {"review_score": 2}
+
+    async def get_external_pr(self, pr_id):
+        return {
+            "pr": {
+                "repo": "o/r", "pr_number": 7, "url": "https://github.com/o/r/pull/7", "state": "open",
+                "ci_state": "passed", "lane": "plugin", "base_ref": "contrib", "head_sha": "abc123def4567",
+                "policy": {"violations": ["too big"], "base_reason": None},
+            },
+            "reviews": [{"reviewer_name": "bob", "verdict": "approve", "current": True}],
+        }
+
+
+async def test_start_contribution_uses_landing_branch_and_user_lanes(monkeypatch, tmp_path):
+    from mira_engine.community import contribute
+
+    seen = {}
+
+    async def fake_start(**kw):
+        seen.update(kw)
+        scope = contribute.ContributionScope(repo=kw["repo"], landing_branch=kw["landing_branch"], branch="mira/x-1")
+        return tmp_path / "ws", scope
+
+    monkeypatch.setattr(contribute, "start_contribution", fake_start)
+    cfg = SimpleNamespace(contribution_lanes=["plugin"])
+    tool = community_tools.CommunityStartContributionTool(_ContribClient(), AutonomyGate("hitl"), cfg, tmp_path)
+    out = await tool.execute(repo="o/r", title="x")
+    assert seen["landing_branch"] == "contrib"
+    assert seen["allowed_lanes"] == ["plugin"]
+    assert seen["plugin_lane_paths"] == ["plugins/**"]
+    assert seen["workspace"] == tmp_path
+    assert "community_open_pr" in out and "contrib" in out
+
+
+async def test_review_code_records_head_bound_review():
+    client = _ContribClient()
+    tool = community_tools.CommunityReviewCodeTool(client, AutonomyGate("fully_autonomous"))
+    out = await tool.execute(pr_id="pr1", verdict="approve", head_sha="abc123def4567", body="read it")
+    assert client.calls == [("review_pr", "pr1", "approve", "abc123def4567", "read it")]
+    assert "score now 2" in out
+
+
+async def test_review_code_is_low_impact_in_hybrid():
+    client = _ContribClient()
+    tool = community_tools.CommunityReviewCodeTool(client, AutonomyGate("hybrid"))
+    await tool.execute(pr_id="pr1", verdict="request_changes", head_sha="h", body="b")
+    assert client.calls  # ran directly, not queued
+
+
+async def test_review_pr_by_id_shows_head_lane_and_findings():
+    tool = community_tools.CommunityReviewPrTool(_ContribClient(), AutonomyGate("hitl"))
+    out = await tool.execute(pr_id="pr1")
+    assert "head_sha=abc123def4567" in out and "lane=plugin" in out
+    assert "too big" in out and "bob=approve" in out
