@@ -74,6 +74,8 @@ jobs:
           PY
       - name: Start published gateway and run smoke checks
         run: |
+          # The gateway requires a token on /api/*; the smoke script reads the same variable.
+          export MIRA_GATEWAY_TOKEN="release-train-smoke-$GITHUB_RUN_ID"
           engine-assets/mira-engine-linux-x86_64 run-gateway --host 127.0.0.1 --port 18790 > gateway.log 2>&1 &
           GATEWAY_PID=$!
           trap 'kill "$GATEWAY_PID" 2>/dev/null || true' EXIT
