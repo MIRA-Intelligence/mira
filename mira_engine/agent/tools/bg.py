@@ -334,8 +334,12 @@ async def spawn_background_job(
     job_dir_root: Path | None = None,
     owner_session_id: str | None = None,
     owner_turn_id: str | None = None,
+    argv: list[str] | None = None,
 ) -> BackgroundJob:
     """Spawn ``command`` as a detached shell subprocess and register it.
+
+    ``argv``, when given, is executed instead of ``bash -l -c <command>`` (the
+    sandboxed form from :class:`ExecTool`); ``command`` is still recorded.
 
     The caller is expected to have already applied any sandboxing / PATH
     munging it cares about — this function just spawns and bookkeeps. We use
@@ -367,10 +371,7 @@ async def spawn_background_job(
             )
         else:
             process = await asyncio.create_subprocess_exec(
-                "bash",
-                "-l",
-                "-c",
-                command,
+                *(argv or ["bash", "-l", "-c", command]),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=stdout_handle,
                 stderr=stderr_handle,

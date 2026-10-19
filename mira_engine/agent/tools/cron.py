@@ -4,7 +4,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 
-from mira_engine.agent.tools.base import Tool
+from mira_engine.agent.tools.base import UNSET, Tool, turn_value
 from mira_engine.cron.service import CronService
 from mira_engine.cron.types import CronSchedule
 
@@ -18,10 +18,10 @@ class CronTool(Tool):
         self._chat_id = ""
         self._project_id: str | None = None
         self._project_dir: str | None = None
-        self._runtime_channel: ContextVar[str | None] = ContextVar("cron_channel", default=None)
-        self._runtime_chat_id: ContextVar[str | None] = ContextVar("cron_chat_id", default=None)
-        self._runtime_project_id: ContextVar[str | None] = ContextVar("cron_project_id", default=None)
-        self._runtime_project_dir: ContextVar[str | None] = ContextVar("cron_project_dir", default=None)
+        self._runtime_channel: ContextVar[str | None] = ContextVar("cron_channel", default=UNSET)
+        self._runtime_chat_id: ContextVar[str | None] = ContextVar("cron_chat_id", default=UNSET)
+        self._runtime_project_id: ContextVar[str | None] = ContextVar("cron_project_id", default=UNSET)
+        self._runtime_project_dir: ContextVar[str | None] = ContextVar("cron_project_dir", default=UNSET)
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
         self._default_timezone = default_timezone
 
@@ -131,10 +131,10 @@ class CronTool(Tool):
     ) -> str:
         if not message:
             return "Error: message is required for add"
-        channel = self._runtime_channel.get() or self._channel
-        chat_id = self._runtime_chat_id.get() or self._chat_id
-        project_id = self._runtime_project_id.get() or self._project_id
-        project_dir = self._runtime_project_dir.get() or self._project_dir
+        channel = turn_value(self._runtime_channel, self._channel)
+        chat_id = turn_value(self._runtime_chat_id, self._chat_id)
+        project_id = turn_value(self._runtime_project_id, self._project_id)
+        project_dir = turn_value(self._runtime_project_dir, self._project_dir)
         if not channel or not chat_id:
             return "Error: no session context (channel/chat_id)"
         if tz and not cron_expr:

@@ -1052,10 +1052,13 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
         async def close_mcp(self) -> None:
             return None
 
-    def _fake_create_app(agent_loop, model_name: str, request_timeout: float):
+    def _fake_create_app(agent_loop, model_name: str, request_timeout: float, *,
+                         api_keys, allowed_origins):
         seen["agent_loop"] = agent_loop
         seen["model_name"] = model_name
         seen["request_timeout"] = request_timeout
+        seen["api_keys"] = api_keys
+        seen["allowed_origins"] = allowed_origins
         return _FakeApiApp()
 
     def _fake_run_app(api_app, host: str, port: int, print):
@@ -1486,6 +1489,42 @@ def test_serve_cli_options_override_api_config(monkeypatch, tmp_path: Path) -> N
     assert seen["host"] == "127.0.0.1"
     assert seen["port"] == 18901
     assert seen["request_timeout"] == 46.0
+
+
+def test_serve_passes_api_keys_and_origins(monkeypatch, tmp_path: Path) -> None:
+    config_file = _write_instance_config(tmp_path)
+    config = Config()
+    config.api.keys = ["cfg-key"]
+    config.api.cors_origins = ["http://localhost:3000"]
+    seen: dict[str, object] = {}
+
+    _patch_serve_runtime(monkeypatch, config, seen)
+    monkeypatch.delenv("MIRA_API_KEYS", raising=False)
+    monkeypatch.delenv("MIRA_API_ALLOWED_ORIGINS", raising=False)
+
+    result = runner.invoke(app, ["serve", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    assert seen["api_keys"] == ["cfg-key"]
+    assert seen["allowed_origins"] == ["http://localhost:3000"]
+
+
+def test_serve_falls_back_to_gateway_token(monkeypatch, tmp_path: Path) -> None:
+    config_file = _write_instance_config(tmp_path)
+    config = Config()
+    seen: dict[str, object] = {}
+
+    _patch_serve_runtime(monkeypatch, config, seen)
+    monkeypatch.delenv("MIRA_API_KEYS", raising=False)
+    monkeypatch.delenv("MIRA_GATEWAY_TOKEN", raising=False)
+
+    result = runner.invoke(app, ["serve", "--config", str(config_file)])
+
+    assert result.exit_code == 0
+    from mira_engine.security.gateway_auth import gateway_token_path
+
+    assert seen["api_keys"] == [gateway_token_path().read_text().strip()]
+    assert seen["allowed_origins"] == []
 
 
 def test_channels_login_requires_channel_name() -> None:

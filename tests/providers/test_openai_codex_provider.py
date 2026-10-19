@@ -79,13 +79,13 @@ async def test_request_codex_retries_ipv4_after_connect_timeout(monkeypatch) -> 
         calls.append(force_ipv4)
         if not force_ipv4:
             raise httpx.ConnectTimeout("")
-        return "ok", [], "stop"
+        return "ok", [], "stop", {}
 
     monkeypatch.setattr(codex_provider, "_request_codex_once", fake_request_once)
 
     result = await _request_codex("https://example.test", {}, {}, verify=True)
 
-    assert result == ("ok", [], "stop")
+    assert result == ("ok", [], "stop", {})
     assert calls == [False, True]
 
 
@@ -97,7 +97,7 @@ async def test_openai_codex_chat_prepares_oauth_state_before_getting_token(monke
         calls.append("prepare")
 
     async def fake_request_codex(*args, **kwargs):
-        return "ok", [], "stop"
+        return "ok", [], "stop", {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "cached_tokens": 80}
 
     monkeypatch.setattr(codex_provider, "ensure_oauth_state_dirs_for_runtime", fake_prepare)
     monkeypatch.setattr(
@@ -111,4 +111,18 @@ async def test_openai_codex_chat_prepares_oauth_state_before_getting_token(monke
     response = await provider.chat([{"role": "user", "content": "hi"}])
 
     assert response.content == "ok"
+    assert response.usage["cached_tokens"] == 80
     assert calls == ["prepare"]
+
+
+@pytest.mark.parametrize("cached", [0, 80, None])
+async def test_codex_sse_retains_usage(cached):
+    usage = {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110,
+             "input_tokens_details": {"cached_tokens": cached}}
+    response = _FakeSSE([{"type": "response.completed", "response": {"status": "completed", "usage": usage}}])
+    _, _, _, result = await _consume_sse(response)
+    assert result["prompt_tokens"] == 100
+    if cached is None:
+        assert "cached_tokens" not in result
+    else:
+        assert result["cached_tokens"] == cached

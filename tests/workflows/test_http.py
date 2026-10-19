@@ -60,6 +60,31 @@ async def test_contract_and_direct_run_creation(workflow_client: TestClient) -> 
     assert snapshot["runs"][0]["module_type"] == "delivery"
 
 
+@pytest.mark.parametrize("journal_id", ["radiology", "media"])
+async def test_journal_catalog_and_selection_round_trip(workflow_client: TestClient, journal_id):
+    response = await workflow_client.get("/api/workflow/v1/journals")
+    assert response.status == 200
+    catalog = await response.json()
+    assert len(catalog["journals"]) == 7
+    selected = next(item for item in catalog["journals"] if item["id"] == journal_id)
+    assert selected["verification_status"] == "verified"
+    response = await workflow_client.post("/api/workflow/v1/projects/PRJ-api/runs", json={
+        "command_id": "journal", "module_type": "delivery",
+        "module_data": {"intent": "write", "delivery_format": "paper_article", "target_journal": journal_id},
+    })
+    assert response.status == 201
+    run_id = (await response.json())["run_id"]
+    snapshot = await (await workflow_client.get("/api/workflow/v1/projects/PRJ-api")).json()
+    run = next(run for run in snapshot["runs"] if run["run_id"] == run_id)
+    assert run["module_data"]["target_journal"] == journal_id
+    assert run["module_data"]["journal_profile_version"] == catalog["profile_version"]
+    invalid = await workflow_client.post("/api/workflow/v1/projects/PRJ-api/runs", json={
+        "command_id": "invalid-journal", "module_type": "delivery",
+        "module_data": {"delivery_format": "paper_article", "target_journal": "unknown"},
+    })
+    assert invalid.status == 422
+
+
 async def test_websocket_replays_and_then_follows_live_events(
     workflow_client: TestClient,
 ) -> None:
@@ -199,3 +224,45 @@ async def test_project_policy_and_structured_interaction_routes(
     )
     assert checkpoint.status == 200
     assert (await checkpoint.json())["state"] == {"step": 2}
+
+
+async def test_slide_deck_content_is_sandboxed_and_editable_on_request(workflow_client: TestClient) -> None:
+    route = next(
+        route for route in workflow_client.server.app.router.routes()
+        if route.resource.canonical == "/api/workflow/v1/projects/{project_id}"
+    )
+    ref = route.handler.__self__.registry.resolve("PRJ-api")
+    deck = (
+        '<html><script type="application/bento+json" id="bento-doc">'
+        '{"format": "bento/slides", "readonly": true}</script></html>'
+    )
+    (ref.project_dir / "slides.bento.html").write_text(deck, encoding="utf-8")
+    imported = await workflow_client.post(
+        "/api/workflow/v1/projects/PRJ-api/artifacts",
+        json={
+            "command_id": "cmd-deck",
+            "source_path": "slides.bento.html",
+            # Stored as payload.html under a label without an extension, as the
+            # Slides deliverable does: the deck must be recognised by content.
+            "label": "科学结果幻灯片",
+            "artifact_type": "slides",
+            "media_type": "text/html",
+        },
+    )
+    assert imported.status == 201
+    artifact = (await imported.json())["artifact"]
+    assert artifact["payload_ref"].endswith("payload.html")
+    url = f"/api/workflow/v1/projects/PRJ-api/artifacts/{artifact['artifact_id']}/content"
+
+    preview = await workflow_client.get(url)
+    assert preview.status == 200
+    assert preview.headers["Content-Security-Policy"].startswith("sandbox allow-scripts")
+    assert '"readonly": true' in await preview.text()
+
+    edit = await workflow_client.get(f"{url}?mode=edit")
+    assert edit.status == 200
+    csp = edit.headers["Content-Security-Policy"]
+    assert "sandbox allow-scripts" in csp and "allow-same-origin" not in csp
+    assert "connect-src data: blob:" in csp
+    assert "readonly" not in await edit.text()
+    assert '"readonly": true' in (ref.project_dir / "slides.bento.html").read_text(encoding="utf-8")

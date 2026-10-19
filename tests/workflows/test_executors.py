@@ -59,6 +59,11 @@ async def test_experiment_mode_enforces_repeatable_boundaries(tmp_path: Path, mo
             *[ToolCallRequest(id=f"{number}-{state}", name="record_workflow_experiment", arguments={
                 "experiment": {"id": f"Exp00{number}", "title": f"Experiment {number}", "status": state},
             }) for state in ["pending", "running", "completed"]],
+            # The continuation form waits for this separate replan call instead of blocking it.
+            ToolCallRequest(id=f"replan-{number}", name="record_workflow_experiment", arguments={
+                "experiment": {"id": f"Exp00{number}", "title": f"Experiment {number}", "status": "completed",
+                               "replan": {"action": "continue", "rationale": "Proceed as planned"}},
+            }),
             ToolCallRequest(id=f"after-{number}", name="write_file", arguments={
                 "path": str(service.repository.project_dir / f"after-{number}.txt"), "content": "continued",
             }),
@@ -92,8 +97,10 @@ async def test_experiment_mode_enforces_repeatable_boundaries(tmp_path: Path, mo
             assert not (service.repository.project_dir / f"after-{number}.txt").exists()
             assert not (service.repository.project_dir / f"unregistered-{number}.txt").exists()
             assert run.module_data["experiments"][-1]["status"] == "completed"
+            assert run.module_data["experiments"][-1]["replan"]["action"] == "continue"
             interaction = run.module_data["interaction"]
             assert interaction["interaction_type"] == "confirm_experiment_continuation"
+            assert "continue — Proceed as planned" in interaction["prompt"]
             service.command_run(run_id, command_id=f"answer-{number}", command_type="submit_interaction", payload={
                 "interaction_id": interaction["interaction_id"], "response": {"selection": decision},
             })
@@ -915,7 +922,10 @@ async def test_native_executor_enriches_skill_audit_with_run_policy_identity(
         audit_hook=audit_hook,
     )
 
-    assert audit_events == [
+    loaded = [event for event in audit_events if event.get("loaded")]
+    assert any(event["skill_name"] == "audit-policy" and event["source"] == "read_file" for event in loaded)
+    assert all(event["run_id"] == run_id and event["module_type"] == "experiment" for event in loaded)
+    assert [event for event in audit_events if not event.get("loaded")] == [
         {
             "project_id": service.repository.project_id,
             "run_id": run_id,

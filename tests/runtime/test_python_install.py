@@ -136,7 +136,7 @@ class TestEnsureProjectVenvInterpreterInstall:
         assert args[1] == "3.11"
 
     def test_skips_ensure_python_when_no_version(self, tmp_path: Path) -> None:
-        cfg = PythonRuntimeConfig(manager="uv")  # no python_version
+        cfg = PythonRuntimeConfig(manager="uv", python_version="")
         with patch(
             "mira_engine.runtime.python_env.ensure_python_interpreter"
         ) as ensure, patch(
@@ -177,7 +177,7 @@ class TestCli:
         ) as load:
             load.return_value = MagicMock(
                 tools=MagicMock(
-                    exec=MagicMock(python=PythonRuntimeConfig(manager="uv"))
+                    exec=MagicMock(python=PythonRuntimeConfig(manager="uv", python_version=""))
                 )
             )
             result = runner.invoke(
@@ -219,7 +219,7 @@ class TestCli:
         ) as load:
             load.return_value = MagicMock(
                 tools=MagicMock(
-                    exec=MagicMock(python=PythonRuntimeConfig(manager="uv"))
+                    exec=MagicMock(python=PythonRuntimeConfig(manager="uv", python_version=""))
                 )
             )
             result = runner.invoke(app, ["runtime", "install-python"])
@@ -323,7 +323,7 @@ class TestCli:
         ) as load:
             load.return_value = MagicMock(
                 tools=MagicMock(
-                    exec=MagicMock(python=PythonRuntimeConfig(manager="uv"))
+                    exec=MagicMock(python=PythonRuntimeConfig(manager="uv", python_version=""))
                 )
             )
             result = runner.invoke(app, ["runtime", "info"])

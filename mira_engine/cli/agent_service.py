@@ -10,6 +10,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -50,6 +51,7 @@ LOG_ROTATE_BYTES = 1_000_000
 LOG_ROTATE_FILES = 3
 DIAGNOSTICS_LOG_TAIL_LINES = 200
 LIFECYCLE_TIMEOUT = 30.0
+_lifecycle_request_id: str | None = None
 
 
 def _wait_until(predicate, timeout: float = LIFECYCLE_TIMEOUT) -> bool:
@@ -82,6 +84,22 @@ def _tree_stopped(processes: list[psutil.Process]) -> bool:
     return True
 
 
+def _gateway_config_path(base: str, config_path: str | None = None) -> str | None:
+    """Read ``config_path`` from ``/api/config`` using the local gateway token."""
+    from mira_engine.security.gateway_auth import local_gateway_tokens
+
+    for token in local_gateway_tokens(config_path) or [None]:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        request = urllib.request.Request(f"{base}/api/config", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=1) as response:
+                return json.load(response).get("config_path")
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                raise
+    return None
+
+
 def _endpoint_gateway(host: str, port: int) -> dict[str, Any] | None:
     """Read-only diagnosis of a leftover listener; never authorize a kill by HTTP."""
     host = "127.0.0.1" if host == "0.0.0.0" else "::1" if host == "::" else host
@@ -94,8 +112,7 @@ def _endpoint_gateway(host: str, port: int) -> dict[str, Any] | None:
             return None
         info = {"endpoint": base, "config_path": None}
         try:
-            with urllib.request.urlopen(f"{base}/api/config", timeout=1) as response:
-                info["config_path"] = json.load(response).get("config_path")
+            info["config_path"] = _gateway_config_path(base)
         except (OSError, ValueError, urllib.error.URLError):
             pass
         return info
@@ -123,9 +140,8 @@ def _gateway_healthy(pid: int | None, host: str, port: int, config_path: str | N
             healthy = (resp.status == 200 and data.get("status") == "ok"
                        and data.get("service") == "mira-gateway" and data.get("running") is True)
         if healthy and config_path:
-            with urllib.request.urlopen(f"http://{address}:{port}/api/config", timeout=1) as resp:
-                actual = json.load(resp).get("config_path")
-                return bool(actual) and Path(actual).resolve() == Path(config_path).resolve()
+            actual = _gateway_config_path(f"http://{address}:{port}", config_path)
+            return bool(actual) and Path(actual).resolve() == Path(config_path).resolve()
         return healthy
     except (psutil.Error, OSError, ValueError, urllib.error.URLError):
         return False
@@ -133,6 +149,19 @@ def _gateway_healthy(pid: int | None, host: str, port: int, config_path: str | N
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _diagnostic_request_id() -> str:
+    """One CLI command is one request, even when it writes several lifecycle events."""
+    global _lifecycle_request_id
+    from mira_engine.observability import correlation_id
+
+    inherited = os.environ.get("MIRA_DIAGNOSTIC_REQUEST_ID")
+    if inherited and correlation_id(inherited) == inherited:
+        return inherited
+    if _lifecycle_request_id is None:
+        _lifecycle_request_id = correlation_id()
+    return _lifecycle_request_id
 
 
 def _engine_manifest_path() -> Path:
@@ -251,6 +280,10 @@ class LocalServiceManager:
         self.paths.ensure()
         self._rotate_log_if_needed()
         payload = {
+            "schema_version": 1,
+            "component": "engine-service",
+            "pid": os.getpid(),
+            "request_id": _diagnostic_request_id(),
             "timestamp": _now_iso(),
             "event": event,
             "service_mode": self._default_state().get("service_mode"),
@@ -426,19 +459,76 @@ class LocalServiceManager:
         self.paths.backups_dir.mkdir(parents=True, exist_ok=True)
         diagnostics_dir = self.paths.runtime_dir / "diagnostics"
         diagnostics_dir.mkdir(parents=True, exist_ok=True)
-        bundle = diagnostics_dir / f"diagnostics-{_now_iso().replace(':', '-')}.zip"
+        import uuid
+        bundle = diagnostics_dir / f"diagnostics-{_now_iso().replace(':', '-')}-{uuid.uuid4().hex[:8]}.zip"
 
         _, doctor_payload = self.doctor()
-        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("doctor.json", json.dumps(doctor_payload, ensure_ascii=False, indent=2) + "\n")
-            if self.paths.state_file.exists():
-                zf.write(self.paths.state_file, arcname="agent-service-state.json")
-            if self.paths.log_file.exists():
-                lines = self.paths.log_file.read_text(encoding="utf-8").splitlines()
-                tail = "\n".join(lines[-DIAGNOSTICS_LOG_TAIL_LINES:]) + ("\n" if lines else "")
-                zf.writestr("agent-service.log.tail", tail)
+        # Create private from the start: a failed export must never leave a readable bundle.
+        descriptor = os.open(bundle, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                self._write_diagnostics_bundle(stream, doctor_payload)
+        except BaseException:
+            bundle.unlink(missing_ok=True)
+            raise
+        bundle.chmod(0o600)
         self._append_log("diagnostics_exported", bundle=str(bundle))
         return EXIT_OK, str(bundle)
+
+    def _write_diagnostics_bundle(self, stream: Any, doctor_payload: dict[str, Any]) -> None:
+        from mira_engine.observability import read_tail, redact, structured_service_tail
+
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("doctor.json", json.dumps(redact(doctor_payload), ensure_ascii=False, indent=2) + "\n")
+            if self.paths.state_file.exists():
+                zf.writestr("agent-service-state.json", json.dumps(redact(self.load_state()), indent=2) + "\n")
+            if self.paths.log_file.exists():
+                zf.writestr("agent-service.log.tail", structured_service_tail(self.paths.log_file))
+            config_path = self.load_state().get("config_path")
+            runtime_dir = (Path(config_path).parent if config_path else self.paths.root) / "logs" / "runtime"
+            files = []
+            errors = []
+            if runtime_dir.is_dir():
+                candidates = []
+                for path in runtime_dir.iterdir():
+                    if not re.fullmatch(r"(?:engine|fault)-\d+-[a-f0-9]{32}\.(?:jsonl|log)(?:\.\d+)?", path.name):
+                        continue
+                    try:
+                        # lstat once: a running engine may rotate or prune files mid-export.
+                        info = path.lstat()
+                    except OSError as exc:
+                        errors.append({"file": path.name, "error_type": type(exc).__name__})
+                        continue
+                    if stat.S_ISREG(info.st_mode):
+                        candidates.append((info.st_mtime, path))
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                for _, path in candidates[:16]:
+                    try:
+                        lines = read_tail(path).splitlines()
+                        if path.name.startswith("engine-"):
+                            records = []
+                            for line in lines:
+                                try:
+                                    row = json.loads(line)
+                                except (ValueError, RecursionError):
+                                    errors.append({"file": path.name, "error_type": "InvalidJSONL"})
+                                    continue
+                                if isinstance(row, dict):
+                                    # Redact individual values, not the serialized line:
+                                    # long tracebacks must remain complete, parseable JSON.
+                                    records.append(json.dumps(redact(row), ensure_ascii=False))
+                            tail = "\n".join(records) + "\n"
+                        else:
+                            tail = "\n".join(redact(line) for line in lines) + "\n"
+                        zf.writestr(f"engine-runtime/{path.name}.tail", tail)
+                        files.append(path.name)
+                    except OSError as exc:
+                        errors.append({"file": path.name, "error_type": type(exc).__name__})
+            zf.writestr("manifest.json", json.dumps({
+                "schema_version": 1, "created_at": _now_iso(), "runtime_files": files,
+                "errors": errors, "privacy": "No config, conversation, tool arguments or native minidumps. Legacy unstructured service output omitted.",
+                "tail_bytes_per_file": 131072,
+            }, indent=2) + "\n")
 
 
 class SystemdUserServiceManager(LocalServiceManager):

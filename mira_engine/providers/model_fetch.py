@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from mira_engine.config.loader import get_config_path
-from mira_engine.config.schema import Config
+from mira_engine.config.schema import Config, is_custom_provider_id
 from mira_engine.providers.factory import resolve_provider_proxy
 from mira_engine.providers.registry import find_by_name
 
@@ -153,6 +153,8 @@ async def fetch_models_to_cache(
 async def fetch_provider_models(config: Config, provider_name: str) -> ModelCache:
     """Fetch models from a provider without writing cache."""
     provider_name = _normalize_provider_name(provider_name)
+    if provider_name in config.providers.custom_providers:
+        return await _fetch_openai_compatible_models(config, provider_name)
     spec = find_by_name(provider_name)
     if not spec:
         raise ModelFetchError(f"Unknown provider: {provider_name}")
@@ -289,7 +291,7 @@ async def _fetch_ollama_models(config: Config) -> ModelCache:
 
 
 async def _fetch_openai_compatible_models(config: Config, provider_name: str) -> ModelCache:
-    provider_cfg = getattr(config.providers, provider_name, None)
+    provider_cfg = config.providers.entry(provider_name)
     spec = find_by_name(provider_name)
     api_base = (
         getattr(provider_cfg, "api_base", None)
@@ -300,7 +302,7 @@ async def _fetch_openai_compatible_models(config: Config, provider_name: str) ->
         raise ModelFetchError(f"{provider_name} does not have an API base URL for model fetch.")
 
     api_key = getattr(provider_cfg, "api_key", None) if provider_cfg is not None else None
-    if not api_key and not (provider_name == "custom" or (spec and spec.is_local)):
+    if not api_key and not (is_custom_provider_id(provider_name) or (spec and spec.is_local)):
         raise ModelFetchError(f"{provider_name} requires an API key before fetching models.")
 
     headers = {"Accept": "application/json"}

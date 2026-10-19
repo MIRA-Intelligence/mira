@@ -21,6 +21,7 @@ a = Analysis(
     binaries=_extra_binaries,
     datas=(
         collect_data_files('litellm')
+        + collect_data_files('jieba')
         + collect_data_files(
             'mira_engine',
             includes=[
@@ -35,7 +36,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Mira Server runs from a pip install on Linux hosts, never from the desktop bundle.
+    excludes=['mira_server', 'pam'],
     noarchive=False,
     optimize=0,
 )

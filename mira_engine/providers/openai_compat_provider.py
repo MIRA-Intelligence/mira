@@ -26,6 +26,7 @@ else:
     from openai import AsyncOpenAI
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.usage import extract_usage
 from mira_engine.providers.registry import model_overrides_for
 from mira_engine.providers.openai_responses import (
     consume_sdk_stream,
@@ -359,7 +360,7 @@ class OpenAICompatProvider(LLMProvider):
             if spec.name == "dashscope":
                 extra = {"enable_thinking": thinking_enabled}
             elif spec.name in (
-                "volcengine", "volcengine_coding_plan",
+                "volcengine", "volcengine_coding_plan", "volcengine_agent_plan",
                 "byteplus", "byteplus_coding_plan",
                 "deepseek",
             ):
@@ -536,52 +537,7 @@ class OpenAICompatProvider(LLMProvider):
 
     @classmethod
     def _extract_usage(cls, response: Any) -> dict[str, int]:
-        """Extract token usage from an OpenAI-compatible response.
-
-        Handles both dict-based (raw JSON) and object-based (SDK Pydantic)
-        responses.  Provider-specific ``cached_tokens`` fields are normalised
-        under a single key; see the priority chain inside for details.
-        """
-        # --- resolve usage object ---
-        usage_obj = None
-        response_map = cls._maybe_mapping(response)
-        if response_map is not None:
-            usage_obj = response_map.get("usage")
-        elif hasattr(response, "usage") and response.usage:
-            usage_obj = response.usage
-
-        usage_map = cls._maybe_mapping(usage_obj)
-        if usage_map is not None:
-            result = {
-                "prompt_tokens": int(usage_map.get("prompt_tokens") or 0),
-                "completion_tokens": int(usage_map.get("completion_tokens") or 0),
-                "total_tokens": int(usage_map.get("total_tokens") or 0),
-            }
-        elif usage_obj:
-            result = {
-                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
-            }
-        else:
-            return {}
-
-        # --- cached_tokens (normalised across providers) ---
-        # Try nested paths first (dict), fall back to attribute (SDK object).
-        # Priority order ensures the most specific field wins.
-        for path in (
-            ("prompt_tokens_details", "cached_tokens"),  # OpenAI/Zhipu/MiniMax/Qwen/Mistral/xAI
-            ("cached_tokens",),                          # StepFun/Moonshot (top-level)
-            ("prompt_cache_hit_tokens",),                # DeepSeek/SiliconFlow
-        ):
-            cached = cls._get_nested_int(usage_map, path)
-            if not cached and usage_obj:
-                cached = cls._get_nested_int(usage_obj, path)
-            if cached:
-                result["cached_tokens"] = cached
-                break
-
-        return result
+        return extract_usage(response)
 
     @staticmethod
     def _get_nested_int(obj: Any, path: tuple[str, ...]) -> int:

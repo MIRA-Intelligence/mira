@@ -1,13 +1,15 @@
 """Configuration schema using Pydantic."""
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
 from mira_engine.cron.types import CronSchedule
+from mira_engine.security.gateway_auth import DEFAULT_ALLOWED_ORIGINS
 
 
 def _default_workspace() -> str:
@@ -245,7 +247,8 @@ class UiChannelConfig(Base):
 
     enabled: bool = False
     allow_from: list[str] = Field(default_factory=list)
-    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    # Browser origins allowed to call the gateway; "*" accepts any site (unsafe).
+    cors_origins: list[str] = Field(default_factory=lambda: list(DEFAULT_ALLOWED_ORIGINS))
     feedback: UiFeedbackConfig = Field(default_factory=UiFeedbackConfig)
     project_storage: Literal["user_selectable", "managed"] = "user_selectable"
     managed_project_root: str | None = None
@@ -435,6 +438,19 @@ class ProviderConfig(Base):
     # (has a credential/endpoint/model list, or is local/OAuth). ``True``/``False``
     # force the state regardless of configuration.
     enabled: bool | None = None
+    # User-chosen display name. Only custom (OpenAI-compatible) providers use it;
+    # names are labels, not identifiers, so two providers may share one.
+    name: str | None = None
+
+
+# Ids of additional custom providers under ``providers.customProviders``. The
+# built-in ``custom`` entry keeps its own id.
+CUSTOM_PROVIDER_ID_PATTERN = re.compile(r"^custom_[a-z0-9]{1,32}$")
+
+
+def is_custom_provider_id(name: str | None) -> bool:
+    """True for ``custom`` and for additional custom provider ids (``custom_<suffix>``)."""
+    return bool(name) and (name == "custom" or bool(CUSTOM_PROVIDER_ID_PATTERN.match(name)))
 
 
 class ModelParamRule(Base):
@@ -460,6 +476,8 @@ class ProvidersConfig(Base):
     # default; surfaced and edited from the Providers UI.
     model_params: list[ModelParamRule] = Field(default_factory=list)
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
+    # Additional OpenAI-compatible endpoints, keyed by a stable id ("custom_<suffix>").
+    custom_providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -467,14 +485,19 @@ class ProvidersConfig(Base):
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
     nvidia: ProviderConfig = Field(default_factory=ProviderConfig)
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
+    xai: ProviderConfig = Field(default_factory=ProviderConfig)  # xAI (Grok)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
+    zhipu_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # GLM Coding Plan (智谱 / Z.ai)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)
+    dashscope_token_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # Bailian Token Plan (阿里云百炼)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
     ovms: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenVINO Model Server (OVMS)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
+    kimi_code: ProviderConfig = Field(default_factory=ProviderConfig)  # Kimi Code (Kimi membership)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    minimax_token_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # MiniMax Token Plan
     mistral: ProviderConfig = Field(default_factory=ProviderConfig)
     stepfun: ProviderConfig = Field(default_factory=ProviderConfig)  # Step Fun (阶跃星辰)
     xiaomi_mimo: ProviderConfig = Field(default_factory=ProviderConfig)  # Xiaomi MIMO (小米)
@@ -482,11 +505,21 @@ class ProvidersConfig(Base):
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
     volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Coding Plan
+    volcengine_agent_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Agent Plan
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
+
+    def entry(self, name: str) -> ProviderConfig | None:
+        """Return the config for a provider id, including additional custom providers."""
+        if name in self.custom_providers:
+            return self.custom_providers[name]
+        if name in {"proxy", "model_params", "custom_providers"}:
+            return None
+        value = getattr(self, name, None)
+        return value if isinstance(value, ProviderConfig) else None
 
 
 class HeartbeatConfig(Base):
@@ -503,13 +536,19 @@ class ApiConfig(Base):
     host: str = "127.0.0.1"  # Safer default: local-only bind.
     port: int = 8900
     timeout: float = 120.0  # Per-request timeout in seconds.
+    # Bearer keys for /v1; env MIRA_API_KEYS wins. Empty falls back to the gateway token.
+    keys: list[str] = Field(default_factory=list)
+    # Browser origins allowed to call /v1; requests with any other Origin get 403.
+    cors_origins: list[str] = Field(default_factory=list)
 
 
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"  # Local-only by default; servers opt in to 0.0.0.0.
     port: int = 18790
+    # Overrides the generated <MIRA_HOME>/runtime/gateway-token; env MIRA_GATEWAY_TOKEN wins.
+    auth_token: str = ""
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
@@ -539,7 +578,7 @@ class PythonRuntimeConfig(Base):
     When ``manager == "uv"`` and ``auto_bootstrap`` is true, the exec tool
     creates a project-local ``.venv`` (configurable via ``venv_dir``) on the
     first python-related command and prepends it to PATH for every subsequent
-    subprocess. With ``manager == "off"`` (the default) the exec tool keeps
+    subprocess. With ``manager == "off"`` the exec tool keeps
     its legacy behaviour and resolves ``python`` against the parent process
     environment, leaving environment management entirely to the user.
 
@@ -549,7 +588,7 @@ class PythonRuntimeConfig(Base):
     # ``off`` keeps the historical behaviour. ``uv`` enables per-project venv
     # auto-bootstrap. ``system`` is reserved for a future passthrough mode
     # (no venv, but with explicit interpreter pinning).
-    manager: Literal["off", "uv", "system"] = "off"
+    manager: Literal["off", "uv", "system"] = "uv"
 
     # Whether to lazily create the project venv the first time the agent runs
     # a python-shaped command (python, pip, pytest, jupyter, ipython, uv).
@@ -574,9 +613,11 @@ class PythonRuntimeConfig(Base):
     baseline_requirements: list[str] = Field(default_factory=list)
 
     # Pinned interpreter version, e.g. ``3.11``, ``3.12``, ``3.11.10``.
-    # Empty means "let uv pick a compatible interpreter, downloading a
-    # standalone build if necessary".
-    python_version: str = ""
+    # Defaults to the project minimum so uv never picks an old system
+    # interpreter (e.g. macOS' 3.9) and can download a standalone build on
+    # hosts with no Python at all (typical Windows desktop install).
+    # Empty means "let uv pick any compatible interpreter".
+    python_version: str = "3.11"
 
     # Opt-in: when True and ``manager == "uv"``, the exec tool rewrites
     # ``pip install ...`` and ``python -m pip install ...`` into
@@ -595,6 +636,10 @@ class ExecToolConfig(Base):
     timeout: int = 60
     path_append: str = ""
     sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
+    sandbox_network: Literal["full", "none"] = "full"  # "none": no network inside the sandbox
+    # Extra host paths visible read-only inside the sandbox (e.g. a conda
+    # install). Paths inside the Mira home (config, tokens) are never mounted.
+    sandbox_read_only_paths: list[str] = Field(default_factory=list)
     python: PythonRuntimeConfig = Field(default_factory=PythonRuntimeConfig)
 
 
@@ -610,6 +655,15 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all tools; [] = no tools
 
+class KnowledgeConfig(Base):
+    """User-level knowledge bases (~/.mira/knowledge) searchable by the agent."""
+
+    enabled: bool = True
+    max_upload_mb: int = 200  # per uploaded file
+    max_code_files: int = 20000  # per code source (zip, directory or git repo)
+    max_file_kb: int = 1024  # code files larger than this are skipped
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -618,6 +672,7 @@ class ToolsConfig(Base):
     restrict_to_workspace: bool = False  # restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
 
 
 class Config(BaseSettings):
@@ -629,6 +684,14 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+
+    # The user's own values of settings the host policy overrides
+    # (security/host_policy.py), keyed by config.json path; save_config writes
+    # these instead of the enforced values.
+    _policy_user_values: dict[tuple[str, ...], Any] = PrivateAttr(default_factory=dict)
+    # What the Mira Server team layer changed (config/team_layer.py), so
+    # save_config can take it back out.
+    _team_values: Any = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _enable_channel_builtin_access(self) -> "Config":
@@ -670,6 +733,8 @@ class Config(BaseSettings):
         else:
             forced = self.agents.defaults.provider
         if forced != "auto":
+            if forced in self.providers.custom_providers:
+                return self.providers.custom_providers[forced], forced
             forced_normalized = _normalized_provider_name(forced)
             spec = find_by_name(forced_normalized or forced)
             if spec:

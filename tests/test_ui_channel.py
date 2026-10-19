@@ -110,6 +110,112 @@ def test_load_ui_instructions_joins_present_files(monkeypatch: pytest.MonkeyPatc
     assert _load_ui_instructions() == "alpha\n\n---\n\nbeta"
 
 
+@pytest.mark.asyncio
+async def test_turn_events_reach_client_and_track_active_turns(ui_channel):
+    ws = MagicMock(closed=False, send_json=AsyncMock())
+    ui_channel._clients["chat-test"] = ws
+    ui_channel._turn_event_sockets.add(ws)
+    request = SimpleNamespace(match_info={"session_id": "chat-test"})
+
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="chat-test", content="", metadata={
+        "_turn_event": "started", "turn_id": "t1", "workflow_run_id": "run-1", "project_dir": "/x",
+    }))
+    assert ws.send_json.call_args.args[0] == {
+        "type": "turn_started", "session_id": "chat-test", "content": "",
+        "metadata": {"turn_id": "t1", "workflow_run_id": "run-1"},
+    }
+    active = json.loads((await ui_channel._handle_active_turns(request)).text)["active"]
+    assert [(t["turn_id"], t["workflow_run_id"]) for t in active] == [("t1", "run-1")]
+
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="chat-test", content="", metadata={
+        "_turn_event": "finished", "turn_id": "t1", "workflow_run_id": "run-1",
+        "stop_reason": "max_iterations",
+    }))
+    assert ws.send_json.call_args.args[0]["type"] == "turn_finished"
+    assert ws.send_json.call_args.args[0]["metadata"]["stop_reason"] == "max_iterations"
+    assert json.loads((await ui_channel._handle_active_turns(request)).text)["active"] == []
+    # Lifecycle events are transient: nothing lands in the chat history log.
+    assert ui_channel._stream_buffers == {}
+
+
+@pytest.mark.asyncio
+async def test_turn_events_skip_clients_that_did_not_ask_but_turns_are_tracked(ui_channel):
+    ws = MagicMock(closed=False, send_json=AsyncMock())
+    ui_channel._clients["legacy"] = ws
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="legacy", content="", metadata={
+        "_turn_event": "started", "turn_id": "t3",
+    }))
+    ws.send_json.assert_not_called()
+    request = SimpleNamespace(match_info={"session_id": "legacy"})
+    assert [t["turn_id"] for t in json.loads((await ui_channel._handle_active_turns(request)).text)["active"]] == ["t3"]
+
+
+@pytest.mark.asyncio
+async def test_turn_finished_without_a_client_still_clears_the_turn(ui_channel):
+    for event in ("started", "finished"):
+        await ui_channel.send(OutboundMessage(channel="ui", chat_id="gone", content="", metadata={
+            "_turn_event": event, "turn_id": "t2",
+        }))
+    request = SimpleNamespace(match_info={"session_id": "gone"})
+    assert json.loads((await ui_channel._handle_active_turns(request)).text)["active"] == []
+
+
+@pytest.mark.asyncio
+async def test_skill_load_history_persist_stream_paginate_and_isolate(ui_channel):
+    from mira_engine.agent.skill_events import skill_loaded
+
+    ws = SimpleNamespace(closed=False, send_json=AsyncMock())
+    ui_channel._clients["chat-test"] = ws
+    for session_id, name in [("chat-test", "one"), ("other", "private"), ("chat-test", "two"), ("chat-test", "three")]:
+        await ui_channel.send(OutboundMessage(channel="ui", chat_id=session_id, content="", metadata={
+            "_audit_only": True, "_audit_event": "skill_loaded",
+            "_audit_details": skill_loaded(name, "manual"),
+            "workflow_module_type": "experiment", "workflow_run_id": "run-1",
+        }))
+    assert ws.send_json.call_count == 3
+    payload = ws.send_json.call_args.args[0]
+    assert payload["type"] == "skill_loaded"
+    assert payload["metadata"]["skill_event"]["module_type"] == "experiment"
+    assert payload["metadata"]["skill_event"]["run_id"] == "run-1"
+    # Disconnect: only persisted audit facts are used by the history endpoint.
+    ui_channel._clients.clear()
+    ui_channel._audit(source="agent", action="skill_invoked", session_id="chat-test", details={"skill_name": "failed"})
+    request = SimpleNamespace(match_info={"session_id": "chat-test"}, query={"limit": "2"})
+    first = json.loads((await ui_channel._handle_skill_history(request)).text)
+    assert [e["skill_name"] for e in first["events"]] == ["two", "three"]
+    request.query["cursor"] = str(first["next_cursor"])
+    second = json.loads((await ui_channel._handle_skill_history(request)).text)
+    assert [e["skill_name"] for e in second["events"]] == ["one"]
+    assert second["next_cursor"] is None
+    request.query["cursor"] = "-1"
+    assert (await ui_channel._handle_skill_history(request)).status == 400
+    request.match_info["session_id"] = "unknown"
+    request.query = {}
+    assert json.loads((await ui_channel._handle_skill_history(request)).text)["events"] == []
+
+
+async def test_token_usage_snapshot_and_side_effect_free_push(ui_channel):
+    from mira_engine.agent.token_usage import TokenUsageStore
+
+    snapshot = TokenUsageStore(ui_channel.workspace).record("chat-test", "", "model",
+        {"prompt_tokens": 120, "completion_tokens": 3, "total_tokens": 123, "cached_tokens": 100})
+    ws = SimpleNamespace(closed=False, send_json=AsyncMock())
+    ui_channel._clients["chat-test"] = ws
+    ui_channel._workflow_api.broadcast_activity = AsyncMock()
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="chat-test", content="", metadata={
+        "_usage_only": True, "token_usage": snapshot, "workflow_run_id": "run", "project_id": "project",
+    }))
+    assert ws.send_json.call_args.args[0]["type"] == "token_usage"
+    assert ws.send_json.call_args.args[0]["metadata"]["token_usage"] == snapshot
+    assert snapshot["cached_tokens"] == 100
+    assert snapshot["cache_reported_calls"] == 1
+    ui_channel._workflow_api.broadcast_activity.assert_not_called()
+    response = await ui_channel._handle_token_usage(SimpleNamespace(match_info={"session_id": "chat-test"}))
+    assert json.loads(response.text) == snapshot
+    response = await ui_channel._handle_token_usage(SimpleNamespace(match_info={"session_id": "other"}))
+    assert json.loads(response.text)["total_tokens"] == 0
+
+
 def test_load_ui_instructions_skips_missing_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(ui_channel_mod, "_ASSETS_DIR", tmp_path)
     (tmp_path / "AGENTS_UI.md").write_text("only", encoding="utf-8")
@@ -1863,6 +1969,63 @@ async def test_cors_is_preserved_for_http_errors(ui_channel: UiChannel) -> None:
     assert resp.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
 
 
+async def test_handle_list_project_files_returns_project_tree(ui_channel: UiChannel) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
+    project_dir.mkdir(parents=True)
+    (project_dir / "task_plan.json").write_text("{}", encoding="utf-8")
+    exp_dir = project_dir / "experiments" / "exp001"
+    exp_dir.mkdir(parents=True)
+    (exp_dir / "metrics.json").write_text("{}", encoding="utf-8")
+    internal = project_dir / ".mira" / "sessions"
+    internal.mkdir(parents=True)
+    (internal / "ui.jsonl").write_text("{}", encoding="utf-8")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+
+    resp = await ui_channel._handle_list_project_files(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    paths = {item["path"] for item in body["files"]}
+    assert "task_plan.json" in paths
+    assert "experiments/exp001/metrics.json" in paths
+    assert "ui.jsonl" not in paths
+    assert body["truncated"] is False
+
+
+async def test_handle_list_project_files_skips_links_outside_project(
+    ui_channel: UiChannel, tmp_path: Path,
+) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
+    (project_dir / "data").mkdir(parents=True)
+    (project_dir / "data" / "a.csv").write_text("x", encoding="utf-8")
+    (project_dir / "data" / "alias.csv").symlink_to(project_dir / "data" / "a.csv")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("x", encoding="utf-8")
+    (project_dir / "leak.txt").symlink_to(outside / "secret.txt")
+    (project_dir / "linked_dir").symlink_to(outside, target_is_directory=True)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+
+    body = json.loads((await ui_channel._handle_list_project_files(req)).text)
+    assert [item["path"] for item in body["files"]] == ["data/a.csv", "data/alias.csv"]
+
+
+def test_collect_project_file_entries_truncates_at_limit(tmp_path: Path) -> None:
+    for i in range(5):
+        (tmp_path / f"f{i}.txt").write_text("x", encoding="utf-8")
+
+    entries, truncated = ui_channel_mod._collect_project_file_entries(tmp_path, limit=3)
+    assert [e["path"] for e in entries] == ["f0.txt", "f1.txt", "f2.txt"]
+    assert truncated is True
+
+    entries, truncated = ui_channel_mod._collect_project_file_entries(tmp_path, limit=5)
+    assert len(entries) == 5
+    assert truncated is False
+
+
 async def test_handle_upload_project_files_invalid_multipart(ui_channel: UiChannel) -> None:
     req = MagicMock(spec=web.Request)
     req.match_info = {"session_id": "PRJ-0001"}
@@ -2217,6 +2380,46 @@ async def test_handle_project_artifact_serves_file(ui_channel: UiChannel) -> Non
     assert isinstance(resp, web.FileResponse)
     assert resp.status == 200
     assert Path(resp._path) == artifact
+
+
+async def test_handle_project_artifact_download_sets_attachment(ui_channel: UiChannel) -> None:
+    artifact = ui_channel.projects_root / "PRJ-0001" / "报告 v1.pdf"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"pdf")
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {"path": "报告 v1.pdf", "download": "1"}
+
+    resp = await ui_channel._handle_project_artifact(req)
+    assert isinstance(resp, web.FileResponse)
+    disposition = resp.headers["Content-Disposition"]
+    assert disposition.startswith('attachment; filename="__ v1.pdf"')
+    assert "filename*=UTF-8''%E6%8A%A5%E5%91%8A%20v1.pdf" in disposition
+
+
+async def test_handle_project_artifact_serves_editable_deck(ui_channel: UiChannel) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-0001"
+    deck = project_dir / "result" / "exports" / "slides.bento.html"
+    deck.parent.mkdir(parents=True)
+    deck.write_text(
+        '<html><script type="application/bento+json" id="bento-doc">'
+        '{"format": "bento/slides", "readonly": true}</script></html>',
+        encoding="utf-8",
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": "PRJ-0001"}
+    req.query = {"path": "result/exports/slides.bento.html"}
+    preview = await ui_channel._handle_project_artifact(req)
+    assert isinstance(preview, web.FileResponse)
+    assert "allow-same-origin" not in preview.headers["Content-Security-Policy"]
+
+    req.query = {"path": "result/exports/slides.bento.html", "mode": "edit"}
+    edit = await ui_channel._handle_project_artifact(req)
+    assert edit.status == 200
+    assert "readonly" not in edit.text
+    assert "connect-src data: blob:" in edit.headers["Content-Security-Policy"]
 
 
 async def test_handle_project_artifact_blocks_traversal(ui_channel: UiChannel, tmp_path: Path) -> None:
@@ -2574,6 +2777,28 @@ async def test_ws_handler_invalid_json_and_missing_session_id(
     await ui_channel._ws_handler(req)
     assert ws.sent[0]["content"] == "Invalid JSON"
     assert ws.sent[1]["content"] == "session_id required"
+
+
+@pytest.mark.parametrize(("query", "expected"), [({"turn_events": "1"}, True), ({}, False)])
+async def test_ws_handler_remembers_turn_event_support_while_open(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch, query: dict, expected: bool,
+) -> None:
+    ws = _FakeWs([_FakeWsMessage(web.WSMsgType.TEXT, json.dumps({
+        "type": "message", "session_id": "PRJ-4100", "content": "hi",
+    }))])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    seen: list[bool] = []
+
+    async def _record(**_kwargs: Any) -> None:
+        seen.append(ws in ui_channel._turn_event_sockets)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _record)
+    req = MagicMock(spec=web.Request)
+    req.query = query
+    await ui_channel._ws_handler(req)
+
+    assert seen == [expected]
+    assert ws not in ui_channel._turn_event_sockets
 
 
 async def test_ws_handler_message_and_set_mode_dispatch(
@@ -3025,3 +3250,155 @@ async def test_handle_provider_test_reports_failure(
     body = json.loads(resp.text)
     assert body["ok"] is False
     assert body["message"] == "unauthorized"
+
+
+async def test_handle_provider_models_and_test_accept_additional_custom_provider(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Config.model_validate(
+        {"providers": {"customProviders": {"custom_gw": {"name": "Gateway", "apiBase": "https://gw.example/v1"}}}}
+    )
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _path=None: config)
+    monkeypatch.setattr(ui_channel_mod, "read_model_cache", lambda *_a, **_k: None)
+
+    async def fake_fetch_to_cache(cfg, provider, cfg_path):
+        return _model_cache(provider), tmp_path / "models" / f"{provider}.json"
+
+    captured: dict[str, Any] = {}
+
+    async def fake_fetch(cfg, provider):
+        captured["provider"] = provider
+        captured["api_base"] = cfg.providers.custom_providers["custom_gw"].api_base
+        return _model_cache(provider)
+
+    monkeypatch.setattr(ui_channel_mod, "fetch_models_to_cache", fake_fetch_to_cache)
+    monkeypatch.setattr(ui_channel_mod, "fetch_provider_models", fake_fetch)
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "custom_gw"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+    assert resp.status == 200
+    assert json.loads(resp.text)["provider"] == "custom_gw"
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "custom_gw"}
+    req.json = AsyncMock(return_value={"api_base": "https://other.example/v1"})
+    resp = await ui_channel._handle_provider_test(req)
+    assert json.loads(resp.text)["ok"] is True
+    assert captured == {"provider": "custom_gw", "api_base": "https://other.example/v1"}
+
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"name": "custom_missing"}
+    req.query = {}
+    resp = await ui_channel._handle_provider_models(req)
+    assert resp.status == 400
+
+
+async def test_ws_handler_rejects_non_object_frames(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = _FakeWs([_FakeWsMessage(web.WSMsgType.TEXT, "[]"), _FakeWsMessage(web.WSMsgType.TEXT, '"x"')])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+    assert [item["content"] for item in ws.sent] == ["Invalid JSON", "Invalid JSON"]
+
+
+async def test_ws_handler_cleans_up_bound_client_when_loop_raises(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mira_engine.observability as observability
+
+    events: list[str] = []
+    monkeypatch.setattr(observability, "emit_event", lambda event, **_fields: events.append(event))
+
+    class _BrokenWs(_FakeWs):
+        def __aiter__(self):
+            async def _gen():
+                yield _FakeWsMessage(web.WSMsgType.TEXT, json.dumps({"type": "bind", "session_id": "s-1"}))
+                raise ConnectionResetError("peer reset")
+            return _gen()
+
+    ws = _BrokenWs([])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    with pytest.raises(ConnectionResetError):
+        await ui_channel._ws_handler(MagicMock(spec=web.Request))
+    assert "s-1" not in ui_channel._clients
+    assert events[-1] == "websocket.disconnected"
+
+
+def _write_host_policy(text: str) -> None:
+    from mira_engine.security import host_policy
+
+    host_policy.POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    host_policy.POLICY_PATH.write_text(text)
+    host_policy.reset_cache()
+
+
+async def test_host_policy_can_forbid_skill_plugin_install_and_uninstall(
+    ui_channel: UiChannel, tmp_path: Path
+) -> None:
+    _write_host_policy("[tools]\nplugin_install = false\n")
+    src = _create_plugin_source(tmp_path)
+    install_req = MagicMock(spec=web.Request)
+    install_req.match_info = {"session_id": "PRJ-0001"}
+    install_req.headers = {"Content-Type": "application/json"}
+    install_req.json = AsyncMock(return_value={"path": str(src)})
+    resp = await ui_channel._handle_skill_plugins_install(install_req)
+    assert resp.status == 403
+    assert json.loads(resp.text)["code"] == "locked_by_policy"
+
+    remove_req = MagicMock(spec=web.Request)
+    remove_req.match_info = {"session_id": "PRJ-0001", "plugin_id": "plugin-pack"}
+    resp = await ui_channel._handle_skill_plugins_uninstall(remove_req)
+    assert resp.status == 403
+
+
+async def test_config_and_status_report_the_host_policy(ui_channel: UiChannel) -> None:
+    _write_host_policy('[tools]\nrestrict_to_workspace = true\n[sandbox]\nmode = "bwrap"\n')
+    resp = await ui_channel._handle_get_config(MagicMock(spec=web.Request))
+    policy = json.loads(resp.text)["policy"]
+    assert policy["locked"] == ["tools.restrictToWorkspace", "tools.exec.sandbox"]
+    assert policy["source"].endswith("policy.toml")
+
+    resp = await ui_channel._handle_status(MagicMock(spec=web.Request))
+    body = json.loads(resp.text)
+    assert body["policy"]["locked"] == policy["locked"]
+    assert body["sandbox"]["mode"] == "bwrap"
+    assert isinstance(body["sandbox"]["available"], bool)
+
+
+async def test_config_update_cannot_turn_off_an_enforced_setting(ui_channel: UiChannel) -> None:
+    _write_host_policy("[tools]\nrestrict_to_workspace = true\n")
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"runtime": {"restrict_to_workspace": False}})
+    resp = await ui_channel._handle_config(req)
+    assert resp.status == 403
+    assert json.loads(resp.text)["code"] == "locked_by_policy"
+
+
+async def test_handle_project_knowledge_attaches_existing_bases(ui_channel: UiChannel) -> None:
+    project_dir = ui_channel.projects_root / "PRJ-KB"
+    project_dir.mkdir(parents=True)
+    kb = ui_channel._knowledge.store.create("Specs")
+
+    def request(method: str, body: object = None) -> MagicMock:
+        req = MagicMock(spec=web.Request)
+        req.method = method
+        req.match_info = {"session_id": "PRJ-KB"}
+        req.json = AsyncMock(return_value=body)
+        return req
+
+    resp = await ui_channel._handle_project_knowledge(request("PUT", {"knowledge_bases": ["kb_000000000000"]}))
+    assert resp.status == 400
+
+    resp = await ui_channel._handle_project_knowledge(request("PUT", {"knowledge_bases": [kb.id, kb.id]}))
+    assert resp.status == 200
+    assert json.loads(resp.text)["knowledge_bases"] == [kb.id]
+    meta = json.loads((project_dir / ".mira" / "project.json").read_text(encoding="utf-8"))
+    assert meta["knowledge_bases"] == [kb.id]
+
+    resp = await ui_channel._handle_project_knowledge(request("GET"))
+    assert json.loads(resp.text)["knowledge_bases"] == [kb.id]

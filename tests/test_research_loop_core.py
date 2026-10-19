@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from mira_engine.agent.base_loop import BaseAgentLoop
 from mira_engine.agent.context import ContextBuilder
 from mira_engine.agent.research_loop import ResearchAgentLoop
@@ -803,6 +805,8 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     out = await loop._process_message(msg, on_progress=_progress)
     assert out.content == "round-2"
     intermediate = await loop.bus.consume_outbound()
+    while intermediate.metadata.get("_audit_only"):
+        intermediate = await loop.bus.consume_outbound()
     assert intermediate.channel == "ui"
     assert intermediate.chat_id == "PRJ-5"
     assert intermediate.content == "round-1"
@@ -813,6 +817,40 @@ async def test_process_message_auto_continue_round(monkeypatch, tmp_path: Path) 
     assert any(
         "auto-run stop reason: queue exhausted" in item for item in progress_events
     )
+
+
+@pytest.mark.parametrize(
+    ("max_rounds", "final_decision", "expected"),
+    [
+        (1, (False, "max rounds reached (1)"), "budget_exceeded"),
+        (100, (False, "queue exhausted, no replan condition met"), "completed"),
+    ],
+)
+async def test_auto_run_reports_round_limit_as_budget_exceeded(
+    monkeypatch, tmp_path: Path, max_rounds, final_decision, expected,
+) -> None:
+    from mira_engine.agent.base_loop import TURN_COMPLETED, _turn_stop_reason, set_turn_stop_reason
+
+    loop = _make_real_loop(tmp_path)
+    loop._auto_max_rounds = max_rounds
+    decisions = iter([(True, None), final_decision])
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        set_turn_stop_reason(TURN_COMPLETED)
+        return "round", [], messages + [{"role": "assistant", "content": "round"}]
+
+    async def _progress(_msg: str) -> None:
+        return None
+
+    monkeypatch.setattr(loop, "_evaluate_continuation", lambda **_kw: next(decisions))
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+    msg = InboundMessage(
+        channel="ui", sender_id="u", chat_id="PRJ-6", content="go",
+        metadata={"run_mode": "auto", "project_dir": str(tmp_path / "PRJ-6")},
+    )
+    await loop._process_message(msg, on_progress=_progress)
+
+    assert _turn_stop_reason.get() == expected
 
 
 async def test_process_message_auto_continue_round_non_ui_channel(

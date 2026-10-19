@@ -12,6 +12,7 @@ from litellm import acompletion
 from loguru import logger
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.usage import extract_usage
 from mira_engine.providers.registry import find_by_model, find_gateway, model_overrides_for
 
 # Standard chat-completion message keys.
@@ -364,13 +365,7 @@ class LiteLLMProvider(LLMProvider):
                 arguments=args,
             ))
 
-        usage = {}
-        if hasattr(response, "usage") and response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
+        usage = extract_usage(response)
 
         reasoning_content = self._message_value(message, "reasoning_content") or None
         if not reasoning_content:

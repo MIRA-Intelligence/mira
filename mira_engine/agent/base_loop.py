@@ -19,24 +19,31 @@ import inspect
 import json
 import re
 import time
+import uuid
 import weakref
-from contextlib import AsyncExitStack, suppress
+from contextlib import AsyncExitStack, nullcontext, suppress
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from mira_engine.observability import correlation_id, diagnostic_context, emit_event, opaque_ref
+
 from mira_engine.agent.context import ContextBuilder
+from mira_engine.agent.token_usage import record_token_usage, track_token_usage
 from mira_engine.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from mira_engine.agent.memory import Consolidator, Dream, MemoryStore
 from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
 from mira_engine.agent.routing import RoutedProviderManager
 from mira_engine.agent.runner import AgentRunner
+from mira_engine.agent.skill_events import skill_loaded, skill_read_details
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
 from mira_engine.agent.tools.consult import ConsultRoleTool
 from mira_engine.agent.tools.cron import CronTool
+from mira_engine.agent.tools.knowledge import KnowledgeReadTool, KnowledgeScope, KnowledgeSearchTool
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
@@ -64,12 +71,38 @@ from mira_engine.modules.tools import (
 from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
+from mira_engine.utils.helpers import normalize_citations
 
 if TYPE_CHECKING:
-    from mira_engine.config.schema import ChannelsConfig, ExecToolConfig
+    from mira_engine.config.schema import ChannelsConfig, ExecToolConfig, KnowledgeConfig
     from mira_engine.cron.service import CronService
 
 UNIFIED_SESSION_KEY = "unified:default"
+
+# Whether the last _run_agent_loop in this task ended on text the model streamed.
+# Synthesized endings (iteration limit, stop guards, errors) are never streamed,
+# so the dispatcher must still publish them or the client keeps waiting.
+_final_content_streamed: ContextVar[bool] = ContextVar("mira_final_content_streamed", default=False)
+
+# Why the current turn ended, reported to the UI in its turn_finished event so
+# the client never has to infer the end of a turn from message text.
+TURN_COMPLETED = "completed"
+TURN_MAX_ITERATIONS = "max_iterations"
+TURN_MAX_TOKENS = "max_tokens"
+TURN_WAITING_INPUT = "waiting_input"
+TURN_BUDGET_EXCEEDED = "budget_exceeded"
+TURN_STOPPED = "stopped"
+TURN_ERROR = "error"
+_turn_stop_reason: ContextVar[str] = ContextVar("mira_turn_stop_reason", default=TURN_COMPLETED)
+
+
+# reconfigure_runtime: leave this setting as it is.
+_KEEP: Any = object()
+
+
+def set_turn_stop_reason(reason: str) -> None:
+    """Record why the turn running in this task ended (last writer wins)."""
+    _turn_stop_reason.set(reason)
 
 
 class BaseAgentLoop:
@@ -110,6 +143,7 @@ class BaseAgentLoop:
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        knowledge_config: KnowledgeConfig | None = None,
         cron_service: CronService | None = None,
         timezone: str | None = None,
         restrict_to_workspace: bool = False,
@@ -123,7 +157,7 @@ class BaseAgentLoop:
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
     ):
-        from mira_engine.config.schema import ExecToolConfig
+        from mira_engine.config.schema import ExecToolConfig, KnowledgeConfig
         self.bus = bus
         self.channels_config = channels_config
         self.provider_factory = provider_factory
@@ -141,6 +175,8 @@ class BaseAgentLoop:
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.knowledge_config = knowledge_config or KnowledgeConfig()
+        self._knowledge_scope: KnowledgeScope | None = None
         self.cron_service = cron_service
         self.timezone = timezone
         self.restrict_to_workspace = restrict_to_workspace
@@ -184,6 +220,9 @@ class BaseAgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._last_loop_tokens_used: int = 0
         self._processing_lock = asyncio.Lock()
+        # Runtime swap saved while a turn held the lock; applied when it ends.
+        self._pending_runtime_swap: Callable[[], Awaitable[None]] | None = None
+        self._runtime_swap_task: asyncio.Task[None] | None = None
         # Shared registry for `exec(background=true)` jobs. Lives for the whole
         # loop lifetime so the agent can monitor jobs across many iterations,
         # and is drained on shutdown so we don't leak processes.
@@ -254,98 +293,174 @@ class BaseAgentLoop:
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        knowledge_config: KnowledgeConfig | None = None,
         timezone: str | None = None,
         channels_config: ChannelsConfig | None = None,
         context_window_tokens: int | None = None,
+        temperature: float | None | object = _KEEP,
+        auto_max_rounds: int | None = None,
     ) -> None:
-        """Apply UI-saved runtime config to the live agent loop."""
-        async with self._processing_lock:
-            next_workspace = workspace.expanduser()
-            workspace_changed = next_workspace != self.workspace
+        """Apply UI-saved runtime config to the live agent loop.
 
-            if self._mcp_stack:
+        Limits (iterations, tokens, reasoning, temperature, auto rounds) take
+        effect at once, even mid-turn: the loop reads them on every LLM call.
+        Swapping the provider, workspace, tools and MCP connections waits for
+        the running turn, but in the background, so saving settings never
+        blocks behind a long turn.
+        """
+        self._apply_runtime_limits(
+            max_iterations=max_iterations,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            temperature=temperature,
+            auto_max_rounds=auto_max_rounds,
+        )
+
+        async def _swap() -> None:
+            await self._swap_runtime(
+                provider=provider,
+                model=model,
+                provider_factory=provider_factory,
+                model_candidates=model_candidates,
+                role_provider_factory=role_provider_factory,
+                workspace=workspace,
+                restrict_to_workspace=restrict_to_workspace,
+                brave_api_key=brave_api_key,
+                web_proxy=web_proxy,
+                exec_config=exec_config,
+                knowledge_config=knowledge_config,
+                timezone=timezone,
+                channels_config=channels_config,
+                context_window_tokens=context_window_tokens,
+            )
+
+        idle = not self._processing_lock.locked() and (
+            self._runtime_swap_task is None or self._runtime_swap_task.done()
+        )
+        if idle:
+            # Nothing running: swap now, so errors reach the caller as before.
+            self._pending_runtime_swap = None
+            async with self._processing_lock:
+                await _swap()
+            return
+        # Newest settings win if several saves arrive during one turn.
+        self._pending_runtime_swap = _swap
+        if self._runtime_swap_task is None or self._runtime_swap_task.done():
+            self._runtime_swap_task = asyncio.create_task(self._apply_pending_runtime_swap())
+        logger.info("Runtime limits applied; provider/workspace swap deferred until the current turn ends")
+
+    def _apply_runtime_limits(
+        self,
+        *,
+        max_iterations: int,
+        max_tokens: int,
+        reasoning_effort: str | None,
+        temperature: float | None | object = _KEEP,
+        auto_max_rounds: int | None = None,  # used by ResearchAgentLoop
+    ) -> None:
+        """Knobs the loop reads on every call, so changing them mid-turn is safe."""
+        self.max_iterations = max_iterations
+        self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
+        if temperature is not _KEEP:
+            self.temperature = temperature
+        subagents = getattr(self, "subagents", None)
+        if subagents is not None:
+            subagents.temperature = self.temperature
+            subagents.max_tokens = self.max_tokens
+            subagents.reasoning_effort = self.reasoning_effort
+
+    async def _apply_pending_runtime_swap(self) -> None:
+        while self._pending_runtime_swap is not None:
+            async with self._processing_lock:
+                swap, self._pending_runtime_swap = self._pending_runtime_swap, None
+                if swap is None:
+                    continue
                 try:
-                    await self._mcp_stack.aclose()
-                finally:
-                    self._mcp_stack = None
-                    self._mcp_connected = False
-                    self._mcp_connecting = False
+                    await swap()
+                except Exception:
+                    # Deferred: no caller is waiting to receive the error.
+                    logger.exception("Failed to apply the deferred runtime config update")
 
-            self.provider = provider
-            self.model = model or provider.get_default_model()
-            self.provider_factory = provider_factory
-            self.model_candidates = list(model_candidates) if model_candidates else None
-            self.role_provider_factory = role_provider_factory
-            self.workspace = next_workspace
-            self.max_iterations = max_iterations
-            self.max_tokens = max_tokens
-            self.reasoning_effort = reasoning_effort
-            self.brave_api_key = brave_api_key
-            self.web_proxy = web_proxy
-            if exec_config is not None:
-                self.exec_config = exec_config
-            self.timezone = timezone
-            self.restrict_to_workspace = restrict_to_workspace
-            if channels_config is not None:
-                self.channels_config = channels_config
-            if context_window_tokens is not None:
-                self.context_window_tokens = context_window_tokens
+    async def _swap_runtime(
+        self,
+        *,
+        provider: LLMProvider,
+        model: str,
+        provider_factory: Callable[[str], LLMProvider] | None,
+        model_candidates: list[str] | None,
+        role_provider_factory: "Callable[[str], tuple[LLMProvider, str, tuple[str, ...]]] | None",
+        workspace: Path,
+        restrict_to_workspace: bool,
+        brave_api_key: str | None,
+        web_proxy: str | None,
+        exec_config: ExecToolConfig | None,
+        knowledge_config: KnowledgeConfig | None,
+        timezone: str | None,
+        channels_config: ChannelsConfig | None,
+        context_window_tokens: int | None,
+    ) -> None:
+        """Replace provider, workspace, tools and MCP connections (caller holds the lock)."""
+        next_workspace = workspace.expanduser()
+        workspace_changed = next_workspace != self.workspace
 
-            if workspace_changed:
-                self.context = ContextBuilder(next_workspace)
-                self.sessions = SessionManager(next_workspace)
-                self._project_sessions.clear()
+        if self._mcp_stack:
+            try:
+                await self._mcp_stack.aclose()
+            finally:
+                self._mcp_stack = None
+                self._mcp_connected = False
+                self._mcp_connecting = False
 
-            self._session_model_runtimes.clear()
+        self.provider = provider
+        self.model = model or provider.get_default_model()
+        self.provider_factory = provider_factory
+        self.model_candidates = list(model_candidates) if model_candidates else None
+        self.role_provider_factory = role_provider_factory
+        self.workspace = next_workspace
+        self.brave_api_key = brave_api_key
+        self.web_proxy = web_proxy
+        if exec_config is not None:
+            self.exec_config = exec_config
+        if knowledge_config is not None:
+            self.knowledge_config = knowledge_config
+        self.timezone = timezone
+        self.restrict_to_workspace = restrict_to_workspace
+        if channels_config is not None:
+            self.channels_config = channels_config
+        if context_window_tokens is not None:
+            self.context_window_tokens = context_window_tokens
 
-            self.subagents.provider = provider
-            self.subagents.model = self.model
-            self.subagents.workspace = next_workspace
-            self.subagents.temperature = self.temperature
-            self.subagents.max_tokens = self.max_tokens
-            self.subagents.reasoning_effort = self.reasoning_effort
-            self.subagents.brave_api_key = self.brave_api_key
-            self.subagents.web_proxy = self.web_proxy
-            self.subagents.exec_config = self.exec_config
-            self.subagents.restrict_to_workspace = self.restrict_to_workspace
-            self.subagents.provider_factory = provider_factory
-            self.subagents.model_candidates = self.model_candidates
-            self.subagents.role_provider_factory = role_provider_factory
-            self.subagents.runner = AgentRunner(provider)
-            self.subagents._session_runtimes.clear()
+        if workspace_changed:
+            self.context = ContextBuilder(next_workspace)
+            self.sessions = SessionManager(next_workspace)
+            self._project_sessions.clear()
 
-            self.tools = ToolRegistry()
-            self._register_default_tools()
-            self._rebuild_memory_helpers()
+        self._session_model_runtimes.clear()
 
-            logger.info("Agent runtime reconfigured: model={}, workspace={}", self.model, self.workspace)
+        self.subagents.provider = provider
+        self.subagents.model = self.model
+        self.subagents.workspace = next_workspace
+        self.subagents.brave_api_key = self.brave_api_key
+        self.subagents.web_proxy = self.web_proxy
+        self.subagents.exec_config = self.exec_config
+        self.subagents.restrict_to_workspace = self.restrict_to_workspace
+        self.subagents.provider_factory = provider_factory
+        self.subagents.model_candidates = self.model_candidates
+        self.subagents.role_provider_factory = role_provider_factory
+        self.subagents.runner = AgentRunner(provider)
+        self.subagents._session_runtimes.clear()
+
+        self.tools = ToolRegistry()
+        self._register_default_tools()
+        self._rebuild_memory_helpers()
+
+        logger.info("Agent runtime reconfigured: model={}, workspace={}", self.model, self.workspace)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        skill_access_dirs: list[Path] = []
-        if self.restrict_to_workspace:
-            from mira_engine.agent.skills import SkillsLoader
-
-            def _add_skill_dir(path: Path) -> None:
-                try:
-                    resolved = path.resolve()
-                except Exception:
-                    return
-                if resolved != self.workspace and resolved not in skill_access_dirs:
-                    skill_access_dirs.append(resolved)
-
-            skills_loader = SkillsLoader(self.workspace)
-            for root in skills_loader.workspace_skills_roots:
-                _add_skill_dir(root)
-            if skills_loader.builtin_skills:
-                _add_skill_dir(skills_loader.builtin_skills)
-            for skill in skills_loader.list_skills(filter_unavailable=False):
-                skill_path = Path(skill["path"])
-                _add_skill_dir(skill_path.parent)
-                parent = skill_path.parent.parent
-                if parent != skill_path.parent:
-                    _add_skill_dir(parent)
+        skill_access_dirs = self._skill_access_dirs_for_workspace(self.workspace)
 
         supports_vision = self.provider.supports_vision(self.model)
         self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs, supports_vision=supports_vision))
@@ -372,6 +487,10 @@ class BaseAgentLoop:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
+                sandbox=self.exec_config.sandbox or None,
+                sandbox_network=self.exec_config.sandbox_network,
+                sandbox_read_only_paths=self.exec_config.sandbox_read_only_paths,
+                sandbox_extra_dirs=skill_access_dirs,
                 background_registry=self._bg_registry,
                 enable_background=True,
                 python_runtime=self.exec_config.python,
@@ -380,6 +499,10 @@ class BaseAgentLoop:
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(PubMedSearchTool(proxy=self.web_proxy))
+        self._knowledge_scope = KnowledgeScope() if self.knowledge_config.enabled else None
+        if self._knowledge_scope is not None:
+            self.tools.register(KnowledgeSearchTool(self._knowledge_scope))
+            self.tools.register(KnowledgeReadTool(self._knowledge_scope))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SetPlanTool())
         self.tools.register(WorkflowInteractionTool())
@@ -395,9 +518,11 @@ class BaseAgentLoop:
             self.tools.register(cron_tool)
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
-        skill_access_dirs: list[Path] = []
-        if not self.restrict_to_workspace:
-            return skill_access_dirs
+        if not (self.restrict_to_workspace or self.exec_config.sandbox):
+            return []
+        from mira_engine.agent.skills import skill_access_dirs
+
+        return skill_access_dirs(workspace)
 
         from mira_engine.agent.skills import SkillsLoader
 
@@ -568,12 +693,12 @@ class BaseAgentLoop:
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
-        """Remove <think>…</think> blocks that some models embed in content."""
+        """Remove <think>…</think> blocks and normalize native citation markup."""
         if not text:
             return None
         cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
         cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
-        return cleaned.strip() or None
+        return normalize_citations(cleaned).strip() or None
 
     @staticmethod
     async def _emit_activity_ping(on_progress: Callable[..., Awaitable[None]]) -> None:
@@ -687,6 +812,19 @@ class BaseAgentLoop:
         sections = [chunk for chunk in (python_hint, base, notice) if chunk]
         return "\n\n".join(sections) if sections else None
 
+    def _with_knowledge(
+        self,
+        extra_system: str | None,
+        meta: dict[str, Any],
+        project_ref: ProjectRef | None,
+    ) -> str | None:
+        """Scope the kb tools to this turn's knowledge bases and describe them."""
+        scope = self._knowledge_scope
+        if scope is None:
+            return extra_system
+        section = scope.begin_turn(meta, project_ref.project_dir if project_ref else None)
+        return "\n\n".join(part for part in (extra_system, section) if part) or None
+
     def _get_model_runtime(self, session_key: str, *, role: str | None = None) -> RoutedProviderManager:
         """Return the session-local model runtime, creating it on demand."""
         if role and self.role_provider_factory is not None:
@@ -731,6 +869,8 @@ class BaseAgentLoop:
         active_route = None
         loop_tokens_used = 0
         hook = getattr(self, "_hook", None)
+        _final_content_streamed.set(False)
+        set_turn_stop_reason(TURN_COMPLETED)
 
         while iteration < self.max_iterations:
             if turn_stop_guard is not None:
@@ -738,11 +878,13 @@ class BaseAgentLoop:
                 if stop_message is not None:
                     final_content = stop_message
                     messages = self.context.add_assistant_message(messages, stop_message)
+                    set_turn_stop_reason(TURN_WAITING_INPUT)
                     break
             hook_ctx = AgentHookContext(iteration=iteration, messages=messages)
             if hook:
                 await hook.before_iteration(hook_ctx)
             iteration += 1
+            iteration_streamed = False
 
             use_routed_runtime = model_runtime is not None and (
                 self.provider_factory is not None or self.role_provider_factory is not None
@@ -779,6 +921,7 @@ class BaseAgentLoop:
                         on_content_delta=_stream_delta,
                     )
                     clean_streamed = self._strip_think(streamed_raw)
+                    iteration_streamed = bool(clean_streamed)
                     if response.content and clean_streamed:
                         response.content = clean_streamed
                     if on_stream_end:
@@ -827,6 +970,7 @@ class BaseAgentLoop:
                         on_content_delta=_stream_delta,
                     )
                     clean_streamed = self._strip_think(streamed_raw)
+                    iteration_streamed = bool(clean_streamed)
                     if response.content and clean_streamed:
                         response.content = clean_streamed
                     if on_stream_end:
@@ -840,6 +984,7 @@ class BaseAgentLoop:
                         max_tokens=self.max_tokens,
                         reasoning_effort=self.reasoning_effort,
                     )
+            await record_token_usage(response.usage, getattr(active_route, "model", None) or self.model)
             if isinstance(response.usage, dict):
                 self._last_usage = {
                     "prompt_tokens": int(response.usage.get("prompt_tokens", 0) or 0),
@@ -882,8 +1027,9 @@ class BaseAgentLoop:
 
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                    logger.info("Tool call: {} (arguments omitted)", tool_call.name)
+                    tool_started = time.monotonic()
+                    emit_event("tool.started", tool=tool_call.name)
                     if audit_hook:
                         skill_event = self._build_skill_invoked_event(
                             tool_name=tool_call.name,
@@ -895,8 +1041,20 @@ class BaseAgentLoop:
                     if on_progress:
                         ping_task = asyncio.create_task(self._activity_ping_loop(on_progress))
                     try:
-                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                        manager = getattr(self, "subagents", None)
+                        scope = manager.skill_audit_scope(audit_hook) if manager is not None else nullcontext()
+                        with scope:
+                            result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    except asyncio.CancelledError:
+                        # /stop and shutdown cancel tools; they are not tool failures.
+                        emit_event("tool.cancelled", tool=tool_call.name)
+                        raise
+                    except BaseException as exc:
+                        emit_event("tool.failed", level="ERROR", tool=tool_call.name, exception=exc)
+                        raise
                     finally:
+                        emit_event("tool.finished", tool=tool_call.name,
+                                   duration_ms=round((time.monotonic() - tool_started) * 1000, 2))
                         if ping_task is not None:
                             ping_task.cancel()
                             with suppress(asyncio.CancelledError):
@@ -904,6 +1062,10 @@ class BaseAgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    if audit_hook:
+                        loaded_event = skill_read_details(tool_call.name, tool_call.arguments, result)
+                        if loaded_event:
+                            await audit_hook(loaded_event)
                     hook_ctx.tool_results.append(result)
                     hook_ctx.tool_events.append(
                         {"name": tool_call.name, "status": "ok", "detail": str(result)}
@@ -915,6 +1077,7 @@ class BaseAgentLoop:
                     if stop_message is not None:
                         final_content = stop_message
                         messages = self.context.add_assistant_message(messages, stop_message)
+                        set_turn_stop_reason(TURN_WAITING_INPUT)
                         hook_ctx.final_content = stop_message
                         hook_ctx.stop_reason = "durable_boundary"
                         if hook:
@@ -923,7 +1086,8 @@ class BaseAgentLoop:
             else:
                 clean = self._strip_think(response.content)
                 if response.finish_reason == "error":
-                    logger.error("LLM returned error: {}", (clean or "")[:200])
+                    logger.error("LLM returned an error (response content omitted)")
+                    emit_event("provider.failed", level="ERROR", reason="error_finish_reason")
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     # Save a neutral placeholder so the session doesn't end
                     # with an orphaned user message (consecutive users cause
@@ -931,6 +1095,7 @@ class BaseAgentLoop:
                     messages = self.context.add_assistant_message(
                         messages, "(error — see previous log)"
                     )
+                    set_turn_stop_reason(TURN_ERROR)
                     hook_ctx.final_content = final_content
                     hook_ctx.stop_reason = "error"
                     if hook:
@@ -963,6 +1128,11 @@ class BaseAgentLoop:
                             await hook.after_iteration(hook_ctx)
                         continue
                 final_content = clean
+                _final_content_streamed.set(iteration_streamed)
+                # "length": the reply was cut off by the output token limit.
+                set_turn_stop_reason(
+                    TURN_MAX_TOKENS if response.finish_reason == "length" else TURN_COMPLETED
+                )
                 hook_ctx.final_content = final_content
                 hook_ctx.stop_reason = "completed"
                 if hook:
@@ -975,9 +1145,14 @@ class BaseAgentLoop:
         if final_content is None and iteration >= self.max_iterations:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             final_content = (
-                f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
-                "without completing the task. You can try breaking the task into smaller steps."
+                f"I stopped before finishing: this turn reached the limit of "
+                f"{self.max_iterations} tool calls. Reply \"continue\" and I will pick up "
+                "where I left off, or break the task into smaller steps."
             )
+            # Close the turn in the transcript too, so the saved session does not
+            # end on a bare tool result and the next message reads as a follow-up.
+            messages = self.context.add_assistant_message(messages, final_content)
+            set_turn_stop_reason(TURN_MAX_ITERATIONS)
 
         self._last_loop_tokens_used = loop_tokens_used
         return final_content, tools_used, messages
@@ -1107,6 +1282,15 @@ class BaseAgentLoop:
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
+        metadata = msg.metadata or {}
+        # /stop bypasses _dispatch, so it needs its own correlation scope.
+        with diagnostic_context(request_id=correlation_id(metadata.get("_diagnostic_request_id")),
+                                session_ref=opaque_ref(msg.session_key), channel=msg.channel):
+            emit_event("agent.stop.requested")
+            total = await self._handle_stop_with_context(msg)
+            emit_event("agent.stop.completed", count=total)
+
+    async def _handle_stop_with_context(self, msg: InboundMessage) -> int:
         project_ref = self._project_ref_from_metadata(msg.metadata)
         raw_key = (
             UNIFIED_SESSION_KEY
@@ -1131,6 +1315,7 @@ class BaseAgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=content,
             metadata=metadata,
         ))
+        return total
 
     async def _cancel_session_work(self, scoped_key: str) -> tuple[int, int, int]:
         """Cancel agent, subagent and background work owned by a session."""
@@ -1149,12 +1334,65 @@ class BaseAgentLoop:
         return cancelled, sub_cancelled, background_cancelled
 
     async def _dispatch(self, msg: InboundMessage) -> None:
+        metadata = msg.metadata or {}
+        request_id = correlation_id(metadata.get("_diagnostic_request_id"))
+        started = time.monotonic()
+        with diagnostic_context(request_id=request_id, run_id=correlation_id(),
+                                session_ref=opaque_ref(msg.session_key), channel=msg.channel,
+                                workflow_run_id=metadata.get("workflow_run_id")):
+            emit_event("agent.dispatch.started")
+            # Only the UI renders turn state; other channels would print the
+            # empty lifecycle messages.
+            lifecycle = msg.channel == "ui"
+            turn_id = metadata.get("turn_id") if isinstance(metadata.get("turn_id"), str) else None
+            turn_id = turn_id or f"turn-{uuid.uuid4().hex[:12]}"
+            if lifecycle:
+                await self._publish_turn_event(msg, turn_id, "started")
+            set_turn_stop_reason(TURN_COMPLETED)
+            stop_reason: str | None = None
+            try:
+                await self._dispatch_with_context(msg)
+            except asyncio.CancelledError:
+                stop_reason = TURN_STOPPED
+                emit_event("agent.dispatch.cancelled")
+                raise
+            except Exception as exc:
+                stop_reason = TURN_ERROR
+                emit_event("agent.dispatch.failed", level="ERROR", exception=exc)
+                raise
+            finally:
+                emit_event("agent.dispatch.finished",
+                           duration_ms=round((time.monotonic() - started) * 1000, 2))
+                # Exactly one turn_finished per turn, however it ended, so the
+                # client never keeps a "thinking" state for a finished turn.
+                if lifecycle:
+                    await self._publish_turn_event(
+                        msg, turn_id, "finished", stop_reason or _turn_stop_reason.get(),
+                    )
+
+    async def _publish_turn_event(
+        self,
+        msg: InboundMessage,
+        turn_id: str,
+        event: str,
+        stop_reason: str | None = None,
+    ) -> None:
+        metadata = dict(msg.metadata or {})
+        metadata.update({"_turn_event": event, "turn_id": turn_id})
+        if stop_reason is not None:
+            metadata["stop_reason"] = stop_reason
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content="", metadata=metadata,
+        ))
+
+    async def _dispatch_with_context(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
         if getattr(self, "_unified_session", False) and not msg.session_key_override:
             msg.session_key_override = UNIFIED_SESSION_KEY
 
         if bool((msg.metadata or {}).get("_wants_stream")):
             stream_meta = dict(msg.metadata or {})
+            _final_content_streamed.set(False)
             streamed_any = False
             fallback_prefix = "MIRA_SKILL_FALLBACK_REQUIRED:"
             inspect_fallback_prefix = bool(stream_meta.get("selected_skill_ids"))
@@ -1224,11 +1462,12 @@ class BaseAgentLoop:
                 response = await self._process_message(
                     msg, on_stream=_on_stream, on_stream_end=_on_stream_end
                 )
-                # Fallback: if the runtime never streamed (e.g. routed provider
-                # without token streaming), the deltas/end markers carry no
-                # content, so publish the final response normally so the client
-                # still receives the answer.
-                if not streamed_any and response is not None:
+                # Publish the final response unless its text already reached the
+                # client as deltas: the runtime may never have streamed (e.g. a
+                # routed provider without token streaming), or the turn ended
+                # on text the model never produced (iteration limit, a stop
+                # guard, an error), and without it the client keeps "thinking".
+                if response is not None and (not streamed_any or not _final_content_streamed.get()):
                     await self.bus.publish_outbound(response)
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
@@ -1239,6 +1478,8 @@ class BaseAgentLoop:
                 raise asyncio.CancelledError() from None
             except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                emit_event("agent.turn.failed", level="ERROR", exception=exc)
+                set_turn_stop_reason(TURN_ERROR)
                 await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
             return
         async with self._processing_lock:
@@ -1260,6 +1501,8 @@ class BaseAgentLoop:
                 raise asyncio.CancelledError() from None
             except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                emit_event("agent.turn.failed", level="ERROR", exception=exc)
+                set_turn_stop_reason(TURN_ERROR)
                 await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
 
     async def _warm_skill_scan_cache(self) -> None:
@@ -1306,6 +1549,7 @@ class BaseAgentLoop:
         self._session_model_runtimes.pop(session_key, None)
         self._session_model_runtimes.pop(f"{session_key}:role:supervisor", None)
 
+    @track_token_usage
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1356,8 +1600,7 @@ class BaseAgentLoop:
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Processing message on {} (content length={})", msg.channel, len(msg.content))
 
         meta = msg.metadata or {}
         project_ref = self._project_ref_from_metadata(meta)
@@ -1464,6 +1707,7 @@ class BaseAgentLoop:
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
         )
+        extra_system = self._with_knowledge(extra_system, meta, project_ref)
 
         raw_selected_skills = meta.get("selected_skill_ids")
         selected_skills = [
@@ -1480,7 +1724,7 @@ class BaseAgentLoop:
             limit=3,
         )
         active_skills: list[str] = []
-        for name in [*selected_skills, *suggested_skills, *recent_skill_names]:
+        for name in [*selected_skills, *suggested_skills]:
             if name not in active_skills:
                 active_skills.append(name)
         active_skills = active_skills[:8]
@@ -1519,10 +1763,12 @@ class BaseAgentLoop:
             extra_system = skill_hint + "\n\n" + extra_system if skill_hint else extra_system
         else:
             extra_system = skill_hint or None
+        loaded_skills: list[str] = []
         initial_messages = ctx.build_messages(
             history=history,
             current_message=msg.content,
             skill_names=active_skills or None,
+            loaded_skills=loaded_skills,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
@@ -1546,17 +1792,23 @@ class BaseAgentLoop:
 
         progress_cb = on_progress or _bus_progress
         current_turn_skills: set[str] = set()
+        loaded_this_turn: set[tuple[str | None, str]] = set()
         audit_cb = None
         emit_audit_to_channel = msg.channel == "ui" or bool(meta.get("_emit_skill_audit"))
         if emit_audit_to_channel or audit_hook:
             async def _audit(details: dict[str, Any]) -> None:
+                if details.get("loaded"):
+                    identity = (details.get("agent"), details.get("skill_name"))
+                    if identity in loaded_this_turn:
+                        return
+                    loaded_this_turn.add(identity)
                 audit_context = meta.get("_audit_context")
                 enriched_details = {
                     **(audit_context if isinstance(audit_context, dict) else {}),
                     **details,
                 }
                 skill_name = enriched_details.get("skill_name")
-                if isinstance(skill_name, str) and skill_name.strip():
+                if not details.get("loaded") and isinstance(skill_name, str) and skill_name.strip():
                     current_turn_skills.add(skill_name.strip())
                 if audit_hook:
                     await audit_hook(enriched_details)
@@ -1565,6 +1817,7 @@ class BaseAgentLoop:
                 metadata = dict(msg.metadata or {})
                 metadata["_audit_only"] = True
                 metadata["_audit_event"] = (
+                    "skill_loaded" if details.get("loaded") else
                     "skill_selected" if details.get("selected") else "skill_invoked"
                 )
                 metadata["_audit_details"] = enriched_details
@@ -1577,6 +1830,9 @@ class BaseAgentLoop:
 
             audit_cb = _audit
         if audit_cb:
+            for name in loaded_skills:
+                source = "manual" if name in selected_skills else "auto" if name in suggested_skills else "recent" if name in recent_skill_names else "always"
+                await audit_cb(skill_loaded(name, source, tool="system_prompt"))
             for selected_skill in selected_skills:
                 await audit_cb({
                     "tool": "system_prompt",
@@ -1602,13 +1858,9 @@ class BaseAgentLoop:
             final_content = "I've completed processing but have no response to give."
 
         if isinstance(session.metadata, dict):
-            prior = session.metadata.get("_recent_skills")
             merged: list[str] = []
-            if isinstance(prior, list):
-                for item in prior:
-                    if isinstance(item, str) and item not in merged:
-                        merged.append(item)
-            for item in [*selected_skills, *sorted(current_turn_skills)]:
+            # Remember this task's skills, not an ever-growing list of old topics.
+            for item in [*(name for name in active_skills if name in loaded_skills), *sorted(current_turn_skills)]:
                 if item not in merged:
                     merged.append(item)
             session.metadata["_recent_skills"] = merged[-10:]
@@ -1619,8 +1871,7 @@ class BaseAgentLoop:
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Response on {} (content length={})", msg.channel, len(final_content))
         outbound_meta = dict(msg.metadata or {})
         fallback_prefix = "MIRA_SKILL_FALLBACK_REQUIRED:"
         if selected_skills and final_content.lstrip().startswith(fallback_prefix):
@@ -1779,7 +2030,6 @@ class BaseAgentLoop:
         so callers can inject CLI flags (``run_mode``, ``agent_profile``,
         ``automation_policy``, ``project_dir``, …) that subclasses interpret.
         """
-        await self._connect_mcp()
         msg = InboundMessage(
             channel=channel,
             sender_id="user",
@@ -1787,12 +2037,26 @@ class BaseAgentLoop:
             content=content,
             metadata=dict(metadata or {}),
         )
-        response = await self._process_message(
-            msg,
-            session_key=session_key,
-            on_progress=on_progress,
-            audit_hook=audit_hook,
-        )
+        with diagnostic_context(run_id=correlation_id(), session_ref=opaque_ref(session_key), channel=channel):
+            emit_event("agent.direct.started")
+            started = time.monotonic()
+            try:
+                await self._connect_mcp()
+                response = await self._process_message(
+                    msg,
+                    session_key=session_key,
+                    on_progress=on_progress,
+                    audit_hook=audit_hook,
+                )
+            except asyncio.CancelledError:
+                emit_event("agent.direct.cancelled")
+                raise
+            except Exception as exc:
+                emit_event("agent.direct.failed", level="ERROR", exception=exc)
+                raise
+            finally:
+                emit_event("agent.direct.finished",
+                           duration_ms=round((time.monotonic() - started) * 1000, 2))
         if response is None:
             return ""
         if isinstance(response, OutboundMessage) and isinstance(content, str) and content.strip().startswith("/"):
