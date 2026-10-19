@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # Stands in for `mira gateway`: takes the real lease, then serves /health and /api/config.
 _FAKE_GATEWAY = textwrap.dedent(
     """
-    import sys, time
+    import socketserver, sys, time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from mira_engine.cli.engine_lease import acquire_engine_lease
 
@@ -51,7 +51,14 @@ _FAKE_GATEWAY = textwrap.dedent(
         def log_message(self, *args):
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    class Server(ThreadingHTTPServer):
+        # HTTPServer.server_bind resolves socket.getfqdn(), which can stall
+        # for a long time on CI macOS runners; the name is not needed here.
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+    server = Server(("127.0.0.1", port), Handler)
     print(f"fake gateway: serving on {server.server_address}", flush=True)
     server.serve_forever()
     """
