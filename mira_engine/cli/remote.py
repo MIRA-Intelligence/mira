@@ -70,11 +70,15 @@ def _token() -> str:
     return token
 
 
+# Probes go to 127.0.0.1; never route them through a (system) HTTP proxy.
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _http_status(port: int, path: str, token: str | None = None, timeout: float = 2.0) -> int | None:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _LOOPBACK_OPENER.open(request, timeout=timeout) as response:
             return response.status
     except urllib.error.HTTPError as exc:
         return exc.code

@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import sys
+from ipaddress import ip_address
 from pathlib import Path
 
 import pytest
@@ -224,9 +225,12 @@ def test_parse_proc_net_tcp_keeps_only_listeners() -> None:
     assert [(str(item.address), item.port, item.uid) for item in listeners] == [
         ("127.0.0.1", 18806, 1001), ("0.0.0.0", 22, 0), ("10.0.0.10", 18810, 1006)]
     v6 = parse_proc_net_tcp((PROC / "net" / "tcp6").read_text())
-    assert [(str(item.address), item.port, item.uid) for item in v6] == [
-        ("::1", 18807, 1002), ("::", 8081, 0), ("::ffff:127.0.0.1", 18808, 1003),
-        ("fe80::fea6:57ff:fe21:1b6b", 18809, 1004)]
+    # Compare addresses, not strings: how ::ffff:127.0.0.1 prints changed between
+    # Python 3.11 patch releases.
+    assert [(item.address, item.port, item.uid) for item in v6] == [
+        (ip_address(text), port, uid) for text, port, uid in (
+            ("::1", 18807, 1002), ("::", 8081, 0), ("::ffff:127.0.0.1", 18808, 1003),
+            ("fe80::fea6:57ff:fe21:1b6b", 18809, 1004))]
 
 
 @pytest.mark.parametrize("port,uid,ok", [

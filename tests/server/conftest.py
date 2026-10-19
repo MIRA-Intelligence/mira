@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+
+# Mira Server runs on Linux (and macOS for development); its code uses POSIX
+# calls such as os.geteuid, so the suite does not apply on Windows.
+if sys.platform == "win32":
+    collect_ignore_glob = ["test_*.py"]
 import hashlib
 import json
 import os

@@ -194,7 +194,7 @@ def test_prepare_gateway_ui_channel_bootstraps_fresh_home(tmp_path, monkeypatch)
 
     config_path = tmp_path / "config.json"
     assert config_path.exists()
-    written = json.loads(config_path.read_text())
+    written = json.loads(config_path.read_text(encoding="utf-8"))
     assert written["channels"]["ui"]["enabled"] is True
 
 

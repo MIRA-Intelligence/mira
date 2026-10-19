@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,10 @@ from mira_engine.security.host_policy import (
     enforce,
     load_host_policy,
     parse_policy,
+)
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="the host policy lives in /etc/mira on POSIX hosts",
 )
 
 POLICY = Path("/etc/mira/policy.toml")
@@ -157,7 +162,7 @@ network = "none"
 
     cfg.agents.defaults.max_tool_iterations = 9
     loader.save_config(cfg, config_path)
-    saved = json.loads(config_path.read_text())
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["tools"]["restrictToWorkspace"] is False
     assert saved["tools"]["exec"]["sandbox"] == ""
     assert saved["tools"]["exec"]["sandboxNetwork"] == "full"

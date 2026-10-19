@@ -177,8 +177,11 @@ jobs:
           }
           config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
+          # The gateway requires a token (#163); pin one so the probes can authenticate.
+          token = "release-smoke-token-0123456789"
           env = os.environ.copy()
           env["MIRA_CONFIG_PATH"] = str(config_path)
+          env["MIRA_GATEWAY_TOKEN"] = token
           env["HOME"] = str(tmp_root)
           env["USERPROFILE"] = str(tmp_root)
 
@@ -194,7 +197,8 @@ jobs:
           ws_url = f"ws://127.0.0.1:{port}/ws"
 
           def fetch_json(url: str) -> dict:
-              with urllib.request.urlopen(url, timeout=5) as resp:
+              request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+              with urllib.request.urlopen(request, timeout=5) as resp:
                   return json.loads(resp.read().decode("utf-8"))
 
           try:
@@ -229,7 +233,10 @@ jobs:
               if "runtime" not in config_payload or "providers" not in config_payload:
                   raise RuntimeError(f"unexpected config payload: {config_payload}")
 
-              ws = websocket.create_connection(ws_url, timeout=10)
+              # Not a browser: no Origin header, which the gateway's origin check would reject.
+              ws = websocket.create_connection(
+                  ws_url, timeout=10, header=[f"Authorization: Bearer {token}"], suppress_origin=True,
+              )
               try:
                   ws.send(json.dumps({
                       "type": "message",
@@ -239,11 +246,21 @@ jobs:
                       "media": [],
                       "mode": "manual",
                   }))
-                  raw = ws.recv()
+                  # Side events (skill_loaded, token_usage, ...) can arrive first;
+                  # wait for the agent to answer or report progress.
+                  seen = []
+                  ws_deadline = time.time() + 30
+                  payload = {}
+                  while time.time() < ws_deadline:
+                      payload = json.loads(ws.recv())
+                      seen.append(payload.get("type"))
+                      if payload.get("type") in {"response", "progress"}:
+                          break
+                  else:
+                      raise RuntimeError(f"no response or progress over the websocket; got {seen}")
               finally:
                   ws.close()
 
-              payload = json.loads(raw)
               if payload.get("type") not in {"response", "progress"}:
                   raise RuntimeError(f"unexpected websocket payload: {payload}")
           except Exception:

@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # Stands in for `mira gateway`: takes the real lease, then serves /health and /api/config.
 _FAKE_GATEWAY = textwrap.dedent(
     """
-    import sys, time
+    import socketserver, sys, time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from mira_engine.cli.engine_lease import acquire_engine_lease
 
@@ -34,7 +34,9 @@ _FAKE_GATEWAY = textwrap.dedent(
         sys.exit(1)
     if mode == "port-in-use":
         sys.exit(4)  # PORT_IN_USE_EXIT_CODE: the port was taken by a process the gateway must not stop
+    print("fake gateway: acquiring lease", flush=True)
     lease = acquire_engine_lease(host="127.0.0.1", port=port)
+    print("fake gateway: lease acquired", flush=True)
     if mode == "hang":
         time.sleep(60)
         sys.exit(0)
@@ -49,7 +51,16 @@ _FAKE_GATEWAY = textwrap.dedent(
         def log_message(self, *args):
             pass
 
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    class Server(ThreadingHTTPServer):
+        # HTTPServer.server_bind resolves socket.getfqdn(), which can stall
+        # for a long time on CI macOS runners; the name is not needed here.
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+    server = Server(("127.0.0.1", port), Handler)
+    print(f"fake gateway: serving on {server.server_address}", flush=True)
+    server.serve_forever()
     """
 )
 
@@ -61,10 +72,16 @@ def spawned(monkeypatch):
     state = {"mode": "serve"}
     env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
 
+    logs: list[Path] = []
+
     def fake_spawn(port: int) -> subprocess.Popen:
-        proc = subprocess.Popen([sys.executable, "-c", _FAKE_GATEWAY, str(port), state["mode"]],
-                                env={**env, **{k: os.environ[k] for k in ("MIRA_HOME", "MIRA_RUNTIME_DIR")}},
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Keep the child's output: when it dies early, a failure should say why.
+        log = Path(os.environ["MIRA_HOME"]).parent / f"fake-gateway-{len(logs)}.log"
+        logs.append(log)
+        with log.open("wb") as out:
+            proc = subprocess.Popen([sys.executable, "-c", _FAKE_GATEWAY, str(port), state["mode"]],
+                                    env={**env, **{k: os.environ[k] for k in ("MIRA_HOME", "MIRA_RUNTIME_DIR")}},
+                                    stdout=out, stderr=subprocess.STDOUT)
         children.append(proc)
         return proc
 
@@ -74,6 +91,9 @@ def spawned(monkeypatch):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+    for log in logs:  # pytest shows this only for failing tests
+        print(f"--- {log.name} (exit {children[logs.index(log)].returncode}) ---")
+        print(log.read_text(encoding="utf-8", errors="replace") if log.exists() else "(no log)")
 
 
 def _free_port() -> int:
