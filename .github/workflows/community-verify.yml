@@ -8,6 +8,7 @@ name: Community Verify
 #
 # - `pull_request_target` runs *this file as it exists on the landing branch*,
 #   never the PR's copy, so editing CI in a PR has no effect here.
+# - The code under test is the PR merged into the current landing branch.
 # - Every test that exists on the landing branch runs in its landing-branch
 #   version, with the landing branch's pytest config and lint rules; tests the
 #   PR *adds* run too. Deleting, skipping or loosening an existing test in a PR
@@ -67,14 +68,32 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Check out the PR head (code under test)
+      # Code under test = the PR merged into the landing branch as it is now,
+      # so a PR that only passes against an older base can't go green. (The
+      # bot's landing watch re-checks every merge on the real tip afterwards.)
+      - name: Check out the landing branch for the merge
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.base.sha }}
           path: pr
-          submodules: recursive
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Merge the PR head (code under test)
+        working-directory: pr
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+          fetched="$(git rev-parse refs/remotes/pr/head)"
+          if [ "$fetched" != "$HEAD_SHA" ]; then
+            echo "PR head moved ($HEAD_SHA -> $fetched); a newer run verifies it."
+            exit 1
+          fi
+          git -c user.name="mira-verify" -c user.email="verify@invalid" merge --no-ff --no-edit "$HEAD_SHA"
+          git submodule update --init --recursive
 
       - name: Overlay the trusted test harness
         run: |
