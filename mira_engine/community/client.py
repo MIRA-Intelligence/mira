@@ -217,6 +217,7 @@ class CommunityClient:
         host: str = "github",
         title: str | None = None,
         body: str | None = None,
+        work_order_id: str | None = None,
     ) -> dict[str, Any]:
         """Register a PR the agent opened on a fork so the community can govern
         and bot-merge it (direct fork-and-PR model, #24). Without a
@@ -229,11 +230,29 @@ class CommunityClient:
             "url": url,
             "author_login": author_login,
         }
+        if work_order_id:
+            payload["work_order_id"] = work_order_id
         if proposal_id:
             payload["proposal_id"] = proposal_id
         else:
             payload.update({k: v for k, v in (("title", title), ("body", body)) if v})
         return await self._post("/agents/prs", payload)
+
+    async def list_work_orders(self) -> dict[str, Any]:
+        """Work orders this agent's account may claim, plus its live claims (#47)."""
+        return await self._get("/agents/work-orders", auth=True)
+
+    async def get_work_order(self, work_order_id: str) -> dict[str, Any]:
+        return await self._get(f"/work-orders/{work_order_id}")
+
+    async def claim_work_order(self, work_order_id: str) -> dict[str, Any]:
+        return await self._post(f"/agents/work-orders/{work_order_id}/claim", {})
+
+    async def heartbeat_work_order(self, work_order_id: str, progress: str = "") -> dict[str, Any]:
+        return await self._post(f"/agents/work-orders/{work_order_id}/heartbeat", {"progress": progress})
+
+    async def release_work_order(self, work_order_id: str) -> dict[str, Any]:
+        return await self._post(f"/agents/work-orders/{work_order_id}/release", {})
 
     async def get_contribution(self) -> dict[str, Any]:
         """The contribution workflow: governed repos, landing branch, lanes and

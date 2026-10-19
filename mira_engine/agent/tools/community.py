@@ -468,7 +468,7 @@ class CommunityOpenPrTool(_CommunityTool):
         **_: Any,
     ) -> str:
         async def run() -> str:
-            from mira_engine.community.contribute import ContributeError, open_pr_github
+            from mira_engine.community.contribute import ContributeError, load_scope, open_pr_github
             from mira_engine.community.privacy import default_guard
 
             try:
@@ -480,17 +480,18 @@ class CommunityOpenPrTool(_CommunityTool):
                 )
             except ContributeError as e:
                 return f"Could not open the PR: {e}"
-            scope_repo = _scope_repo(working_dir)
+            scope = load_scope(working_dir)
             try:
                 reg = await self._client.register_pr(
                     proposal_id,
-                    scope_repo,
+                    scope.repo,
                     result.number,
                     result.url,
                     result.login,
                     host="github",
                     title=title,
                     body=body,
+                    work_order_id=scope.work_order_id,
                 )
             except Exception as e:  # noqa: BLE001 - PR is open even if register fails
                 return (
@@ -509,12 +510,6 @@ class CommunityOpenPrTool(_CommunityTool):
             {"working_dir": working_dir, "title": title, "body": body, "proposal_id": proposal_id},
             run,
         )
-
-
-def _scope_repo(working_dir: str) -> str:
-    from mira_engine.community.contribute import load_scope
-
-    return load_scope(working_dir).repo
 
 
 class CommunityReviewPrTool(_CommunityTool):
@@ -621,6 +616,144 @@ class CommunityAcceptAnswerTool(_CommunityTool):
         )
 
 
+def _work_order_refusal(wo: dict[str, Any], community_config: Any) -> str | None:
+    """Why this user's settings forbid claiming ``wo`` (mira#205), or None."""
+    kinds = list(getattr(community_config, "work_order_kinds", None) or [])
+    if kinds and wo.get("kind") not in kinds:
+        return f"your user only allows work orders of kind {', '.join(kinds)} (this is {wo.get('kind')})"
+    lanes = list(getattr(community_config, "contribution_lanes", None) or ["plugin", "core"])
+    if wo.get("lane") not in lanes:
+        return f"your user only allows {', '.join(lanes)}-lane contributions (this is {wo.get('lane')})"
+    return None
+
+
+class CommunityListWorkOrdersTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_list_work_orders"
+
+    @property
+    def description(self) -> str:
+        return (
+            "List the community work orders you may claim (bounded tasks with a fixed repo, "
+            "allowed paths and acceptance tests) and the leases you hold. Orders your user's "
+            "settings don't allow are marked."
+        )
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **_: Any) -> str:
+        data = await self._client.list_work_orders()
+        lines: list[str] = []
+        for c in data.get("claims") or []:
+            wo = c.get("work_order") or {}
+            lines.append(
+                f"HELD [{c.get('status')}] {wo.get('id')} \"{wo.get('title')}\" — lease until {c.get('expires_at')}; "
+                f"paths {', '.join(wo.get('allowed_paths') or [])}"
+            )
+        for wo in data.get("claimable") or []:
+            refusal = _work_order_refusal(wo, self._community_config)
+            mark = f" (not allowed: {refusal})" if refusal else ""
+            lines.append(
+                f"- {wo.get('id')} [{wo.get('kind')}/{wo.get('lane')}] \"{wo.get('title')}\" in {wo.get('repo')}; "
+                f"paths {', '.join(wo.get('allowed_paths') or [])}; bonus +{wo.get('reward')}{mark}"
+            )
+        return "\n".join(lines) if lines else "No work orders available for you right now."
+
+
+class CommunityClaimWorkOrderTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_claim_work_order"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Claim a work order under a lease so you can deliver it. Only claim work you "
+            "intend to finish: an expired lease costs reputation. High-impact: may require "
+            "your user's approval. After claiming, call community_start_contribution with "
+            "the work_order_id."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"work_order_id": {"type": "string", "description": "Work order id."}},
+            "required": ["work_order_id"],
+        }
+
+    async def execute(self, work_order_id: str, **_: Any) -> str:
+        try:
+            wo = (await self._client.get_work_order(work_order_id)).get("work_order") or {}
+        except Exception as e:  # noqa: BLE001 - surface, don't crash the turn
+            return f"Could not read work order {work_order_id}: {e}"
+        refusal = _work_order_refusal(wo, self._community_config)
+        if refusal:
+            return f"Not claiming: {refusal}."
+        limit = int(getattr(self._community_config, "max_active_work_orders", 1) or 1)
+        held = [c for c in (await self._client.list_work_orders()).get("claims") or [] if c.get("status") == "active"]
+        if len(held) >= limit:
+            return f"Not claiming: your user allows {limit} active work order(s) at a time; finish or release one first."
+
+        async def run() -> str:
+            res = await self._client.claim_work_order(work_order_id)
+            claim = res.get("claim") or {}
+            return (
+                f"Claimed \"{wo.get('title')}\"; lease until {claim.get('expires_at')}. Next: "
+                f"community_start_contribution(work_order_id='{work_order_id}'), change only "
+                f"{', '.join(wo.get('allowed_paths') or [])}, renew the lease while you work."
+            )
+
+        return await self._gated("claim_work_order", {"work_order_id": work_order_id}, run)
+
+
+class CommunityWorkOrderLeaseTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_work_order_lease"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Renew the lease on a work order you hold (and report progress), or release it "
+            "if you won't finish — releasing is better than letting it expire."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "work_order_id": {"type": "string"},
+                "action": {"type": "string", "enum": ["renew", "release"]},
+                "progress": {"type": "string", "description": "What is done so far (renew)."},
+            },
+            "required": ["work_order_id", "action"],
+        }
+
+    async def execute(self, work_order_id: str, action: str, progress: str = "", **_: Any) -> str:
+        if action not in ("renew", "release"):
+            return "action must be renew or release"
+
+        async def run() -> str:
+            if action == "renew":
+                res = await self._client.heartbeat_work_order(work_order_id, progress)
+                return f"Lease renewed until {(res.get('claim') or {}).get('expires_at')}."
+            await self._client.release_work_order(work_order_id)
+            return "Work order released."
+
+        return await self._gated(
+            f"{action}_work_order", {"work_order_id": work_order_id, "progress": progress}, run
+        )
+
+
 class CommunityStartContributionTool(_CommunityTool):
     """Create the isolated workspace every code contribution happens in (mira#204)."""
 
@@ -635,7 +768,8 @@ class CommunityStartContributionTool(_CommunityTool):
     @property
     def description(self) -> str:
         return (
-            "Start a code contribution to a MIRA repo: clones the repo at the community "
+            "Start a code contribution to a MIRA repo — preferably for a work order you "
+            "claimed (pass work_order_id). Clones the repo at the community "
             "landing branch into a fresh, isolated contribution workspace and returns its "
             "path and scope. Make ALL changes for the PR inside that workspace (never in "
             "your user's own projects), then call community_open_pr with it. Prefer "
@@ -648,13 +782,18 @@ class CommunityStartContributionTool(_CommunityTool):
         return {
             "type": "object",
             "properties": {
-                "repo": {"type": "string", "description": "Upstream repo, 'owner/name' (a governed repo)."},
+                "work_order_id": {
+                    "type": "string",
+                    "description": "A work order you claimed: its repo and allowed paths become the scope.",
+                },
+                "repo": {"type": "string", "description": "Upstream repo, 'owner/name' (free contributions only)."},
                 "title": {"type": "string", "description": "Short name of the change (used for the branch)."},
             },
-            "required": ["repo", "title"],
         }
 
-    async def execute(self, repo: str, title: str, **_: Any) -> str:
+    async def execute(
+        self, repo: str = "", title: str = "", work_order_id: str | None = None, **_: Any
+    ) -> str:
         from mira_engine.community.contribute import (
             ContributeError,
             describe_scope,
@@ -669,6 +808,20 @@ class CommunityStartContributionTool(_CommunityTool):
         lanes = info.get("lanes") or {}
         plugin_paths = (lanes.get("plugin") or {}).get("paths") or None
         allowed_lanes = list(getattr(self._community_config, "contribution_lanes", None) or ["plugin", "core"])
+        allowed_paths: list[str] | None = None
+        if work_order_id:
+            try:
+                wo = (await self._client.get_work_order(work_order_id)).get("work_order") or {}
+            except Exception as e:  # noqa: BLE001
+                return f"Could not read work order {work_order_id}: {e}"
+            refusal = _work_order_refusal(wo, self._community_config)
+            if refusal:
+                return f"Not starting: {refusal}."
+            repo = wo.get("repo") or repo
+            title = title or wo.get("title") or "work-order"
+            allowed_paths = list(wo.get("allowed_paths") or [])
+        if not repo or not title:
+            return "Pass work_order_id, or repo and title for a free contribution (a new plugin or docs/)."
         try:
             path, scope = await start_contribution(
                 repo=repo,
@@ -677,6 +830,8 @@ class CommunityStartContributionTool(_CommunityTool):
                 workspace=self._workspace or get_workspace_path(),
                 plugin_lane_paths=plugin_paths,
                 allowed_lanes=allowed_lanes,
+                allowed_paths=allowed_paths,
+                work_order_id=work_order_id,
             )
         except ContributeError as e:
             return f"Could not start the contribution: {e}"
@@ -754,6 +909,9 @@ def build_community_tools(community_config: Any, workspace: Any = None) -> list[
         CommunityOpenPrTool(client, gate, community_config),
         CommunitySubmitPatchTool(client, gate, community_config),
         CommunityReviewPrTool(client, gate, community_config),
+        CommunityListWorkOrdersTool(client, gate, community_config),
+        CommunityClaimWorkOrderTool(client, gate, community_config),
+        CommunityWorkOrderLeaseTool(client, gate, community_config),
         CommunityStartContributionTool(client, gate, community_config, workspace),
         CommunityReviewCodeTool(client, gate, community_config),
     ]
