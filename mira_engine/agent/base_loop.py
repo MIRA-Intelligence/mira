@@ -96,6 +96,10 @@ TURN_ERROR = "error"
 _turn_stop_reason: ContextVar[str] = ContextVar("mira_turn_stop_reason", default=TURN_COMPLETED)
 
 
+# reconfigure_runtime: leave this setting as it is.
+_KEEP: Any = object()
+
+
 def set_turn_stop_reason(reason: str) -> None:
     """Record why the turn running in this task ended (last writer wins)."""
     _turn_stop_reason.set(reason)
@@ -216,6 +220,9 @@ class BaseAgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._last_loop_tokens_used: int = 0
         self._processing_lock = asyncio.Lock()
+        # Runtime swap saved while a turn held the lock; applied when it ends.
+        self._pending_runtime_swap: Callable[[], Awaitable[None]] | None = None
+        self._runtime_swap_task: asyncio.Task[None] | None = None
         # Shared registry for `exec(background=true)` jobs. Lives for the whole
         # loop lifetime so the agent can monitor jobs across many iterations,
         # and is drained on shutdown so we don't leak processes.
@@ -290,70 +297,165 @@ class BaseAgentLoop:
         timezone: str | None = None,
         channels_config: ChannelsConfig | None = None,
         context_window_tokens: int | None = None,
+        temperature: float | None | object = _KEEP,
+        auto_max_rounds: int | None = None,
     ) -> None:
-        """Apply UI-saved runtime config to the live agent loop."""
-        async with self._processing_lock:
-            next_workspace = workspace.expanduser()
-            workspace_changed = next_workspace != self.workspace
+        """Apply UI-saved runtime config to the live agent loop.
 
-            if self._mcp_stack:
+        Limits (iterations, tokens, reasoning, temperature, auto rounds) take
+        effect at once, even mid-turn: the loop reads them on every LLM call.
+        Swapping the provider, workspace, tools and MCP connections waits for
+        the running turn, but in the background, so saving settings never
+        blocks behind a long turn.
+        """
+        self._apply_runtime_limits(
+            max_iterations=max_iterations,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            temperature=temperature,
+            auto_max_rounds=auto_max_rounds,
+        )
+
+        async def _swap() -> None:
+            await self._swap_runtime(
+                provider=provider,
+                model=model,
+                provider_factory=provider_factory,
+                model_candidates=model_candidates,
+                role_provider_factory=role_provider_factory,
+                workspace=workspace,
+                restrict_to_workspace=restrict_to_workspace,
+                brave_api_key=brave_api_key,
+                web_proxy=web_proxy,
+                exec_config=exec_config,
+                knowledge_config=knowledge_config,
+                timezone=timezone,
+                channels_config=channels_config,
+                context_window_tokens=context_window_tokens,
+            )
+
+        idle = not self._processing_lock.locked() and (
+            self._runtime_swap_task is None or self._runtime_swap_task.done()
+        )
+        if idle:
+            # Nothing running: swap now, so errors reach the caller as before.
+            self._pending_runtime_swap = None
+            async with self._processing_lock:
+                await _swap()
+            return
+        # Newest settings win if several saves arrive during one turn.
+        self._pending_runtime_swap = _swap
+        if self._runtime_swap_task is None or self._runtime_swap_task.done():
+            self._runtime_swap_task = asyncio.create_task(self._apply_pending_runtime_swap())
+        logger.info("Runtime limits applied; provider/workspace swap deferred until the current turn ends")
+
+    def _apply_runtime_limits(
+        self,
+        *,
+        max_iterations: int,
+        max_tokens: int,
+        reasoning_effort: str | None,
+        temperature: float | None | object = _KEEP,
+        auto_max_rounds: int | None = None,  # used by ResearchAgentLoop
+    ) -> None:
+        """Knobs the loop reads on every call, so changing them mid-turn is safe."""
+        self.max_iterations = max_iterations
+        self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
+        if temperature is not _KEEP:
+            self.temperature = temperature
+        subagents = getattr(self, "subagents", None)
+        if subagents is not None:
+            subagents.temperature = self.temperature
+            subagents.max_tokens = self.max_tokens
+            subagents.reasoning_effort = self.reasoning_effort
+
+    async def _apply_pending_runtime_swap(self) -> None:
+        while self._pending_runtime_swap is not None:
+            async with self._processing_lock:
+                swap, self._pending_runtime_swap = self._pending_runtime_swap, None
+                if swap is None:
+                    continue
                 try:
-                    await self._mcp_stack.aclose()
-                finally:
-                    self._mcp_stack = None
-                    self._mcp_connected = False
-                    self._mcp_connecting = False
+                    await swap()
+                except Exception:
+                    # Deferred: no caller is waiting to receive the error.
+                    logger.exception("Failed to apply the deferred runtime config update")
 
-            self.provider = provider
-            self.model = model or provider.get_default_model()
-            self.provider_factory = provider_factory
-            self.model_candidates = list(model_candidates) if model_candidates else None
-            self.role_provider_factory = role_provider_factory
-            self.workspace = next_workspace
-            self.max_iterations = max_iterations
-            self.max_tokens = max_tokens
-            self.reasoning_effort = reasoning_effort
-            self.brave_api_key = brave_api_key
-            self.web_proxy = web_proxy
-            if exec_config is not None:
-                self.exec_config = exec_config
-            if knowledge_config is not None:
-                self.knowledge_config = knowledge_config
-            self.timezone = timezone
-            self.restrict_to_workspace = restrict_to_workspace
-            if channels_config is not None:
-                self.channels_config = channels_config
-            if context_window_tokens is not None:
-                self.context_window_tokens = context_window_tokens
+    async def _swap_runtime(
+        self,
+        *,
+        provider: LLMProvider,
+        model: str,
+        provider_factory: Callable[[str], LLMProvider] | None,
+        model_candidates: list[str] | None,
+        role_provider_factory: "Callable[[str], tuple[LLMProvider, str, tuple[str, ...]]] | None",
+        workspace: Path,
+        restrict_to_workspace: bool,
+        brave_api_key: str | None,
+        web_proxy: str | None,
+        exec_config: ExecToolConfig | None,
+        knowledge_config: KnowledgeConfig | None,
+        timezone: str | None,
+        channels_config: ChannelsConfig | None,
+        context_window_tokens: int | None,
+    ) -> None:
+        """Replace provider, workspace, tools and MCP connections (caller holds the lock)."""
+        next_workspace = workspace.expanduser()
+        workspace_changed = next_workspace != self.workspace
 
-            if workspace_changed:
-                self.context = ContextBuilder(next_workspace)
-                self.sessions = SessionManager(next_workspace)
-                self._project_sessions.clear()
+        if self._mcp_stack:
+            try:
+                await self._mcp_stack.aclose()
+            finally:
+                self._mcp_stack = None
+                self._mcp_connected = False
+                self._mcp_connecting = False
 
-            self._session_model_runtimes.clear()
+        self.provider = provider
+        self.model = model or provider.get_default_model()
+        self.provider_factory = provider_factory
+        self.model_candidates = list(model_candidates) if model_candidates else None
+        self.role_provider_factory = role_provider_factory
+        self.workspace = next_workspace
+        self.brave_api_key = brave_api_key
+        self.web_proxy = web_proxy
+        if exec_config is not None:
+            self.exec_config = exec_config
+        if knowledge_config is not None:
+            self.knowledge_config = knowledge_config
+        self.timezone = timezone
+        self.restrict_to_workspace = restrict_to_workspace
+        if channels_config is not None:
+            self.channels_config = channels_config
+        if context_window_tokens is not None:
+            self.context_window_tokens = context_window_tokens
 
-            self.subagents.provider = provider
-            self.subagents.model = self.model
-            self.subagents.workspace = next_workspace
-            self.subagents.temperature = self.temperature
-            self.subagents.max_tokens = self.max_tokens
-            self.subagents.reasoning_effort = self.reasoning_effort
-            self.subagents.brave_api_key = self.brave_api_key
-            self.subagents.web_proxy = self.web_proxy
-            self.subagents.exec_config = self.exec_config
-            self.subagents.restrict_to_workspace = self.restrict_to_workspace
-            self.subagents.provider_factory = provider_factory
-            self.subagents.model_candidates = self.model_candidates
-            self.subagents.role_provider_factory = role_provider_factory
-            self.subagents.runner = AgentRunner(provider)
-            self.subagents._session_runtimes.clear()
+        if workspace_changed:
+            self.context = ContextBuilder(next_workspace)
+            self.sessions = SessionManager(next_workspace)
+            self._project_sessions.clear()
 
-            self.tools = ToolRegistry()
-            self._register_default_tools()
-            self._rebuild_memory_helpers()
+        self._session_model_runtimes.clear()
 
-            logger.info("Agent runtime reconfigured: model={}, workspace={}", self.model, self.workspace)
+        self.subagents.provider = provider
+        self.subagents.model = self.model
+        self.subagents.workspace = next_workspace
+        self.subagents.brave_api_key = self.brave_api_key
+        self.subagents.web_proxy = self.web_proxy
+        self.subagents.exec_config = self.exec_config
+        self.subagents.restrict_to_workspace = self.restrict_to_workspace
+        self.subagents.provider_factory = provider_factory
+        self.subagents.model_candidates = self.model_candidates
+        self.subagents.role_provider_factory = role_provider_factory
+        self.subagents.runner = AgentRunner(provider)
+        self.subagents._session_runtimes.clear()
+
+        self.tools = ToolRegistry()
+        self._register_default_tools()
+        self._rebuild_memory_helpers()
+
+        logger.info("Agent runtime reconfigured: model={}, workspace={}", self.model, self.workspace)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""

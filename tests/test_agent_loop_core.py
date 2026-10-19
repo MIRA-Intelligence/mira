@@ -205,6 +205,71 @@ async def test_reconfigure_runtime_updates_provider_and_clears_cached_routes(
     assert read_tool._allowed_dir == new_workspace
 
 
+def _reconfigure_kwargs(workspace: Path, provider: LLMProvider, **overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = dict(
+        provider=provider,
+        model="custom/new-model",
+        provider_factory=None,
+        workspace=workspace,
+        max_iterations=64,
+        max_tokens=2048,
+        reasoning_effort="high",
+        restrict_to_workspace=True,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+async def test_reconfigure_during_a_turn_applies_limits_now_and_swaps_after(tmp_path: Path) -> None:
+    """Saving settings must not block behind a long turn that holds the lock."""
+    loop = _make_real_loop(tmp_path)
+    old_provider = loop.provider
+    first, second = _NoopProvider(), _NoopProvider()
+
+    await loop._processing_lock.acquire()  # a non-streaming turn is running
+    try:
+        await asyncio.wait_for(
+            loop.reconfigure_runtime(**_reconfigure_kwargs(tmp_path, first, max_iterations=7, temperature=0.4)),
+            timeout=1,
+        )
+        await asyncio.wait_for(
+            loop.reconfigure_runtime(**_reconfigure_kwargs(tmp_path, second, max_iterations=9)),
+            timeout=1,
+        )
+        # Limits are live for the running turn; the provider swap waits for it.
+        assert loop.max_iterations == 9
+        assert loop.temperature == 0.4
+        assert loop.max_tokens == 2048
+        assert loop.provider is old_provider
+    finally:
+        loop._processing_lock.release()
+
+    await asyncio.wait_for(loop._runtime_swap_task, timeout=1)
+    assert loop.provider is second  # newest save wins
+    assert loop._pending_runtime_swap is None
+
+
+async def test_reconfigure_when_idle_swaps_before_returning(tmp_path: Path) -> None:
+    loop = _make_real_loop(tmp_path)
+    provider = _NoopProvider()
+    await loop.reconfigure_runtime(**_reconfigure_kwargs(tmp_path, provider, temperature=None))
+    assert loop.provider is provider
+    assert loop.temperature is None
+    assert loop._runtime_swap_task is None
+
+
+async def test_reconfigure_updates_research_auto_round_limit(tmp_path: Path) -> None:
+    from mira_engine.agent.research_loop import ResearchAgentLoop
+
+    loop = ResearchAgentLoop(
+        bus=MessageBus(), provider=_NoopProvider(), workspace=tmp_path, model="dummy/default",
+        channels_config=ChannelsConfig(), exec_config=ExecToolConfig(timeout=5),
+        session_manager=SessionManager(tmp_path), auto_max_rounds=100,
+    )
+    await loop.reconfigure_runtime(**_reconfigure_kwargs(tmp_path, _NoopProvider(), auto_max_rounds=12))
+    assert loop._auto_round_limit() == 12
+
+
 def test_restrict_workspace_allows_nested_workspace_mira_skills_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)

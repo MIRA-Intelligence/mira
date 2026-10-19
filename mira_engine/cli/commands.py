@@ -1606,6 +1606,8 @@ def gateway(
             max_iterations=next_config.agents.defaults.max_tool_iterations,
             max_tokens=next_config.agents.defaults.max_tokens,
             reasoning_effort=next_config.agents.defaults.reasoning_effort,
+            temperature=next_config.agents.defaults.temperature,
+            auto_max_rounds=next_config.agents.defaults.auto_max_rounds,
             restrict_to_workspace=next_config.tools.restrict_to_workspace,
             brave_api_key=next_config.tools.web.search.api_key or None,
             web_proxy=next_config.tools.web.proxy or None,

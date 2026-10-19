@@ -69,6 +69,11 @@ class ResearchAgentLoop(BaseAgentLoop):
         # a session after engine restart starts the counter back at zero.
         self._session_tokens_used: dict[str, int] = {}
 
+    def _apply_runtime_limits(self, *, auto_max_rounds: int | None = None, **limits: Any) -> None:
+        super()._apply_runtime_limits(**limits)
+        if isinstance(auto_max_rounds, int) and auto_max_rounds > 0:
+            self._auto_max_rounds = auto_max_rounds
+
     # ------------------------------------------------------------------
     # Run-mode / agent-profile / automation-policy helpers
     # ------------------------------------------------------------------
