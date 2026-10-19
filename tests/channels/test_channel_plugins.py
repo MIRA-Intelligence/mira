@@ -133,11 +133,14 @@ def test_discover_all_includes_builtins():
     with patch(_EP_TARGET, return_value=[]):
         result = discover_all()
 
-    # discover_all() only returns channels that are actually available (dependencies installed)
-    # discover_channel_names() returns all built-in channel names
-    # So we check that all actually loaded channels are in the result
+    # discover_all() only returns channels that are actually available (dependencies installed):
+    # built-ins, plus channels provided by loaded mira plugins (e.g. the bundled discord plugin).
+    from mira_engine.plugins import get_runtime
+
+    plugin_channels = set(get_runtime().channels())
+    assert "discord" in plugin_channels and "discord" in result
     for name in result:
-        assert name in discover_channel_names()
+        assert name in discover_channel_names() or name in plugin_channels
 
 
 def test_discover_all_includes_external_plugin():

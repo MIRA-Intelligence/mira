@@ -40,6 +40,7 @@ from rich.text import Text
 from loguru import logger
 
 from mira_engine import __logo__, __version__
+from mira_engine.cli.plugin import plugin_app
 from mira_engine.cli.remote import remote_app
 from mira_engine.cli.workflow import workflow_app
 from mira_engine.config.paths import get_workspace_path
@@ -55,6 +56,7 @@ app = typer.Typer(
 )
 app.add_typer(workflow_app, name="workflow")
 app.add_typer(remote_app, name="remote")
+app.add_typer(plugin_app, name="plugin")
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
