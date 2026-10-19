@@ -2,17 +2,23 @@ Update memory files based on the analysis below.
 - [FILE] entries: add the described content to the appropriate file
 - [FILE-REMOVE] entries: delete the corresponding content from memory files
 
+## Long-term memory
+- PERSONAL: use edit_memory with scope="personal"; this is shared across projects
+- MEMORY: use edit_memory with scope="project"; this is private to the current project
+- Use exact, unique old_text and new_text for surgical changes
+- To create empty memory, use old_text=""; never use "(empty)" as actual content
+- Do not use edit_file for PERSONAL or MEMORY
+
 ## File paths (relative to workspace root)
 - SOUL.md
 - USER.md
-- memory/MEMORY.md
 
 Do NOT guess paths.
 
 ## Editing rules
 - Edit directly — file contents provided below, no read_file needed
 - Use exact text as old_text, include surrounding blank lines for unique match
-- Batch changes to the same file into one edit_file call
+- Batch changes to the same file into one tool call
 - For deletions: section header + all bullets as old_text, new_text empty
 - Surgical edits only — never rewrite entire files
 - If nothing to update, stop without calling tools

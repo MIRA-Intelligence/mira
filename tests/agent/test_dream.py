@@ -72,7 +72,7 @@ class TestDreamRun:
         mock_runner.run.assert_called_once()
         spec = mock_runner.run.call_args[0][0]
         assert spec.max_iterations == 10
-        assert spec.fail_on_tool_error is False
+        assert spec.fail_on_tool_error is True
 
     async def test_advances_dream_cursor(self, dream, mock_provider, mock_runner, store):
         """Dream should advance the cursor after processing."""

@@ -619,6 +619,19 @@ class BaseAgentLoop:
             self._project_contexts[cache_key] = ctx
         return ctx
 
+    def _get_project_dream(self, project_ref: ProjectRef | None) -> Dream:
+        """Use the requesting project's history with the current Dream settings."""
+        if project_ref is None:
+            return self.dream
+        return Dream(
+            store=self._get_project_context(project_ref).memory,
+            provider=self.dream.provider,
+            model=self.dream.model,
+            max_batch_size=self.dream.max_batch_size,
+            max_iterations=self.dream.max_iterations,
+            max_tool_result_chars=self.dream.max_tool_result_chars,
+        )
+
     def _get_project_consolidator(
         self,
         project_ref: ProjectRef | None,

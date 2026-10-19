@@ -107,14 +107,23 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
 
     loop = ctx.loop
     msg = ctx.msg
+    project_ref = loop._project_ref_from_metadata(msg.metadata)
+    dream = loop._get_project_dream(project_ref)
 
     async def _run_dream():
         t0 = time.monotonic()
         try:
-            did_work = await loop.dream.run()
+            did_work = await dream.run()
             elapsed = time.monotonic() - t0
             if did_work:
                 content = f"Dream completed in {elapsed:.1f}s."
+            elif dream.store.read_unprocessed_history(
+                since_cursor=dream.store.get_last_dream_cursor()
+            ):
+                content = (
+                    "Dream could not complete. Unprocessed history was kept. "
+                    "Check model credentials or gateway logs and retry /dream."
+                )
             else:
                 content = "Dream: nothing to process."
         except Exception as e:
@@ -122,11 +131,13 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
             content = f"Dream failed after {elapsed:.1f}s: {e}"
         await loop.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata=dict(msg.metadata or {}),
         ))
 
     asyncio.create_task(_run_dream())
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content="Dreaming...",
+        metadata=dict(msg.metadata or {}),
     )
 
 

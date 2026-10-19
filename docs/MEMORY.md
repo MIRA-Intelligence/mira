@@ -21,6 +21,34 @@ It separates memory into layers, because different kinds of remembering deserve 
 
 This keeps the system light in the moment, but reflective over time.
 
+## Personal memory across projects
+
+Personal memory lives in `$MIRA_HOME/workspace/memory/MEMORY.md` (by default,
+`~/.mira/workspace/memory/MEMORY.md`). Every project loads this shared memory
+alongside its own `.mira/memory/MEMORY.md`. New sessions and restarted instances
+read the same files, so preferences persist across conversations and projects.
+
+Dream classifies confirmed user facts, preferences and reusable workflows as
+`PERSONAL`, and project architecture, paths and decisions as `MEMORY`. Its
+`edit_memory` tool applies surgical edits to either scope, creates missing memory,
+and uses file locks and concurrency checks to avoid overwriting another instance's
+changes. Project edits also update the legacy file and backup. Failed Dream runs
+keep their history cursor unchanged so the next run can retry.
+
+In the UI, `/dream` processes the current project's archived history and keeps its
+completion response attached to that project. Archive the conversation first
+(for example with `/new`), then run `/dream`. A model or tool failure preserves
+unprocessed history and reports that the update could not complete.
+
+For example, “I prefer Chinese replies” is personal memory; “this project uses
+PostgreSQL” stays in project memory. Existing global knowledge remains available;
+existing project facts are not automatically promoted into shared memory.
+Credentials and secrets should never be stored as personal memory.
+
+You can inspect or edit the shared Markdown file directly to correct or remove a
+personal fact. `/dream-log` and `/dream-restore` cover project memory snapshots;
+they do not version or restore the shared personal memory file.
+
 ## The Flow
 
 Memory moves through mira in two stages.

@@ -129,7 +129,10 @@ class MemoryStore:
     def read_long_term(self) -> str:
         if self.memory_file.exists():
             return self.memory_file.read_text(encoding="utf-8")
-        if self._legacy_project_memory_file.exists():
+        if (
+            self._legacy_project_memory_file.exists()
+            and self._legacy_project_memory_file.resolve() != self.global_memory_file.resolve()
+        ):
             return self._legacy_project_memory_file.read_text(encoding="utf-8")
         # Fallback to backup if local was accidentally deleted
         if self.backup_dir and self.memory_backup_file.exists():
@@ -911,11 +914,13 @@ class Dream:
 
     def _build_tools(self) -> ToolRegistry:
         from mira_engine.agent.tools.filesystem import EditFileTool, ReadFileTool
+        from mira_engine.agent.tools.memory import EditMemoryTool
 
         tools = ToolRegistry()
         workspace = self.store.project_workspace
         tools.register(ReadFileTool(workspace=workspace, allowed_dir=workspace))
         tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace))
+        tools.register(EditMemoryTool(self.store))
         return tools
 
     async def run(self) -> bool:
@@ -927,11 +932,13 @@ class Dream:
         batch = entries[: self.max_batch_size]
         history_text = "\n".join(f"[{e['timestamp']}] {e['content']}" for e in batch)
         current_date = datetime.now().strftime("%Y-%m-%d")
+        current_personal = self.store.read_global_term() or "(empty)"
         current_memory = self.store.read_memory() or "(empty)"
         current_soul = self.store.read_soul() or "(empty)"
         current_user = self.store.read_user() or "(empty)"
         file_context = (
             f"## Current Date\n{current_date}\n\n"
+            f"## Current PERSONAL memory ({len(current_personal)} chars)\n{current_personal}\n\n"
             f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
             f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
@@ -951,6 +958,9 @@ class Dream:
                 tool_choice=None,
             )
             await record_token_usage(phase1_response.usage, self.model)
+            if phase1_response.finish_reason == "error":
+                logger.warning("Dream Phase 1 returned a provider error; keeping history for retry")
+                return False
             analysis = phase1_response.content or ""
         except Exception:
             logger.exception("Dream Phase 1 failed")
@@ -969,12 +979,15 @@ class Dream:
                     model=self.model,
                     max_iterations=self.max_iterations,
                     max_tool_result_chars=self.max_tool_result_chars,
-                    fail_on_tool_error=False,
+                    fail_on_tool_error=True,
                 )
             )
         except Exception:
             logger.exception("Dream Phase 2 failed")
             result = None
+
+        if not result or result.stop_reason != "completed":
+            return False
 
         new_cursor = batch[-1]["cursor"]
         self.store.set_last_dream_cursor(new_cursor)
