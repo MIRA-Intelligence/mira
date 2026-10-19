@@ -52,6 +52,16 @@ as its own package, so relative imports work.
 | 3 consecutive failures | the plugin is **tripped** and stays off until `mira plugin enable` |
 | a plugin tool/channel reuses a built-in name | the built-in wins |
 
+## Remote disable
+
+The plugin registry can switch a plugin version off on every install
+(`GET <registry>/plugins/disabled`). The gateway polls it
+(`plugins.registry_url`, every `plugins.poll_interval_s`, on unless
+`plugins.remote_disable` is false): a listed version's tools and hooks stop
+at once, it is not loaded on the next start, and a channel it provides stops
+at the next gateway restart. When the registry lifts it, it comes back on its
+own. `mira plugin list` shows `remote-disabled` with the registry's reason.
+
 ## Trust tiers
 
 | Tier | Who | Loads | May use |

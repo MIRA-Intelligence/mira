@@ -66,3 +66,23 @@ class PluginState:
     def trip(self, plugin_id: str, reason: str) -> None:
         self._data.setdefault(plugin_id, {})["tripped"] = {"reason": reason, "at": int(time.time())}
         self._write()
+
+    # -- remote disable list (mira#210) --------------------------------------
+
+    def remote_reason(self, plugin_id: str, version: str | None) -> str | None:
+        """Why the platform disabled this plugin version, or None."""
+        listed = (self._data.get("_remote") or {}).get(plugin_id) or {}
+        if not isinstance(listed, dict):
+            return None
+        reason = listed.get("*") or (listed.get(version) if version else None)
+        return str(reason) if reason else None
+
+    def set_remote(self, disabled: dict[str, dict[str, str]]) -> bool:
+        """Replace the remote disable list (``{plugin_id: {version_or_*: reason}}``).
+        Returns True when it changed. Plugins the platform no longer lists are
+        re-enabled automatically; the user's own toggles are untouched."""
+        if (self._data.get("_remote") or {}) == disabled:
+            return False
+        self._data["_remote"] = disabled
+        self._write()
+        return True
