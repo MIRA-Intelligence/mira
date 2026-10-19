@@ -59,7 +59,7 @@ async def test_a_listed_version_stops_now_and_on_the_next_start(tmp_path):
     reg = _Registry({"disabled": [{"id": "flaky", "versions": ["1.0.0"], "reasons": {"1.0.0": "leaks tokens"}}]})
     poller = RemoteDisablePoller(rt, "https://reg.example/community/", fetch=reg)
     assert await poller.poll_once() == ["flaky"]
-    assert reg.urls == ["https://reg.example/community/plugins/disabled"]
+    assert reg.urls == ["https://reg.example/community/plugins", "https://reg.example/community/plugins/disabled"]
     assert "unavailable" in await tool.execute(text="hi")
     p = _rt(tmp_path).get("flaky")
     assert p.status == "remote-disabled" and "leaks tokens" in p.reason
@@ -99,3 +99,16 @@ def test_the_poller_follows_config():
     cfg.plugins.remote_disable = True
     poller = poller_from_config(cfg)
     assert poller is not None and poller.url == "https://r/plugins/disabled" and poller.interval_s == 600
+
+
+async def test_registry_tiers_are_recorded_for_the_next_load(tmp_path):
+    rt = _rt(tmp_path)
+
+    async def fetch(url):
+        if url.endswith("/plugins"):
+            return {"plugins": [{"id": "good", "tier": "verified"}, {"id": "x", "tier": "core-bundled"}]}
+        return {"disabled": []}
+
+    await RemoteDisablePoller(rt, "https://reg", fetch=fetch).poll_once()
+    assert rt.state.registry_tier("good") == "verified"
+    assert rt.state.registry_tier("x") is None  # the registry can't hand out core-bundled

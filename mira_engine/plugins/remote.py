@@ -55,12 +55,15 @@ class RemoteDisablePoller:
     ):
         self.runtime = runtime
         self.url = registry_url.rstrip("/") + "/plugins/disabled"
+        self.tiers_url = registry_url.rstrip("/") + "/plugins"
         self.interval_s = max(60.0, float(interval_s))
         self._fetch = fetch or _http_fetch
         self._task: asyncio.Task | None = None
 
     async def poll_once(self) -> list[str]:
-        """Fetch and apply the list. Returns ids of loaded plugins newly switched off."""
+        """Fetch and apply the list. Returns ids of loaded plugins newly switched off.
+        Also records the tiers the registry issued (applied at the next load)."""
+        await self._sync_tiers()
         try:
             disabled = _normalise(await self._fetch(self.url))
         except Exception as e:  # noqa: BLE001 - keep the last known list
@@ -88,6 +91,20 @@ class RemoteDisablePoller:
                     " — its channel stops at the next gateway restart" if p.channels else "",
                 )
         return newly
+
+    async def _sync_tiers(self) -> None:
+        try:
+            payload = await self._fetch(self.tiers_url)
+        except Exception as e:  # noqa: BLE001 - keep the last known tiers
+            logger.debug("plugin registry tiers unavailable: {}", e)
+            return
+        tiers = {
+            str(p["id"]): str(p["tier"])
+            for p in payload.get("plugins") or []
+            if isinstance(p, dict) and p.get("id") and p.get("tier") in ("verified", "community", "experimental")
+        }
+        if self.runtime.state.set_registry_tiers(tiers):
+            logger.info("plugin registry tiers updated; they apply at the next gateway start")
 
     async def run(self) -> None:
         while True:

@@ -64,16 +64,33 @@ own. `mira plugin list` shows `remote-disabled` with the registry's reason.
 
 ## Trust tiers
 
-| Tier | Who | Loads | May use |
+| Tier | Who | Runs | May use |
 |---|---|---|---|
 | `core-bundled` | `plugins/` in this repo | in-process, on by default | everything incl. `mutate` hooks |
-| `verified` | reviewed community plugins (platform registry, upcoming) | in-process | everything incl. `mutate` hooks |
-| `community` | anything a user installs | in-process, **off until enabled** | channels, tools, skills, `observe` hooks |
-| `experimental` | new / low-trust plugins | out-of-process runner (upcoming) | tools, skills |
+| `verified` | issued by the plugin registry after review | in-process | everything incl. `mutate` hooks |
+| `community` | issued by the registry | in-process, **off until enabled** | channels, tools, skills, `observe` hooks |
+| `experimental` | default for anything in `~/.mira/plugins` the registry hasn't rated | **out of process, sandboxed** | tools, skills |
 
-A manifest cannot raise its own tier. `observe` hooks receive a snapshot of the
-loop state and cannot change messages or the final answer. Permissions are
-recorded and shown today; they are enforced once plugins run out of process.
+A manifest cannot raise its own tier: user plugins get the tier the registry
+issued (`GET <registry>/plugins`, synced by the gateway's poller, applied on
+the next start), else `plugins.default_user_tier`. Promotion is
+`experimental → community → verified` by a maintainer
+(`PUT /plugins/:id` on the platform).
+
+### Out-of-process plugins
+
+An experimental plugin's tools are served by `python -m mira_engine.plugins.host`
+in a child process. With bubblewrap (Linux) the host sees system directories
+and its own code read-only, a private scratch directory, the workspace only if
+`permissions.filesystem` asks (`workspace:read` / `workspace:write`), and **no
+network** unless `permissions.network` is non-empty; the Mira home (config,
+keys, gateway token) is masked. The host gets a minimal environment (no API
+keys), a memory limit, and is killed when a call hangs; a crash fails that call
+and the next call starts a fresh host.
+
+Without bubblewrap (e.g. macOS) experimental plugins don't load unless
+`plugins.unsandboxed_experimental` is set — they then still run out of process
+(crashes and hangs stay isolated), but their permissions are not enforced.
 
 ## Contract
 

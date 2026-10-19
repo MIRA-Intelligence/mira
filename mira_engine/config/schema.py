@@ -683,6 +683,12 @@ class PluginsConfig(Base):
     registry_url: str = "https://mira-intelligence.com/community"
     remote_disable: bool = True
     poll_interval_s: int = 600
+    # Tier for plugins in ~/.mira/plugins that the registry hasn't rated
+    # (mira#211): "experimental" runs them out of process, sandboxed.
+    default_user_tier: str = "experimental"
+    # Without bwrap (e.g. macOS) experimental plugins don't load unless this is
+    # set: they then run out of process but their permissions aren't enforced.
+    unsandboxed_experimental: bool = False
 
 
 class Config(BaseSettings):

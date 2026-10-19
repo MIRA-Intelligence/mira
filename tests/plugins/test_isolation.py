@@ -1,0 +1,153 @@
+"""Experimental plugins run out of process, sandboxed where possible (mira#211)."""
+
+from __future__ import annotations
+
+import json
+import os
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from mira_engine.agent.tools.sandbox import sandbox_available
+from mira_engine.plugins import PluginRuntime, PluginSource
+from mira_engine.plugins.state import PluginState
+
+PROBE = '''
+import asyncio, os, socket
+from mira_engine.agent.tools.base import Tool
+
+class Probe(Tool):
+    name = "probe"
+    description = "isolation probe"
+    parameters = {"type": "object", "properties": {"what": {"type": "string"}, "path": {"type": "string"}}}
+
+    async def execute(self, what="pid", path="", **kw):
+        if what == "pid":
+            return str(os.getpid())
+        if what == "env":
+            return os.environ.get("MIRA_TEST_SECRET", "absent")
+        if what == "crash":
+            os._exit(3)
+        if what == "hang":
+            await asyncio.sleep(3600)
+        if what == "print":
+            print("noise on stdout")
+            return "still fine"
+        if what == "net":
+            try:
+                socket.create_connection(("1.1.1.1", 53), timeout=3).close()
+                return "connected"
+            except OSError as e:
+                return "blocked: " + type(e).__name__
+        if what == "read":
+            try:
+                return open(path).read()[:50]
+            except OSError as e:
+                return "blocked: " + type(e).__name__
+        return "?"
+'''
+
+
+def _plugin(root: Path, pid: str, manifest: dict | None = None) -> Path:
+    d = root / pid
+    d.mkdir(parents=True)
+    data = {
+        "id": pid, "version": "1.0.0", "default_enabled": True,
+        "provides": {"tools": [{"name": "probe", "entry": "probe:Probe"}]}, **(manifest or {}),
+    }
+    (d / "plugin.json").write_text(json.dumps(data))
+    (d / "probe.py").write_text(textwrap.dedent(PROBE))
+    return d
+
+
+def _rt(tmp_path: Path, *, unsandboxed: bool, workspace: Path | None = None) -> PluginRuntime:
+    rt = PluginRuntime(
+        sources=[PluginSource(tmp_path / "plugins", "experimental")],
+        state=PluginState(tmp_path / "state.json"),
+        workspace=workspace or tmp_path / "ws",
+        allow_unsandboxed=unsandboxed,
+    )
+    rt.load()
+    return rt
+
+
+def test_without_a_sandbox_experimental_plugins_need_an_explicit_opt_in(tmp_path, monkeypatch):
+    from mira_engine.plugins import isolation
+
+    monkeypatch.setattr("mira_engine.agent.tools.sandbox.sandbox_available", lambda network=True: (False, "no bwrap"))
+    _plugin(tmp_path / "plugins", "exp")
+    p = _rt(tmp_path, unsandboxed=False).get("exp")
+    assert p.status == "unsupported" and "unsandboxed_experimental" in p.reason
+    assert isolation  # imported for the monkeypatch target
+
+
+def test_out_of_process_plugins_cannot_provide_channels_or_hooks(tmp_path):
+    hooks = {"provides": {"hooks": [{"entry": "probe:Probe"}]}}
+    _plugin(tmp_path / "plugins", "hooky", hooks)
+    p = _rt(tmp_path, unsandboxed=True).get("hooky")
+    assert p.status == "failed" and "only provide tools" in p.reason
+
+
+@pytest.fixture
+def unsandboxed(tmp_path, monkeypatch):
+    monkeypatch.setattr("mira_engine.agent.tools.sandbox.sandbox_available", lambda network=True: (False, "test"))
+    monkeypatch.setenv("MIRA_TEST_SECRET", "sk-should-not-leak")
+    _plugin(tmp_path / "plugins", "exp")
+    rt = _rt(tmp_path, unsandboxed=True)
+    assert rt.get("exp").status == "loaded", rt.get("exp").reason
+    return rt.tools()[0]
+
+
+async def test_tools_run_in_another_process_without_the_engine_env(unsandboxed):
+    tool = unsandboxed
+    assert int(await tool.execute(what="pid")) != os.getpid()
+    assert await tool.execute(what="env") == "absent"
+    assert await tool.execute(what="print") == "still fine"  # plugin stdout can't corrupt the protocol
+
+
+async def test_a_crashing_plugin_never_takes_the_engine_down(unsandboxed):
+    tool = unsandboxed
+    first = await tool.execute(what="pid")
+    assert "exited" in await tool.execute(what="crash")
+    assert await tool.execute(what="pid") != first  # a fresh host on the next call
+
+
+async def test_a_hung_plugin_call_is_killed_and_the_host_replaced(unsandboxed):
+    tool = unsandboxed
+    tool._inner._call_timeout_s = 0.5
+    first = await tool.execute(what="pid")
+    assert "Error" in await tool.execute(what="hang")
+    assert await tool.execute(what="pid") != first
+
+
+def test_registry_tier_promotes_a_plugin_in_process(tmp_path):
+    _plugin(tmp_path / "plugins", "trusted")
+    state = PluginState(tmp_path / "state.json")
+    state.set_registry_tiers({"trusted": "verified"})
+    rt = PluginRuntime(sources=[PluginSource(tmp_path / "plugins", "experimental")], state=state, workspace=tmp_path, allow_unsandboxed=False)
+    rt.load()
+    p = rt.get("trusted")
+    assert p.tier == "verified" and p.status == "loaded" and p.reason == ""
+
+
+BWRAP_OK = sandbox_available(network=False)[0]
+
+
+@pytest.mark.skipif(not BWRAP_OK, reason="needs bubblewrap (Linux)")
+async def test_sandbox_enforces_network_and_filesystem_permissions(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "data.txt").write_text("workspace data")
+    secret = Path(os.environ.get("MIRA_HOME", tmp_path / "mira-home")) / "config.json"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text('{"providers": {"key": "sk-secret"}}')
+    _plugin(tmp_path / "plugins", "noperm")
+    _plugin(tmp_path / "plugins", "reader", {"permissions": {"filesystem": "workspace:read"}})
+    rt = _rt(tmp_path, unsandboxed=False, workspace=ws)
+    noperm = next(t for t in rt.tools() if t.plugin_id == "noperm")
+    reader = next(t for t in rt.tools() if t.plugin_id == "reader")
+    assert (await noperm.execute(what="net")).startswith("blocked")
+    assert (await noperm.execute(what="read", path=str(ws / "data.txt"))).startswith("blocked")
+    assert await reader.execute(what="read", path=str(ws / "data.txt")) == "workspace data"
+    assert (await reader.execute(what="read", path=str(secret))).startswith("blocked")
