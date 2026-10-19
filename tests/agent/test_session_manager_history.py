@@ -277,3 +277,28 @@ def test_window_cuts_mid_tool_group():
     # leaving orphan tool results for split_a at the front.
     history = session.get_history(max_messages=6)
     _assert_no_orphans(history)
+
+
+def test_turn_longer_than_window_keeps_its_request():
+    """A turn of hundreds of tool calls must not leave "continue" with no context."""
+    session = Session(key="k")
+    session.messages.append({"role": "user", "content": "train all models"})
+    for i in range(200):
+        session.messages.extend(_tool_turn("long", i))
+    session.messages.append({"role": "assistant", "content": "stopped at the limit"})
+
+    history = session.get_history(max_messages=100)
+
+    assert history[0] == {"role": "user", "content": "train all models"}
+    assert history[1]["role"] == "assistant"
+    assert history[-1]["content"] == "stopped at the limit"
+    assert len(history) <= 101
+    _assert_no_orphans(history)
+
+
+def test_window_without_any_user_message_stays_empty():
+    session = Session(key="k")
+    for i in range(10):
+        session.messages.extend(_tool_turn("orphan", i))
+
+    assert session.get_history(max_messages=6) == []

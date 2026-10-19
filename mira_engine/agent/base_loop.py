@@ -21,6 +21,7 @@ import re
 import time
 import weakref
 from contextlib import AsyncExitStack, nullcontext, suppress
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -76,6 +77,11 @@ if TYPE_CHECKING:
     from mira_engine.cron.service import CronService
 
 UNIFIED_SESSION_KEY = "unified:default"
+
+# Whether the last _run_agent_loop in this task ended on text the model streamed.
+# Synthesized endings (iteration limit, stop guards, errors) are never streamed,
+# so the dispatcher must still publish them or the client keeps waiting.
+_final_content_streamed: ContextVar[bool] = ContextVar("mira_final_content_streamed", default=False)
 
 
 class BaseAgentLoop:
@@ -744,6 +750,7 @@ class BaseAgentLoop:
         active_route = None
         loop_tokens_used = 0
         hook = getattr(self, "_hook", None)
+        _final_content_streamed.set(False)
 
         while iteration < self.max_iterations:
             if turn_stop_guard is not None:
@@ -756,6 +763,7 @@ class BaseAgentLoop:
             if hook:
                 await hook.before_iteration(hook_ctx)
             iteration += 1
+            iteration_streamed = False
 
             use_routed_runtime = model_runtime is not None and (
                 self.provider_factory is not None or self.role_provider_factory is not None
@@ -792,6 +800,7 @@ class BaseAgentLoop:
                         on_content_delta=_stream_delta,
                     )
                     clean_streamed = self._strip_think(streamed_raw)
+                    iteration_streamed = bool(clean_streamed)
                     if response.content and clean_streamed:
                         response.content = clean_streamed
                     if on_stream_end:
@@ -840,6 +849,7 @@ class BaseAgentLoop:
                         on_content_delta=_stream_delta,
                     )
                     clean_streamed = self._strip_think(streamed_raw)
+                    iteration_streamed = bool(clean_streamed)
                     if response.content and clean_streamed:
                         response.content = clean_streamed
                     if on_stream_end:
@@ -995,6 +1005,7 @@ class BaseAgentLoop:
                             await hook.after_iteration(hook_ctx)
                         continue
                 final_content = clean
+                _final_content_streamed.set(iteration_streamed)
                 hook_ctx.final_content = final_content
                 hook_ctx.stop_reason = "completed"
                 if hook:
@@ -1007,9 +1018,13 @@ class BaseAgentLoop:
         if final_content is None and iteration >= self.max_iterations:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             final_content = (
-                f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
-                "without completing the task. You can try breaking the task into smaller steps."
+                f"I stopped before finishing: this turn reached the limit of "
+                f"{self.max_iterations} tool calls. Reply \"continue\" and I will pick up "
+                "where I left off, or break the task into smaller steps."
             )
+            # Close the turn in the transcript too, so the saved session does not
+            # end on a bare tool result and the next message reads as a follow-up.
+            messages = self.context.add_assistant_message(messages, final_content)
 
         self._last_loop_tokens_used = loop_tokens_used
         return final_content, tools_used, messages
@@ -1217,6 +1232,7 @@ class BaseAgentLoop:
 
         if bool((msg.metadata or {}).get("_wants_stream")):
             stream_meta = dict(msg.metadata or {})
+            _final_content_streamed.set(False)
             streamed_any = False
             fallback_prefix = "MIRA_SKILL_FALLBACK_REQUIRED:"
             inspect_fallback_prefix = bool(stream_meta.get("selected_skill_ids"))
@@ -1286,11 +1302,12 @@ class BaseAgentLoop:
                 response = await self._process_message(
                     msg, on_stream=_on_stream, on_stream_end=_on_stream_end
                 )
-                # Fallback: if the runtime never streamed (e.g. routed provider
-                # without token streaming), the deltas/end markers carry no
-                # content, so publish the final response normally so the client
-                # still receives the answer.
-                if not streamed_any and response is not None:
+                # Publish the final response unless its text already reached the
+                # client as deltas: the runtime may never have streamed (e.g. a
+                # routed provider without token streaming), or the turn ended
+                # on text the model never produced (iteration limit, a stop
+                # guard, an error), and without it the client keeps "thinking".
+                if response is not None and (not streamed_any or not _final_content_streamed.get()):
                     await self.bus.publish_outbound(response)
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)

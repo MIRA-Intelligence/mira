@@ -159,6 +159,59 @@ class TestDispatch:
         assert second.metadata["_stream_end"] is True
 
     @pytest.mark.asyncio
+    async def test_dispatch_publishes_unstreamed_final_after_streamed_text(self):
+        """A turn that streamed earlier text but ended on a synthesized notice
+        (e.g. the tool-call limit) must still deliver it, or the UI keeps thinking."""
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui", sender_id="u1", chat_id="c1", content="go",
+            metadata={"_wants_stream": True},
+        )
+
+        async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
+            await on_stream("Let me run the experiments.")
+            await on_stream_end(resuming=False)
+            return OutboundMessage(channel="ui", chat_id="c1", content="limit reached")
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        delta = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        end = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        final = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        assert delta.metadata["_stream_delta"] is True
+        assert end.metadata["_stream_end"] is True
+        assert final.content == "limit reached"
+        assert bus.outbound.empty()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_skips_final_already_streamed(self):
+        from mira_engine.agent import base_loop
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui", sender_id="u1", chat_id="c1", content="hi",
+            metadata={"_wants_stream": True},
+        )
+
+        async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
+            await on_stream("hello there")
+            await on_stream_end(resuming=False)
+            base_loop._final_content_streamed.set(True)
+            return OutboundMessage(channel="ui", chat_id="c1", content="hello there")
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        end = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        assert end.metadata["_stream_end"] is True
+        assert bus.outbound.empty()
+
+    @pytest.mark.asyncio
     async def test_dispatch_buffers_streamed_skill_fallback_marker(self):
         from mira_engine.bus.events import InboundMessage, OutboundMessage
 

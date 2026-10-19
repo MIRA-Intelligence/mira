@@ -405,11 +405,46 @@ async def test_run_agent_loop_error_and_max_iterations(tmp_path: Path) -> None:
             )
         ]
     )
-    final2, _, _ = await loop._run_agent_loop(
+    final2, _, messages2 = await loop._run_agent_loop(
         [{"role": "user", "content": "go"}],
         model_runtime=runtime_max,
     )
-    assert "maximum number of tool call iterations" in final2
+    assert "limit of 1 tool calls" in final2
+    # The transcript ends on the notice, not on a bare tool result.
+    assert messages2[-1] == {"role": "assistant", "content": final2}
+
+
+async def test_run_agent_loop_reports_whether_final_text_was_streamed(tmp_path: Path) -> None:
+    from mira_engine.agent.base_loop import _final_content_streamed
+
+    async def _noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    loop = _make_loop(tmp_path)
+    streamed = _RuntimeStub([LLMResponse(content="all done")], stream_deltas=["all ", "done"])
+    final, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=streamed,
+        on_stream=_noop,
+        on_stream_end=_noop,
+    )
+    assert final == "all done"
+    assert _final_content_streamed.get() is True
+
+    # The iteration-limit notice is written by the engine, never streamed.
+    loop.max_iterations = 1
+    limited = _RuntimeStub(
+        [LLMResponse(content="", tool_calls=[ToolCallRequest(id="c1", name="echo", arguments={"value": 1})])],
+        stream_deltas=["checking"],
+    )
+    final2, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "go"}],
+        model_runtime=limited,
+        on_stream=_noop,
+        on_stream_end=_noop,
+    )
+    assert "limit of 1 tool calls" in final2
+    assert _final_content_streamed.get() is False
 
 
 async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
