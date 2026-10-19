@@ -691,6 +691,36 @@ class BaseAgentLoop:
         sections = [chunk for chunk in (python_hint, base, notice, rules) if chunk]
         return "\n\n".join(sections) if sections else None
 
+    def _community_budget(self):
+        from mira_engine.community.budget import CommunityBudget
+
+        return CommunityBudget(int(getattr(self.community_config, "daily_token_budget", 0) or 0))
+
+    async def _community_admit(self, msg: InboundMessage) -> tuple[bool, str]:
+        """Budget + triage gate for a community event (mira#213)."""
+        from mira_engine.community.budget import TRIAGE_PROMPT, should_handle
+
+        if self.community_config is None:
+            return True, "no community config"
+
+        event = (msg.metadata or {}).get("community_event")
+        triage = None
+        triage_model = (getattr(self.community_config, "triage_model", "") or "").strip()
+        if triage_model:
+            interests = ", ".join(getattr(self.community_config, "domains", None) or []) or "general"
+
+            async def triage(content: str) -> tuple[bool, int]:
+                resp = await self.provider.chat_with_retry(
+                    messages=[{"role": "user", "content": TRIAGE_PROMPT.format(interests=interests, event=content[:2000])}],
+                    model=triage_model,
+                    max_tokens=5,
+                    temperature=0,
+                )
+                tokens = int((resp.usage or {}).get("total_tokens", 0) or 0)
+                return "RESPOND" in (resp.content or "").upper(), tokens
+
+        return await should_handle(event, msg.content, self._community_budget(), triage=triage)
+
     def _get_model_runtime(self, session_key: str) -> RoutedProviderManager:
         """Return the session-local model runtime, creating it on demand."""
         runtime = self._session_model_runtimes.get(session_key)
@@ -1367,6 +1397,15 @@ class BaseAgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        # The user's community budget decides which events get a full turn
+        # (mira#213): priorities tighten as the day's tokens run down, and an
+        # optional cheap model triages low-priority events first.
+        if msg.channel == COMMUNITY_CHANNEL:
+            handle, why = await self._community_admit(msg)
+            if not handle:
+                logger.info("community event skipped: {}", why)
+                return None
+
         # Community threads are public, untrusted input: never archive them into
         # the long-term memory that Dream distils into USER.md/MEMORY.md
         # (mira#203). Their sessions stay bounded by ``memory_window``.
@@ -1470,6 +1509,8 @@ class BaseAgentLoop:
             run_kwargs["on_stream_end"] = on_stream_end
         await self._emit_activity_ping(progress_cb)
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
+        if msg.channel == COMMUNITY_CHANNEL and self.community_config is not None:
+            self._community_budget().record_turn(self._last_loop_tokens_used)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."

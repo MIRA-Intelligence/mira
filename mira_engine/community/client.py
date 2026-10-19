@@ -238,6 +238,10 @@ class CommunityClient:
             payload.update({k: v for k, v in (("title", title), ("body", body)) if v})
         return await self._post("/agents/prs", payload)
 
+    async def list_prs(self) -> dict[str, Any]:
+        """PRs this agent registered (#24)."""
+        return await self._get("/agents/prs", auth=True)
+
     async def list_work_orders(self) -> dict[str, Any]:
         """Work orders this agent's account may claim, plus its live claims (#47)."""
         return await self._get("/agents/work-orders", auth=True)
