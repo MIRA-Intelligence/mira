@@ -1047,6 +1047,9 @@ class UiChannel(BaseChannel):
         self._clients: dict[str, web.WebSocketResponse] = {}
         # Every open WebSocket, bound to a session or not, so shutdown can close them all.
         self._sockets: set[web.WebSocketResponse] = set()
+        # Sockets whose client understands turn_started/turn_finished; older
+        # clients would render them as empty messages.
+        self._turn_event_sockets: set[web.WebSocketResponse] = set()
         self._client_project_dirs: dict[str, Path | None] = {}
         # Accumulates streamed assistant text per session so the final turn can
         # be persisted to the UI history log on stream end.
@@ -1924,6 +1927,8 @@ class UiChannel(BaseChannel):
         await ws.prepare(request)
         emit_event("websocket.connected", connection_id=connection_id)
         self._sockets.add(ws)
+        if request.query.get("turn_events") == "1":
+            self._turn_event_sockets.add(ws)
 
         session_id: str | None = None
 
@@ -2505,6 +2510,7 @@ class UiChannel(BaseChannel):
             # Runs on errors too, so a crashed loop cannot leave a stale client bound.
             emit_event("websocket.disconnected", connection_id=connection_id, code=getattr(ws, "close_code", None))
             self._sockets.discard(ws)
+            self._turn_event_sockets.discard(ws)
             if session_id and self._clients.get(session_id) is ws:
                 del self._clients[session_id]
                 self._client_project_dirs.pop(session_id, None)
@@ -2742,7 +2748,7 @@ class UiChannel(BaseChannel):
         }
 
     async def _send_turn_event(self, msg: OutboundMessage) -> None:
-        """Track a turn's start/finish and tell the client; never persisted to history."""
+        """Track a turn's start/finish and tell a client that asked for it; never persisted."""
         metadata = msg.metadata or {}
         event = metadata.get("_turn_event")
         turn_id = metadata.get("turn_id")
@@ -2766,7 +2772,7 @@ class UiChannel(BaseChannel):
             **({"stop_reason": metadata["stop_reason"]} if metadata.get("stop_reason") else {}),
         }
         ws = self._clients.get(msg.chat_id)
-        if ws is not None and not ws.closed:
+        if ws is not None and not ws.closed and ws in self._turn_event_sockets:
             try:
                 await ws.send_json({
                     "type": f"turn_{event}",

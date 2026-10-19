@@ -4,7 +4,7 @@ Covers a turn that hits the tool-call limit and the "continue" that follows it.
 """
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from mira_engine.bus.events import InboundMessage
 from mira_engine.providers.base import LLMResponse, ToolCallRequest
@@ -33,8 +33,9 @@ async def test_limit_hit_reaches_client_and_continue_has_context(tmp_path, ui_ch
 
     loop.provider.chat_stream_with_retry = chat_stream_with_retry
 
-    ws = SimpleNamespace(closed=False, send_json=AsyncMock())
+    ws = MagicMock(closed=False, send_json=AsyncMock())
     ui_channel._clients["chat-1"] = ws
+    ui_channel._turn_event_sockets.add(ws)
 
     async def run_turn(text):
         ws.send_json.reset_mock()
