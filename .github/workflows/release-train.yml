@@ -39,9 +39,11 @@ jobs:
     needs: verify-tags
     runs-on: ubuntu-latest
     steps:
+      # The harness (scripts/release_train_smoke.py) comes from this workflow's
+      # ref, so harness fixes apply to tags already published; what is tested
+      # is the engine binary downloaded from the agent_tag release below.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.agent_tag }}
           fetch-depth: 0
       - name: Set isolated gateway paths on the runner
         run: |
