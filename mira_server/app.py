@@ -843,9 +843,13 @@ class MiraServer:
         engine = await self._ready_engine(identity)
         handle = engine.handle
         assert handle is not None and self.http is not None
-        # The same path on the engine (/ws, /ws/workflow/v1, ...); only the engine token in the query.
+        # The same path on the engine (/ws, /ws/workflow/v1, ...). The client's own
+        # parameters (e.g. turn_events=1) pass through; its token is swapped for the engine's.
+        client_query = strip_token_query(request.rel_url.raw_query_string)
+        engine_token = f"access_token={quote(handle.token, safe='')}"
         url = URL.build(scheme="http", host="127.0.0.1", port=handle.port, path=request.rel_url.raw_path,
-                        query_string=f"access_token={quote(handle.token, safe='')}", encoded=True)
+                        query_string=f"{client_query}&{engine_token}" if client_query else engine_token,
+                        encoded=True)
         try:
             upstream = await self.http.ws_connect(
                 url,

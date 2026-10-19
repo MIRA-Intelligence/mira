@@ -422,6 +422,17 @@ async def test_ws_overwrites_user_id_and_passes_frames(harness: Harness) -> None
     assert ws_request["headers"]["X-Mira-Server-User"] == "alice"
 
 
+async def test_ws_keeps_client_parameters_but_swaps_the_token(harness: Harness) -> None:
+    tokens = await harness.login()
+    await harness.wait_running(tokens)
+    async with harness.client.ws_connect(
+        f"/ws?turn_events=1&access_token={tokens['access_token']}", headers={"Origin": "file://"},
+    ):
+        pass
+    ws_request = [r for r in harness.spawner.logs["alice"].requests if r["path"] == "/ws"][0]
+    assert ws_request["query"] == f"turn_events=1&access_token={harness.spawner.tokens['alice']}"
+
+
 async def test_ws_accepts_bearer_header(harness: Harness) -> None:
     tokens = await harness.login()
     await harness.wait_running(tokens)
