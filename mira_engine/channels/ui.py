@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import quote
 from uuid import uuid4
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, WSCloseCode, web
@@ -829,6 +830,54 @@ def _resolve_upload_destination(
     return _next_available_path(parent, safe_parts[-1])
 
 
+_PROJECT_FILE_LIST_SKIP_DIRS = frozenset({".mira", "__pycache__", ".git", "node_modules"})
+_PROJECT_FILE_LIST_LIMIT = 5000
+
+
+def _collect_project_file_entries(
+    project_dir: Path,
+    limit: int = _PROJECT_FILE_LIST_LIMIT,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Walk a project directory and return file rows for the UI explorer.
+
+    Skipped directories are pruned rather than walked, symlinked directories are
+    not followed, and files that resolve outside the project are left out because
+    the artifacts endpoint would refuse to serve them. Returns the rows and
+    whether *limit* cut the listing short.
+    """
+    root = project_dir.resolve()
+    entries: list[dict[str, Any]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _PROJECT_FILE_LIST_SKIP_DIRS)
+        current = Path(dirpath)
+        for name in sorted(filenames):
+            if name == ".DS_Store":
+                continue
+            path = current / name
+            try:
+                if path.is_symlink():
+                    path.resolve().relative_to(root)
+                stat = path.stat()
+            except (OSError, ValueError):
+                continue
+            if len(entries) >= limit:
+                return entries, True
+            entries.append({
+                "name": name,
+                "path": path.relative_to(root).as_posix(),
+                "size": stat.st_size,
+                "mtime": int(stat.st_mtime),
+                "is_dir": False,
+            })
+    return entries, False
+
+
+def _attachment_disposition(filename: str) -> str:
+    """Content-Disposition for a download, keeping non-ASCII names intact (RFC 6266)."""
+    fallback = "".join(ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_" for ch in filename)
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
 def _next_available_dir(base_dir: Path, dirname: str) -> Path:
     """Return a non-colliding directory path inside *base_dir*."""
     candidate = base_dir / dirname
@@ -1304,6 +1353,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_patch("/api/projects/{session_id}/meta", self._handle_project_meta)
         self._app.router.add_post("/api/projects/{session_id}/remove", self._handle_remove_project)
         self._app.router.add_delete("/api/projects", self._handle_delete_project)
+        self._app.router.add_get("/api/projects/{session_id}/files", self._handle_list_project_files)
         self._app.router.add_post("/api/projects/{session_id}/files", self._handle_upload_project_files)
         self._app.router.add_post(
             "/api/projects/{session_id}/context/from-chat",
@@ -3818,6 +3868,23 @@ class UiChannel(BaseChannel):
         )
         return web.json_response({"deleted": False, "removed": True})
 
+    async def _handle_list_project_files(self, request: web.Request) -> web.Response:
+        """List files under projects_root/<session_id> for the UI resource explorer."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        project_dir = self._resolve_project_dir(session_id)
+        if project_dir is None or not project_dir.is_dir():
+            return web.json_response({"error": "project not found"}, status=404)
+
+        files, truncated = await asyncio.to_thread(_collect_project_file_entries, project_dir)
+        return web.json_response({
+            "session_id": session_id,
+            "files": files,
+            "truncated": truncated,
+        })
+
     async def _handle_upload_project_files(self, request: web.Request) -> web.Response:
         """Upload files into projects_root/<session_id>/data for web clients."""
         session_id = request.match_info.get("session_id", "").strip()
@@ -4061,6 +4128,13 @@ class UiChannel(BaseChannel):
         if not candidate.is_file():
             return web.json_response({"error": "artifact not found"}, status=404)
 
+        if request.query.get("download") == "1":
+            # The UI and engine are usually different origins, where the
+            # browser ignores <a download>, so the header has to ask for it.
+            return web.FileResponse(
+                candidate,
+                headers={"Content-Disposition": _attachment_disposition(candidate.name)},
+            )
         if is_deck_file(candidate):
             return deck_response(candidate, edit=request.query.get("mode") == "edit")
         return web.FileResponse(candidate)
