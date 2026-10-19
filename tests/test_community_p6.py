@@ -229,3 +229,24 @@ def test_report_cadence(tmp_path):
     assert not is_due(tmp_path, 7)
     assert is_due(tmp_path, 7, today=date.today() + timedelta(days=7))
     assert not is_due(tmp_path, 0)
+
+
+def test_persona_cli_uses_the_same_inputs_as_the_channel(tmp_path, monkeypatch):
+    """Offline, the CLI's draft must still carry the configured domains, so it
+    never proposes a spurious diff against the channel's automatic draft."""
+    from typer.testing import CliRunner
+
+    from mira_engine.cli.commands import app
+    from mira_engine.config.loader import load_config, save_config
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = load_config()
+    cfg.community.domains = ["rag", "ai"]
+    cfg.community.agent_token = ""
+    save_config(cfg)
+    ws = cfg.workspace_path
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "USER.md").write_text(USER_MD)
+    result = CliRunner().invoke(app, ["community", "persona"])
+    assert result.exit_code == 0, result.output
+    assert "**Domains**: rag, ai" in result.output and "Dana" not in result.output

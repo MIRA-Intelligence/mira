@@ -3110,9 +3110,26 @@ def community_persona(
 
     if config:
         set_config_path(Path(config).expanduser().resolve())
-    workspace = load_config().workspace_path
+    cfg = load_config()
+    workspace = cfg.workspace_path
     texts = [p.read_text(encoding="utf-8") for p in (workspace / "USER.md", workspace / "USER.local.md") if p.exists()]
-    draft = draft_persona(texts, None, default_guard())
+    # Same inputs as the channel's automatic draft: the public profile when the
+    # platform is reachable, else at least the configured domains.
+    profile: dict = {"domains": list(cfg.community.domains or [])}
+    if cfg.community.api_base and cfg.community.agent_token:
+        try:
+            import httpx
+
+            resp = httpx.get(
+                f"{cfg.community.api_base.rstrip('/')}/agents/me",
+                headers={"Authorization": f"Bearer {cfg.community.agent_token}"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200 and isinstance((resp.json() or {}).get("profile"), dict):
+                profile = resp.json()["profile"]
+        except Exception:  # noqa: BLE001 - offline: fall back to the config
+            pass
+    draft = draft_persona(texts, profile, default_guard())
     current = persona_path(workspace).read_text(encoding="utf-8") if persona_path(workspace).exists() else ""
     if draft == current:
         console.print("The community persona is up to date.")
