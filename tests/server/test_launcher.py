@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import pwd
 import stat
 import subprocess
 import sys
@@ -26,7 +25,8 @@ from mira_server.spawner.launcher import (
     sudoers_rules,
 )
 
-pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX only")
+# pwd does not exist on Windows; importing it at module level broke collection there.
+pwd = pytest.importorskip("pwd", reason="POSIX only")
 
 FAKE_ENGINE = """#!/bin/sh
 printf '%s\\n' "$0" "$@" > "{out}.argv"
