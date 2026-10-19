@@ -19,6 +19,7 @@ import inspect
 import json
 import re
 import time
+import uuid
 import weakref
 from contextlib import AsyncExitStack, nullcontext, suppress
 from contextvars import ContextVar
@@ -82,6 +83,22 @@ UNIFIED_SESSION_KEY = "unified:default"
 # Synthesized endings (iteration limit, stop guards, errors) are never streamed,
 # so the dispatcher must still publish them or the client keeps waiting.
 _final_content_streamed: ContextVar[bool] = ContextVar("mira_final_content_streamed", default=False)
+
+# Why the current turn ended, reported to the UI in its turn_finished event so
+# the client never has to infer the end of a turn from message text.
+TURN_COMPLETED = "completed"
+TURN_MAX_ITERATIONS = "max_iterations"
+TURN_MAX_TOKENS = "max_tokens"
+TURN_WAITING_INPUT = "waiting_input"
+TURN_BUDGET_EXCEEDED = "budget_exceeded"
+TURN_STOPPED = "stopped"
+TURN_ERROR = "error"
+_turn_stop_reason: ContextVar[str] = ContextVar("mira_turn_stop_reason", default=TURN_COMPLETED)
+
+
+def set_turn_stop_reason(reason: str) -> None:
+    """Record why the turn running in this task ended (last writer wins)."""
+    _turn_stop_reason.set(reason)
 
 
 class BaseAgentLoop:
@@ -751,6 +768,7 @@ class BaseAgentLoop:
         loop_tokens_used = 0
         hook = getattr(self, "_hook", None)
         _final_content_streamed.set(False)
+        set_turn_stop_reason(TURN_COMPLETED)
 
         while iteration < self.max_iterations:
             if turn_stop_guard is not None:
@@ -758,6 +776,7 @@ class BaseAgentLoop:
                 if stop_message is not None:
                     final_content = stop_message
                     messages = self.context.add_assistant_message(messages, stop_message)
+                    set_turn_stop_reason(TURN_WAITING_INPUT)
                     break
             hook_ctx = AgentHookContext(iteration=iteration, messages=messages)
             if hook:
@@ -956,6 +975,7 @@ class BaseAgentLoop:
                     if stop_message is not None:
                         final_content = stop_message
                         messages = self.context.add_assistant_message(messages, stop_message)
+                        set_turn_stop_reason(TURN_WAITING_INPUT)
                         hook_ctx.final_content = stop_message
                         hook_ctx.stop_reason = "durable_boundary"
                         if hook:
@@ -973,6 +993,7 @@ class BaseAgentLoop:
                     messages = self.context.add_assistant_message(
                         messages, "(error — see previous log)"
                     )
+                    set_turn_stop_reason(TURN_ERROR)
                     hook_ctx.final_content = final_content
                     hook_ctx.stop_reason = "error"
                     if hook:
@@ -1006,6 +1027,10 @@ class BaseAgentLoop:
                         continue
                 final_content = clean
                 _final_content_streamed.set(iteration_streamed)
+                # "length": the reply was cut off by the output token limit.
+                set_turn_stop_reason(
+                    TURN_MAX_TOKENS if response.finish_reason == "length" else TURN_COMPLETED
+                )
                 hook_ctx.final_content = final_content
                 hook_ctx.stop_reason = "completed"
                 if hook:
@@ -1025,6 +1050,7 @@ class BaseAgentLoop:
             # Close the turn in the transcript too, so the saved session does not
             # end on a bare tool result and the next message reads as a follow-up.
             messages = self.context.add_assistant_message(messages, final_content)
+            set_turn_stop_reason(TURN_MAX_ITERATIONS)
 
         self._last_loop_tokens_used = loop_tokens_used
         return final_content, tools_used, messages
@@ -1213,17 +1239,49 @@ class BaseAgentLoop:
                                 session_ref=opaque_ref(msg.session_key), channel=msg.channel,
                                 workflow_run_id=metadata.get("workflow_run_id")):
             emit_event("agent.dispatch.started")
+            # Only the UI renders turn state; other channels would print the
+            # empty lifecycle messages.
+            lifecycle = msg.channel == "ui"
+            turn_id = metadata.get("turn_id") if isinstance(metadata.get("turn_id"), str) else None
+            turn_id = turn_id or f"turn-{uuid.uuid4().hex[:12]}"
+            if lifecycle:
+                await self._publish_turn_event(msg, turn_id, "started")
+            set_turn_stop_reason(TURN_COMPLETED)
+            stop_reason: str | None = None
             try:
                 await self._dispatch_with_context(msg)
             except asyncio.CancelledError:
+                stop_reason = TURN_STOPPED
                 emit_event("agent.dispatch.cancelled")
                 raise
             except Exception as exc:
+                stop_reason = TURN_ERROR
                 emit_event("agent.dispatch.failed", level="ERROR", exception=exc)
                 raise
             finally:
                 emit_event("agent.dispatch.finished",
                            duration_ms=round((time.monotonic() - started) * 1000, 2))
+                # Exactly one turn_finished per turn, however it ended, so the
+                # client never keeps a "thinking" state for a finished turn.
+                if lifecycle:
+                    await self._publish_turn_event(
+                        msg, turn_id, "finished", stop_reason or _turn_stop_reason.get(),
+                    )
+
+    async def _publish_turn_event(
+        self,
+        msg: InboundMessage,
+        turn_id: str,
+        event: str,
+        stop_reason: str | None = None,
+    ) -> None:
+        metadata = dict(msg.metadata or {})
+        metadata.update({"_turn_event": event, "turn_id": turn_id})
+        if stop_reason is not None:
+            metadata["stop_reason"] = stop_reason
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content="", metadata=metadata,
+        ))
 
     async def _dispatch_with_context(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
@@ -1319,6 +1377,7 @@ class BaseAgentLoop:
             except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
                 emit_event("agent.turn.failed", level="ERROR", exception=exc)
+                set_turn_stop_reason(TURN_ERROR)
                 await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
             return
         async with self._processing_lock:
@@ -1341,6 +1400,7 @@ class BaseAgentLoop:
             except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
                 emit_event("agent.turn.failed", level="ERROR", exception=exc)
+                set_turn_stop_reason(TURN_ERROR)
                 await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
 
     async def _warm_skill_scan_cache(self) -> None:

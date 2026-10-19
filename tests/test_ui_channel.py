@@ -111,6 +111,43 @@ def test_load_ui_instructions_joins_present_files(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_turn_events_reach_client_and_track_active_turns(ui_channel):
+    ws = SimpleNamespace(closed=False, send_json=AsyncMock())
+    ui_channel._clients["chat-test"] = ws
+    request = SimpleNamespace(match_info={"session_id": "chat-test"})
+
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="chat-test", content="", metadata={
+        "_turn_event": "started", "turn_id": "t1", "workflow_run_id": "run-1", "project_dir": "/x",
+    }))
+    assert ws.send_json.call_args.args[0] == {
+        "type": "turn_started", "session_id": "chat-test", "content": "",
+        "metadata": {"turn_id": "t1", "workflow_run_id": "run-1"},
+    }
+    active = json.loads((await ui_channel._handle_active_turns(request)).text)["active"]
+    assert [(t["turn_id"], t["workflow_run_id"]) for t in active] == [("t1", "run-1")]
+
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="chat-test", content="", metadata={
+        "_turn_event": "finished", "turn_id": "t1", "workflow_run_id": "run-1",
+        "stop_reason": "max_iterations",
+    }))
+    assert ws.send_json.call_args.args[0]["type"] == "turn_finished"
+    assert ws.send_json.call_args.args[0]["metadata"]["stop_reason"] == "max_iterations"
+    assert json.loads((await ui_channel._handle_active_turns(request)).text)["active"] == []
+    # Lifecycle events are transient: nothing lands in the chat history log.
+    assert ui_channel._stream_buffers == {}
+
+
+@pytest.mark.asyncio
+async def test_turn_finished_without_a_client_still_clears_the_turn(ui_channel):
+    for event in ("started", "finished"):
+        await ui_channel.send(OutboundMessage(channel="ui", chat_id="gone", content="", metadata={
+            "_turn_event": event, "turn_id": "t2",
+        }))
+    request = SimpleNamespace(match_info={"session_id": "gone"})
+    assert json.loads((await ui_channel._handle_active_turns(request)).text)["active"] == []
+
+
+@pytest.mark.asyncio
 async def test_skill_load_history_persist_stream_paginate_and_isolate(ui_channel):
     from mira_engine.agent.skill_events import skill_loaded
 

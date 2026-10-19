@@ -447,6 +447,42 @@ async def test_run_agent_loop_reports_whether_final_text_was_streamed(tmp_path: 
     assert _final_content_streamed.get() is False
 
 
+async def test_run_agent_loop_records_why_the_turn_ended(tmp_path: Path) -> None:
+    from mira_engine.agent.base_loop import _turn_stop_reason
+
+    loop = _make_loop(tmp_path)
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=_RuntimeStub([LLMResponse(content="done")]),
+    )
+    assert _turn_stop_reason.get() == "completed"
+
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=_RuntimeStub([LLMResponse(content="half an ans", finish_reason="length")]),
+    )
+    assert _turn_stop_reason.get() == "max_tokens"
+
+    async def _needs_input() -> str | None:
+        return "Waiting for your approval."
+
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "hi"}],
+        model_runtime=_RuntimeStub([LLMResponse(content="done")]),
+        turn_stop_guard=_needs_input,
+    )
+    assert _turn_stop_reason.get() == "waiting_input"
+
+    loop.max_iterations = 1
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "go"}],
+        model_runtime=_RuntimeStub([
+            LLMResponse(content="", tool_calls=[ToolCallRequest(id="c1", name="echo", arguments={"value": 1})]),
+        ]),
+    )
+    assert _turn_stop_reason.get() == "max_iterations"
+
+
 async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)
     loop.bus = MessageBus()
@@ -467,8 +503,14 @@ async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
 
     loop._process_message = _ok
     await loop._dispatch(msg)
+    started = await loop.bus.consume_outbound()
     dispatched = await loop.bus.consume_outbound()
+    finished = await loop.bus.consume_outbound()
+    assert started.metadata["_turn_event"] == "started"
     assert dispatched.content == "ok"
+    assert finished.metadata["_turn_event"] == "finished"
+    assert finished.metadata["stop_reason"] == "completed"
+    assert finished.metadata["turn_id"] == started.metadata["turn_id"]
 
     async def _none(_msg):
         return None
@@ -484,7 +526,11 @@ async def test_dispatch_and_stop_handlers(tmp_path: Path) -> None:
 
     loop._process_message = _boom
     await loop._dispatch(msg)
+    assert (await loop.bus.consume_outbound()).metadata["_turn_event"] == "started"
     err = await loop.bus.consume_outbound()
+    failed = await loop.bus.consume_outbound()
+    assert failed.metadata["_turn_event"] == "finished"
+    assert failed.metadata["stop_reason"] == "error"
     assert err.content.startswith("Sorry, I ran into a problem")
     assert "RuntimeError: kaboom detail" in err.content
     assert err.metadata.get("_error") is True

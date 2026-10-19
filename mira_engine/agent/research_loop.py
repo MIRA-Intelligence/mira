@@ -17,7 +17,12 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from mira_engine.agent.base_loop import UNIFIED_SESSION_KEY, BaseAgentLoop
+from mira_engine.agent.base_loop import (
+    TURN_BUDGET_EXCEEDED,
+    UNIFIED_SESSION_KEY,
+    BaseAgentLoop,
+    set_turn_stop_reason,
+)
 from mira_engine.agent.context import ContextBuilder
 from mira_engine.agent.skill_events import skill_loaded
 from mira_engine.agent.token_usage import track_token_usage
@@ -604,11 +609,18 @@ class ResearchAgentLoop(BaseAgentLoop):
             if completed >= max_experiments:
                 return f"max experiments reached ({completed}/{max_experiments})"
 
-        max_tokens = policy.get("maxTokens")
-        if isinstance(max_tokens, int) and max_tokens > 0 and tokens_used >= max_tokens:
-            return f"token budget reached ({tokens_used}/{max_tokens})"
+        if cls._token_budget_reached(policy, tokens_used):
+            return f"token budget reached ({tokens_used}/{policy['maxTokens']})"
 
         return None
+
+    @staticmethod
+    def _token_budget_reached(policy: dict | None, tokens_used: int) -> bool:
+        max_tokens = policy.get("maxTokens") if isinstance(policy, dict) else None
+        return isinstance(max_tokens, int) and max_tokens > 0 and tokens_used >= max_tokens
+
+    def _auto_round_limit(self) -> int:
+        return getattr(self, "_auto_max_rounds", None) or self._AUTO_MAX_ROUNDS
 
     # ------------------------------------------------------------------
     # task_plan.result restore guard
@@ -1021,7 +1033,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             return False, "awaiting plan approval"
         if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
             return False, "task_plan guardrail blocking"
-        max_rounds = getattr(self, "_auto_max_rounds", None) or self._AUTO_MAX_ROUNDS
+        max_rounds = self._auto_round_limit()
         if auto_round >= max_rounds:
             logger.warning("Auto mode max rounds ({}) reached", max_rounds)
             return False, f"max rounds reached ({max_rounds})"
@@ -1669,6 +1681,8 @@ class ResearchAgentLoop(BaseAgentLoop):
                     tokens_used=total_tokens_used,
                 )
                 if stop_reason:
+                    if self._token_budget_reached(automation_policy, total_tokens_used):
+                        set_turn_stop_reason(TURN_BUDGET_EXCEEDED)
                     await progress_cb(f"auto-run stop condition: {stop_reason}")
                     break
 
@@ -1743,6 +1757,8 @@ class ResearchAgentLoop(BaseAgentLoop):
                             )
                     continue
                 if current_mode == "auto" and continuation_reason:
+                    if auto_round >= self._auto_round_limit():
+                        set_turn_stop_reason(TURN_BUDGET_EXCEEDED)
                     detail = self._format_stop_reason_detail(
                         continuation_reason, final_content
                     )

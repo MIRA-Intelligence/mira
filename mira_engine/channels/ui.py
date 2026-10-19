@@ -1051,6 +1051,9 @@ class UiChannel(BaseChannel):
         # Accumulates streamed assistant text per session so the final turn can
         # be persisted to the UI history log on stream end.
         self._stream_buffers: dict[str, str] = {}
+        # Turns the agent has started and not yet finished, per session and
+        # workflow run, so a reconnecting client can drop a stale "thinking".
+        self._active_turns: dict[str, dict[str, dict[str, Any]]] = {}
         self._app: web.Application | None = None
         self._workflow_api = WorkflowHttpApi(self.project_registry)
         self._knowledge = KnowledgeService(config=_knowledge_config, proxy=_web_proxy)
@@ -1318,6 +1321,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/sessions/{session_id}/history", self._handle_history)
         self._app.router.add_get("/api/sessions/{session_id}/skills", self._handle_skill_history)
         self._app.router.add_get("/api/sessions/{session_id}/usage", self._handle_token_usage)
+        self._app.router.add_get("/api/sessions/{session_id}/turns", self._handle_active_turns)
         self._app.router.add_get(
             "/api/sessions/{session_id}/context-preview",
             self._handle_chat_context_preview,
@@ -1465,6 +1469,9 @@ class UiChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         metadata = msg.metadata or {}
+        if metadata.get("_turn_event"):
+            await self._send_turn_event(msg)
+            return
         if metadata.get("_usage_only"):
             # Do not append a chat message, toggle streaming, or refresh workflow state.
             ws = self._clients.get(msg.chat_id)
@@ -2733,6 +2740,50 @@ class UiChannel(BaseChannel):
             "run_id": details.get("workflow_run_id"), "module_type": details.get("module_type"),
             "turn_id": details.get("turn_id"), "agent": details.get("agent"),
         }
+
+    async def _send_turn_event(self, msg: OutboundMessage) -> None:
+        """Track a turn's start/finish and tell the client; never persisted to history."""
+        metadata = msg.metadata or {}
+        event = metadata.get("_turn_event")
+        turn_id = metadata.get("turn_id")
+        run_id = metadata.get("workflow_run_id") if isinstance(metadata.get("workflow_run_id"), str) else ""
+        if not msg.chat_id or event not in {"started", "finished"} or not isinstance(turn_id, str):
+            return
+        turns = self._active_turns.setdefault(msg.chat_id, {})
+        if event == "started":
+            turns[turn_id] = {
+                "turn_id": turn_id,
+                "workflow_run_id": run_id or None,
+                "started_at": int(time.time()),
+            }
+        else:
+            turns.pop(turn_id, None)
+            if not turns:
+                self._active_turns.pop(msg.chat_id, None)
+        payload = {
+            "turn_id": turn_id,
+            **({"workflow_run_id": run_id} if run_id else {}),
+            **({"stop_reason": metadata["stop_reason"]} if metadata.get("stop_reason") else {}),
+        }
+        ws = self._clients.get(msg.chat_id)
+        if ws is not None and not ws.closed:
+            try:
+                await ws.send_json({
+                    "type": f"turn_{event}",
+                    "session_id": msg.chat_id,
+                    "content": "",
+                    "metadata": payload,
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Turn event delivery deferred to /turns: {}", exc)
+
+    async def _handle_active_turns(self, request: web.Request) -> web.Response:
+        """List the session's running turns so a reconnecting client can resync."""
+        session_id = request.match_info.get("session_id", "").strip()
+        if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+        turns = list(self._active_turns.get(session_id, {}).values())
+        return web.json_response({"session_id": session_id, "active": turns})
 
     async def _handle_token_usage(self, request: web.Request) -> web.Response:
         from mira_engine.agent.token_usage import TokenUsageStore
