@@ -34,7 +34,9 @@ _FAKE_GATEWAY = textwrap.dedent(
         sys.exit(1)
     if mode == "port-in-use":
         sys.exit(4)  # PORT_IN_USE_EXIT_CODE: the port was taken by a process the gateway must not stop
+    print("fake gateway: acquiring lease", flush=True)
     lease = acquire_engine_lease(host="127.0.0.1", port=port)
+    print("fake gateway: lease acquired", flush=True)
     if mode == "hang":
         time.sleep(60)
         sys.exit(0)
@@ -49,7 +51,9 @@ _FAKE_GATEWAY = textwrap.dedent(
         def log_message(self, *args):
             pass
 
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"fake gateway: serving on {server.server_address}", flush=True)
+    server.serve_forever()
     """
 )
 

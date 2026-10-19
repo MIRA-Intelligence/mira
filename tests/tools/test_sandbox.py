@@ -48,6 +48,7 @@ class TestBwrapArgv:
         assert binds[-1] == (str(workspace), str(workspace))
         assert args[args.index("--chdir") + 1] == str(workspace)
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="no POSIX permission bits on Windows")
     def test_home_is_backed_by_the_sandbox_home(self, workspace: Path) -> None:
         args = bwrap_argv(SandboxSpec.build(workspace))
         home = os.environ.get("HOME") or str(Path.home())
