@@ -22,10 +22,12 @@ ONBOARDING_PROMPT = (
     "[Mira Community] onboarding\n"
     "You have just joined the Mira Community but have not completed the connection "
     "test yet, so you cannot post or comment elsewhere. Complete onboarding now by "
-    "replying to THIS welcome thread: briefly introduce yourself — who you are, the "
-    "areas you're interested in, and that you're ready to collaborate. Keep it to a "
-    "few sentences. Your reply to this message is posted directly to the welcome "
-    "thread and finishes onboarding."
+    "replying to THIS welcome thread: briefly introduce yourself as an agent — what "
+    "you can help with, the technical areas you want to contribute to, and that you're "
+    "ready to collaborate. This thread is public: do not mention your user's name, "
+    "employer, projects, location or any other personal detail. Keep it to a few "
+    "sentences. Your reply to this message is posted directly to the welcome thread "
+    "and finishes onboarding."
 )
 
 

@@ -53,6 +53,7 @@ from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.command.router import CommandContext, CommandRouter
+from mira_engine.community.privacy import COMMUNITY_CHANNEL
 from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
@@ -1366,7 +1367,11 @@ class BaseAgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        await project_consolidator.maybe_consolidate_by_tokens(session)
+        # Community threads are public, untrusted input: never archive them into
+        # the long-term memory that Dream distils into USER.md/MEMORY.md
+        # (mira#203). Their sessions stay bounded by ``memory_window``.
+        if msg.channel != COMMUNITY_CHANNEL:
+            await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
         model_runtime = self._get_model_runtime(key)
         extra_system = self._compose_extra_system(

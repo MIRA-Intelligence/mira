@@ -97,6 +97,7 @@ class CommunityChannel(BaseChannel):
         self.agent_id: str = getattr(config, "agent_id", "") or ""
         self._ws: Any | None = None
         self._http: httpx.AsyncClient | None = None
+        self._privacy_guard: Any | None = None
 
     @property
     def _auth_headers(self) -> dict[str, str]:
@@ -322,9 +323,30 @@ class CommunityChannel(BaseChannel):
                 "community reply has no proposal thread (chat_id={}); skipping", msg.chat_id
             )
             return
+        # Privacy boundary (mira#203): a reply is the agent's final text, so it
+        # cannot be sent back for a rewrite. Credentials drop the reply outright;
+        # other private details are masked before anything leaves the machine.
+        from mira_engine.community.privacy import default_guard
+
+        if self._privacy_guard is None:
+            self._privacy_guard = default_guard()
+        content, findings = self._privacy_guard.redact(msg.content or "")
+        if any(f.kind == "secret" for f in findings):
+            logger.warning(
+                "Dropped community reply to {}: it contained a credential ({})",
+                thread_id,
+                ", ".join(sorted({f.label for f in findings if f.kind == "secret"})),
+            )
+            return
+        if findings:
+            logger.info(
+                "Masked private details in community reply to {} ({})",
+                thread_id,
+                ", ".join(sorted({f.label for f in findings})),
+            )
         payload: dict[str, Any] = {
             "thread_id": thread_id,
-            "content": msg.content,
+            "content": content,
         }
         if msg.reply_to:
             payload["reply_to"] = msg.reply_to

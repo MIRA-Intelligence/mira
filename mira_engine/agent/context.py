@@ -10,6 +10,11 @@ from typing import Any
 
 from mira_engine.agent.memory import MemoryStore
 from mira_engine.agent.skills import SkillsLoader
+from mira_engine.community.privacy import (
+    COMMUNITY_BOOTSTRAP_FILES,
+    COMMUNITY_CHANNEL,
+    COMMUNITY_PERSONA_FILE,
+)
 from mira_engine.utils.helpers import detect_image_mime
 from mira_engine.utils.prompt_templates import render_template
 
@@ -35,16 +40,33 @@ class ContextBuilder:
         agents_filename: str = "AGENTS.md",
         channel: str | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, bootstrap files, memory, and skills.
+
+        Community turns (mira#203) talk to the public, so they get a reduced
+        prompt: no ``USER.md`` profile, no long-term memory and no recent
+        cross-session history — only the agent's own instructions/persona and
+        the user-approved ``COMMUNITY_PERSONA.md``.
+        """
+        community = channel == COMMUNITY_CHANNEL
         parts = [self._get_identity(channel=channel)]
 
-        bootstrap = self._load_bootstrap_files(agents_filename=agents_filename)
+        bootstrap = self._load_bootstrap_files(
+            agents_filename=agents_filename,
+            files=COMMUNITY_BOOTSTRAP_FILES if community else None,
+        )
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        if community:
+            persona = self.workspace / COMMUNITY_PERSONA_FILE
+            if persona.is_file():
+                text = persona.read_text(encoding="utf-8").strip()
+                if text:
+                    parts.append(f"## {COMMUNITY_PERSONA_FILE}\n\n{text}")
+        else:
+            memory = self.memory.get_memory_context()
+            if memory:
+                parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -56,7 +78,7 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary).strip())
 
-        recent_history = self._build_recent_history_section()
+        recent_history = "" if community else self._build_recent_history_section()
         if recent_history:
             parts.append(recent_history)
 
@@ -142,8 +164,14 @@ class ContextBuilder:
             pass
         return None
 
-    def _load_bootstrap_files(self, agents_filename: str = "AGENTS.md") -> str:
+    def _load_bootstrap_files(
+        self,
+        agents_filename: str = "AGENTS.md",
+        files: tuple[str, ...] | list[str] | None = None,
+    ) -> str:
         """Load bootstrap files with override / append / fallback resolution.
+
+        ``files`` restricts which bootstrap files are loaded (default: all).
 
         Per file (e.g. AGENTS.md):
           1. workspace/AGENTS.md exists  →  use it              (override)
@@ -152,7 +180,7 @@ class ContextBuilder:
         """
         parts = []
 
-        for filename in self.BOOTSTRAP_FILES:
+        for filename in files if files is not None else self.BOOTSTRAP_FILES:
             effective_name = agents_filename if filename == "AGENTS.md" else filename
             stem = effective_name.rsplit(".", 1)[0]
 

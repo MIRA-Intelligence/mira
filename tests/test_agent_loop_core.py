@@ -744,3 +744,27 @@ async def test_run_main_loop_and_process_direct(monkeypatch, tmp_path: Path) -> 
     assert await loop.process_direct("hello") == ""
     loop.stop()
     assert loop._running is False
+
+
+async def test_community_turns_are_never_archived_into_long_term_memory(monkeypatch, tmp_path: Path) -> None:
+    """Community threads are public, untrusted input; they must not reach the
+    memory Dream distils into USER.md/MEMORY.md (mira#203)."""
+    loop = _make_real_loop(tmp_path)
+
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+        return "done", [], messages + [{"role": "assistant", "content": "done"}]
+
+    consolidated: list[str] = []
+
+    async def _spy(session):
+        consolidated.append(session.key)
+
+    monkeypatch.setattr(loop, "_run_agent_loop", _fake_run)
+    monkeypatch.setattr(loop.consolidator, "maybe_consolidate_by_tokens", _spy)
+
+    thread = "24110f35-3c7d-4006-81e4-02a54584a7a4"
+    await loop._process_message(InboundMessage(channel="community", sender_id="c", chat_id=thread, content="hi"))
+    assert consolidated == []
+
+    await loop._process_message(InboundMessage(channel="ui", sender_id="u", chat_id="PRJ-9", content="hi"))
+    assert consolidated == ["ui:PRJ-9"]

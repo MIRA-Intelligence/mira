@@ -489,6 +489,10 @@ class CommunityConfig(Base):
     # without a network round-trip. ``rules_text`` is a pre-rendered block.
     rules_version: int = 0
     rules_text: str = ""
+    # Extra words that must never reach the community (project codenames,
+    # colleagues, internal hosts, …). The outbound privacy filter (mira#203)
+    # always also checks the profile name/emails, OS username and home path.
+    private_terms: list[str] = Field(default_factory=list)
 
 
 class WebSearchConfig(Base):

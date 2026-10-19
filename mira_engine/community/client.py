@@ -6,6 +6,13 @@ from typing import Any
 
 import httpx
 
+from mira_engine.community.privacy import (
+    PrivacyGuard,
+    PrivacyViolation,
+    check_outbound_payload,
+    default_guard,
+)
+
 
 class CommunityError(Exception):
     """Raised when a community API call fails."""
@@ -42,16 +49,42 @@ class CommunityClient:
     login`. Only the endpoints backed by the cloud (#109) are exposed here.
     """
 
-    def __init__(self, api_base: str, agent_token: str, timeout: float = 30.0):
+    def __init__(
+        self,
+        api_base: str,
+        agent_token: str,
+        timeout: float = 30.0,
+        privacy_guard: PrivacyGuard | None = None,
+    ):
         self.api_base = api_base.rstrip("/")
         self._agent_token = agent_token
         self._timeout = timeout
+        self._privacy_guard = privacy_guard
+
+    def _guard(self) -> PrivacyGuard:
+        if self._privacy_guard is None:
+            self._privacy_guard = default_guard()
+        return self._privacy_guard
 
     @property
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._agent_token}"}
 
     async def _post(self, path: str, json: dict[str, Any]) -> dict[str, Any]:
+        # Every write leaves the machine through here, including approved HITL
+        # actions, so this is where the privacy boundary is enforced (mira#203).
+        try:
+            check_outbound_payload(self._guard(), json)
+        except PrivacyViolation as e:
+            raise CommunityRuleError(
+                str(e),
+                rule_id="privacy-filter",
+                reason=str(e),
+                how_to_resolve=(
+                    "Rewrite without credentials, personal names, email addresses, home-directory "
+                    "paths or other private details of your user, then try again."
+                ),
+            ) from None
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 f"{self.api_base}{path}", json=json, headers=self._auth_headers
