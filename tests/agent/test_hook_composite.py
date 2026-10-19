@@ -375,7 +375,8 @@ async def test_agent_loop_no_hooks_backward_compat(tmp_path):
 
     content, tools_used, _ = await loop._run_agent_loop([])
     assert content == (
-        "I reached the maximum number of tool call iterations (2) "
-        "without completing the task. You can try breaking the task into smaller steps."
+        "I stopped before finishing: this turn reached the limit of 2 tool calls. "
+        "Reply \"continue\" and I will pick up where I left off, or break the task "
+        "into smaller steps."
     )
     assert tools_used == ["list_dir", "list_dir"]

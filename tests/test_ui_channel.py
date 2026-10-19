@@ -111,6 +111,56 @@ def test_load_ui_instructions_joins_present_files(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_turn_events_reach_client_and_track_active_turns(ui_channel):
+    ws = MagicMock(closed=False, send_json=AsyncMock())
+    ui_channel._clients["chat-test"] = ws
+    ui_channel._turn_event_sockets.add(ws)
+    request = SimpleNamespace(match_info={"session_id": "chat-test"})
+
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="chat-test", content="", metadata={
+        "_turn_event": "started", "turn_id": "t1", "workflow_run_id": "run-1", "project_dir": "/x",
+    }))
+    assert ws.send_json.call_args.args[0] == {
+        "type": "turn_started", "session_id": "chat-test", "content": "",
+        "metadata": {"turn_id": "t1", "workflow_run_id": "run-1"},
+    }
+    active = json.loads((await ui_channel._handle_active_turns(request)).text)["active"]
+    assert [(t["turn_id"], t["workflow_run_id"]) for t in active] == [("t1", "run-1")]
+
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="chat-test", content="", metadata={
+        "_turn_event": "finished", "turn_id": "t1", "workflow_run_id": "run-1",
+        "stop_reason": "max_iterations",
+    }))
+    assert ws.send_json.call_args.args[0]["type"] == "turn_finished"
+    assert ws.send_json.call_args.args[0]["metadata"]["stop_reason"] == "max_iterations"
+    assert json.loads((await ui_channel._handle_active_turns(request)).text)["active"] == []
+    # Lifecycle events are transient: nothing lands in the chat history log.
+    assert ui_channel._stream_buffers == {}
+
+
+@pytest.mark.asyncio
+async def test_turn_events_skip_clients_that_did_not_ask_but_turns_are_tracked(ui_channel):
+    ws = MagicMock(closed=False, send_json=AsyncMock())
+    ui_channel._clients["legacy"] = ws
+    await ui_channel.send(OutboundMessage(channel="ui", chat_id="legacy", content="", metadata={
+        "_turn_event": "started", "turn_id": "t3",
+    }))
+    ws.send_json.assert_not_called()
+    request = SimpleNamespace(match_info={"session_id": "legacy"})
+    assert [t["turn_id"] for t in json.loads((await ui_channel._handle_active_turns(request)).text)["active"]] == ["t3"]
+
+
+@pytest.mark.asyncio
+async def test_turn_finished_without_a_client_still_clears_the_turn(ui_channel):
+    for event in ("started", "finished"):
+        await ui_channel.send(OutboundMessage(channel="ui", chat_id="gone", content="", metadata={
+            "_turn_event": event, "turn_id": "t2",
+        }))
+    request = SimpleNamespace(match_info={"session_id": "gone"})
+    assert json.loads((await ui_channel._handle_active_turns(request)).text)["active"] == []
+
+
+@pytest.mark.asyncio
 async def test_skill_load_history_persist_stream_paginate_and_isolate(ui_channel):
     from mira_engine.agent.skill_events import skill_loaded
 
@@ -2727,6 +2777,28 @@ async def test_ws_handler_invalid_json_and_missing_session_id(
     await ui_channel._ws_handler(req)
     assert ws.sent[0]["content"] == "Invalid JSON"
     assert ws.sent[1]["content"] == "session_id required"
+
+
+@pytest.mark.parametrize(("query", "expected"), [({"turn_events": "1"}, True), ({}, False)])
+async def test_ws_handler_remembers_turn_event_support_while_open(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch, query: dict, expected: bool,
+) -> None:
+    ws = _FakeWs([_FakeWsMessage(web.WSMsgType.TEXT, json.dumps({
+        "type": "message", "session_id": "PRJ-4100", "content": "hi",
+    }))])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    seen: list[bool] = []
+
+    async def _record(**_kwargs: Any) -> None:
+        seen.append(ws in ui_channel._turn_event_sockets)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _record)
+    req = MagicMock(spec=web.Request)
+    req.query = query
+    await ui_channel._ws_handler(req)
+
+    assert seen == [expected]
+    assert ws not in ui_channel._turn_event_sockets
 
 
 async def test_ws_handler_message_and_set_mode_dispatch(
