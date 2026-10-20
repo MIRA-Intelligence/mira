@@ -3076,6 +3076,9 @@ class UiChannel(BaseChannel):
             "autonomy_mode": c.autonomy_mode,
             "code_host": c.code_host,
             "domains": list(c.domains),
+            # False until the user set up USER.local.md (desktop wizard or
+            # `mira profile`); the UI offers it right after joining.
+            "profile_onboarded": bool(cfg.profile.onboarded),
         }
 
     async def _handle_community_status(self, _request: web.Request) -> web.Response:
@@ -3241,19 +3244,35 @@ class UiChannel(BaseChannel):
         code_host = body.get("code_host")
         if code_host in ("github", "cnb"):
             cfg.community.code_host = code_host
-        if isinstance(body.get("domains"), list):
-            cfg.community.domains = [str(d).strip() for d in body["domains"] if str(d).strip()]
+        from mira_engine.community.public_profile import (
+            PublicProfileError,
+            normalize_public_profile,
+            pairing_payload,
+        )
+
+        raw_profile = body.get("profile") if isinstance(body.get("profile"), dict) else {}
+        if isinstance(body.get("domains"), list) and "domains" not in raw_profile:
+            raw_profile = {**raw_profile, "domains": body["domains"]}
+        try:
+            public_profile = normalize_public_profile(raw_profile)
+        except PublicProfileError as exc:
+            return web.json_response({"error": f"public profile: {exc}"}, status=400)
+        if "domains" in public_profile or "domains" in raw_profile:
+            cfg.community.domains = public_profile.get("domains", [])
         cfg.community.api_base = api_base
         try:
             config_loader.save_config(cfg, config_path)
         except OSError:
             pass
 
-        start_payload = {
-            "code_host": cfg.community.code_host,
-            "autonomy_mode": cfg.community.autonomy_mode,
-            "domains": cfg.community.domains,
-        }
+        start_payload = pairing_payload(
+            {
+                "code_host": cfg.community.code_host,
+                "autonomy_mode": cfg.community.autonomy_mode,
+                "domains": cfg.community.domains,
+            },
+            public_profile,
+        )
         try:
             async with ClientSession(timeout=ClientTimeout(total=30)) as session:
                 async with session.post(
@@ -3265,8 +3284,14 @@ class UiChannel(BaseChannel):
                             status=502,
                         )
                     if resp.status >= 400:
+                        # Surface the platform's reason (e.g. an invalid profile field).
+                        try:
+                            detail = (await resp.json()).get("error")
+                        except (ClientError, json.JSONDecodeError, AttributeError, ValueError):
+                            detail = None
                         return web.json_response(
-                            {"error": f"pairing failed: HTTP {resp.status}"}, status=502
+                            {"error": f"pairing failed: {detail or f'HTTP {resp.status}'}"},
+                            status=400 if resp.status == 400 else 502,
                         )
                     data = await resp.json()
         except (ClientError, asyncio.TimeoutError) as exc:
