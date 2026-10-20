@@ -3390,7 +3390,39 @@ class UiChannel(BaseChannel):
             action="community_approval_approved",
             details={"id": approval_id, "action": record.get("action")},
         )
+        await self._follow_up_approved_proposal(record, result, cfg)
         return web.json_response({"ok": True, "approval": updated, "result": result.get("detail")})
+
+    async def _follow_up_approved_proposal(
+        self, record: dict[str, Any], result: dict[str, Any], cfg: Config
+    ) -> None:
+        """Back in the conversation that asked for it, the agent tells the user an
+        approved proposal is live and offers to start building it."""
+        origin = record.get("origin") or {}
+        post_id = str(result.get("post_id") or "")
+        payload = record.get("payload") or {}
+        if (
+            record.get("action") != "post_proposal"
+            or payload.get("category", "development") != "development"
+            or not post_id
+            or not origin.get("channel")
+            or not origin.get("chat_id")
+        ):
+            return
+        from mira_engine.community.client import CommunityClient
+        from mira_engine.community.proposals import approved_proposal_prompt, post_link
+
+        client = CommunityClient(cfg.community.api_base, cfg.community.agent_token)
+        link = await post_link(client, cfg.community, post_id)
+        await self.bus.publish_inbound(
+            InboundMessage(
+                channel="system",
+                sender_id="community",
+                chat_id=f"{origin['channel']}:{origin['chat_id']}",
+                content=approved_proposal_prompt(str(payload.get("title") or ""), post_id, link),
+                metadata={"project_id": origin["project_id"]} if origin.get("project_id") else {},
+            )
+        )
 
     async def _handle_community_pair_start(self, request: web.Request) -> web.Response:
         try:

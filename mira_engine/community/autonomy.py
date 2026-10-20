@@ -99,8 +99,10 @@ class AutonomyGate:
     def approvals_path(self):
         return approvals_store.approvals_path()
 
-    def enqueue_approval(self, action: str, payload: dict[str, Any]) -> str:
+    def enqueue_approval(
+        self, action: str, payload: dict[str, Any], origin: dict[str, str] | None = None
+    ) -> str:
         """Persist a pending action for later human review. Returns its id."""
-        approval_id = approvals_store.append_approval(action, payload)
+        approval_id = approvals_store.append_approval(action, payload, origin)
         logger.info("community action '{}' queued for approval ({})", action, approval_id)
         return approval_id

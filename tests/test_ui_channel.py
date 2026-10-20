@@ -3267,6 +3267,47 @@ async def test_handle_community_decide_approve_executes(
     assert body["approval"]["status"] == "approved"
 
 
+async def test_approving_a_proposal_follows_up_in_its_conversation(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {
+        "id": "3",
+        "action": "post_proposal",
+        "status": "pending",
+        "payload": {"title": "Local model picker", "body": "B", "category": "development"},
+        "origin": {"channel": "ui", "chat_id": "chat-7", "project_id": "PRJ-1"},
+    }
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "set_status", lambda i, s: {**rec, "status": s})
+
+    async def fake_exec(r, c):
+        return {"ok": True, "detail": "post created (p1)", "post_id": "p1"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    cfg = Config()
+    cfg.community.web_url = "http://web.test"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "3"}
+    assert (await ui_channel._handle_community_decide(req)).status == 200
+    msg = ui_channel.bus.publish_inbound.await_args.args[0]
+    assert msg.channel == "system" and msg.chat_id == "ui:chat-7"
+    assert msg.metadata == {"project_id": "PRJ-1"}
+    assert '"Local model picker"' in msg.content and "http://web.test/proposals/p1" in msg.content
+    assert "proposal_id='p1'" in msg.content
+
+    # Other approvals, and proposals without a conversation, are not followed up.
+    ui_channel.bus.publish_inbound.reset_mock()
+    rec["action"] = "comment"
+    await ui_channel._handle_community_decide(req)
+    rec["action"], rec["origin"] = "post_proposal", {}
+    await ui_channel._handle_community_decide(req)
+    ui_channel.bus.publish_inbound.assert_not_awaited()
+
+
 async def test_handle_community_decide_keeps_pending_on_execution_failure(
     ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

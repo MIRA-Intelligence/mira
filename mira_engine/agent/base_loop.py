@@ -712,7 +712,7 @@ class BaseAgentLoop:
                 if hasattr(tool, "clear_project_context"):
                     tool.clear_project_context()
 
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "community_post_proposal"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))

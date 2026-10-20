@@ -33,11 +33,15 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def append_approval(action: str, payload: dict[str, Any]) -> str:
+def append_approval(
+    action: str, payload: dict[str, Any], origin: dict[str, str] | None = None
+) -> str:
     """Persist a pending action for later human review. Returns its id.
 
     The id pairs a millisecond timestamp (so ids sort roughly chronologically)
     with a short random suffix so rapid successive calls never collide.
+    ``origin`` (``channel``/``chat_id``/``project_id``) is the conversation the
+    agent asked from, so the outcome can be followed up there.
     """
     approval_id = f"{int(datetime.now(timezone.utc).timestamp() * 1000)}-{uuid.uuid4().hex[:8]}"
     record = {
@@ -47,6 +51,8 @@ def append_approval(action: str, payload: dict[str, Any]) -> str:
         "status": "pending",
         "created_at": _now(),
     }
+    if origin:
+        record["origin"] = origin
     path = approvals_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,7 +174,7 @@ async def execute_approval(record: dict[str, Any], community_config: Any) -> dic
                 category=payload.get("category", "development"),
                 tags=payload.get("tags"),
             )
-            return {"ok": True, "detail": f"post created ({res.get('id', '?')})"}
+            return {"ok": True, "detail": f"post created ({res.get('id', '?')})", "post_id": res.get("id")}
         if action == "accept_answer":
             res = await client.accept_answer(
                 payload.get("post_id", ""), payload.get("comment_id", "")
