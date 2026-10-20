@@ -1581,6 +1581,11 @@ def gateway(
         """Execute a cron job through the agent."""
         from mira_engine.agent.tools.cron import CronTool
         from mira_engine.agent.tools.message import MessageTool
+        from mira_engine.cron.system_jobs import run_system_job
+
+        # Built-in jobs (Dream) run directly, not as an agent turn.
+        if await run_system_job(job, lambda: agent.dream.run()):
+            return None
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
@@ -1639,6 +1644,10 @@ def gateway(
             ))
         return response
     cron.on_job = on_cron_job
+
+    from mira_engine.cron.system_jobs import register_dream_job
+
+    register_dream_job(cron, config.agents.defaults.dream, default_tz)
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
@@ -1747,6 +1756,7 @@ def gateway(
         provider = next_provider
         provider_factory = next_provider_factory
         default_tz = next_tz
+        register_dream_job(cron, next_config.agents.defaults.dream, next_tz)
         logger.info("Gateway runtime config reloaded from UI settings")
 
     # Create channel manager after the reload callback exists so UI config
