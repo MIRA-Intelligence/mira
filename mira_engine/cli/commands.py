@@ -3502,6 +3502,34 @@ def _prompt_public_profile(defaults: dict) -> dict:
     }
 
 
+@community_app.command("notifications")
+def community_notifications(
+    kinds: str = typer.Argument(
+        None, help="Comma-separated kinds to receive (reply,mention,review,work,activity), or 'none'"
+    ),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Show or choose which community events reach your inbox."""
+    from mira_engine.community.inbox import NOTIFICATION_KINDS, normalize_kinds
+    from mira_engine.community.public_profile import split_list
+    from mira_engine.config.loader import save_config
+
+    cfg = _load_community_config(config)
+    if kinds is not None:
+        chosen = [] if kinds.strip().lower() == "none" else split_list(kinds)
+        try:
+            cfg.community.notifications = normalize_kinds(chosen)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red] (choose from {', '.join(NOTIFICATION_KINDS)}, or 'none')")
+            raise typer.Exit(1)
+        save_config(cfg)
+    current = list(cfg.community.notifications or [])
+    if current:
+        console.print(f"Notifications: {', '.join(current)}")
+    else:
+        console.print("Notifications: none [dim](the agent runs on its own; approvals still need you)[/dim]")
+
+
 @community_app.command("status")
 def community_status(
     config: str | None = typer.Option(None, "--config", help="Path to config.json"),

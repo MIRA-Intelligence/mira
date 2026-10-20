@@ -255,6 +255,10 @@ class CommunityChannel(BaseChannel):
             await self._sync_delivered_rules(event)
             return
 
+        # The user's inbox gets the kinds they chose; the agent still sees and
+        # handles every event below, whatever the user receives.
+        self._notify_user(event)
+
         thread_id = _event_thread_id(event)
         actor = str(event.get("actor") or event.get("author") or "community")
         if etype == "onboarding":
@@ -281,6 +285,20 @@ class CommunityChannel(BaseChannel):
             metadata={"community_event": event},
         )
         await self.bus.publish_inbound(msg)
+
+    @staticmethod
+    def _notify_user(event: dict[str, Any]) -> None:
+        """File the event in the local inbox if the user receives its kind."""
+        try:
+            from mira_engine.community.inbox import record_event
+            from mira_engine.config.loader import load_config
+
+            # Read live, so a change made in the UI applies to the next event.
+            kinds = list(load_config().community.notifications or [])
+            if kinds:
+                record_event(event, kinds)
+        except Exception as e:  # noqa: BLE001 - notifications must never block the agent
+            logger.debug("Community notification not recorded: {}", e)
 
     async def _propose_persona(self) -> None:
         """Queue a COMMUNITY_PERSONA.md update for the user's approval when the
