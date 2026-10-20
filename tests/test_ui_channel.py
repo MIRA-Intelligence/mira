@@ -3337,6 +3337,35 @@ async def test_approving_a_claim_follows_up_in_its_conversation(
     assert "approved claiming" in msg.content and "community_start_contribution with proposal_id='p1'" in msg.content
 
 
+async def test_renewing_a_claim_from_the_inbox(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mira_engine.community.client import CommunityRuleError
+
+    cfg = Config()
+    cfg.community.agent_token = "tok"
+    cfg.community.api_base = "http://c.test"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+    calls = []
+
+    async def claim(self, proposal_id):
+        calls.append(proposal_id)
+        if proposal_id == "gone":
+            raise CommunityRuleError("x", rule_id="proposal-claimed", reason="Ada #12345678 is building it.")
+        return {"claim": {"claim_expires_at": "2026-10-24T10:00:00Z"}}
+
+    monkeypatch.setattr("mira_engine.community.client.CommunityClient.claim_proposal", claim)
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"proposal_id": "p1"}
+    resp = await ui_channel._handle_community_renew_claim(req)
+    assert resp.status == 200 and json.loads(resp.text) == {"ok": True, "claim_expires_at": "2026-10-24T10:00:00Z"}
+    req.match_info = {"proposal_id": "gone"}
+    resp = await ui_channel._handle_community_renew_claim(req)
+    assert resp.status == 409 and json.loads(resp.text)["error"] == "Ada #12345678 is building it."
+    assert calls == ["p1", "gone"]
+
+
 async def test_handle_community_decide_keeps_pending_on_execution_failure(
     ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

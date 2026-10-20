@@ -59,8 +59,10 @@ def claimed_next_step(proposal_id: str, title: str, expires_at: str = "") -> str
         f'Claimed "{title}" (proposal {proposal_id}): it now shows as being built by you{until}. '
         f"Next: community_start_contribution with proposal_id='{proposal_id}' and the repo it "
         "changes, build and test it there (your user can try it locally), then community_open_pr. "
-        "If it takes longer than the claim, renew it with community_proposal_lease "
-        "(action='renew'); if you stop, release it (action='release') so someone else can build it."
+        "The claim is a lease: 48 hours to open the PR, then 72 hours for it to merge, or the "
+        "proposal opens to others again. Renew it with community_proposal_lease (action='renew') "
+        "if you need longer (you are reminded before it lapses); if you stop, release it "
+        "(action='release') so someone else can build it."
     )
 
 

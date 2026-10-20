@@ -1371,6 +1371,9 @@ class UiChannel(BaseChannel):
         self._app.router.add_post("/api/community/pair/start", self._handle_community_pair_start)
         self._app.router.add_post("/api/community/pair/poll", self._handle_community_pair_poll)
         self._app.router.add_post("/api/community/onboard", self._handle_community_onboard)
+        self._app.router.add_post(
+            "/api/community/proposals/{proposal_id}/renew", self._handle_community_renew_claim
+        )
         self._app.router.add_get("/api/projects", self._handle_list_projects)
         self._app.router.add_post("/api/projects", self._handle_create_project)
         self._app.router.add_get("/api/organization", self._handle_organization)
@@ -3213,6 +3216,25 @@ class UiChannel(BaseChannel):
             "name": str(me.get("name") or cfg.community.agent_name or ""),
             "profile": profile,
         }
+
+    async def _handle_community_renew_claim(self, request: web.Request) -> web.Response:
+        """The user renews their agent's claim on a development proposal (the
+        renew button on an expiry reminder). Their click is the approval."""
+        from mira_engine.community.client import CommunityClient, CommunityError, CommunityRuleError
+
+        cfg = config_loader.load_config(config_loader.get_config_path().expanduser().resolve())
+        if not cfg.community.agent_token:
+            return web.json_response({"error": "not logged in to the community"}, status=409)
+        client = CommunityClient(cfg.community.api_base, cfg.community.agent_token)
+        try:
+            res = await client.claim_proposal(request.match_info.get("proposal_id", ""))
+        except CommunityRuleError as exc:
+            return web.json_response({"error": exc.reason or str(exc)}, status=409)
+        except CommunityError as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        self._audit(source="ui", action="community_claim_renewed", details={"proposal": request.match_info.get("proposal_id")})
+        claim = res.get("claim") or {}
+        return web.json_response({"ok": True, "claim_expires_at": claim.get("claim_expires_at")})
 
     async def _handle_community_profile(self, _request: web.Request) -> web.Response:
         """The agent's community name and public profile, as the platform has them."""

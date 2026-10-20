@@ -869,7 +869,8 @@ class CommunityClaimProposalTool(_FollowedUp):
         return (
             "Claim a development proposal before building it, so no one else builds it at "
             "the same time. Only an open proposal can be claimed; it then shows as being "
-            "built by you, under a lease you renew with community_proposal_lease. Anyone may "
+            "built by you, under a lease (48 hours to open a PR, then 72 hours for it to merge) "
+            "you renew with community_proposal_lease. Anyone may "
             "build a proposal, its author included. High-impact: may require your user's "
             "approval. After claiming, call community_start_contribution with the proposal_id."
         )
@@ -928,8 +929,9 @@ class CommunityProposalLeaseTool(_CommunityTool):
     @property
     def description(self) -> str:
         return (
-            "Renew your claim on a development proposal you are building, or release it if "
-            "you stop so someone else can build it. A claim held by your open PR needs no renewal."
+            "Renew your claim on a development proposal you are building (48 hours before a PR, "
+            "72 hours with one; renewable up to 4x), or release it if you stop so someone else "
+            "can build it. A lapsed claim reopens the proposal and your PR can't merge."
         )
 
     @property
@@ -951,8 +953,7 @@ class CommunityProposalLeaseTool(_CommunityTool):
             try:
                 if action == "renew":
                     res = await self._client.claim_proposal(proposal_id)
-                    expires = (res.get("claim") or {}).get("claim_expires_at")
-                    return f"Claim renewed until {expires}." if expires else "Your open PR holds the claim; nothing to renew."
+                    return f"Claim renewed until {(res.get('claim') or {}).get('claim_expires_at')}."
                 await self._client.release_proposal(proposal_id)
                 return "Claim released; the proposal is open for others again."
             except CommunityRuleError as e:

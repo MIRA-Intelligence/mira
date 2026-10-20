@@ -244,11 +244,30 @@ def test_claim_events_reach_the_inbox_as_work_and_prompt_the_agent():
     from mira_engine.channels.community import CommunityChannel
     from mira_engine.community import inbox
 
-    expired = {"type": "proposal_claim", "proposal_id": "p1", "title": "Picker", "state": "expired"}
-    reopened = {**expired, "state": "reopened"}
-    assert inbox.kind_of(expired) == "work"
+    base = {"type": "proposal_claim", "proposal_id": "p1", "title": "Picker"}
+    expiring = {**base, "state": "expiring", "expires_at": "2026-10-22T10:00:00Z", "has_pr": True}
+    expired = {**base, "state": "expired", "has_pr": True}
+    closed = {**base, "state": "pr_closed", "expires_at": "2026-10-22T10:00:00Z"}
+    rejected = {**base, "state": "rejected", "score": -3}
+    assert {inbox.kind_of(e) for e in (expiring, expired, closed, rejected)} == {"work"}
+    assert inbox._title(expiring) == 'Your claim on "Picker" expires soon'
     assert inbox._title(expired) == 'Your claim on "Picker" expired; it is open to others again'
-    assert "still hold the claim" in inbox._title(reopened)
-    text = CommunityChannel._format_event(expired)
-    assert "community_claim_proposal" in text and "community_comment" not in text
-    assert "community_open_pr" in CommunityChannel._format_event(reopened)
+    assert "voted" in inbox._title(rejected) and "still hold the claim" in inbox._title(closed)
+
+    text = CommunityChannel._format_event(expiring)
+    assert "and your PR for it lapses at 2026-10-22T10:00:00Z" in text
+    assert "action='renew'" in text and "Community inbox" in text and "community_comment" not in text
+    assert "your PR can't merge unless you claim it again" in CommunityChannel._format_event(expired)
+    assert "score -3" in CommunityChannel._format_event(rejected)
+    assert "until 2026-10-22T10:00:00Z" in CommunityChannel._format_event(closed)
+
+
+def test_each_lease_gets_its_own_reminder(tmp_path, monkeypatch):
+    from mira_engine.community import inbox
+
+    monkeypatch.setattr("mira_engine.community.inbox.get_data_dir", lambda: tmp_path)
+    first = {"type": "proposal_claim", "target_id": "p1", "proposal_id": "p1", "state": "expiring", "expires_at": "A"}
+    item = inbox.record_event(first, ["work"])
+    assert item and item["expires_at"] == "A" and item["thread_id"] == "p1"
+    assert inbox.record_event(first, ["work"]) is None
+    assert inbox.record_event({**first, "expires_at": "B"}, ["work"]) is not None
