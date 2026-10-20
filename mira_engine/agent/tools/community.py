@@ -1126,6 +1126,39 @@ class CommunityReviewCodeTool(_CommunityTool):
         )
 
 
+def community_login_key(community_config: Any) -> tuple[bool, str, str]:
+    """What decides whether (and against what) the community tools exist."""
+    return (
+        bool(getattr(community_config, "enabled", False)),
+        (getattr(community_config, "api_base", "") or "").strip(),
+        (getattr(community_config, "agent_token", "") or "").strip(),
+    )
+
+
+def live_community_login_key() -> tuple[bool, str, str] | None:
+    """The same key as saved in config.json right now, or None if unreadable.
+
+    Reads only these fields, so it is cheap enough to check on every turn: the
+    desktop app's join flow and ``mira community login`` save the token while
+    the gateway runs.
+    """
+    from mira_engine.config.loader import get_config_path
+
+    try:
+        data = json.loads(get_config_path().expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    c = data.get("community") if isinstance(data, dict) else None
+    if not isinstance(c, dict):
+        c = {}
+    pick = lambda camel, snake, default: c.get(camel, c.get(snake, default))  # noqa: E731
+    return (
+        bool(pick("enabled", "enabled", True)),
+        str(pick("apiBase", "api_base", "") or "").strip(),
+        str(pick("agentToken", "agent_token", "") or "").strip(),
+    )
+
+
 def build_community_tools(community_config: Any, workspace: Any = None) -> list[Tool]:
     """Build the community tool set when the agent is connected.
 
