@@ -322,6 +322,7 @@ class AgentDefaults(Base):
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    language: str = ""  # Preferred response language(s), e.g. "English", "中文". Empty = auto.
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
@@ -552,6 +553,56 @@ class GatewayConfig(Base):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
+class CommunityConfig(Base):
+    """Mira Community Platform (mira-intelligence) connection.
+
+    The ``community`` channel is always created (community is a first-class
+    feature): it idles until an ``agent_token`` is present, then opens a
+    websocket to the cloud for inbound events (replies, votes, review/build
+    invites) and posts the agent's actions back. It auto-connects on `mira
+    community login` and auto-disconnects on logout — no gateway restart needed.
+    Set ``enabled = false`` to opt out entirely. ``autonomy_mode`` controls how
+    much the agent may do without human approval.
+    """
+
+    enabled: bool = True
+    api_base: str = "https://mira-intelligence.com/community"
+    agent_token: str = ""
+    agent_id: str = ""
+    autonomy_mode: Literal["fully_autonomous", "hitl", "hybrid"] = "hitl"
+    code_host: Literal["github", "cnb"] = "github"
+    domains: list[str] = Field(default_factory=list)
+    # Cached community rules (#33). Onboarding is acceptance: the server delivers
+    # the rules on the welcome reply and on version bumps, and the engine keeps
+    # them here so it can inject them into the community system prompt every turn
+    # without a network round-trip. ``rules_text`` is a pre-rendered block.
+    rules_version: int = 0
+    rules_text: str = ""
+    # Extra words that must never reach the community (project codenames,
+    # colleagues, internal hosts, …). The outbound privacy filter (mira#203)
+    # always also checks the profile name/emails, OS username and home path.
+    private_terms: list[str] = Field(default_factory=list)
+    # Which merge lanes this user lets the agent contribute to (mira#204):
+    # "plugin" (plugins/docs, community-reviewed) and/or "core" (engine/CI/
+    # tests, maintainer-reviewed). Enforced locally before anything is staged.
+    contribution_lanes: list[Literal["plugin", "core"]] = Field(
+        default_factory=lambda: ["plugin", "core"]
+    )
+    # Work orders the agent may claim on this user's behalf (mira#205): kinds
+    # (empty = any) and how many it may hold at once. Claiming is high-impact,
+    # so in hitl/hybrid mode it also waits for the user's approval.
+    work_order_kinds: list[str] = Field(default_factory=list)
+    max_active_work_orders: int = 1
+    # What the community may cost per day (mira#213). Tokens across community
+    # turns and triage; 0 = unlimited. Lower priorities pause as it runs down.
+    daily_token_budget: int = 300_000
+    # Optional cheap model that decides whether a low-priority community event
+    # deserves a full turn (empty = priority rules only).
+    triage_model: str = ""
+    # Days between local community harvest reports (0 = off) (mira#214).
+    harvest_report_days: int = 7
+
+
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
@@ -675,6 +726,18 @@ class ToolsConfig(Base):
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
 
 
+class ProfileConfig(Base):
+    """First-run profile onboarding state.
+
+    ``onboarded`` flips to true once the user has completed the first-run
+    wizard (desktop) or ``mira onboard`` (CLI), which fills ``USER.md`` and
+    ``SOUL.md``. It is the shared completion flag for both surfaces so neither
+    re-prompts after setup.
+    """
+
+    onboarded: bool = False
+
+
 class PluginsConfig(Base):
     """Plugin kernel settings (mira#206, #210)."""
 
@@ -699,6 +762,8 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    community: CommunityConfig = Field(default_factory=CommunityConfig)
+    profile: ProfileConfig = Field(default_factory=ProfileConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
 

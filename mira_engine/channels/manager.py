@@ -101,7 +101,12 @@ class ChannelManager:
 
         providers = discover_all()
         for name, cls in providers.items():
-            section = self._iter_channel_sections().get(name)
+            if name == "community":
+                # The community channel is configured at the top level
+                # (config.community), not under config.channels.
+                section = self.config.community
+            else:
+                section = self._iter_channel_sections().get(name)
             if section is None:
                 continue
             enabled = bool(self._config_value(section, "enabled", False))

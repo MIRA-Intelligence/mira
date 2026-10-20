@@ -2,11 +2,7 @@
 
 Optional information that helps MIRA personalize responses. This template is intentionally general and should not contain private identity, employer, project, credential, or sensitive research details by default.
 
-## Basic Information
-
-- **Name**: MIRA User
-- **Timezone**: Not specified
-- **Preferred language(s)**: Not specified
+Basic information (name, timezone, preferred language) is stored in `USER.local.md`, which is appended on top of this file.
 
 ## Preferences
 

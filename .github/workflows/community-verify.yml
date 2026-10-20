@@ -1,0 +1,158 @@
+name: Community Verify
+
+# Trusted verifier for community PRs (MIRA-Intelligence/mira-community#44).
+#
+# The community merge bot only counts the `mira/verify` commit status
+# (MERGE_REQUIRED_CHECKS=mira/verify on the platform). This workflow produces it
+# so that a PR cannot change what "verified" means:
+#
+# - `pull_request_target` runs *this file as it exists on the landing branch*,
+#   never the PR's copy, so editing CI in a PR has no effect here.
+# - The code under test is the PR merged into the current landing branch.
+# - Every test that exists on the landing branch runs in its landing-branch
+#   version, with the landing branch's pytest config and lint rules; tests the
+#   PR *adds* run too. Deleting, skipping or loosening an existing test in a PR
+#   therefore cannot turn it green. (A PR that legitimately rewrites existing
+#   tests is core-lane by definition: a maintainer reviews and merges it.)
+#
+# Security model:
+# - `verify` executes PR code. It has a read-only token, references no secrets,
+#   does not persist git credentials and uses no caches, and it cannot write
+#   statuses.
+# - `pending` / `report` never check out PR code; only they may write the status.
+# - This protects the *verdict* from PRs that edit tests or CI. It does not make
+#   hostile code trustworthy: code under test can always sabotage its own run.
+#   Merge lanes and review (core lane = maintainer) exist for that.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [contrib]
+
+permissions: {}
+
+concurrency:
+  group: community-verify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pending:
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'pending',
+              context: 'mira/verify',
+              description: 'Running the landing-branch test suite against this PR',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the landing branch (trusted harness)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          submodules: recursive
+          persist-credentials: false
+
+      # Code under test = the PR merged into the landing branch as it is now,
+      # so a PR that only passes against an older base can't go green. (The
+      # bot's landing watch re-checks every merge on the real tip afterwards.)
+      - name: Check out the landing branch for the merge
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge the PR head (code under test)
+        working-directory: pr
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pr/head"
+          fetched="$(git rev-parse refs/remotes/pr/head)"
+          if [ "$fetched" != "$HEAD_SHA" ]; then
+            echo "PR head moved ($HEAD_SHA -> $fetched); a newer run verifies it."
+            exit 1
+          fi
+          git -c user.name="mira-verify" -c user.email="verify@invalid" merge --no-ff --no-edit "$HEAD_SHA"
+          git submodule update --init --recursive
+
+      - name: Overlay the trusted test harness
+        run: |
+          set -euo pipefail
+          # Restore every landing-branch test file (modified or deleted by the
+          # PR) to its landing-branch version; files the PR adds are kept.
+          mkdir -p pr/tests
+          cp -R base/tests/. pr/tests/
+          # Root-level pytest/conftest config would be picked up from the PR's
+          # rootdir; pytest is pointed at the base pyproject instead.
+          rm -f pr/conftest.py pr/pytest.ini pr/tox.ini pr/setup.cfg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y -qq bubblewrap
+          python -m pip install --upgrade pip
+          pip install -e "./pr[dev]"
+
+      - name: Lint (landing-branch rules)
+        # --isolated: ignore any ruff config the PR ships.
+        run: ruff check --isolated --select F401,F841 pr/mira_engine pr/mira_server
+
+      - name: Allow bwrap to create user namespaces (Ubuntu AppArmor)
+        run: |
+          sudo install -m 0644 base/deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+          sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
+          bwrap --ro-bind / / --unshare-pid --proc /proc true && echo "bwrap works"
+
+      - name: Run the landing-branch test suite
+        working-directory: pr
+        env:
+          MIRA_REQUIRE_BWRAP: "1"
+        run: python -m pytest -c ../base/pyproject.toml --rootdir . -p no:cacheprovider tests/
+
+  report:
+    needs: [verify]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          RESULT: ${{ needs.verify.result }}
+        with:
+          script: |
+            const ok = process.env.RESULT === 'success';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: ok ? 'success' : 'failure',
+              context: 'mira/verify',
+              description: ok
+                ? 'Landing-branch tests pass on this PR'
+                : `Verification ${process.env.RESULT}: see the run for details`,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
