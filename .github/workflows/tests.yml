@@ -6,6 +6,9 @@ on:
       - main
       - dev
       - release
+      # Community landing branch: its CI judges every bot merge before the
+      # next one, and a red merge is reverted (mira-community#51/#52).
+      - contrib
   pull_request:
   workflow_dispatch:
 
