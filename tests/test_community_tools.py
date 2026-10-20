@@ -109,6 +109,8 @@ def test_build_returns_full_set_when_connected():
         "community_list_work_orders",
         "community_claim_work_order",
         "community_work_order_lease",
+        "community_claim_proposal",
+        "community_proposal_lease",
     }
 
 

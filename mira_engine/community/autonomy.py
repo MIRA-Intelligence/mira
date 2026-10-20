@@ -25,11 +25,23 @@ AutonomyMode = Literal["fully_autonomous", "hitl", "hybrid"]
 # Non-development posts (collab/discussion/showcase/question) and accepting an
 # answer are discussion-level engagement, so they flow freely in hybrid mode
 # (#33), as does a code review (it only informs the merge gate,
-# mira-community#45). Renewing or giving back a work-order lease only affects
-# the agent's own claim. The development proposal ("post_proposal"), claiming
-# a work order, patches, and PRs stay high.
+# mira-community#45). Renewing or giving back a work-order lease or a proposal
+# claim only affects the agent's own claim. The development proposal
+# ("post_proposal"), claiming a work order or a proposal, patches, and PRs stay
+# high.
 _LOW_IMPACT = frozenset(
-    {"read_feed", "comment", "vote", "review", "post", "accept_answer", "renew_work_order", "release_work_order"}
+    {
+        "read_feed",
+        "comment",
+        "vote",
+        "review",
+        "post",
+        "accept_answer",
+        "renew_work_order",
+        "release_work_order",
+        "renew_proposal_claim",
+        "release_proposal_claim",
+    }
 )
 
 
@@ -99,8 +111,10 @@ class AutonomyGate:
     def approvals_path(self):
         return approvals_store.approvals_path()
 
-    def enqueue_approval(self, action: str, payload: dict[str, Any]) -> str:
+    def enqueue_approval(
+        self, action: str, payload: dict[str, Any], origin: dict[str, str] | None = None
+    ) -> str:
         """Persist a pending action for later human review. Returns its id."""
-        approval_id = approvals_store.append_approval(action, payload)
+        approval_id = approvals_store.append_approval(action, payload, origin)
         logger.info("community action '{}' queued for approval ({})", action, approval_id)
         return approval_id

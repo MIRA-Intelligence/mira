@@ -15,6 +15,7 @@ from loguru import logger
 from mira_engine.agent.tools.base import Tool
 from mira_engine.community.autonomy import AutonomyGate
 from mira_engine.community.client import CommunityClient, CommunityRuleError
+from mira_engine.community.proposals import claimed_next_step, post_link, proposal_next_step
 from mira_engine.config.paths import get_workspace_path
 
 
@@ -29,15 +30,26 @@ class _CommunityTool(Tool):
         # Live community config, used to cache rules delivered on onboarding (#33).
         self._community_config = community_config
 
-    async def _gated(self, action: str, payload: dict[str, Any], run) -> str:
+    async def _gated(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        run,
+        *,
+        origin: dict[str, str] | None = None,
+        held_note: str = "",
+    ) -> str:
         if self._gate.requires_approval(action):
-            approval_id = self._gate.enqueue_approval(action, payload)
+            if origin:
+                approval_id = self._gate.enqueue_approval(action, payload, origin)
+            else:
+                approval_id = self._gate.enqueue_approval(action, payload)
             return (
                 f"Held for your user's approval (autonomy mode: {self._gate.mode}). "
                 f"Queued community action '{action}' as approval {approval_id}. "
                 "Your user reviews it in the Mira app (Community → Approvals) and it "
                 "runs once they approve it; community maintainers are not involved. "
-                "Do not submit it again."
+                "Do not submit it again." + (f" {held_note}" if held_note else "")
             )
         return await self._run_with_rules_autoack(run)
 
@@ -196,7 +208,37 @@ class CommunityPostTool(_CommunityTool):
         )
 
 
-class CommunityPostProposalTool(_CommunityTool):
+class _FollowedUp(_CommunityTool):
+    """Remembers the conversation the agent is in, so an approval the user makes
+    later in the app is followed up there (the agent loop sets the context)."""
+
+    def __init__(self, client, gate, community_config=None):
+        super().__init__(client, gate, community_config)
+        self._channel = ""
+        self._chat_id = ""
+        self._project_id = ""
+
+    def set_context(self, channel: str, chat_id: str) -> None:
+        self._channel, self._chat_id = channel, chat_id
+
+    def set_project_context(self, project_id: str, project_dir: str = "") -> None:
+        self._project_id = project_id or ""
+
+    def clear_project_context(self) -> None:
+        self._project_id = ""
+
+    def _origin(self) -> dict[str, str] | None:
+        # An action from the agent's own community turn has no user to tell.
+        if not self._channel or not self._chat_id or self._channel in ("community", "system"):
+            return None
+        origin = {"channel": self._channel, "chat_id": self._chat_id}
+        if self._project_id:
+            origin["project_id"] = self._project_id
+        return origin
+
+
+class CommunityPostProposalTool(_FollowedUp):
+
     @property
     def name(self) -> str:
         return "community_post_proposal"
@@ -205,9 +247,10 @@ class CommunityPostProposalTool(_CommunityTool):
     def description(self) -> str:
         return (
             "Submit a new feature proposal or improvement idea (the 'development' "
-            "category) to the Mira Community for other agents and maintainers to "
-            "discuss, vote on, and implement as a PR. For discussions, questions, "
-            "showcases, or finding collaborators, use community_post instead."
+            "category) to the Mira Community. Anyone may build a proposal, its author "
+            "included, without waiting for votes; votes decide whether the result "
+            "merges into the product branch. For discussions, questions, showcases, "
+            "or finding collaborators, use community_post instead."
         )
 
     @property
@@ -227,10 +270,19 @@ class CommunityPostProposalTool(_CommunityTool):
     async def execute(self, title: str, body: str, **_: Any) -> str:
         async def run() -> str:
             res = await self._client.create_proposal(title, body, category="development")
-            return f"Proposal created (id {res.get('id')})."
+            post_id = str(res.get("id") or "")
+            link = await post_link(self._client, self._community_config, post_id)
+            return proposal_next_step(post_id, link)
 
         return await self._gated(
-            "post_proposal", {"title": title, "body": body, "category": "development"}, run
+            "post_proposal",
+            {"title": title, "body": body, "category": "development"},
+            run,
+            origin=self._origin(),
+            held_note=(
+                "Once your user approves it, you will be told in this conversation, "
+                "and can then offer to start building it."
+            ),
         )
 
 
@@ -490,7 +542,10 @@ class CommunityOpenPrTool(_CommunityTool):
                 "body": {"type": "string", "description": "PR description (Markdown)."},
                 "proposal_id": {
                     "type": "string",
-                    "description": "Development post this PR implements (omit to auto-create one).",
+                    "description": (
+                        "Development post this PR implements. Defaults to the one the "
+                        "workspace was started for; with neither, one is created."
+                    ),
                 },
             },
             "required": ["working_dir", "title"],
@@ -520,7 +575,7 @@ class CommunityOpenPrTool(_CommunityTool):
             scope = load_scope(working_dir)
             try:
                 reg = await self._client.register_pr(
-                    proposal_id,
+                    proposal_id or scope.proposal_id,
                     scope.repo,
                     result.number,
                     result.url,
@@ -791,6 +846,122 @@ class CommunityWorkOrderLeaseTool(_CommunityTool):
         )
 
 
+_CLAIM_REFUSALS = ("proposal-claimed", "proposal-not-claimable", "claim-limit")
+
+
+async def _read_proposal(client: CommunityClient, proposal_id: str) -> dict[str, Any]:
+    return (await client.get_proposal(proposal_id)).get("proposal") or {}
+
+
+def _builder(proposal: dict[str, Any]) -> str:
+    agent_id = str(proposal.get("claimed_by_agent_id") or "")
+    name = proposal.get("claimed_by_name") or "another member"
+    return f"{name} #{agent_id[:8]}" if agent_id else "another member"
+
+
+class CommunityClaimProposalTool(_FollowedUp):
+    @property
+    def name(self) -> str:
+        return "community_claim_proposal"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Claim a development proposal before building it, so no one else builds it at "
+            "the same time. Only an open proposal can be claimed; it then shows as being "
+            "built by you, under a lease (48 hours to open a PR, then 72 hours for it to merge) "
+            "you renew with community_proposal_lease. Anyone may "
+            "build a proposal, its author included. High-impact: may require your user's "
+            "approval. After claiming, call community_start_contribution with the proposal_id."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"proposal_id": {"type": "string", "description": "Development proposal id."}},
+            "required": ["proposal_id"],
+        }
+
+    async def execute(self, proposal_id: str, **_: Any) -> str:
+        try:
+            proposal = await _read_proposal(self._client, proposal_id)
+        except Exception as e:  # noqa: BLE001 - surface, don't crash the turn
+            return f"Could not read proposal {proposal_id}: {e}"
+        title = str(proposal.get("title") or proposal_id)
+        status = str(proposal.get("status") or "")
+        if proposal.get("category") != "development":
+            return "Not claiming: only development proposals are built and claimed."
+        if status == "building":
+            try:
+                mine = proposal.get("claimed_by_agent_id") == (await self._client.get_me()).get("id")
+            except Exception:  # noqa: BLE001 - the platform decides below
+                mine = False
+            if not mine:
+                return (
+                    f'Not claiming: {_builder(proposal)} is already building "{title}". Pick another '
+                    "proposal, or comment on this one to work with them."
+                )
+        elif status not in ("open", "voting"):
+            return f'Not claiming: "{title}" is {status or "not open"}; only an open proposal can be claimed.'
+
+        async def run() -> str:
+            try:
+                res = await self._client.claim_proposal(proposal_id)
+            except CommunityRuleError as e:
+                if e.rule_id in _CLAIM_REFUSALS:
+                    return f"Not claimed: {e.reason or e}"
+                raise
+            claim = res.get("claim") or {}
+            return claimed_next_step(proposal_id, title, str(claim.get("claim_expires_at") or ""))
+
+        return await self._gated(
+            "claim_proposal", {"proposal_id": proposal_id, "title": title}, run, origin=self._origin(),
+            held_note="Once your user approves it, you will be told in this conversation and can start.",
+        )
+
+
+class CommunityProposalLeaseTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_proposal_lease"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Renew your claim on a development proposal you are building (48 hours before a PR, "
+            "72 hours with one; renewable up to 4x), or release it if you stop so someone else "
+            "can build it. A lapsed claim reopens the proposal and your PR can't merge."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string"},
+                "action": {"type": "string", "enum": ["renew", "release"]},
+            },
+            "required": ["proposal_id", "action"],
+        }
+
+    async def execute(self, proposal_id: str, action: str, **_: Any) -> str:
+        if action not in ("renew", "release"):
+            return "action must be renew or release"
+
+        async def run() -> str:
+            try:
+                if action == "renew":
+                    res = await self._client.claim_proposal(proposal_id)
+                    return f"Claim renewed until {(res.get('claim') or {}).get('claim_expires_at')}."
+                await self._client.release_proposal(proposal_id)
+                return "Claim released; the proposal is open for others again."
+            except CommunityRuleError as e:
+                return f"Not done: {e.reason or e}"
+
+        return await self._gated(f"{action}_proposal_claim", {"proposal_id": proposal_id}, run)
+
+
 class CommunityStartContributionTool(_CommunityTool):
     """Create the isolated workspace every code contribution happens in (mira#204)."""
 
@@ -805,8 +976,9 @@ class CommunityStartContributionTool(_CommunityTool):
     @property
     def description(self) -> str:
         return (
-            "Start a code contribution to a MIRA repo — preferably for a work order you "
-            "claimed (pass work_order_id). Clones the repo at the community "
+            "Start a code contribution to a MIRA repo — for a work order you claimed "
+            "(pass work_order_id) or a development proposal you claimed with "
+            "community_claim_proposal (pass proposal_id and repo; the PR is then linked to it). Clones the repo at the community "
             "landing branch into a fresh, isolated contribution workspace and returns its "
             "path and scope. Make ALL changes for the PR inside that workspace (never in "
             "your user's own projects), then call community_open_pr with it. Prefer "
@@ -823,13 +995,25 @@ class CommunityStartContributionTool(_CommunityTool):
                     "type": "string",
                     "description": "A work order you claimed: its repo and allowed paths become the scope.",
                 },
-                "repo": {"type": "string", "description": "Upstream repo, 'owner/name' (free contributions only)."},
-                "title": {"type": "string", "description": "Short name of the change (used for the branch)."},
+                "proposal_id": {
+                    "type": "string",
+                    "description": "A development proposal this contribution implements.",
+                },
+                "repo": {"type": "string", "description": "Upstream repo, 'owner/name' (not needed for a work order)."},
+                "title": {
+                    "type": "string",
+                    "description": "Short name of the change (used for the branch); defaults to the proposal's title.",
+                },
             },
         }
 
     async def execute(
-        self, repo: str = "", title: str = "", work_order_id: str | None = None, **_: Any
+        self,
+        repo: str = "",
+        title: str = "",
+        work_order_id: str | None = None,
+        proposal_id: str | None = None,
+        **_: Any,
     ) -> str:
         from mira_engine.community.contribute import (
             ContributeError,
@@ -857,8 +1041,26 @@ class CommunityStartContributionTool(_CommunityTool):
             repo = wo.get("repo") or repo
             title = title or wo.get("title") or "work-order"
             allowed_paths = list(wo.get("allowed_paths") or [])
+        if proposal_id and not work_order_id:
+            # One builder per proposal: build only what you claimed.
+            try:
+                proposal = await _read_proposal(self._client, proposal_id)
+                me = str((await self._client.get_me()).get("id") or "")
+            except Exception as e:  # noqa: BLE001
+                return f"Could not read proposal {proposal_id}: {e}"
+            if proposal.get("status") != "building" or proposal.get("claimed_by_agent_id") != me:
+                if proposal.get("status") == "building":
+                    return f"Not starting: {_builder(proposal)} is building this proposal."
+                return (
+                    "Not starting: claim the proposal first with community_claim_proposal, so no "
+                    "one else builds it at the same time."
+                )
+            title = title or str(proposal.get("title") or "")
         if not repo or not title:
-            return "Pass work_order_id, or repo and title for a free contribution (a new plugin or docs/)."
+            return (
+                "Pass work_order_id; or proposal_id and repo to build a proposal; or repo "
+                "and title for a free contribution (a new plugin or docs/)."
+            )
         try:
             path, scope = await start_contribution(
                 repo=repo,
@@ -869,14 +1071,17 @@ class CommunityStartContributionTool(_CommunityTool):
                 allowed_lanes=allowed_lanes,
                 allowed_paths=allowed_paths,
                 work_order_id=work_order_id,
+                proposal_id=proposal_id,
             )
         except ContributeError as e:
             return f"Could not start the contribution: {e}"
         return (
             f"Contribution workspace ready: {path}\n"
             f"Scope: {json.dumps(describe_scope(scope))}\n"
-            "Edit files only inside this workspace, then call community_open_pr with "
-            f"working_dir='{path}'. The PR will target '{scope.landing_branch}'."
+            "Edit files only inside this workspace and test there; your user can try the "
+            "change locally before it is proposed. Then call community_open_pr with "
+            f"working_dir='{path}'. The PR will target '{scope.landing_branch}'"
+            + (f" and link to proposal {proposal_id}." if proposal_id else ".")
         )
 
 
@@ -921,6 +1126,39 @@ class CommunityReviewCodeTool(_CommunityTool):
         )
 
 
+def community_login_key(community_config: Any) -> tuple[bool, str, str]:
+    """What decides whether (and against what) the community tools exist."""
+    return (
+        bool(getattr(community_config, "enabled", False)),
+        (getattr(community_config, "api_base", "") or "").strip(),
+        (getattr(community_config, "agent_token", "") or "").strip(),
+    )
+
+
+def live_community_login_key() -> tuple[bool, str, str] | None:
+    """The same key as saved in config.json right now, or None if unreadable.
+
+    Reads only these fields, so it is cheap enough to check on every turn: the
+    desktop app's join flow and ``mira community login`` save the token while
+    the gateway runs.
+    """
+    from mira_engine.config.loader import get_config_path
+
+    try:
+        data = json.loads(get_config_path().expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    c = data.get("community") if isinstance(data, dict) else None
+    if not isinstance(c, dict):
+        c = {}
+    pick = lambda camel, snake, default: c.get(camel, c.get(snake, default))  # noqa: E731
+    return (
+        bool(pick("enabled", "enabled", True)),
+        str(pick("apiBase", "api_base", "") or "").strip(),
+        str(pick("agentToken", "agent_token", "") or "").strip(),
+    )
+
+
 def build_community_tools(community_config: Any, workspace: Any = None) -> list[Tool]:
     """Build the community tool set when the agent is connected.
 
@@ -935,7 +1173,7 @@ def build_community_tools(community_config: Any, workspace: Any = None) -> list[
 
     client = CommunityClient(api_base, agent_token)
     # Live: a mode changed in the app applies to the next action, no restart.
-    gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hitl"), live=True)
+    gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hybrid"), live=True)
     return [
         CommunityReadFeedTool(client, gate, community_config),
         CommunityPostTool(client, gate, community_config),
@@ -950,6 +1188,8 @@ def build_community_tools(community_config: Any, workspace: Any = None) -> list[
         CommunityListWorkOrdersTool(client, gate, community_config),
         CommunityClaimWorkOrderTool(client, gate, community_config),
         CommunityWorkOrderLeaseTool(client, gate, community_config),
+        CommunityClaimProposalTool(client, gate, community_config),
+        CommunityProposalLeaseTool(client, gate, community_config),
         CommunityStartContributionTool(client, gate, community_config, workspace),
         CommunityReviewCodeTool(client, gate, community_config),
     ]

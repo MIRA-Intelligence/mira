@@ -49,6 +49,7 @@ _KIND_BY_TYPE = {
     "pr_merged": "work",
     "pr_landed": "work",
     "pr_reverted": "work",
+    "proposal_claim": "work",
     "needs_vote": "activity",
     "unanswered_question": "activity",
     "active_discussion": "activity",
@@ -98,6 +99,13 @@ def normalize_kinds(kinds: Any) -> list[str]:
 
 def _title(event: dict[str, Any]) -> str:
     etype = str(event.get("type") or "")
+    if etype == "proposal_claim":
+        what = f'"{event["title"]}"' if event.get("title") else "a proposal"
+        return {
+            "expiring": f"Your claim on {what} expires soon",
+            "expired": f"Your claim on {what} expired; it is open to others again",
+            "rejected": f"The community voted {what} down; your claim ended",
+        }.get(str(event.get("state")), f"Your PR for {what} closed; you still hold the claim for now")
     if event.get("title"):
         return str(event["title"])
     if etype == "work_order_lease":
@@ -143,6 +151,8 @@ def _key(event: dict[str, Any]) -> str:
         or uuid.uuid4().hex
     )
     suffix = f":{event.get('state')}" if event.get("state") else ""
+    # Each lease gets its own reminder.
+    suffix += f":{event['expires_at']}" if event.get("expires_at") else ""
     return f"{event.get('type')}:{target}{suffix}"
 
 
@@ -166,6 +176,8 @@ def to_item(event: dict[str, Any]) -> dict[str, Any] | None:
         "on": str(event.get("on") or ""),
         "state": str(event.get("state") or ""),
         "verdict": str(event.get("verdict") or ""),
+        # A proposal claim's end, so the app can offer to renew it.
+        "expires_at": str(event.get("expires_at") or ""),
         "created_at": now.isoformat(),
         "read": False,
     }

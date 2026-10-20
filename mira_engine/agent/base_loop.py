@@ -41,7 +41,11 @@ from mira_engine.agent.runner import AgentRunner
 from mira_engine.agent.skill_events import skill_loaded, skill_read_details
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
-from mira_engine.agent.tools.community import build_community_tools
+from mira_engine.agent.tools.community import (
+    build_community_tools,
+    community_login_key,
+    live_community_login_key,
+)
 from mira_engine.agent.tools.consult import ConsultRoleTool
 from mira_engine.agent.tools.cron import CronTool
 from mira_engine.agent.tools.knowledge import KnowledgeReadTool, KnowledgeScope, KnowledgeSearchTool
@@ -547,7 +551,34 @@ class BaseAgentLoop:
             self.tools.register(cron_tool)
         for community_tool in build_community_tools(self.community_config, workspace=self.workspace):
             self.tools.register(community_tool)
+        self._community_login = community_login_key(self.community_config)
         self._register_plugin_tools()
+
+    def _refresh_community_tools(self) -> None:
+        """Rebuild the community tools when the saved login changed since they
+        were built: joining from the desktop app or ``mira community login``
+        while the gateway runs, logging out, or another community address.
+        Without this the agent has no community_* tools until a restart."""
+        if getattr(self, "community_config", None) is None:  # not a gateway agent
+            return
+        live = live_community_login_key()
+        if live is None or live == getattr(self, "_community_login", None):
+            return
+        from mira_engine.config.loader import load_config
+
+        try:
+            community = load_config().community
+        except Exception as e:  # noqa: BLE001 - keep the current tools
+            logger.warning("Could not reload the community login: {}", e)
+            return
+        for name in [n for n in self.tools.all_tool_names if n.startswith("community_")]:
+            self.tools.unregister(name)
+        self.community_config = community
+        tools = build_community_tools(community, workspace=self.workspace)
+        for tool in tools:
+            self.tools.register(tool)
+        self._community_login = community_login_key(community)
+        logger.info("Community login changed: {} community tools now available", len(tools))
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
         if not (self.restrict_to_workspace or self.exec_config.sandbox):
@@ -691,6 +722,8 @@ class BaseAgentLoop:
         workflow_run_id: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
+        if hasattr(self, "_refresh_community_tools"):
+            self._refresh_community_tools()
         if project_ref is not None:
             allowed_dir = project_ref.project_dir if self.restrict_to_workspace else None
             extra_allowed_dirs = self._skill_access_dirs_for_workspace(project_ref.project_dir)
@@ -712,7 +745,7 @@ class BaseAgentLoop:
                 if hasattr(tool, "clear_project_context"):
                     tool.clear_project_context()
 
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "community_post_proposal", "community_claim_proposal"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))

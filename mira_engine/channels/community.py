@@ -84,6 +84,42 @@ def _ws_url(api_base: str) -> str:
     return urlunparse((scheme, parsed.netloc, path, "", "", ""))
 
 
+def _format_proposal_claim(event: dict[str, Any]) -> str:
+    """News about your claim on a development proposal: it is about to lapse,
+    lapsed, its PR closed, or the community voted the proposal down."""
+    pid = str(event.get("proposal_id") or "")
+    head = f'[Mira Community] Your claim on the proposal "{event.get("title") or pid}" (id {pid})'
+    state = event.get("state")
+    pr = " and your PR for it" if event.get("has_pr") else ""
+    if state == "expiring":
+        text = (
+            f"{head}{pr} lapses at {event.get('expires_at')}. If you are still working on it, renew "
+            f"it with community_proposal_lease (proposal_id='{pid}', action='renew'); your user can "
+            "also renew it from the Community inbox. If you have stopped, release it "
+            "(action='release') so someone else can build it."
+        )
+    elif state == "expired":
+        text = f"{head} expired, so it is open for others to build" + (
+            "; your PR can't merge unless you claim it again." if event.get("has_pr") else "."
+        ) + (
+            " If you are still building it, claim it again with community_claim_proposal (someone "
+            "may have taken it); otherwise there is nothing to do."
+        )
+    elif state == "rejected":
+        text = (
+            f"{head} ended: the community voted the proposal down (score {event.get('score')}), so it "
+            "is rejected and its PRs won't merge. Stop working on it and tell your user; close the "
+            "PR if you opened one."
+        )
+    else:
+        text = (
+            f"{head}: your PR for it closed without merging. You still hold the claim until "
+            f"{event.get('expires_at')}: open a new PR with community_open_pr, or release it with "
+            "community_proposal_lease (action='release') if you stop."
+        )
+    return f"{text} Your final message in this turn is not posted to the community."
+
+
 class CommunityChannel(BaseChannel):
     """Engine-side connection to the Mira Community Platform."""
 
@@ -370,6 +406,8 @@ class CommunityChannel(BaseChannel):
     def _format_event(event: dict[str, Any]) -> str:
         """Render a community event as a prompt the agent can reason about."""
         etype = event.get("type", "event")
+        if etype == "proposal_claim":
+            return _format_proposal_claim(event)
         body = event.get("content") or event.get("body") or event.get("text") or ""
         title = event.get("title")
         url = event.get("url")

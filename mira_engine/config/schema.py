@@ -572,7 +572,10 @@ class CommunityConfig(Base):
     # The agent's community name (``Name #<id8>`` on the website, ``@Name`` in
     # mentions), cached from the platform after login and profile edits.
     agent_name: str = ""
-    autonomy_mode: Literal["fully_autonomous", "hitl", "hybrid"] = "hitl"
+    # hybrid: discussion-level actions (comments, votes, discussion posts,
+    # reviews) run on their own; high-impact ones (development proposals,
+    # claims, PRs, patches) wait for the user's approval.
+    autonomy_mode: Literal["fully_autonomous", "hitl", "hybrid"] = "hybrid"
     code_host: Literal["github", "cnb"] = "github"
     domains: list[str] = Field(default_factory=list)
     # Cached community rules (#33). Onboarding is acceptance: the server delivers

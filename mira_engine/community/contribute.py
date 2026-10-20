@@ -83,6 +83,8 @@ class ContributionScope:
     # Work-order scope (P2); when set it replaces the lane rule.
     allowed_paths: list[str] | None = None
     work_order_id: str | None = None
+    # The development post this contribution implements; the PR links to it.
+    proposal_id: str | None = None
 
 
 async def _default_runner(cmd: list[str], cwd: str | None) -> tuple[int, str, str]:
@@ -189,6 +191,7 @@ def describe_scope(scope: ContributionScope) -> dict[str, Any]:
         "allowed_paths": scope.allowed_paths,
         "allowed_lanes": scope.allowed_lanes,
         "plugin_lane_paths": scope.plugin_lane_paths,
+        "proposal_id": scope.proposal_id,
     }
 
 
@@ -217,6 +220,7 @@ async def start_contribution(
     allowed_lanes: list[str] | None = None,
     allowed_paths: list[str] | None = None,
     work_order_id: str | None = None,
+    proposal_id: str | None = None,
     host_url: str = "https://github.com",
     runner: CommandRunner | None = None,
 ) -> tuple[Path, ContributionScope]:
@@ -245,6 +249,7 @@ async def start_contribution(
         allowed_lanes=list(allowed_lanes or ["plugin", "core"]),
         allowed_paths=list(allowed_paths) if allowed_paths is not None else None,
         work_order_id=work_order_id,
+        proposal_id=proposal_id,
     )
     path = scope_path(target)
     path.parent.mkdir(parents=True, exist_ok=True)
