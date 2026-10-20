@@ -12,6 +12,7 @@ Every entry writes out all fields so you can copy-paste as a template.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +55,10 @@ class ProviderSpec:
 
     # OAuth-based providers (e.g., OpenAI Codex) don't use API keys
     is_oauth: bool = False  # if True, uses OAuth flow instead of API key
+
+    # Billed by a flat-rate subscription (Coding Plan / Token Plan / ChatGPT
+    # login) instead of pay-as-you-go tokens. The UI lists these separately.
+    is_subscription: bool = False
 
     # Direct providers bypass LiteLLM entirely (e.g., CustomProvider)
     is_direct: bool = False
@@ -183,6 +188,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://ark.cn-beijing.volces.com/api/coding/v3",
         strip_model_prefix=False,
         model_overrides=(),
+        is_subscription=True,
+    ),
+    # Agent Plan: Ark's newer multi-model plan with its own key and endpoint.
+    ProviderSpec(
+        name="volcengine_agent_plan",
+        keywords=("volcengine_agent_plan", "volcengine-agent-plan", "agent-plan"),
+        env_key="OPENAI_API_KEY",
+        display_name="VolcEngine Agent Plan",
+        litellm_prefix="volcengine",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="volces.com/api/plan",
+        default_api_base="https://ark.cn-beijing.volces.com/api/plan/v3",
+        strip_model_prefix=False,
+        model_overrides=(),
+        is_subscription=True,
     ),
     ProviderSpec(
         name="byteplus",
@@ -215,6 +239,91 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://ark.byteintlapi.com/api/coding/v3",
         strip_model_prefix=False,
         model_overrides=(),
+        is_subscription=True,
+    ),
+    # === Subscription plans (dedicated key + endpoint, OpenAI-compatible) ===
+    # Each plan issues its own API key that only works against the plan's
+    # endpoint, so they are gateways selected by name or api_base, never by
+    # model keyword (a plain "glm-5" must keep routing to pay-as-you-go).
+    # GLM Coding Plan: defaults to the China endpoint; Z.ai (international)
+    # subscribers set apiBase to https://api.z.ai/api/coding/paas/v4.
+    # Zhipu's terms limit the plan to its officially supported coding tools
+    # (Mira is not listed); the Providers UI warns about this.
+    ProviderSpec(
+        name="zhipu_coding_plan",
+        keywords=("zhipu_coding_plan", "zhipu-coding-plan", "glm-coding-plan"),
+        env_key="OPENAI_API_KEY",
+        display_name="GLM Coding Plan",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="/api/coding/paas",
+        default_api_base="https://open.bigmodel.cn/api/coding/paas/v4",
+        strip_model_prefix=False,
+        model_overrides=(),
+        is_subscription=True,
+    ),
+    # Kimi Code: part of the Kimi membership. Defaults to the China endpoint;
+    # overseas members set apiBase to https://api.kimi.ai/coding/v1. Kimi
+    # forbids spoofing the client User-Agent, so no custom UA is sent.
+    ProviderSpec(
+        name="kimi_code",
+        keywords=("kimi_code", "kimi-code", "kimi-for-coding"),
+        env_key="OPENAI_API_KEY",
+        display_name="Kimi Code",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="api.kimi.",
+        default_api_base="https://api.kimi.com/coding/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+        is_subscription=True,
+    ),
+    # Alibaba Cloud Bailian Token Plan (personal and team editions share the
+    # endpoint). Its keys start with "sk-sp-" and do not work on DashScope.
+    ProviderSpec(
+        name="dashscope_token_plan",
+        keywords=("dashscope_token_plan", "dashscope-token-plan", "bailian-token-plan"),
+        env_key="OPENAI_API_KEY",
+        display_name="Bailian Token Plan",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="token-plan.cn-beijing.maas.aliyuncs.com",
+        default_api_base="https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+        is_subscription=True,
+    ),
+    # MiniMax Token Plan: same host as pay-as-you-go but a separate key.
+    # Defaults to the China endpoint; international subscribers set apiBase
+    # to https://api.minimax.io/v1.
+    ProviderSpec(
+        name="minimax_token_plan",
+        keywords=("minimax_token_plan", "minimax-token-plan"),
+        env_key="OPENAI_API_KEY",
+        display_name="MiniMax Token Plan",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.minimaxi.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+        is_subscription=True,
     ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
@@ -269,6 +378,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
         is_oauth=True,  # OAuth-based authentication
+        is_subscription=True,  # Billed against the user's subscription
     ),
     # GitHub Copilot: uses OAuth, not API key.
     ProviderSpec(
@@ -287,6 +397,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=True,
         model_overrides=(),
         is_oauth=True,  # OAuth-based authentication
+        is_subscription=True,  # Billed against the user's subscription
     ),
     # DeepSeek: routed natively through OpenAICompatProvider to sidestep
     # LiteLLM's buggy reasoning_content round-trip for thinking-mode models
@@ -553,6 +664,23 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    # xAI: Grok models, LiteLLM uses the "xai/" prefix.
+    ProviderSpec(
+        name="xai",
+        keywords=("xai", "grok"),
+        env_key="XAI_API_KEY",
+        display_name="xAI",
+        litellm_prefix="xai",  # grok-4 → xai/grok-4
+        skip_prefixes=("xai/", "openrouter/"),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="https://api.x.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
 )
 
 
@@ -621,6 +749,109 @@ def find_by_name(name: str) -> ProviderSpec | None:
         if spec.name == key:
             return spec
     return None
+
+
+# ---------------------------------------------------------------------------
+# Per-model parameter rules — the single knob for "this model wants different
+# args". Two layers, both keyed by model-name pattern:
+#
+#   1. MODEL_PARAM_RULES below: GLOBAL and provider-agnostic. A rule here
+#      applies to a model no matter which provider serves it (direct API,
+#      gateway, local, ...). Use this for model-family quirks.
+#   2. ProviderSpec.model_overrides (in PROVIDERS): provider-specific. These
+#      are layered on top and WIN on conflict, for "this provider's copy of
+#      the model is special".
+#
+# Pattern semantics (shared by both layers, case-insensitive):
+#   - contains a glob metachar (* ? [ ]) -> fnmatch against the full model id
+#     AND its short form (after the last "/"); e.g. "*/gpt-5*" or "*gpt-5*".
+#   - otherwise -> plain substring match; e.g. "gpt-5", "kimi-k2.5".
+#
+# Value semantics:
+#   - None  -> DROP the parameter entirely (model rejects it).
+#   - other -> FORCE the parameter to this value.
+# ---------------------------------------------------------------------------
+
+MODEL_PARAM_RULES: tuple[tuple[str, dict[str, Any]], ...] = (
+    # OpenAI GPT-5 family and o-series reasoning models reject a custom
+    # ``temperature`` (only the default is accepted). Dropping it keeps the
+    # request valid across every provider/gateway that fronts these models.
+    ("*gpt-5*", {"temperature": None}),
+    ("*o1*", {"temperature": None}),
+    ("*o3*", {"temperature": None}),
+    ("*o4*", {"temperature": None}),
+)
+
+
+def _model_pattern_matches(pattern: str, model_lower: str, short_lower: str) -> bool:
+    """Match a model-name *pattern* against a model id and its short form."""
+    pat = pattern.lower()
+    if any(ch in pat for ch in "*?[]"):
+        return fnmatch.fnmatch(model_lower, pat) or fnmatch.fnmatch(short_lower, pat)
+    return pat in model_lower or pat in short_lower
+
+
+# User-defined rules from config (providers.model_params), injected at config
+# load time via ``set_user_model_param_rules``. Empty until configured. These
+# layer on top of the built-in defaults AND provider-specific overrides, so a
+# rule a user adds in the UI always wins.
+_USER_MODEL_PARAM_RULES: tuple[tuple[str, dict[str, Any]], ...] = ()
+
+
+def set_user_model_param_rules(
+    rules: list[tuple[str, dict[str, Any]]] | None,
+) -> None:
+    """Replace the process-wide user model-parameter rules.
+
+    Accepts a list of ``(pattern, params)`` tuples; ``None`` or empty clears
+    them. Rules with a blank pattern are ignored.
+    """
+    cleaned: list[tuple[str, dict[str, Any]]] = []
+    for pattern, params in rules or ():
+        if isinstance(pattern, str) and pattern.strip() and isinstance(params, dict):
+            cleaned.append((pattern.strip(), dict(params)))
+    global _USER_MODEL_PARAM_RULES
+    _USER_MODEL_PARAM_RULES = tuple(cleaned)
+
+
+def model_overrides_for(
+    model: str | None,
+    spec: ProviderSpec | None = None,
+) -> dict[str, Any]:
+    """Return the resolved per-model request-parameter overrides for *model*.
+
+    Merges the global ``MODEL_PARAM_RULES`` (all matches, in order) with the
+    provider-specific ``spec.model_overrides`` (first match wins). Provider
+    rules are applied last so they win on conflict. When *spec* is omitted it
+    is resolved from the model name.
+
+    A value of ``None`` means "drop this parameter"; any other value forces it.
+    The caller applies the result via ``LLMProvider._apply_param_overrides``.
+    """
+    if not model:
+        return {}
+    model_lower = model.lower()
+    short_lower = model_lower.rsplit("/", 1)[-1]
+
+    result: dict[str, Any] = {}
+    for pattern, overrides in MODEL_PARAM_RULES:
+        if _model_pattern_matches(pattern, model_lower, short_lower):
+            result.update(overrides)
+
+    if spec is None:
+        spec = find_by_model(model)
+    if spec is not None:
+        for pattern, overrides in spec.model_overrides:
+            if _model_pattern_matches(pattern, model_lower, short_lower):
+                result.update(overrides)
+                break
+
+    # User-configured rules win over built-in defaults and provider overrides.
+    for pattern, overrides in _USER_MODEL_PARAM_RULES:
+        if _model_pattern_matches(pattern, model_lower, short_lower):
+            result.update(overrides)
+
+    return result
 
 
 # Substrings that identify vision-capable (multimodal) chat models. Matched on

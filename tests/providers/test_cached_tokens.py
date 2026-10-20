@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from mira_engine.providers.nvidia_provider import NvidiaProvider
 from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
 
 
@@ -99,7 +102,7 @@ def test_extract_usage_no_cached_tokens_dict():
 
 
 def test_extract_usage_openai_cached_zero_dict():
-    """cached_tokens=0 should NOT be included (same as existing fields)."""
+    """An explicit zero is known, not missing cache telemetry."""
     p = _provider()
     response = {
         "choices": [_DICT_CHOICE],
@@ -111,7 +114,18 @@ def test_extract_usage_openai_cached_zero_dict():
         }
     }
     result = p._parse(response)
-    assert "cached_tokens" not in result.usage
+    assert result.usage["cached_tokens"] == 0
+
+
+@pytest.mark.parametrize("cached", [0, 10000])
+@pytest.mark.parametrize("details", ["prompt_tokens_details", "input_tokens_details"])
+def test_nvidia_preserves_cache_details(cached, details):
+    result = NvidiaProvider._extract_usage({"usage": {
+        "prompt_tokens": 14000, "completion_tokens": 100, "total_tokens": 14100,
+        details: {"cached_tokens": cached},
+    }})
+    assert result["cached_tokens"] == cached
+    assert result["total_tokens"] == 14100
 
 
 # --- object-based response (OpenAI SDK Pydantic model) ---
@@ -231,3 +245,65 @@ def test_anthropic_no_cache_fields():
     )
     result = AnthropicProvider._parse_response(response)
     assert "cached_tokens" not in result.usage
+
+
+@pytest.mark.parametrize("cached", [0, 80, None, -1, True, "bad"])
+@pytest.mark.parametrize("provider", ["nvidia", "compat", "custom", "litellm", "responses"])
+def test_cache_fields_across_provider_parsers(provider, cached):
+    from mira_engine.providers.custom_provider import CustomProvider
+    from mira_engine.providers.litellm_provider import LiteLLMProvider
+    from mira_engine.providers.openai_responses.parsing import parse_response_output
+
+    usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+             "prompt_tokens_details": {"cached_tokens": cached}}
+    if provider == "nvidia":
+        result = NvidiaProvider._parse_success({"choices": [_DICT_CHOICE], "usage": usage})
+    elif provider == "compat":
+        result = _provider()._parse({"choices": [_DICT_CHOICE], "usage": usage})
+    elif provider == "responses":
+        result = parse_response_output({"status": "completed", "output": [], "usage": {
+            "input_tokens": 100, "output_tokens": 10, "total_tokens": 110,
+            "input_tokens_details": {"cached_tokens": cached},
+        }})
+    else:
+        response = FakeUsage(choices=[_FakeChoice()], usage=FakeUsage(**{
+            **usage, "prompt_tokens_details": FakePromptDetails(cached),
+        }))
+        cls = CustomProvider if provider == "custom" else LiteLLMProvider
+        parser = cls._parse if provider == "custom" else cls._parse_response
+        result = parser(cls.__new__(cls), response)
+    assert result.usage["total_tokens"] == 110
+    if type(cached) is int and cached >= 0:
+        assert result.usage["cached_tokens"] == cached
+    else:
+        assert "cached_tokens" not in result.usage
+
+
+def test_explicit_nested_zero_has_priority_over_top_level_cache():
+    from mira_engine.providers.usage import extract_usage
+    assert extract_usage({"usage": {"prompt_tokens": 100,
+        "prompt_tokens_details": {"cached_tokens": 0}, "cached_tokens": 80}})["cached_tokens"] == 0
+
+
+@pytest.mark.parametrize("cached", [0, 80, None])
+async def test_responses_stream_preserves_cache_usage(cached):
+    from mira_engine.providers.openai_responses.parsing import consume_sdk_stream
+
+    async def stream():
+        yield FakeUsage(type="response.completed", response=FakeUsage(status="completed", output=[],
+            usage=FakeUsage(input_tokens=100, output_tokens=10, total_tokens=110,
+                            input_tokens_details=FakePromptDetails(cached))))
+
+    _, _, _, usage, _ = await consume_sdk_stream(stream())
+    assert usage["prompt_tokens"] == 100
+    if cached is None:
+        assert "cached_tokens" not in usage
+    else:
+        assert usage["cached_tokens"] == cached
+
+
+def test_anthropic_preserves_explicit_cache_miss():
+    from mira_engine.providers.anthropic_provider import AnthropicProvider
+    response = FakeUsage(stop_reason="end_turn", content=[],
+                         usage=FakeUsage(input_tokens=100, output_tokens=10, cache_read_input_tokens=0))
+    assert AnthropicProvider._parse_response(response).usage["cached_tokens"] == 0

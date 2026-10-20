@@ -28,6 +28,7 @@ import asyncio
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -51,6 +52,26 @@ _KILL_GRACE_SECONDS = 5.0
 """SIGTERM-then-SIGKILL grace window for :meth:`BackgroundJob.kill`."""
 
 _COMMAND_PREVIEW_CHARS = 200
+
+
+def _terminate_windows_tree(pid: int, force: bool) -> None:
+    """Terminate a Windows process and all descendants."""
+    try:
+        import psutil
+
+        parent = psutil.Process(pid)
+        processes = parent.children(recursive=True)
+        processes.append(parent)
+        for process in reversed(processes):
+            try:
+                process.kill() if force else process.terminate()
+            except psutil.Error:
+                pass
+    except Exception:
+        flags = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            flags.append("/F")
+        subprocess.run(flags, capture_output=True, check=False)
 
 
 def _utc_iso(ts: float) -> str:
@@ -113,6 +134,8 @@ class BackgroundJob:
     exited_at: float | None = None
     exit_code: int | None = None
     description: str | None = None
+    owner_session_id: str | None = None
+    owner_turn_id: str | None = None
 
     @property
     def running(self) -> bool:
@@ -152,6 +175,10 @@ class BackgroundJob:
         }
         if self.description:
             summary["description"] = self.description
+        if self.owner_session_id:
+            summary["owner_session_id"] = self.owner_session_id
+        if self.owner_turn_id:
+            summary["owner_turn_id"] = self.owner_turn_id
         if self.exited_at is not None:
             summary["exited_at"] = _utc_iso(self.exited_at)
         if self.exit_code is not None:
@@ -172,9 +199,9 @@ class BackgroundJob:
             return
         try:
             if _IS_WINDOWS:
-                self.process.terminate()
+                await asyncio.to_thread(_terminate_windows_tree, self.pid, False)
             else:
-                self.process.send_signal(signal.SIGTERM)
+                os.killpg(self.pid, signal.SIGTERM)
         except ProcessLookupError:
             return
         try:
@@ -183,7 +210,10 @@ class BackgroundJob:
         except asyncio.TimeoutError:
             pass
         try:
-            self.process.kill()
+            if _IS_WINDOWS:
+                await asyncio.to_thread(_terminate_windows_tree, self.pid, True)
+            else:
+                os.killpg(self.pid, signal.SIGKILL)
         except ProcessLookupError:
             return
         try:
@@ -280,6 +310,19 @@ class BackgroundJobRegistry:
                 pass
         self._reapers.clear()
 
+    async def kill_by_session(self, session_id: str) -> int:
+        """Terminate every live job owned by ``session_id``."""
+        jobs = [
+            job for job in self._jobs.values()
+            if job.owner_session_id == session_id and job.running
+        ]
+        for job in jobs:
+            try:
+                await job.kill()
+            except Exception:
+                logger.exception("Failed to terminate background job {}", job.job_id)
+        return len(jobs)
+
 
 async def spawn_background_job(
     *,
@@ -289,8 +332,14 @@ async def spawn_background_job(
     env: dict[str, str],
     description: str | None = None,
     job_dir_root: Path | None = None,
+    owner_session_id: str | None = None,
+    owner_turn_id: str | None = None,
+    argv: list[str] | None = None,
 ) -> BackgroundJob:
     """Spawn ``command`` as a detached shell subprocess and register it.
+
+    ``argv``, when given, is executed instead of ``bash -l -c <command>`` (the
+    sandboxed form from :class:`ExecTool`); ``command`` is still recorded.
 
     The caller is expected to have already applied any sandboxing / PATH
     munging it cares about — this function just spawns and bookkeeps. We use
@@ -318,13 +367,11 @@ async def spawn_background_job(
                 stderr=stderr_handle,
                 cwd=cwd,
                 env=env,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             )
         else:
             process = await asyncio.create_subprocess_exec(
-                "bash",
-                "-l",
-                "-c",
-                command,
+                *(argv or ["bash", "-l", "-c", command]),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
@@ -355,6 +402,8 @@ async def spawn_background_job(
         stderr_path=stderr_path,
         process=process,
         description=description,
+        owner_session_id=owner_session_id,
+        owner_turn_id=owner_turn_id,
     )
     await registry.register(job)
     logger.info(

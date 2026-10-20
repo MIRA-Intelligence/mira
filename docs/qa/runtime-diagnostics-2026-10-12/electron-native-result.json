@@ -1,0 +1,8 @@
+{
+  "reason": "killed",
+  "exitCode": 2,
+  "uploadToServer": false,
+  "electronVersion": "36.9.5",
+  "nativeDumpCount": 1,
+  "scope": "Isolated test application; no user engine or application data"
+}

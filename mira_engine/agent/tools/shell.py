@@ -6,6 +6,8 @@ import asyncio
 import logging
 import os
 import re
+import signal
+import subprocess
 import sys
 from contextvars import ContextVar
 from pathlib import Path
@@ -17,7 +19,7 @@ from mira_engine.agent.tools.bg import (
     cleanup_old_job_dirs,
     spawn_background_job,
 )
-from mira_engine.agent.tools.sandbox import wrap_command
+from mira_engine.agent.tools.sandbox import SandboxSpec, bwrap_argv, sandbox_available
 from mira_engine.config.paths import get_media_dir
 from mira_engine.security.network import contains_internal_url
 
@@ -200,12 +202,24 @@ class ExecTool(Tool):
         background_registry: BackgroundJobRegistry | None = None,
         enable_background: bool = False,
         python_runtime: "PythonRuntimeConfig | None" = None,
+        sandbox_network: str = "full",
+        sandbox_read_only_paths: list[str] | None = None,
+        sandbox_extra_dirs: list[Path] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
         self._runtime_working_dir: ContextVar[str | None] = ContextVar(
             "exec_runtime_working_dir",
             default=None,
+        )
+        self._runtime_extra_dirs: ContextVar[list[Path] | None] = ContextVar(
+            "exec_runtime_extra_dirs", default=None
+        )
+        self._runtime_session_id: ContextVar[str | None] = ContextVar(
+            "exec_runtime_session_id", default=None
+        )
+        self._runtime_turn_id: ContextVar[str | None] = ContextVar(
+            "exec_runtime_turn_id", default=None
         )
         # Background execution is opt-in: callers (the loop) wire a shared
         # registry and flip ``enable_background``. Subagents leave it off so
@@ -221,6 +235,9 @@ class ExecTool(Tool):
         # to mean "bootstrap was attempted and failed; do not retry"). Keeps
         # the bootstrap subprocess off the hot path for repeated commands.
         self._venv_cache: dict[str, Path | None] = {}
+        # Why bootstrap failed for a cwd; surfaced to the agent so it does not
+        # go hunting for an interpreter on its own.
+        self._venv_errors: dict[str, str] = {}
         self._venv_cache_lock = asyncio.Lock()
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
@@ -237,16 +254,29 @@ class ExecTool(Tool):
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
         self.sandbox = sandbox
+        self.sandbox_network = sandbox_network
+        self.sandbox_read_only_paths = list(sandbox_read_only_paths or [])
+        # Directories commands may read besides the workspace (skills).
+        self.sandbox_extra_dirs = list(sandbox_extra_dirs or [])
 
-    def set_runtime_context(self, *, workspace: Path, **_: Any) -> None:
+    def set_runtime_context(
+        self, *, workspace: Path, extra_allowed_dirs: list[Path] | None = None, **_: Any
+    ) -> None:
         """Set the per-turn working directory used by a multi-project gateway."""
 
         self._runtime_working_dir.set(str(workspace))
+        self._runtime_extra_dirs.set(list(extra_allowed_dirs) if extra_allowed_dirs else None)
 
     def clear_runtime_context(self) -> None:
         """Clear the per-turn working directory."""
 
         self._runtime_working_dir.set(None)
+        self._runtime_extra_dirs.set(None)
+
+    def set_session_context(self, session_id: str, turn_id: str | None = None) -> None:
+        """Associate spawned processes with the active UI/session turn."""
+        self._runtime_session_id.set(session_id)
+        self._runtime_turn_id.set(turn_id)
 
     @property
     def name(self) -> str:
@@ -302,8 +332,53 @@ class ExecTool(Tool):
             "required": ["command"],
         }
 
+    def _workspace(self) -> str:
+        return self._runtime_working_dir.get() or self.working_dir or os.getcwd()
+
+    def _working_dir_error(self, working_dir: str | None) -> str | None:
+        """A model-supplied working_dir must stay in the workspace when access is restricted."""
+        if not working_dir or not (self.restrict_to_workspace or self.sandbox == "bwrap"):
+            return None
+        try:
+            requested = Path(working_dir).expanduser()
+            if not requested.is_absolute():
+                requested = Path(self._workspace()) / requested
+            requested = requested.resolve()
+            workspace = Path(self._workspace()).resolve()
+        except (OSError, RuntimeError):
+            return "Error: invalid working_dir"
+        if requested == workspace or workspace in requested.parents:
+            return None
+        return "Error: Command blocked by safety guard (working_dir outside the workspace)"
+
+    def _sandbox_spec(self) -> SandboxSpec:
+        from mira_engine.security.host_policy import load_host_policy
+
+        policy = load_host_policy()
+        return SandboxSpec.build(
+            self._workspace(),
+            network="none" if policy.network_disabled else self.sandbox_network,
+            read_only_paths=[*self.sandbox_read_only_paths, *policy.read_only_paths],
+            read_write_paths=list(policy.read_write_paths),
+            extra_read_only=self._runtime_extra_dirs.get() or self.sandbox_extra_dirs,
+        )
+
+    def _sandbox_error(self, spec: SandboxSpec) -> str | None:
+        if _IS_WINDOWS:
+            return "Error: the bwrap sandbox is required (tools.exec.sandbox) but is not available on Windows"
+        ok, reason = sandbox_available(spec.network)
+        if ok:
+            return None
+        return (f"Error: shell commands must run in the bwrap sandbox (tools.exec.sandbox), "
+                f"but it is unavailable on this host: {reason}. Ask an administrator to install "
+                "bubblewrap and allow unprivileged user namespaces.")
+
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
-        cwd = working_dir or self._runtime_working_dir.get() or self.working_dir or os.getcwd()
+        if error := self._working_dir_error(working_dir):
+            return error
+        if working_dir and not Path(working_dir).expanduser().is_absolute():
+            working_dir = str(Path(self._workspace()) / working_dir)
+        cwd = working_dir or self._workspace()
         background = bool(kwargs.get("background", False))
         timeout = kwargs.get("timeout", self.timeout)
         try:
@@ -323,7 +398,18 @@ class ExecTool(Tool):
                     "the main loop where the `bg` tool is available."
                 )
 
-        venv = await self._maybe_bootstrap_venv(command, cwd)
+        sandbox_spec: SandboxSpec | None = None
+        if self.sandbox == "bwrap":
+            try:
+                sandbox_spec = self._sandbox_spec()
+            except Exception as exc:  # noqa: BLE001 - e.g. an invalid host policy
+                return f"Error: cannot prepare the sandbox: {exc}"
+            if error := self._sandbox_error(sandbox_spec):
+                return error
+        elif self.sandbox:
+            return f"Error: unknown sandbox backend {self.sandbox!r} (tools.exec.sandbox)"
+
+        venv = await self._maybe_bootstrap_venv(command, cwd, sandbox_spec)
         env = self._build_env()
         if venv is not None:
             self._apply_venv_to_env(env, venv)
@@ -337,19 +423,23 @@ class ExecTool(Tool):
             else:
                 spawn_command = f'export PATH="$PATH:{self.path_append}" && {spawn_command}'
 
-        if self.sandbox and self.sandbox == "bwrap" and not _IS_WINDOWS:
-            spawn_command = wrap_command(self.sandbox, spawn_command, cwd, cwd)
+        argv: list[str] | None = None
+        if sandbox_spec is not None:
+            # The whole shell runs inside; no login profile, only the curated env.
+            argv = [*bwrap_argv(sandbox_spec, cwd), "bash", "-c", spawn_command]
+            cwd = str(sandbox_spec.workspace)
 
         if background:
             return await self._launch_background(
                 spawn_command=spawn_command,
+                argv=argv,
                 cwd=cwd,
                 env=env,
                 description=kwargs.get("description"),
             )
 
         create_shell = getattr(asyncio, "create_subprocess_shell", None)
-        if create_shell is not None and self.sandbox != "bwrap":
+        if create_shell is not None and argv is None:
             try:
                 await create_shell(
                     "true" if not _IS_WINDOWS else "ver",
@@ -363,7 +453,18 @@ class ExecTool(Tool):
                 return f"Error executing command: {str(e)}"
 
         try:
-            process = await self._spawn(spawn_command, cwd, env)
+            if argv is not None:
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                    env=env,
+                    start_new_session=True,
+                )
+            else:
+                process = await self._spawn(spawn_command, cwd, env)
 
             try:
                 stdout, stderr = await asyncio.wait_for(
@@ -371,14 +472,13 @@ class ExecTool(Tool):
                     timeout=timeout
                 )
             except asyncio.TimeoutError:
-                process.kill()
-                # Wait for the process to fully terminate so pipes are
-                # drained and file descriptors are released.
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
+                await self._terminate_process_tree(process)
                 return f"Error: Command timed out after {timeout} seconds"
+            except asyncio.CancelledError:
+                # Cancelling the agent task must not leave its shell or any
+                # scientific worker processes running after the UI says stop.
+                await asyncio.shield(self._terminate_process_tree(process))
+                raise
 
             output_parts = []
 
@@ -393,6 +493,16 @@ class ExecTool(Tool):
             output_parts.append(f"\nExit code: {process.returncode}")
 
             result = "\n".join(output_parts) if output_parts else "(no output)"
+
+            bootstrap_error = self._venv_errors.get(cwd)
+            if bootstrap_error and _is_python_command(command):
+                result += (
+                    "\n\nNOTE: the managed Python environment could not be "
+                    f"created ({bootstrap_error}). Do NOT search the filesystem "
+                    "for a Python interpreter (no `where python`, `ls C:/...`, "
+                    "glob). Tell the user to install uv "
+                    "(https://docs.astral.sh/uv/) or Python >= 3.11, then retry."
+                )
 
             # Truncate very long output
             max_len = self._MAX_OUTPUT
@@ -416,6 +526,7 @@ class ExecTool(Tool):
         cwd: str,
         env: dict[str, str],
         description: str | None,
+        argv: list[str] | None = None,
     ) -> str:
         """Spawn a detached subprocess and register it with the bg registry.
 
@@ -431,10 +542,13 @@ class ExecTool(Tool):
             job = await spawn_background_job(
                 registry=self.background_registry,
                 command=spawn_command,
+                argv=argv,
                 cwd=cwd,
                 env=env,
                 description=description,
                 job_dir_root=jobs_root,
+                owner_session_id=self._runtime_session_id.get(),
+                owner_turn_id=self._runtime_turn_id.get(),
             )
         except Exception as e:
             return f"Error launching background job: {e}"
@@ -445,7 +559,9 @@ class ExecTool(Tool):
             f"bg(action='wait', job_id='{job.job_id}', timeout=...) to monitor."
         )
 
-    async def _maybe_bootstrap_venv(self, command: str, cwd: str) -> Path | None:
+    async def _maybe_bootstrap_venv(
+        self, command: str, cwd: str, sandbox_spec: SandboxSpec | None = None
+    ) -> Path | None:
         """Lazily provision a project-local venv before running ``command``.
 
         Returns the resolved venv path if the configured manager is active,
@@ -467,7 +583,7 @@ class ExecTool(Tool):
                 return self._venv_cache[cwd]
 
             try:
-                venv = await asyncio.to_thread(self._bootstrap_venv_sync, cwd, runtime)
+                venv = await asyncio.to_thread(self._bootstrap_venv_sync, cwd, runtime, sandbox_spec)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Failed to bootstrap project venv at %s: %s; "
@@ -476,6 +592,7 @@ class ExecTool(Tool):
                     exc,
                 )
                 self._venv_cache[cwd] = None
+                self._venv_errors[cwd] = str(exc)
                 return None
 
             self._venv_cache[cwd] = venv
@@ -483,7 +600,7 @@ class ExecTool(Tool):
 
     @staticmethod
     def _bootstrap_venv_sync(
-        cwd: str, runtime: "PythonRuntimeConfig"
+        cwd: str, runtime: "PythonRuntimeConfig", sandbox_spec: SandboxSpec | None = None
     ) -> Path | None:
         """Synchronous bridge to :func:`ensure_project_venv`.
 
@@ -493,7 +610,19 @@ class ExecTool(Tool):
         """
         from mira_engine.runtime.python_env import ensure_project_venv
 
-        return ensure_project_venv(cwd, runtime)
+        wrap = None
+        if sandbox_spec is not None:
+            spec = sandbox_spec
+
+            def wrap(args: list[str]) -> list[str]:
+                # uv sync runs build backends from the project and its
+                # dependencies, so it is sandboxed like any other command.
+                uv_binary = Path(args[0])
+                extra = spec.extra_read_only + ((uv_binary,) if uv_binary.is_absolute() else ())
+                return [*bwrap_argv(SandboxSpec(spec.workspace, spec.network, spec.read_only,
+                                                spec.read_write, extra), cwd), *args]
+
+        return ensure_project_venv(cwd, runtime, wrap=wrap)
 
     def _should_rewrite_pip(self) -> bool:
         """True iff the active runtime config asked us to rewrite
@@ -595,6 +724,7 @@ class ExecTool(Tool):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=env,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             )
         return await asyncio.create_subprocess_exec(
             "bash",
@@ -606,7 +736,41 @@ class ExecTool(Tool):
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
             env=env,
+            start_new_session=True,
         )
+
+    @staticmethod
+    async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
+        """Terminate ``process`` and descendants, then reap the shell."""
+        if process.returncode is not None:
+            return
+        try:
+            if _IS_WINDOWS:
+                from mira_engine.agent.tools.bg import _terminate_windows_tree
+
+                await asyncio.to_thread(_terminate_windows_tree, process.pid, False)
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            if _IS_WINDOWS:
+                from mira_engine.agent.tools.bg import _terminate_windows_tree
+
+                await asyncio.to_thread(_terminate_windows_tree, process.pid, True)
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning("Process tree rooted at pid=%s did not exit", process.pid)
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""

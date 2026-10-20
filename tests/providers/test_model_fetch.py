@@ -172,3 +172,27 @@ async def test_fetch_ollama_models_uses_tags_endpoint(monkeypatch) -> None:
 
     assert cache.provider == "ollama"
     assert cache.models[0].config_model == "ollama/llama3.2"
+
+
+@pytest.mark.asyncio
+async def test_fetch_models_for_additional_custom_provider(monkeypatch) -> None:
+    config = Config.model_validate(
+        {
+            "providers": {
+                "custom": {"apiBase": "http://localhost:8000/v1"},
+                "customProviders": {"custom_gw": {"apiBase": "https://gw.example/v1", "apiKey": "sk-gw"}},
+            }
+        }
+    )
+
+    async def fake_get_json(url: str, headers: dict[str, str], proxy: str | None = None):
+        assert url == "https://gw.example/v1/models"
+        assert headers["Authorization"] == "Bearer sk-gw"
+        return {"data": [{"id": "gw-model"}]}
+
+    monkeypatch.setattr(model_fetch, "_get_json", fake_get_json)
+
+    cache = await fetch_provider_models(config, "custom_gw")
+
+    assert cache.provider == "custom_gw"
+    assert [m.config_model for m in cache.models] == ["gw-model"]

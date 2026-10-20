@@ -9,6 +9,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from mira_engine.utils.locks import interprocess_lock
+
 
 @dataclass
 class CommitInfo:
@@ -30,6 +32,7 @@ class GitStore:
     def __init__(self, workspace: Path, tracked_files: list[str]):
         self._workspace = workspace
         self._tracked_files = tracked_files
+        self._lock_target = workspace / ".mira-gitstore"
 
     def is_initialized(self) -> bool:
         """Check if the git repo has been initialized."""
@@ -52,42 +55,43 @@ class GitStore:
         Creates .gitignore and makes an initial commit.
         Returns True if a new repo was created, False if already exists.
         """
-        if self.is_initialized():
-            return False
+        with interprocess_lock(self._lock_target):
+            if self.is_initialized():
+                return False
 
-        try:
-            self._workspace.mkdir(parents=True, exist_ok=True)
-            self._git("init", "-q")
+            try:
+                self._workspace.mkdir(parents=True, exist_ok=True)
+                self._git("init", "-q")
 
-            # Write .gitignore
-            gitignore = self._workspace / ".gitignore"
-            gitignore.write_text(self._build_gitignore(), encoding="utf-8")
+                # Write .gitignore
+                gitignore = self._workspace / ".gitignore"
+                gitignore.write_text(self._build_gitignore(), encoding="utf-8")
 
-            # Ensure tracked files exist (touch them if missing) so the initial
-            # commit has something to track.
-            for rel in self._tracked_files:
-                p = self._workspace / rel
-                p.parent.mkdir(parents=True, exist_ok=True)
-                if not p.exists():
-                    p.write_text("", encoding="utf-8")
+                # Ensure tracked files exist (touch them if missing) so the initial
+                # commit has something to track.
+                for rel in self._tracked_files:
+                    p = self._workspace / rel
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    if not p.exists():
+                        p.write_text("", encoding="utf-8")
 
-            # Initial commit
-            self._git("add", ".gitignore", *self._tracked_files)
-            self._git(
-                "-c",
-                "user.name=mira",
-                "-c",
-                "user.email=mira@dream",
-                "commit",
-                "-q",
-                "-m",
-                "init: mira memory store",
-            )
-            logger.info("Git store initialized at {}", self._workspace)
-            return True
-        except Exception:
-            logger.warning("Git store init failed for {}", self._workspace)
-            return False
+                # Initial commit
+                self._git("add", ".gitignore", *self._tracked_files)
+                self._git(
+                    "-c",
+                    "user.name=mira",
+                    "-c",
+                    "user.email=mira@dream",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "init: mira memory store",
+                )
+                logger.info("Git store initialized at {}", self._workspace)
+                return True
+            except Exception:
+                logger.warning("Git store init failed for {}", self._workspace)
+                return False
 
     # -- daily operations ------------------------------------------------------
 
@@ -96,10 +100,13 @@ class GitStore:
 
         Returns the short commit SHA, or None if nothing to commit.
         """
-        if not self.is_initialized():
-            return None
+        with interprocess_lock(self._lock_target):
+            return self._auto_commit_unlocked(message)
 
+    def _auto_commit_unlocked(self, message: str) -> str | None:
         try:
+            if not self.is_initialized():
+                return None
             status = self._git("status", "--porcelain", check=False)
             if not status.stdout.strip():
                 return None
@@ -227,37 +234,48 @@ class GitStore:
 
         Returns the new commit SHA, or None on failure.
         """
-        if not self.is_initialized():
-            return None
-
-        try:
-            full_sha = self._git("rev-parse", "--verify", f"{commit}^{{commit}}", check=False).stdout.strip()
-            if not full_sha:
-                logger.warning("Git revert: SHA not found: {}", commit)
+        with interprocess_lock(self._lock_target):
+            if not self.is_initialized():
                 return None
 
-            parent = self._git("rev-parse", "--verify", f"{full_sha}^", check=False).stdout.strip()
-            if not parent:
-                logger.warning("Git revert: cannot revert root commit {}", commit)
-                return None
+            try:
+                full_sha = self._git(
+                    "rev-parse",
+                    "--verify",
+                    f"{commit}^{{commit}}",
+                    check=False,
+                ).stdout.strip()
+                if not full_sha:
+                    logger.warning("Git revert: SHA not found: {}", commit)
+                    return None
 
-            restored: list[str] = []
-            for filepath in self._tracked_files:
-                target = self._workspace / filepath
-                target.parent.mkdir(parents=True, exist_ok=True)
-                show = self._git("show", f"{parent}:{filepath}", check=False)
-                if show.returncode == 0:
-                    target.write_text(show.stdout, encoding="utf-8")
-                    restored.append(filepath)
-                elif target.exists():
-                    target.write_text("", encoding="utf-8")
-                    restored.append(filepath)
-            if not restored:
-                return None
+                parent = self._git(
+                    "rev-parse",
+                    "--verify",
+                    f"{full_sha}^",
+                    check=False,
+                ).stdout.strip()
+                if not parent:
+                    logger.warning("Git revert: cannot revert root commit {}", commit)
+                    return None
 
-            # Commit the restored state
-            msg = f"revert: undo {commit}"
-            return self.auto_commit(msg)
-        except Exception:
-            logger.warning("Git revert failed for {}", commit)
-            return None
+                restored: list[str] = []
+                for filepath in self._tracked_files:
+                    target = self._workspace / filepath
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    show = self._git("show", f"{parent}:{filepath}", check=False)
+                    if show.returncode == 0:
+                        target.write_text(show.stdout, encoding="utf-8")
+                        restored.append(filepath)
+                    elif target.exists():
+                        target.write_text("", encoding="utf-8")
+                        restored.append(filepath)
+                if not restored:
+                    return None
+
+                # Commit while retaining the same cross-process lock.
+                msg = f"revert: undo {commit}"
+                return self._auto_commit_unlocked(msg)
+            except Exception:
+                logger.warning("Git revert failed for {}", commit)
+                return None

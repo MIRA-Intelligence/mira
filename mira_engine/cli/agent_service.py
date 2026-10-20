@@ -7,8 +7,10 @@ import json
 import os
 import platform
 import plistlib
+import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -22,12 +24,11 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape as xml_escape
 
+import psutil
 import typer
 from rich.console import Console
 
-from mira_engine.utils.migration import run_startup_migrations
-
-run_startup_migrations()
+from mira_engine.utils.locks import atomic_write_text, interprocess_lock
 
 app = typer.Typer(
     name="mira-engine",
@@ -49,10 +50,118 @@ DEFAULT_PORT = 18790
 LOG_ROTATE_BYTES = 1_000_000
 LOG_ROTATE_FILES = 3
 DIAGNOSTICS_LOG_TAIL_LINES = 200
+LIFECYCLE_TIMEOUT = 30.0
+_lifecycle_request_id: str | None = None
+
+
+def _wait_until(predicate, timeout: float = LIFECYCLE_TIMEOUT) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def _process_tree(pid: int | None) -> list[psutil.Process]:
+    if not pid:
+        return []
+    try:
+        proc = psutil.Process(pid)
+        return [proc, *proc.children(recursive=True)]
+    except psutil.NoSuchProcess:
+        return []
+
+
+def _tree_stopped(processes: list[psutil.Process]) -> bool:
+    for proc in processes:
+        try:
+            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                return False
+        except psutil.NoSuchProcess:
+            pass
+    return True
+
+
+def _gateway_config_path(base: str, config_path: str | None = None) -> str | None:
+    """Read ``config_path`` from ``/api/config`` using the local gateway token."""
+    from mira_engine.security.gateway_auth import local_gateway_tokens
+
+    for token in local_gateway_tokens(config_path) or [None]:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        request = urllib.request.Request(f"{base}/api/config", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=1) as response:
+                return json.load(response).get("config_path")
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                raise
+    return None
+
+
+def _endpoint_gateway(host: str, port: int) -> dict[str, Any] | None:
+    """Read-only diagnosis of a leftover listener; never authorize a kill by HTTP."""
+    host = "127.0.0.1" if host == "0.0.0.0" else "::1" if host == "::" else host
+    address = f"[{host}]" if ":" in host else host
+    base = f"http://{address}:{port}"
+    try:
+        with urllib.request.urlopen(f"{base}/api/health", timeout=1) as response:
+            health = json.load(response)
+        if health.get("service") != "mira-gateway":
+            return None
+        info = {"endpoint": base, "config_path": None}
+        try:
+            info["config_path"] = _gateway_config_path(base)
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+        return info
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+
+
+def _gateway_healthy(pid: int | None, host: str, port: int, config_path: str | None = None) -> bool:
+    """A healthy port is insufficient: it must belong to this process tree."""
+    if not pid:
+        return False
+    try:
+        process = psutil.Process(pid)
+        processes = [process, *process.children(recursive=True)]
+        owns_port = any(
+            conn.status == psutil.CONN_LISTEN and conn.laddr.port == port
+            for proc in processes for conn in proc.net_connections(kind="tcp")
+        )
+        if not owns_port:
+            return False
+        host = "127.0.0.1" if host == "0.0.0.0" else "::1" if host == "::" else host
+        address = f"[{host}]" if ":" in host else host
+        with urllib.request.urlopen(f"http://{address}:{port}/api/health", timeout=1) as resp:
+            data = json.load(resp)
+            healthy = (resp.status == 200 and data.get("status") == "ok"
+                       and data.get("service") == "mira-gateway" and data.get("running") is True)
+        if healthy and config_path:
+            actual = _gateway_config_path(f"http://{address}:{port}", config_path)
+            return bool(actual) and Path(actual).resolve() == Path(config_path).resolve()
+        return healthy
+    except (psutil.Error, OSError, ValueError, urllib.error.URLError):
+        return False
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _diagnostic_request_id() -> str:
+    """One CLI command is one request, even when it writes several lifecycle events."""
+    global _lifecycle_request_id
+    from mira_engine.observability import correlation_id
+
+    inherited = os.environ.get("MIRA_DIAGNOSTIC_REQUEST_ID")
+    if inherited and correlation_id(inherited) == inherited:
+        return inherited
+    if _lifecycle_request_id is None:
+        _lifecycle_request_id = correlation_id()
+    return _lifecycle_request_id
 
 
 def _engine_manifest_path() -> Path:
@@ -113,12 +222,19 @@ class AgentPaths:
 
     @classmethod
     def default(cls) -> "AgentPaths":
-        return cls.for_home(Path.home())
+        from mira_engine.config.loader import get_home_dir
+
+        return cls._build(home=Path.home(), root=get_home_dir())
 
     @classmethod
     def for_home(cls, home: Path) -> "AgentPaths":
         home_path = home.expanduser()
-        root = home_path / ".mira"
+        return cls._build(home=home_path, root=home_path / ".mira")
+
+    @classmethod
+    def _build(cls, *, home: Path, root: Path) -> "AgentPaths":
+        home_path = home.expanduser()
+        root = root.expanduser()
         return cls(
             root=root,
             config_dir=root / "config",
@@ -164,6 +280,10 @@ class LocalServiceManager:
         self.paths.ensure()
         self._rotate_log_if_needed()
         payload = {
+            "schema_version": 1,
+            "component": "engine-service",
+            "pid": os.getpid(),
+            "request_id": _diagnostic_request_id(),
             "timestamp": _now_iso(),
             "event": event,
             "service_mode": self._default_state().get("service_mode"),
@@ -201,10 +321,37 @@ class LocalServiceManager:
 
     def save_state(self, state: dict[str, Any]) -> None:
         self.paths.ensure()
-        self.paths.state_file.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_text(self.paths.state_file, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+
+    def restart(self) -> tuple[int, str]:
+        code, message = self.stop()
+        if code != EXIT_OK:
+            return code, message
+        return self.start()
+
+    def _ready(self) -> bool:
+        code, payload = self.status()
+        return code == EXIT_OK and bool(payload.get("healthy"))
+
+    def _await_started(self) -> tuple[int, str]:
+        if not _wait_until(self._ready):
+            return EXIT_ERROR, f"gateway did not become healthy; inspect {self.paths.log_file}"
+        state = self.load_state()
+        state.update(running=True, last_started_at=_now_iso())
+        self.save_state(state)
+        return EXIT_OK, "gateway started and healthy"
+
+    def _stopped_result(self, message: str) -> tuple[int, str]:
+        state = self.load_state()
+        remaining = _endpoint_gateway(state["host"], state["port"])
+        if remaining:
+            return EXIT_ERROR, (
+                f"service stopped, but another Mira gateway still owns {remaining['endpoint']} "
+                f"(config: {remaining['config_path'] or 'unknown'}). "
+                "Select its MIRA_HOME and use `mira-engine status --gateway` / `stop --gateway`; "
+                "it was not terminated."
+            )
+        return EXIT_OK, message
 
     def install_service(
         self,
@@ -269,6 +416,9 @@ class LocalServiceManager:
             "service_mode": state.get("service_mode"),
             "platform": state.get("platform"),
             "port": state.get("port"),
+            "host": state.get("host"),
+            "config_path": state.get("config_path", str(self.paths.root / "config.json")),
+            "mira_home": str(self.paths.root),
             "log_file": str(self.paths.log_file),
             "state_file": str(self.paths.state_file),
             "installed_at": state.get("installed_at"),
@@ -309,19 +459,76 @@ class LocalServiceManager:
         self.paths.backups_dir.mkdir(parents=True, exist_ok=True)
         diagnostics_dir = self.paths.runtime_dir / "diagnostics"
         diagnostics_dir.mkdir(parents=True, exist_ok=True)
-        bundle = diagnostics_dir / f"diagnostics-{_now_iso().replace(':', '-')}.zip"
+        import uuid
+        bundle = diagnostics_dir / f"diagnostics-{_now_iso().replace(':', '-')}-{uuid.uuid4().hex[:8]}.zip"
 
         _, doctor_payload = self.doctor()
-        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("doctor.json", json.dumps(doctor_payload, ensure_ascii=False, indent=2) + "\n")
-            if self.paths.state_file.exists():
-                zf.write(self.paths.state_file, arcname="agent-service-state.json")
-            if self.paths.log_file.exists():
-                lines = self.paths.log_file.read_text(encoding="utf-8").splitlines()
-                tail = "\n".join(lines[-DIAGNOSTICS_LOG_TAIL_LINES:]) + ("\n" if lines else "")
-                zf.writestr("agent-service.log.tail", tail)
+        # Create private from the start: a failed export must never leave a readable bundle.
+        descriptor = os.open(bundle, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                self._write_diagnostics_bundle(stream, doctor_payload)
+        except BaseException:
+            bundle.unlink(missing_ok=True)
+            raise
+        bundle.chmod(0o600)
         self._append_log("diagnostics_exported", bundle=str(bundle))
         return EXIT_OK, str(bundle)
+
+    def _write_diagnostics_bundle(self, stream: Any, doctor_payload: dict[str, Any]) -> None:
+        from mira_engine.observability import read_tail, redact, structured_service_tail
+
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("doctor.json", json.dumps(redact(doctor_payload), ensure_ascii=False, indent=2) + "\n")
+            if self.paths.state_file.exists():
+                zf.writestr("agent-service-state.json", json.dumps(redact(self.load_state()), indent=2) + "\n")
+            if self.paths.log_file.exists():
+                zf.writestr("agent-service.log.tail", structured_service_tail(self.paths.log_file))
+            config_path = self.load_state().get("config_path")
+            runtime_dir = (Path(config_path).parent if config_path else self.paths.root) / "logs" / "runtime"
+            files = []
+            errors = []
+            if runtime_dir.is_dir():
+                candidates = []
+                for path in runtime_dir.iterdir():
+                    if not re.fullmatch(r"(?:engine|fault)-\d+-[a-f0-9]{32}\.(?:jsonl|log)(?:\.\d+)?", path.name):
+                        continue
+                    try:
+                        # lstat once: a running engine may rotate or prune files mid-export.
+                        info = path.lstat()
+                    except OSError as exc:
+                        errors.append({"file": path.name, "error_type": type(exc).__name__})
+                        continue
+                    if stat.S_ISREG(info.st_mode):
+                        candidates.append((info.st_mtime, path))
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                for _, path in candidates[:16]:
+                    try:
+                        lines = read_tail(path).splitlines()
+                        if path.name.startswith("engine-"):
+                            records = []
+                            for line in lines:
+                                try:
+                                    row = json.loads(line)
+                                except (ValueError, RecursionError):
+                                    errors.append({"file": path.name, "error_type": "InvalidJSONL"})
+                                    continue
+                                if isinstance(row, dict):
+                                    # Redact individual values, not the serialized line:
+                                    # long tracebacks must remain complete, parseable JSON.
+                                    records.append(json.dumps(redact(row), ensure_ascii=False))
+                            tail = "\n".join(records) + "\n"
+                        else:
+                            tail = "\n".join(redact(line) for line in lines) + "\n"
+                        zf.writestr(f"engine-runtime/{path.name}.tail", tail)
+                        files.append(path.name)
+                    except OSError as exc:
+                        errors.append({"file": path.name, "error_type": type(exc).__name__})
+            zf.writestr("manifest.json", json.dumps({
+                "schema_version": 1, "created_at": _now_iso(), "runtime_files": files,
+                "errors": errors, "privacy": "No config, conversation, tool arguments or native minidumps. Legacy unstructured service output omitted.",
+                "tail_bytes_per_file": 131072,
+            }, indent=2) + "\n")
 
 
 class SystemdUserServiceManager(LocalServiceManager):
@@ -443,19 +650,8 @@ class WindowsBackgroundProcessManager(LocalServiceManager):
             capture_output=True,
             text=True,
             check=False,
+            timeout=LIFECYCLE_TIMEOUT,
         )
-
-    def _is_pid_running(self, pid: int | None) -> bool:
-        if not isinstance(pid, int) or pid <= 0:
-            return False
-        result = self._run_windows_tool("tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH")
-        if result.returncode != 0:
-            return False
-        output = result.stdout.strip()
-        return bool(output) and "No tasks are running" not in output
-
-    def _terminate_pid(self, pid: int) -> subprocess.CompletedProcess[str]:
-        return self._run_windows_tool("taskkill", "/PID", str(pid), "/T", "/F")
 
     def install_service(
         self,
@@ -476,9 +672,9 @@ class WindowsBackgroundProcessManager(LocalServiceManager):
 
     def uninstall_service(self) -> tuple[int, str]:
         state = self.load_state()
-        pid = state.get("pid")
-        if isinstance(pid, int) and pid > 0 and self._is_pid_running(pid):
-            self._terminate_pid(pid)
+        code, message = self.stop()
+        if code != EXIT_OK:
+            return code, message
         code, msg = super().uninstall_service()
         state = self.load_state()
         state["pid"] = None
@@ -492,12 +688,10 @@ class WindowsBackgroundProcessManager(LocalServiceManager):
         if not state.get("installed"):
             return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
 
-        existing_pid = state.get("pid")
-        if isinstance(existing_pid, int) and self._is_pid_running(existing_pid):
-            state["running"] = True
-            state["service_mode"] = self.SERVICE_MODE
-            self.save_state(state)
-            return EXIT_OK, "Windows background gateway already running"
+        from mira_engine.cli.gateway_lifecycle import verified_process
+
+        if verified_process(state, self.paths.root) is not None:
+            return self._await_started()
 
         host = str(state.get("host", "127.0.0.1"))
         port = int(state.get("port", DEFAULT_PORT))
@@ -513,7 +707,11 @@ class WindowsBackgroundProcessManager(LocalServiceManager):
                 stdout=log_fp,
                 stderr=log_fp,
                 stdin=subprocess.DEVNULL,
-                env=_independent_subprocess_env(PYTHONUNBUFFERED="1"),
+                env=_independent_subprocess_env(
+                    PYTHONUNBUFFERED="1", MIRA_HOME=str(self.paths.root),
+                    MIRA_CONFIG_PATH=str(state.get("config_path") or self.paths.root / "config.json"),
+                    MIRA_SERVICE_MODE=self.SERVICE_MODE,
+                ),
                 close_fds=True,
                 creationflags=creationflags,
             )
@@ -535,23 +733,29 @@ class WindowsBackgroundProcessManager(LocalServiceManager):
 
         state["running"] = True
         state["pid"] = proc.pid
+        state["create_time"] = psutil.Process(proc.pid).create_time()
         state["service_mode"] = self.SERVICE_MODE
         state["last_started_at"] = _now_iso()
         self.save_state(state)
         self._append_log("windows_start_service", running=True, pid=proc.pid)
-        return EXIT_OK, "Windows background gateway started"
+        return self._await_started()
 
-    def stop(self) -> tuple[int, str]:
+    def stop(self, *, force: bool = False) -> tuple[int, str]:
+        from mira_engine.cli.gateway_lifecycle import verified_process
+
         state = self.load_state()
-        if not state.get("installed"):
-            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
-
-        pid = state.get("pid")
-        if isinstance(pid, int) and pid > 0 and self._is_pid_running(pid):
-            result = self._terminate_pid(pid)
-            if result.returncode != 0 and self._is_pid_running(pid):
-                self._append_log("windows_stop_failed", error=result.stderr.strip())
-                return EXIT_ERROR, result.stderr.strip() or "failed to stop Windows background gateway"
+        proc = verified_process(state, self.paths.root)
+        if proc is not None:
+            if not force:
+                return EXIT_ERROR, "detached Windows gateway requires stop --force; use Windows service for graceful stop"
+            processes = [proc, *proc.children(recursive=True)]
+            for owned in reversed(processes):
+                try:
+                    owned.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            if not _wait_until(lambda: _tree_stopped(processes)):
+                return EXIT_ERROR, "timed out waiting for Windows background gateway to stop"
 
         state["running"] = False
         state["pid"] = None
@@ -562,17 +766,15 @@ class WindowsBackgroundProcessManager(LocalServiceManager):
         return EXIT_OK, "Windows background gateway stopped"
 
     def status(self) -> tuple[int, dict[str, Any]]:
+        from mira_engine.cli.gateway_lifecycle import verified_process
+
         base_code, payload = super().status()
         state = self.load_state()
         pid = state.get("pid")
-        running = self._is_pid_running(pid if isinstance(pid, int) else None)
-        if state.get("running") != running or (not running and pid):
-            state["running"] = running
-            if not running:
-                state["pid"] = None
-            self.save_state(state)
-            pid = state.get("pid")
+        running = verified_process(state, self.paths.root) is not None
         payload["running"] = running
+        payload["pid"] = pid if running else None
+        payload["healthy"] = running and _gateway_healthy(pid, state["host"], state["port"], payload["config_path"])
         payload["service_mode"] = state.get("service_mode", self.SERVICE_MODE)
         payload["windows_service"] = WINDOWS_SERVICE_NAME
         payload["windows_pid"] = pid
@@ -597,6 +799,7 @@ class WindowsServiceManager(LocalServiceManager):
             "capture_output": True,
             "text": True,
             "check": False,
+            "timeout": LIFECYCLE_TIMEOUT,
         }
         if platform.system().lower() == "windows":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -668,11 +871,13 @@ class WindowsServiceManager(LocalServiceManager):
         home: str | None,
         config_path: str | None,
     ) -> tuple[Path, Path]:
+        from mira_engine.config.loader import get_home_dir
+
         home_path = Path(home).expanduser() if home else Path.home()
         config_file = (
             Path(config_path).expanduser()
             if config_path
-            else home_path / ".mira" / "config.json"
+            else (home_path / ".mira" / "config.json" if home else get_home_dir() / "config.json")
         )
         command = _gateway_service_args(host, port)
         executable = Path(command[0]).expanduser()
@@ -698,6 +903,8 @@ class WindowsServiceManager(LocalServiceManager):
   <env name="HOME" value="{esc(home_path)}" />
   <env name="USERPROFILE" value="{esc(home_path)}" />
   <env name="MIRA_CONFIG_PATH" value="{esc(config_file)}" />
+  <env name="MIRA_HOME" value="{esc(self.paths.root)}" />
+  <env name="MIRA_SERVICE_MODE" value="windows-service" />
   <logpath>{esc(log_dir)}</logpath>
   <log mode="roll-by-size">
     <sizeThreshold>{LOG_ROTATE_BYTES}</sizeThreshold>
@@ -714,6 +921,24 @@ class WindowsServiceManager(LocalServiceManager):
         return self._run_windows_tool(str(wrapper), command)
 
     def _wrapper_status(self) -> tuple[bool, bool, str]:
+        # Query SCM directly on Windows: WinSW status text is not a reliable
+        # source for permission failures, localization or installation identity.
+        if hasattr(psutil, "win_service_get"):
+            try:
+                service = psutil.win_service_get(WINDOWS_SERVICE_NAME)
+                binary = service.binpath().strip()
+                match = re.match(r'^"([^"]+)"|^(\S+)', binary)
+                path = (match[1] or match[2]) if match else ""
+                if Path(path).resolve() != self._staged_wrapper_path().resolve():
+                    return False, False, f"service belongs to a different installation: {path}"
+                state = service.status()
+                output = {"running": "Started", "stopped": "Stopped",
+                          "start_pending": "StartPending", "stop_pending": "StopPending"}.get(state, state)
+                return True, state == "running", output
+            except psutil.NoSuchProcess:
+                return False, False, "NonExistent"
+            except (psutil.Error, OSError) as exc:
+                return False, False, f"unable to query Windows service: {exc}"
         wrapper = self._staged_wrapper_path()
         if not wrapper.is_file():
             return False, False, "service wrapper is not staged"
@@ -724,13 +949,24 @@ class WindowsServiceManager(LocalServiceManager):
             marker in normalized
             for marker in ("nonexistent", "not installed", "does not exist")
         )
-        running = any(marker in normalized for marker in ("started", "running"))
+        running = installed and normalized in {"started", "running"}
         return installed, running, output
 
-    def _stop_legacy_background_if_needed(self) -> None:
+    def _service_pid(self) -> int | None:
+        if hasattr(psutil, "win_service_get"):
+            try:
+                return psutil.win_service_get(WINDOWS_SERVICE_NAME).pid() or None
+            except psutil.NoSuchProcess:
+                return None
+        result = self._run_windows_tool("sc.exe", "queryex", WINDOWS_SERVICE_NAME)
+        match = re.search(r"^\s*PID\s*:\s*(\d+)\s*$", result.stdout, re.MULTILINE)
+        return int(match[1]) or None if result.returncode == 0 and match else None
+
+    def _stop_legacy_background_if_needed(self) -> tuple[int, str]:
         state = self.load_state()
         if state.get("service_mode") == WindowsBackgroundProcessManager.SERVICE_MODE:
-            self._fallback.stop()
+            return self._fallback.stop()
+        return EXIT_OK, "no legacy background process"
 
     def _fallback_install(
         self,
@@ -774,7 +1010,9 @@ class WindowsServiceManager(LocalServiceManager):
                 reason=f"{WINDOWS_SERVICE_WRAPPER_NAME} not found",
             )
 
-        self._stop_legacy_background_if_needed()
+        stop_code, stop_message = self._stop_legacy_background_if_needed()
+        if stop_code != EXIT_OK:
+            return stop_code, stop_message
         self._release_staged_wrapper_for_update(source)
         try:
             wrapper_path = self._stage_wrapper(source)
@@ -871,35 +1109,52 @@ class WindowsServiceManager(LocalServiceManager):
             return self._fallback.start()
         if not state.get("installed"):
             return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
+        installed, running, output = self._wrapper_status()
+        if running:
+            return self._await_started()
+        if output.strip().lower() not in {"stopped", "startpending", "stoppending"}:
+            return EXIT_ERROR, output or "unable to query Windows service"
+        if output.strip().lower() == "startpending":
+            return self._await_started()
+        if output.strip().lower() == "stoppending":
+            if not _wait_until(lambda: self._wrapper_status()[2].strip().lower() == "stopped"):
+                return EXIT_ERROR, "Windows service is still stopping"
         result = self._run_wrapper("start")
         if result.returncode != 0:
             message = result.stderr.strip() or result.stdout.strip() or "failed to start Windows service"
             self._append_log("windows_service_start_failed", error=message)
             return EXIT_ERROR, message
-        state["running"] = True
-        state["service_mode"] = self.SERVICE_MODE
-        state["last_started_at"] = _now_iso()
-        self.save_state(state)
-        self._append_log("windows_service_start", running=True)
-        return EXIT_OK, "Windows service started"
+        return self._await_started()
 
     def stop(self) -> tuple[int, str]:
         state = self.load_state()
         if state.get("service_mode") == WindowsBackgroundProcessManager.SERVICE_MODE:
             return self._fallback.stop()
-        if not state.get("installed"):
-            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
-        result = self._run_wrapper("stop")
-        if result.returncode != 0:
-            message = result.stderr.strip() or result.stdout.strip() or "failed to stop Windows service"
-            self._append_log("windows_service_stop_failed", error=message)
-            return EXIT_ERROR, message
+        installed, running, output = self._wrapper_status()
+        normalized = output.strip().lower()
+        if normalized == "nonexistent" or (
+            not installed and not state.get("installed") and normalized == "service wrapper is not staged"
+        ):
+            state.update(running=False, last_stopped_at=_now_iso())
+            self.save_state(state)
+            return self._stopped_result("Windows service already stopped")
+        if normalized not in {"started", "running", "stopped", "startpending", "stoppending"}:
+            return EXIT_ERROR, output or "unable to query Windows service"
+        old_processes = _process_tree(self._service_pid()) if normalized != "stopped" else []
+        if normalized not in {"stopped", "stoppending"}:
+            result = self._run_wrapper("stop")
+            if result.returncode != 0:
+                if self._wrapper_status()[2].strip().lower() != "stopped":
+                    return EXIT_ERROR, result.stderr.strip() or result.stdout.strip() or "failed to stop Windows service"
+        if not _wait_until(lambda: self._wrapper_status()[2].strip().lower() == "stopped"
+                           and _tree_stopped(old_processes)):
+            return EXIT_ERROR, "timed out waiting for Windows service to stop"
         state["running"] = False
         state["service_mode"] = self.SERVICE_MODE
         state["last_stopped_at"] = _now_iso()
         self.save_state(state)
         self._append_log("windows_service_stop", running=False)
-        return EXIT_OK, "Windows service stopped"
+        return self._stopped_result("Windows service stopped")
 
     def status(self) -> tuple[int, dict[str, Any]]:
         state = self.load_state()
@@ -907,19 +1162,26 @@ class WindowsServiceManager(LocalServiceManager):
             return self._fallback.status()
         base_code, payload = super().status()
         installed, running, status_output = self._wrapper_status()
-        if payload.get("installed") != installed or payload.get("running") != running:
-            state["installed"] = installed
-            state["running"] = running
-            self.save_state(state)
+        # A failed query must not erase installation metadata.
+        normalized = status_output.strip().lower()
+        known = normalized in {"started", "running", "stopped", "startpending", "stoppending", "nonexistent"}
+        known = known or (not state.get("installed") and normalized == "service wrapper is not staged")
         payload["installed"] = installed
         payload["running"] = running
+        payload["pid"] = self._service_pid() if running else None
+        payload["healthy"] = running and _gateway_healthy(
+            payload["pid"], str(state["host"]), int(state["port"]), payload["config_path"],
+        )
+        payload["state"] = ("running" if running else normalized) if known else "unknown"
         payload["service_mode"] = self.SERVICE_MODE
         payload["windows_service"] = WINDOWS_SERVICE_NAME
         payload["windows_service_wrapper"] = str(self._staged_wrapper_path())
         payload["windows_service_config"] = str(self._service_xml_path(self._staged_wrapper_path()))
         if status_output:
             payload["windows_service_status"] = status_output
-        return base_code, payload
+        if not payload["healthy"]:
+            payload["endpoint_gateway"] = _endpoint_gateway(state["host"], state["port"])
+        return base_code if known else EXIT_ERROR, payload
 
     def doctor(self) -> tuple[int, dict[str, Any]]:
         code, payload = super().doctor()
@@ -957,6 +1219,7 @@ class LaunchdServiceManager(LocalServiceManager):
             capture_output=True,
             text=True,
             check=False,
+            timeout=LIFECYCLE_TIMEOUT,
         )
 
     def _write_plist(
@@ -968,11 +1231,11 @@ class LaunchdServiceManager(LocalServiceManager):
         config_path: str | None,
     ) -> None:
         self.paths.launchd_plist.parent.mkdir(parents=True, exist_ok=True)
-        home_path = Path(home).expanduser() if home else self.paths.root.parent
+        home_path = Path(home).expanduser() if home else Path.home()
         config_file = (
             Path(config_path).expanduser()
             if config_path
-            else home_path / ".mira" / "config.json"
+            else (home_path / ".mira" / "config.json" if home else self.paths.root / "config.json")
         )
         payload = {
             "Label": LAUNCHD_LABEL,
@@ -984,12 +1247,31 @@ class LaunchdServiceManager(LocalServiceManager):
             "EnvironmentVariables": {
                 "HOME": str(home_path),
                 "MIRA_CONFIG_PATH": str(config_file),
+                "MIRA_HOME": str(self.paths.root),
+                "MIRA_SERVICE_MODE": "launchd",
                 "PYINSTALLER_RESET_ENVIRONMENT": "1",
                 "PYTHONUNBUFFERED": "1",
             },
         }
         with self.paths.launchd_plist.open("wb") as fp:
             plistlib.dump(payload, fp)
+
+    def _ownership_error(self) -> str | None:
+        if not self.paths.launchd_plist.exists():
+            return None
+        try:
+            plist = plistlib.loads(self.paths.launchd_plist.read_bytes())
+            env = plist.get("EnvironmentVariables", {})
+            state = self.load_state()
+            expected = Path(state.get("config_path") or self.paths.root / "config.json").resolve()
+            actual = env.get("MIRA_CONFIG_PATH")
+            if actual and Path(actual).resolve() != expected:
+                return f"launchd belongs to config {actual}; select its service home or use --gateway"
+            if env.get("MIRA_HOME") and Path(env["MIRA_HOME"]).resolve() != self.paths.root.resolve():
+                return f"launchd belongs to MIRA_HOME={env['MIRA_HOME']}; refusing to control another instance"
+        except (OSError, ValueError, plistlib.InvalidFileException, AttributeError) as exc:
+            return f"cannot verify launchd service definition: {exc}"
+        return None
 
     def _wait_for_service_unloaded(self, timeout_s: float = 15.0) -> bool:
         """Poll until the LaunchAgent is no longer registered in our domain.
@@ -1008,12 +1290,14 @@ class LaunchdServiceManager(LocalServiceManager):
             result = self._run_launchctl("print", self._service_target)
             # Non-zero return means launchd no longer has the label in this
             # domain — exactly the precondition `bootstrap` needs.
-            if result.returncode != 0:
+            if result.returncode == 113:
                 return True
+            if result.returncode != 0:
+                return False
             time.sleep(0.25)
         return False
 
-    def _teardown_existing_job(self) -> None:
+    def _teardown_existing_job(self) -> bool:
         """Best-effort cleanup of any already-loaded LaunchAgent with our label.
 
         `launchctl bootstrap` returns the opaque "Bootstrap failed: 5: Input/
@@ -1024,7 +1308,7 @@ class LaunchdServiceManager(LocalServiceManager):
         """
         self._run_launchctl("bootout", self._service_target)
         self._run_launchctl("remove", LAUNCHD_LABEL)
-        self._wait_for_service_unloaded()
+        return self._wait_for_service_unloaded()
 
     def install_service(
         self,
@@ -1037,14 +1321,8 @@ class LaunchdServiceManager(LocalServiceManager):
         self.paths.ensure()
         service_host = str(host if host is not None else previous_state.get("host", "127.0.0.1"))
         service_port = int(port if port is not None else previous_state.get("port", DEFAULT_PORT))
-        service_home = (
-            previous_state.get("home") if isinstance(previous_state.get("home"), str) else home
-        )
-        service_config_path = (
-            previous_state.get("config_path")
-            if isinstance(previous_state.get("config_path"), str)
-            else config_path
-        )
+        service_home = home if home is not None else previous_state.get("home")
+        service_config_path = config_path if config_path is not None else previous_state.get("config_path")
 
         # Remember whether a plist already exists so we can restore it if the
         # bootstrap below fails (rollback for the transactional install).
@@ -1056,7 +1334,8 @@ class LaunchdServiceManager(LocalServiceManager):
             except OSError:
                 previous_plist = None
 
-        self._teardown_existing_job()
+        if not self._teardown_existing_job():
+            return EXIT_ERROR, "launchd teardown failed or timed out; service definition was not changed"
         self._write_plist(
             service_host,
             service_port,
@@ -1067,8 +1346,8 @@ class LaunchdServiceManager(LocalServiceManager):
         # Retry once after another cleanup pass — launchctl occasionally races
         # with its own shutdown when the previous job exits during bootout.
         if bootstrap.returncode != 0:
-            self._teardown_existing_job()
-            bootstrap = self._run_launchctl("bootstrap", self._domain, str(plist_path))
+            if self._teardown_existing_job():
+                bootstrap = self._run_launchctl("bootstrap", self._domain, str(plist_path))
             if bootstrap.returncode != 0:
                 # Roll back the plist so a partial install does not leave
                 # disk state pointing at an executable that never loaded.
@@ -1101,7 +1380,8 @@ class LaunchdServiceManager(LocalServiceManager):
         # Symmetric with install_service: bootout + remove drops the label
         # from launchd's cache so a subsequent reinstall starts from a
         # clean slate.
-        self._teardown_existing_job()
+        if not self._teardown_existing_job():
+            return EXIT_ERROR, "launchd teardown failed or timed out; service definition was not removed"
         try:
             self.paths.launchd_plist.unlink(missing_ok=True)
         except OSError as exc:
@@ -1114,34 +1394,56 @@ class LaunchdServiceManager(LocalServiceManager):
         state = self.load_state()
         if not state.get("installed"):
             return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
-        result = self._run_launchctl("kickstart", "-k", self._service_target)
+        code, current = self.status()
+        if code != EXIT_OK:
+            return code, current.get("last_launchctl_error", "unable to query launchd")
+        if current["running"]:
+            return self._await_started()
+        if current["loaded"]:
+            result = self._run_launchctl("kickstart", self._service_target)
+        else:
+            if not self.paths.launchd_plist.is_file():
+                return EXIT_NOT_INSTALLED, "service plist is missing; run install-service first"
+            result = self._run_launchctl("bootstrap", self._domain, str(self.paths.launchd_plist))
         if result.returncode != 0:
             self._append_log("launchd_start_failed", error=result.stderr.strip())
             return EXIT_ERROR, result.stderr.strip() or "failed to start launchd service"
-        state["running"] = True
-        state["last_started_at"] = _now_iso()
-        self.save_state(state)
-        self._append_log("launchd_start_service", running=True)
-        return EXIT_OK, "launchd service started"
+        return self._await_started()
 
     def stop(self) -> tuple[int, str]:
         state = self.load_state()
-        if not state.get("installed"):
-            return EXIT_NOT_INSTALLED, "service is not installed; run install-service first"
-        result = self._run_launchctl("stop", LAUNCHD_LABEL)
-        if result.returncode != 0:
-            self._append_log("launchd_stop_failed", error=result.stderr.strip())
-            return EXIT_ERROR, result.stderr.strip() or "failed to stop launchd service"
+        code, current = self.status()
+        if code != EXIT_OK:
+            return code, current.get("last_launchctl_error", "unable to query launchd")
+        old_processes = _process_tree(current.get("pid"))
+        if current["loaded"]:
+            result = self._run_launchctl("bootout", self._service_target)
+            if result.returncode not in {0, 113}:
+                return EXIT_ERROR, result.stderr.strip() or "failed to unload launchd service"
+        if not self._wait_for_service_unloaded() or not _wait_until(lambda: _tree_stopped(old_processes)):
+            return EXIT_ERROR, "timed out waiting for launchd gateway to stop"
         state["running"] = False
         state["last_stopped_at"] = _now_iso()
         self.save_state(state)
         self._append_log("launchd_stop_service", running=False)
-        return EXIT_OK, "launchd service stopped"
+        return self._stopped_result("launchd service stopped")
 
     def status(self) -> tuple[int, dict[str, Any]]:
         base_code, payload = super().status()
         result = self._run_launchctl("print", self._service_target)
-        payload["running"] = result.returncode == 0
+        payload["loaded"] = result.returncode == 0
+        ownership_error = self._ownership_error()
+        if ownership_error:
+            payload.update(running=False, healthy=False, state="conflict", last_launchctl_error=ownership_error)
+            return EXIT_ERROR, payload
+        pid_match = re.search(r"^\s*pid = (\d+)\s*$", result.stdout, re.MULTILINE)
+        state_match = re.search(r"^\s*state = (.+)$", result.stdout, re.MULTILINE)
+        payload["pid"] = int(pid_match[1]) if pid_match and payload["loaded"] else None
+        payload["state"] = state_match[1].strip() if state_match else "stopped" if result.returncode == 113 else "unknown"
+        payload["running"] = bool(payload["loaded"] and payload["pid"] and payload["state"] == "running")
+        payload["healthy"] = payload["running"] and _gateway_healthy(
+            payload["pid"], str(payload["host"]), int(payload["port"]), payload["config_path"],
+        )
         payload["service_mode"] = "launchd"
         payload["launchd_label"] = LAUNCHD_LABEL
         payload["launchd_plist"] = str(self.paths.launchd_plist)
@@ -1153,9 +1455,11 @@ class LaunchdServiceManager(LocalServiceManager):
                 payload["launchd_program"] = args[0]
         except (OSError, plistlib.InvalidFileException):
             pass
-        if result.returncode != 0 and payload.get("installed"):
-            payload["last_launchctl_error"] = result.stderr.strip()
-        return base_code, payload
+        if result.returncode not in {0, 113}:
+            payload["last_launchctl_error"] = result.stderr.strip() or result.stdout.strip() or "launchctl query failed"
+        if not payload["healthy"]:
+            payload["endpoint_gateway"] = _endpoint_gateway(str(payload["host"]), int(payload["port"]))
+        return base_code if result.returncode in {0, 113} else EXIT_ERROR, payload
 
     def doctor(self) -> tuple[int, dict[str, Any]]:
         code, payload = super().doctor()
@@ -1300,8 +1604,10 @@ def uninstall_service(
 @app.command()
 def start(
     home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
+    gateway: bool = typer.Option(False, "--gateway", help="Control a standalone gateway in this MIRA_HOME."),
+    port: int | None = typer.Option(None, "--port", help="Select a standalone gateway port; requires --gateway."),
 ) -> None:
-    code, message = _manager_for_home(home).start()
+    code, message = _lifecycle_command(home, "start", gateway=gateway, port=port)
     console.print(message)
     raise typer.Exit(code)
 
@@ -1309,8 +1615,54 @@ def start(
 @app.command()
 def stop(
     home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
+    gateway: bool = typer.Option(False, "--gateway", help="Control a standalone gateway in this MIRA_HOME."),
+    port: int | None = typer.Option(None, "--port", help="Select a standalone gateway port; requires --gateway."),
+    force: bool = typer.Option(False, "--force", help="Allow terminating a verified standalone/background gateway."),
 ) -> None:
-    code, message = _manager_for_home(home).stop()
+    code, message = _lifecycle_command(home, "stop", gateway=gateway, port=port, force=force)
+    console.print(message)
+    raise typer.Exit(code)
+
+
+def _lifecycle_command(home: str | None, action: str, *, gateway: bool = False,
+                       port: int | None = None, force: bool = False) -> tuple[int, str]:
+    from mira_engine.cli.gateway_lifecycle import gateway_action
+
+    manager = _manager_for_home(home)
+    if port is not None and not gateway:
+        return EXIT_ERROR, "--port requires --gateway; installed services use their saved port"
+    try:
+        # One transaction covers restart's stop + start. The lock is never
+        # removed on disk: unlinking lock files permits concurrent owners.
+        lock_target = (manager.paths.launchd_plist.with_suffix(".lifecycle")
+                       if isinstance(manager, LaunchdServiceManager) and not gateway
+                       else manager.paths.runtime_dir / "service-lifecycle")
+        with interprocess_lock(lock_target, timeout=1):
+            if gateway:
+                return gateway_action(manager, action, port, force=force)
+            background = manager if isinstance(manager, WindowsBackgroundProcessManager) else (
+                manager._fallback if isinstance(manager, WindowsServiceManager)
+                and manager.load_state().get("service_mode") == WindowsBackgroundProcessManager.SERVICE_MODE else None
+            )
+            if background is not None and action in {"stop", "restart"}:
+                code, message = background.stop(force=force)
+                if code or action == "stop":
+                    return code, message
+                return background.start()
+            return getattr(manager, action)()
+    except (OSError, TimeoutError, RuntimeError, ValueError, psutil.Error, subprocess.SubprocessError) as exc:
+        return EXIT_ERROR, f"{action} failed: {exc}"
+
+
+@app.command()
+def restart(
+    home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
+    gateway: bool = typer.Option(False, "--gateway", help="Control a standalone gateway in this MIRA_HOME."),
+    port: int | None = typer.Option(None, "--port", help="Select a standalone gateway port; requires --gateway."),
+    force: bool = typer.Option(False, "--force", help="Allow terminating a verified standalone/background gateway."),
+) -> None:
+    """Stop completely, then start the same installed service."""
+    code, message = _lifecycle_command(home, "restart", gateway=gateway, port=port, force=force)
     console.print(message)
     raise typer.Exit(code)
 
@@ -1318,8 +1670,21 @@ def stop(
 @app.command()
 def status(
     home: str | None = typer.Option(None, "--home", help="User home directory for service state."),
+    gateway: bool = typer.Option(False, "--gateway", help="Inspect standalone gateways in this MIRA_HOME."),
+    port: int | None = typer.Option(None, "--port", help="Select a standalone gateway port; requires --gateway."),
 ) -> None:
-    code, payload = _manager_for_home(home).status()
+    if port is not None and not gateway:
+        console.print("--port requires --gateway")
+        raise typer.Exit(EXIT_ERROR)
+    try:
+        manager = _manager_for_home(home)
+        if gateway:
+            from mira_engine.cli.gateway_lifecycle import gateway_action
+            code, payload = gateway_action(manager, "status", port)
+        else:
+            code, payload = manager.status()
+    except (OSError, RuntimeError, ValueError, psutil.Error, subprocess.SubprocessError) as exc:
+        code, payload = EXIT_ERROR, {"state": "unknown", "error": str(exc)}
     console.print_json(data=payload)
     raise typer.Exit(code)
 
@@ -1416,7 +1781,9 @@ def run_gateway(
 ) -> None:
     from mira_engine.cli.commands import gateway as gateway_cmd
 
-    gateway_cmd(host=host, port=port, workspace=None, verbose=False, config=None)
+    # Calling a Typer command as a Python function does not resolve OptionInfo
+    # defaults. Pass every boolean explicitly or `no_ui` is truthy here.
+    gateway_cmd(host=host, port=port, workspace=None, verbose=False, config=None, no_ui=False)
 
 
 if __name__ == "__main__":

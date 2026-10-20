@@ -17,6 +17,8 @@ from typing import Any
 import json_repair
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.usage import extract_usage
+from mira_engine.providers.registry import find_by_name, model_overrides_for
 
 _DEFAULT_API_BASE = "https://inference-api.nvidia.com/v1"
 _CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
@@ -231,11 +233,17 @@ class NvidiaProvider(LLMProvider):
             "stream": False,
             "max_tokens": max(1, int(max_tokens)),
         }
-        if self._supports_temperature(model_name, reasoning_effort):
+        if temperature is not None and self._supports_temperature(model_name, reasoning_effort):
             payload["temperature"] = temperature
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice if tool_choice is not None else "auto"
+        # Per-model parameter overrides from the registry (e.g. force a required
+        # temperature, or drop one the model rejects). NVIDIA-hosted models always
+        # resolve against the nvidia spec.
+        self._apply_param_overrides(
+            payload, model_overrides_for(model_name, find_by_name("nvidia"))
+        )
         return payload
 
     def _request_headers(self) -> dict[str, str]:
@@ -306,14 +314,7 @@ class NvidiaProvider(LLMProvider):
 
     @staticmethod
     def _extract_usage(response: Any) -> dict[str, int]:
-        if not isinstance(response, dict) or not isinstance(response.get("usage"), dict):
-            return {}
-        usage = response["usage"]
-        return {
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        }
+        return extract_usage(response)
 
     @classmethod
     def _parse_success(cls, response: Any) -> LLMResponse:

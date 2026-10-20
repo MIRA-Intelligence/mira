@@ -12,7 +12,8 @@ from litellm import acompletion
 from loguru import logger
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from mira_engine.providers.registry import find_by_model, find_gateway
+from mira_engine.providers.usage import extract_usage
+from mira_engine.providers.registry import find_by_model, find_gateway, model_overrides_for
 
 # Standard chat-completion message keys.
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
@@ -151,13 +152,7 @@ class LiteLLMProvider(LLMProvider):
 
     def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
         """Apply model-specific parameter overrides from the registry."""
-        model_lower = model.lower()
-        spec = find_by_model(model)
-        if spec:
-            for pattern, overrides in spec.model_overrides:
-                if pattern in model_lower:
-                    kwargs.update(overrides)
-                    return
+        self._apply_param_overrides(kwargs, model_overrides_for(model))
 
     @staticmethod
     def _extra_msg_keys(original_model: str, resolved_model: str) -> frozenset[str]:
@@ -295,10 +290,13 @@ class LiteLLMProvider(LLMProvider):
             "model": model,
             "messages": self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys),
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        # None => omit temperature entirely (let the model use its own default).
+        if temperature is not None:
+            kwargs["temperature"] = temperature
 
-        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
+        # Apply model-specific overrides (e.g. kimi-k2.5 temperature) — these may
+        # (re)introduce a required temperature even when the caller omitted one.
         self._apply_model_overrides(model, kwargs)
 
         # Pass api_key directly — more reliable than env vars alone
@@ -367,13 +365,7 @@ class LiteLLMProvider(LLMProvider):
                 arguments=args,
             ))
 
-        usage = {}
-        if hasattr(response, "usage") and response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
+        usage = extract_usage(response)
 
         reasoning_content = self._message_value(message, "reasoning_content") or None
         if not reasoning_content:
