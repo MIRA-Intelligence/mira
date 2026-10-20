@@ -1200,7 +1200,12 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     class _FakeCron:
         def __init__(self, _store_path: Path) -> None:
             self.on_job = None
+            self.system_jobs: list[CronJob] = []
             seen["cron"] = self
+
+        def register_system_job(self, job: CronJob) -> CronJob:
+            self.system_jobs.append(job)
+            return job
 
     class _FakeAgentLoop:
         def __init__(self, *args, **kwargs) -> None:
@@ -1253,6 +1258,8 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     cron = seen["cron"]
     assert isinstance(cron, _FakeCron)
     assert cron.on_job is not None
+    # Dream is scheduled at startup (it used to run only on /dream).
+    assert [(j.id, j.schedule.kind, j.schedule.every_ms) for j in cron.system_jobs] == [("dream", "every", 2 * 3_600_000)]
 
     job = CronJob(
         id="cron-1",

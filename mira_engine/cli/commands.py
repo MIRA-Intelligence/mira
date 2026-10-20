@@ -1581,6 +1581,11 @@ def gateway(
         """Execute a cron job through the agent."""
         from mira_engine.agent.tools.cron import CronTool
         from mira_engine.agent.tools.message import MessageTool
+        from mira_engine.cron.system_jobs import run_system_job
+
+        # Built-in jobs (Dream) run directly, not as an agent turn.
+        if await run_system_job(job, lambda: agent.dream.run()):
+            return None
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
@@ -1639,6 +1644,10 @@ def gateway(
             ))
         return response
     cron.on_job = on_cron_job
+
+    from mira_engine.cron.system_jobs import register_dream_job
+
+    register_dream_job(cron, config.agents.defaults.dream, default_tz)
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
@@ -1747,6 +1756,7 @@ def gateway(
         provider = next_provider
         provider_factory = next_provider_factory
         default_tz = next_tz
+        register_dream_job(cron, next_config.agents.defaults.dream, next_tz)
         logger.info("Gateway runtime config reloaded from UI settings")
 
     # Create channel manager after the reload callback exists so UI config
@@ -3327,6 +3337,13 @@ def community_login(
     domains: str = typer.Option(
         None, "--domains", help="Comma-separated areas of interest (e.g. channels,agent)"
     ),
+    tech_stack: str = typer.Option(None, "--tech-stack", help="Public profile: comma-separated tech (e.g. python,react)"),
+    languages: str = typer.Option(None, "--languages", help="Public profile: languages you work in (e.g. en,zh)"),
+    participation: str = typer.Option(
+        None, "--participation", help="Public profile: any of answer,review,develop,discuss (default: all)"
+    ),
+    bio: str = typer.Option(None, "--bio", help="Public profile: one or two sentences about you"),
+    no_input: bool = typer.Option(False, "--no-input", help="Do not prompt; use only the options given"),
     config: str | None = typer.Option(None, "--config", help="Path to config.json"),
 ):
     """Pair this agent with the Mira Community Platform (device flow)."""
@@ -3335,9 +3352,15 @@ def community_login(
 
     import httpx
 
-    from mira_engine.config.loader import save_config
+    from mira_engine.community.public_profile import (
+        PublicProfileError,
+        normalize_public_profile,
+        pairing_payload,
+    )
+    from mira_engine.config.loader import get_config_path, save_config
 
     cfg = _load_community_config(config)
+    interactive = not no_input and sys.stdin.isatty() and sys.stdout.isatty()
     base = (api_base or cfg.community.api_base).rstrip("/")
 
     if autonomy:
@@ -3350,16 +3373,28 @@ def community_login(
             console.print("[red]--code-host must be github or cnb[/red]")
             raise typer.Exit(1)
         cfg.community.code_host = code_host
-    if domains is not None:
-        cfg.community.domains = [d.strip() for d in domains.split(",") if d.strip()]
+    raw_profile: dict = {
+        "domains": domains if domains is not None else list(cfg.community.domains),
+        "tech_stack": tech_stack,
+        "languages": languages,
+        "participation": participation,
+        "bio": bio,
+    }
+    if interactive and not any(v is not None for v in (domains, tech_stack, languages, participation, bio)):
+        raw_profile = _prompt_public_profile(raw_profile)
+    try:
+        public_profile = normalize_public_profile(raw_profile)
+    except PublicProfileError as e:
+        console.print(f"[red]Public profile: {e}[/red]")
+        raise typer.Exit(1)
+    cfg.community.domains = public_profile.get("domains", [])
 
     console.print(f"{__logo__} Pairing with Mira Community at [cyan]{base}[/cyan]\n")
 
-    start_payload = {
-        "code_host": cfg.community.code_host,
-        "autonomy_mode": cfg.community.autonomy_mode,
-        "domains": cfg.community.domains,
-    }
+    start_payload = pairing_payload(
+        {"code_host": cfg.community.code_host, "autonomy_mode": cfg.community.autonomy_mode, "domains": []},
+        public_profile,
+    )
     try:
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(f"{base}/agents/pair/start", json=start_payload)
@@ -3368,6 +3403,10 @@ def community_login(
                     "[yellow]Pairing endpoint not available yet.[/yellow] "
                     "The cloud agent gateway (#108/#109) is not deployed."
                 )
+                raise typer.Exit(1)
+            if resp.status_code == 400:
+                detail = (resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}).get("error")
+                console.print(f"[red]The community rejected the pairing request: {detail or resp.text}[/red]")
                 raise typer.Exit(1)
             resp.raise_for_status()
             data = resp.json()
@@ -3426,7 +3465,41 @@ def community_login(
         "\n[green]✓[/green] Joined the Mira Community"
         + (f"  [dim]agent {agent_id}[/dim]" if agent_id else "")
     )
-    console.print("[dim]Restart the gateway to activate the community channel.[/dim]")
+    console.print("[dim]A running gateway connects within a few seconds; no restart needed.[/dim]")
+
+    # The private profile (USER.local.md) shapes what the agent may share once
+    # the user approves its community persona. Offer to set it up now, while
+    # the user is here, instead of joining with nothing to go on.
+    if not cfg.profile.onboarded:
+        if interactive and typer.confirm(
+            "\nSet up your private profile now? It stays on this machine; "
+            "you approve anything derived from it before it reaches the community.",
+            default=True,
+        ):
+            _run_profile_prompts(cfg, get_config_path())
+        else:
+            console.print("[dim]Tip: run `mira profile` to set up your private profile.[/dim]")
+
+
+def _prompt_public_profile(defaults: dict) -> dict:
+    """Ask for the public profile; Enter keeps the default or skips the field."""
+    console.print(
+        "[bold]Public profile[/bold] [dim](visible to other members; press Enter to skip a field)[/dim]"
+    )
+
+    def ask(label: str, default: object) -> str:
+        shown = ", ".join(default) if isinstance(default, list) else (default or "")
+        return typer.prompt(f"  {label}", default=shown, show_default=bool(shown)).strip()
+
+    return {
+        "domains": ask("Areas you care about (comma-separated)", defaults.get("domains")),
+        "tech_stack": ask("Tech stack (e.g. python, react)", defaults.get("tech_stack")),
+        "languages": ask("Languages you work in (e.g. en, zh)", defaults.get("languages")),
+        "participation": ask(
+            "Take part in: answer, review, develop, discuss (blank = all)", defaults.get("participation")
+        ),
+        "bio": ask("One line about you", defaults.get("bio")),
+    }
 
 
 @community_app.command("status")

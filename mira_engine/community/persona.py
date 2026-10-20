@@ -30,6 +30,21 @@ _PLACEHOLDERS = {"not specified", ""}
 _KEEP_SECTIONS = {"topics of interest": "Interests", "communication style": "Communication style"}
 
 
+def _template_bullets() -> set[str]:
+    """Bullets of the bundled USER.md template. They are defaults, not the
+    user's own words, so they never go into the persona (an untouched copy of
+    the template would otherwise present "General research assistance" as the
+    user's interests)."""
+    from mira_engine.profile.onboarding import load_template
+
+    return {b.strip().lower() for bullets in _sections(load_template("USER.md")).values() for b in bullets}
+
+
+def persona_has_content(draft: str) -> bool:
+    """True when the draft says anything beyond the fixed header."""
+    return any(line.startswith("- ") for line in draft.splitlines())
+
+
 def _sections(text: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     current: str | None = None
@@ -44,9 +59,15 @@ def _sections(text: str) -> dict[str, list[str]]:
     return out
 
 
-def draft_persona(user_texts: list[str], profile: dict[str, Any] | None, guard: PrivacyGuard) -> str:
+def draft_persona(
+    user_texts: list[str],
+    profile: dict[str, Any] | None,
+    guard: PrivacyGuard,
+    template_bullets: set[str] | None = None,
+) -> str:
     """Draft COMMUNITY_PERSONA.md from the private profile + the public one."""
     profile = profile or {}
+    defaults = _template_bullets() if template_bullets is None else template_bullets
     lines = [
         "# Community persona",
         "",
@@ -76,7 +97,7 @@ def draft_persona(user_texts: list[str], profile: dict[str, Any] | None, guard: 
         if value and not guard.scan(value):
             lines.append(f"- **{label}**: {value}")
     for label, bullets in kept.items():
-        safe = [b for b in dict.fromkeys(bullets) if not guard.scan(b)]
+        safe = [b for b in dict.fromkeys(bullets) if b.strip().lower() not in defaults and not guard.scan(b)]
         if safe:
             lines += ["", f"## {label}", "", *[f"- {b}" for b in safe]]
     return "\n".join(lines).rstrip() + "\n"
@@ -110,6 +131,11 @@ def propose_persona_update(workspace: Path, profile: dict[str, Any] | None, guar
         except OSError:
             continue
     draft = draft_persona(texts, profile, guard)
+    if not persona_has_content(draft):
+        # Nothing to say yet (no profile written, no public profile): asking the
+        # user to approve an empty header is noise. Community turns work without
+        # a persona; a draft is proposed once there is something in it.
+        return None
     try:
         current = persona_path(workspace).read_text(encoding="utf-8")
     except OSError:

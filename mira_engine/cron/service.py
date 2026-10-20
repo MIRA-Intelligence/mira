@@ -460,6 +460,15 @@ class CronService:
             if job.enabled and job.state.next_run_at_ms is None:
                 job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
             store.jobs.append(job)
+        elif existing.schedule != job.schedule:
+            # The schedule comes from config (e.g. agents.defaults.dream.intervalH):
+            # apply a changed value instead of keeping the first one forever.
+            for stored in store.jobs:
+                if stored.id == job.id:
+                    now = _now_ms()
+                    stored.schedule = job.schedule
+                    stored.updated_at_ms = now
+                    stored.state.next_run_at_ms = _compute_next_run(job.schedule, now) if stored.enabled else None
         self._protected_job_ids.add(job.id)
         self._save_store()
         self._arm_timer()
