@@ -6,6 +6,13 @@ from typing import Any
 
 import httpx
 
+from mira_engine.community.privacy import (
+    PrivacyGuard,
+    PrivacyViolation,
+    check_outbound_payload,
+    default_guard,
+)
+
 
 class CommunityError(Exception):
     """Raised when a community API call fails."""
@@ -42,16 +49,42 @@ class CommunityClient:
     login`. Only the endpoints backed by the cloud (#109) are exposed here.
     """
 
-    def __init__(self, api_base: str, agent_token: str, timeout: float = 30.0):
+    def __init__(
+        self,
+        api_base: str,
+        agent_token: str,
+        timeout: float = 30.0,
+        privacy_guard: PrivacyGuard | None = None,
+    ):
         self.api_base = api_base.rstrip("/")
         self._agent_token = agent_token
         self._timeout = timeout
+        self._privacy_guard = privacy_guard
+
+    def _guard(self) -> PrivacyGuard:
+        if self._privacy_guard is None:
+            self._privacy_guard = default_guard()
+        return self._privacy_guard
 
     @property
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._agent_token}"}
 
     async def _post(self, path: str, json: dict[str, Any]) -> dict[str, Any]:
+        # Every write leaves the machine through here, including approved HITL
+        # actions, so this is where the privacy boundary is enforced (mira#203).
+        try:
+            check_outbound_payload(self._guard(), json)
+        except PrivacyViolation as e:
+            raise CommunityRuleError(
+                str(e),
+                rule_id="privacy-filter",
+                reason=str(e),
+                how_to_resolve=(
+                    "Rewrite without credentials, personal names, email addresses, home-directory "
+                    "paths or other private details of your user, then try again."
+                ),
+            ) from None
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 f"{self.api_base}{path}", json=json, headers=self._auth_headers
@@ -176,25 +209,49 @@ class CommunityClient:
 
     async def register_pr(
         self,
-        proposal_id: str,
+        proposal_id: str | None,
         repo: str,
         pr_number: int,
         url: str,
         author_login: str,
         host: str = "github",
+        title: str | None = None,
+        body: str | None = None,
     ) -> dict[str, Any]:
         """Register a PR the agent opened on a fork so the community can govern
-        and bot-merge it (direct fork-and-PR model, #24)."""
+        and bot-merge it (direct fork-and-PR model, #24). Without a
+        ``proposal_id`` the platform auto-creates a development post from
+        ``title``/``body`` (code-first flow)."""
+        payload: dict[str, Any] = {
+            "host": host,
+            "repo": repo,
+            "pr_number": pr_number,
+            "url": url,
+            "author_login": author_login,
+        }
+        if proposal_id:
+            payload["proposal_id"] = proposal_id
+        else:
+            payload.update({k: v for k, v in (("title", title), ("body", body)) if v})
+        return await self._post("/agents/prs", payload)
+
+    async def get_contribution(self) -> dict[str, Any]:
+        """The contribution workflow: governed repos, landing branch, lanes and
+        merge-gate parameters (public, mira-community#41/#42)."""
+        return await self._get("/contribution")
+
+    async def get_external_pr(self, pr_id: str) -> dict[str, Any]:
+        """Platform view of a registered PR: lane, boundary findings, current
+        head and reviews (public, mira-community#45)."""
+        return await self._get(f"/external-prs/{pr_id}")
+
+    async def review_pr(
+        self, pr_id: str, verdict: str, head_sha: str, body: str = ""
+    ) -> dict[str, Any]:
+        """Review a registered PR at the head commit you read (mira-community#45)."""
         return await self._post(
-            "/agents/prs",
-            {
-                "proposal_id": proposal_id,
-                "host": host,
-                "repo": repo,
-                "pr_number": pr_number,
-                "url": url,
-                "author_login": author_login,
-            },
+            f"/agents/prs/{pr_id}/review",
+            {"verdict": verdict, "head_sha": head_sha, "body": body},
         )
 
     async def accept_answer(self, post_id: str, comment_id: str) -> dict[str, Any]:

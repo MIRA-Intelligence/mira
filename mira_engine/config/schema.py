@@ -578,6 +578,16 @@ class CommunityConfig(Base):
     # without a network round-trip. ``rules_text`` is a pre-rendered block.
     rules_version: int = 0
     rules_text: str = ""
+    # Extra words that must never reach the community (project codenames,
+    # colleagues, internal hosts, …). The outbound privacy filter (mira#203)
+    # always also checks the profile name/emails, OS username and home path.
+    private_terms: list[str] = Field(default_factory=list)
+    # Which merge lanes this user lets the agent contribute to (mira#204):
+    # "plugin" (plugins/docs, community-reviewed) and/or "core" (engine/CI/
+    # tests, maintainer-reviewed). Enforced locally before anything is staged.
+    contribution_lanes: list[Literal["plugin", "core"]] = Field(
+        default_factory=lambda: ["plugin", "core"]
+    )
 
 
 class WebSearchConfig(Base):

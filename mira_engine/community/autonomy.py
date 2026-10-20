@@ -24,8 +24,10 @@ AutonomyMode = Literal["fully_autonomous", "hitl", "hybrid"]
 # Impact tiers per action. Anything not listed defaults to "high".
 # Non-development posts (collab/discussion/showcase/question) and accepting an
 # answer are discussion-level engagement, so they flow freely in hybrid mode
-# (#33). The development proposal ("post_proposal"), patches, and PRs stay high.
-_LOW_IMPACT = frozenset({"read_feed", "comment", "vote", "post", "accept_answer"})
+# (#33), as does a code review (it only informs the merge gate,
+# mira-community#45). The development proposal ("post_proposal"), patches,
+# and PRs stay high.
+_LOW_IMPACT = frozenset({"read_feed", "comment", "vote", "review", "post", "accept_answer"})
 
 
 class AutonomyGate:

@@ -70,3 +70,17 @@ async def test_get_me_uses_auth_get():
     res = await client.get_me()
     assert captured == {"path": "/agents/me", "auth": True}
     assert res["tier"] == "recruit"
+
+
+async def test_register_pr_code_first_sends_title_body_not_proposal():
+    client = CommunityClient("http://x", "tok")
+    captured: dict = {}
+
+    async def fake_post(path, json):
+        captured["json"] = json
+        return {}
+
+    client._post = fake_post  # type: ignore[assignment]
+    await client.register_pr(None, "o/r", 5, "http://u/pull/5", "alice", title="T", body="B")
+    assert "proposal_id" not in captured["json"]
+    assert captured["json"]["title"] == "T" and captured["json"]["body"] == "B"

@@ -61,6 +61,7 @@ from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.command.router import CommandContext, CommandRouter
+from mira_engine.community.privacy import COMMUNITY_CHANNEL
 from mira_engine.modules.tools import (
     InitiationResearchResultTool,
     PubMedSearchTool,
@@ -524,7 +525,7 @@ class BaseAgentLoop:
             cron_tool = CronTool(self.cron_service)
             setattr(cron_tool, "_default_timezone", self.timezone)
             self.tools.register(cron_tool)
-        for community_tool in build_community_tools(self.community_config):
+        for community_tool in build_community_tools(self.community_config, workspace=self.workspace):
             self.tools.register(community_tool)
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
@@ -1714,7 +1715,11 @@ class BaseAgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        await project_consolidator.maybe_consolidate_by_tokens(session)
+        # Community threads are public, untrusted input: never archive them into
+        # the long-term memory that Dream distils into USER.md/MEMORY.md
+        # (mira#203). Their sessions stay bounded by ``memory_window``.
+        if msg.channel != COMMUNITY_CHANNEL:
+            await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
         profile = meta.get("agent_profile") or getattr(self, "_session_agent_profiles", {}).get(key)
         model_runtime = self._get_model_runtime(key, role="supervisor" if profile == "team" else None)
