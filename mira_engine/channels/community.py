@@ -162,6 +162,8 @@ class CommunityChannel(BaseChannel):
                             self._ws = ws
                             attempt = 0
                             logger.info("Mira Community gateway connected")
+                            asyncio.create_task(self._propose_persona())
+                            asyncio.create_task(self._maybe_write_report())
                             await self._recv_until_creds_change(ws)
                     except asyncio.CancelledError:
                         raise
@@ -263,6 +265,9 @@ class CommunityChannel(BaseChannel):
             from mira_engine.community.onboarding import ONBOARDING_PROMPT
 
             content = ONBOARDING_PROMPT
+            domains = list(getattr(self.config, "domains", None) or [])
+            if domains:
+                content += f"\nThe areas in your public profile: {', '.join(domains)}."
         else:
             content = self._format_event(event)
         if not content:
@@ -276,6 +281,44 @@ class CommunityChannel(BaseChannel):
             metadata={"community_event": event},
         )
         await self.bus.publish_inbound(msg)
+
+    async def _propose_persona(self) -> None:
+        """Queue a COMMUNITY_PERSONA.md update for the user's approval when the
+        private profile or the public one changed (mira#212). Never raises."""
+        try:
+            from mira_engine.community.persona import propose_persona_update
+            from mira_engine.community.privacy import default_guard
+            from mira_engine.config.loader import load_config
+
+            profile = None
+            if self._http is not None:
+                resp = await self._http.get(f"{self.api_base}/agents/me")
+                if resp.status_code == 200:
+                    profile = (resp.json() or {}).get("profile")
+            approval_id = propose_persona_update(load_config().workspace_path, profile, default_guard())
+            if approval_id:
+                logger.info("Community persona draft queued for your approval ({})", approval_id)
+        except Exception as e:  # noqa: BLE001 - housekeeping
+            logger.debug("Community persona check failed: {}", e)
+
+    async def _maybe_write_report(self) -> None:
+        """Write the local harvest report when it is due (mira#214). Read-only
+        towards the platform; never raises."""
+        try:
+            from mira_engine.community.budget import CommunityBudget
+            from mira_engine.community.client import CommunityClient
+            from mira_engine.community.harvest import is_due, write_report
+            from mira_engine.config.loader import load_config
+
+            cfg = load_config()
+            every = int(getattr(cfg.community, "harvest_report_days", 7) or 0)
+            if not is_due(cfg.workspace_path, every):
+                return
+            budget = CommunityBudget(int(getattr(cfg.community, "daily_token_budget", 0) or 0))
+            path = await write_report(CommunityClient(self.api_base, self.agent_token), cfg.workspace_path, cfg.community, budget)
+            logger.info("Community harvest report written to {}", path)
+        except Exception as e:  # noqa: BLE001 - housekeeping
+            logger.debug("Community harvest report failed: {}", e)
 
     async def _sync_delivered_rules(self, event: dict[str, Any]) -> None:
         """Cache rules delivered by a lifecycle event (#33).

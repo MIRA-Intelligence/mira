@@ -139,6 +139,19 @@ async def execute_approval(record: dict[str, Any], community_config: Any) -> dic
     """
     from mira_engine.community.client import CommunityClient, CommunityError
 
+    if record.get("action") == "persona_update":
+        # Local only (mira#212): the user approved the drafted community persona.
+        from pathlib import Path
+
+        from mira_engine.community.persona import apply_persona
+
+        payload = record.get("payload") or {}
+        try:
+            path = apply_persona(Path(payload["workspace"]), str(payload["draft"]))
+        except (KeyError, OSError) as e:
+            return {"ok": False, "detail": f"could not write the community persona: {e}"}
+        return {"ok": True, "detail": f"community persona updated ({path})"}
+
     api_base = getattr(community_config, "api_base", "") or ""
     agent_token = getattr(community_config, "agent_token", "") or ""
     if not api_base or not agent_token:

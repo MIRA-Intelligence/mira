@@ -593,6 +593,14 @@ class CommunityConfig(Base):
     # so in hitl/hybrid mode it also waits for the user's approval.
     work_order_kinds: list[str] = Field(default_factory=list)
     max_active_work_orders: int = 1
+    # What the community may cost per day (mira#213). Tokens across community
+    # turns and triage; 0 = unlimited. Lower priorities pause as it runs down.
+    daily_token_budget: int = 300_000
+    # Optional cheap model that decides whether a low-priority community event
+    # deserves a full turn (empty = priority rules only).
+    triage_model: str = ""
+    # Days between local community harvest reports (0 = off) (mira#214).
+    harvest_report_days: int = 7
 
 
 class WebSearchConfig(Base):

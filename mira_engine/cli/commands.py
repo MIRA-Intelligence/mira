@@ -3489,6 +3489,77 @@ def community_rules(
     )
 
 
+@community_app.command("persona")
+def community_persona(
+    approve: bool = typer.Option(False, "--approve", help="Approve the proposed persona"),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Show (and optionally approve) the community persona drafted from your profile.
+
+    Community turns never see USER.md; they see COMMUNITY_PERSONA.md, which is
+    derived from your profile minus anything identifying and only changes when
+    you approve it (mira#212).
+    """
+    from mira_engine.community.persona import apply_persona, draft_persona, persona_diff, persona_path
+    from mira_engine.community.privacy import default_guard
+    from mira_engine.config.loader import load_config, set_config_path
+
+    if config:
+        set_config_path(Path(config).expanduser().resolve())
+    cfg = load_config()
+    workspace = cfg.workspace_path
+    texts = [p.read_text(encoding="utf-8") for p in (workspace / "USER.md", workspace / "USER.local.md") if p.exists()]
+    # Same inputs as the channel's automatic draft: the public profile when the
+    # platform is reachable, else at least the configured domains.
+    profile: dict = {"domains": list(cfg.community.domains or [])}
+    if cfg.community.api_base and cfg.community.agent_token:
+        try:
+            import httpx
+
+            resp = httpx.get(
+                f"{cfg.community.api_base.rstrip('/')}/agents/me",
+                headers={"Authorization": f"Bearer {cfg.community.agent_token}"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200 and isinstance((resp.json() or {}).get("profile"), dict):
+                profile = resp.json()["profile"]
+        except Exception:  # noqa: BLE001 - offline: fall back to the config
+            pass
+    draft = draft_persona(texts, profile, default_guard())
+    current = persona_path(workspace).read_text(encoding="utf-8") if persona_path(workspace).exists() else ""
+    if draft == current:
+        console.print("The community persona is up to date.")
+        return
+    console.print(persona_diff(current, draft) or draft)
+    if approve:
+        console.print(f"[green]✓[/green] Written to {apply_persona(workspace, draft)}")
+    else:
+        console.print("Run with --approve to use this persona in community turns.")
+
+
+@community_app.command("report")
+def community_report(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Write this week's community harvest report (local only) and print it."""
+    from mira_engine.community.budget import CommunityBudget
+    from mira_engine.community.client import CommunityClient
+    from mira_engine.community.harvest import write_report
+    from mira_engine.config.loader import load_config, set_config_path
+
+    if config:
+        set_config_path(Path(config).expanduser().resolve())
+    cfg = load_config()
+    cc = cfg.community
+    if not (cc.api_base and cc.agent_token):
+        console.print("[red]Not connected to the community (run `mira community login`).[/red]")
+        raise typer.Exit(1)
+    budget = CommunityBudget(int(cc.daily_token_budget or 0))
+    path = asyncio.run(write_report(CommunityClient(cc.api_base, cc.agent_token), cfg.workspace_path, cc, budget))
+    console.print(Markdown(path.read_text(encoding="utf-8")))
+    console.print(f"[dim]Saved to {path}[/dim]")
+
+
 @community_app.command("onboard")
 def community_onboard(
     config: str | None = typer.Option(None, "--config", help="Path to config.json"),
