@@ -18,7 +18,12 @@ def isolate_runtime_home(tmp_path, monkeypatch):
 
     monkeypatch.setattr(host_policy, "POLICY_PATH", tmp_path / "etc-mira" / "policy.toml")
     host_policy.reset_cache()
+    # The plugin runtime is process-wide; load it fresh for each test's home.
+    from mira_engine.plugins import set_runtime_for_tests
+
+    set_runtime_for_tests(None)
     yield
+    set_runtime_for_tests(None)
     # Gateway tests that stop before the event loop leave their lease to atexit.
     from mira_engine.cli.engine_lease import release_all_leases
 
