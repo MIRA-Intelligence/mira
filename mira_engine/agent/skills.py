@@ -4,12 +4,41 @@ import json
 import os
 import re
 import shutil
+import time
 from pathlib import Path
+from typing import Any
 
 from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+
+# ── scan caches ────────────────────────────────────────────────────────
+# Building the system prompt, routing skills and resolving always-on skills
+# each walk the skill directories and re-read every SKILL.md. The inputs
+# almost never change between turns, so the directory index is memoised per
+# (roots, builtin dir, plugin manager paths) and invalidated when any root's
+# mtime moves or after a short TTL; file contents are memoised on
+# (mtime_ns, size). Several SkillsLoader instances exist per process, hence
+# the module-level caches.
+_INDEX_TTL_S = 5.0
+_WHICH_TTL_S = 60.0
+_index_cache: dict[tuple[Any, ...], tuple[float, tuple[Any, ...], dict[str, Any]]] = {}
+_file_cache: dict[str, tuple[int, int, str, dict | None]] = {}
+
+
+def _stat_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def invalidate_skill_caches() -> None:
+    """Drop every memoised skill scan (tests and plugin install paths)."""
+    _index_cache.clear()
+    _file_cache.clear()
 
 
 class SkillsLoader:
@@ -52,6 +81,20 @@ class SkillsLoader:
             self.plugin_manager = SkillPluginManager(workspace)
         else:
             self.plugin_manager = None
+        # PATH lookups for skill `requires.bins`, memoised per loader so a
+        # single prompt build does not re-run `which` dozens of times.
+        self._which_cache: dict[str, tuple[float, bool, Any]] = {}
+
+    def _which_cached(self, binary: str) -> bool:
+        now = time.monotonic()
+        which = shutil.which
+        hit = self._which_cache.get(binary)
+        # The cached answer is only valid for the same resolver (tests swap it).
+        if hit is not None and now - hit[0] < _WHICH_TTL_S and hit[2] is which:
+            return hit[1]
+        found = which(binary) is not None
+        self._which_cache[binary] = (now, found, which)
+        return found
 
     def _list_plugin_skills(self) -> list[dict[str, str]]:
         if self.plugin_manager is None:
@@ -70,17 +113,113 @@ class SkillsLoader:
             return set()
 
     def _plugin_skill_path_by_name(self, name: str) -> str | None:
-        for entry in self._list_plugin_skills():
-            if entry.get("name") == name:
-                return entry.get("path")
+        entry = self._index()["by_name"].get(name)
+        if entry is not None and entry[1] == "plugin":
+            return entry[0]
         return None
 
     def _builtin_skill_path_by_name(self, name: str) -> Path | None:
-        if not self.builtin_skills or not self.builtin_skills.exists():
+        entry = self._index()["by_name"].get(name)
+        if entry is not None and entry[1] == "builtin":
+            return Path(entry[0])
+        return None
+
+    # ── directory index ──────────────────────────────────────────────
+
+    def _index_key(self) -> tuple[Any, ...]:
+        pm = self.plugin_manager
+        return (
+            tuple(str(r) for r in self.workspace_skills_roots),
+            str(self.builtin_skills) if self.builtin_skills else None,
+            (str(pm.global_state_path), str(pm.project_overrides_path), str(pm.plugins_root)) if pm else None,
+        )
+
+    def _index_fingerprint(self) -> tuple[Any, ...]:
+        paths: list[Path] = list(self.workspace_skills_roots)
+        if self.builtin_skills:
+            paths.append(self.builtin_skills)
+        pm = self.plugin_manager
+        if pm is not None:
+            paths.extend((pm.global_state_path, pm.project_overrides_path, pm.plugins_root))
+        return tuple(_stat_signature(p) for p in paths)
+
+    def _index(self) -> dict[str, Any]:
+        key = self._index_key()
+        now = time.monotonic()
+        cached = _index_cache.get(key)
+        if cached is not None and now - cached[0] < _INDEX_TTL_S and cached[1] == self._index_fingerprint():
+            return cached[2]
+        index = self._build_index()
+        _index_cache[key] = (now, self._index_fingerprint(), index)
+        return index
+
+    def _build_index(self) -> dict[str, Any]:
+        skills: list[dict[str, str]] = []
+        by_name: dict[str, tuple[str, str]] = {}
+
+        def add(name: str, path: str, source: str) -> None:
+            if name in by_name:
+                return
+            by_name[name] = (path, source)
+            skills.append({"name": name, "path": path, "source": source})
+
+        # Workspace skills (highest priority)
+        for root in self.workspace_skills_roots:
+            if not root.exists():
+                continue
+            for skill_file in sorted(root.rglob("SKILL.md")):
+                if skill_file.is_file():
+                    add(skill_file.parent.name, str(skill_file), "workspace")
+
+        # Plugin skills (global install + scope toggles)
+        for plugin_skill in self._list_plugin_skills():
+            name = plugin_skill.get("name")
+            path = plugin_skill.get("path")
+            if isinstance(name, str) and isinstance(path, str):
+                add(name, path, "plugin")
+
+        # Built-in skills, minus the ones a plugin manages (possibly disabled)
+        managed_names = self._managed_skill_names()
+        if self.builtin_skills and self.builtin_skills.exists():
+            for skill_file in sorted(self.builtin_skills.rglob("SKILL.md")):
+                if not skill_file.is_file():
+                    continue
+                skill_name = skill_file.parent.name
+                if skill_name in managed_names:
+                    continue
+                add(skill_name, str(skill_file), "builtin")
+
+        return {"skills": skills, "by_name": by_name}
+
+    @staticmethod
+    def _read_skill_file(path: Path) -> str | None:
+        """Read a SKILL.md, memoised on (mtime, size)."""
+        sig = _stat_signature(path)
+        if sig is None:
             return None
-        for skill_file in self.builtin_skills.rglob("SKILL.md"):
-            if skill_file.parent.name == name:
-                return skill_file
+        key = str(path)
+        hit = _file_cache.get(key)
+        if hit is not None and hit[0] == sig[0] and hit[1] == sig[1]:
+            return hit[2]
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        _file_cache[key] = (sig[0], sig[1], content, SkillsLoader._parse_frontmatter(content))
+        return content
+
+    @staticmethod
+    def _parse_frontmatter(content: str) -> dict | None:
+        if content.startswith("---"):
+            match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+            if match:
+                # Simple YAML parsing
+                metadata = {}
+                for line in match.group(1).split("\n"):
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        metadata[key.strip()] = value.strip().strip('"\'')
+                return metadata
         return None
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
@@ -93,53 +232,21 @@ class SkillsLoader:
         Returns:
             List of skill info dicts with 'name', 'path', 'source'.
         """
-        skills = []
-
-        # Workspace skills (highest priority)
-        seen_names: set[str] = set()
-        for root in self.workspace_skills_roots:
-            if not root.exists():
-                continue
-            for skill_file in root.rglob("SKILL.md"):
-                if not skill_file.is_file():
-                    continue
-                skill_name = skill_file.parent.name
-                if skill_name in seen_names:
-                    continue
-                seen_names.add(skill_name)
-                skills.append({"name": skill_name, "path": str(skill_file), "source": "workspace"})
-
-        # Plugin skills (global install + scope toggles)
-        for plugin_skill in self._list_plugin_skills():
-            name = plugin_skill.get("name")
-            path = plugin_skill.get("path")
-            if not isinstance(name, str) or not isinstance(path, str):
-                continue
-            if name in seen_names:
-                continue
-            seen_names.add(name)
-            skills.append({
-                "name": name,
-                "path": path,
-                "source": "plugin",
-            })
-
-        # Built-in skills
-        managed_names = self._managed_skill_names()
-        if self.builtin_skills and self.builtin_skills.exists():
-            for skill_file in self.builtin_skills.rglob("SKILL.md"):
-                if not skill_file.is_file():
-                    continue
-                skill_name = skill_file.parent.name
-                if skill_name in seen_names or skill_name in managed_names:
-                    continue
-                seen_names.add(skill_name)
-                skills.append({"name": skill_name, "path": str(skill_file), "source": "builtin"})
-
-        # Filter by requirements
+        skills = [dict(s) for s in self._index()["skills"]]
         if filter_unavailable:
             return [s for s in skills if self._check_requirements(self._get_skill_meta(s["name"]))]
         return skills
+
+    def _skill_path(self, name: str) -> Path | None:
+        # Direct workspace layout wins even when the index is a few seconds old.
+        for root in self.workspace_skills_roots:
+            workspace_skill = root / name / "SKILL.md"
+            if workspace_skill.exists():
+                return workspace_skill
+        entry = self._index()["by_name"].get(name)
+        if entry is None:
+            return None
+        return Path(entry[0])
 
     def load_skill(self, name: str) -> str | None:
         """
@@ -151,27 +258,10 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        # Check workspace roots first
-        for root in self.workspace_skills_roots:
-            workspace_skill = root / name / "SKILL.md"
-            if workspace_skill.exists():
-                return workspace_skill.read_text(encoding="utf-8")
-
-        plugin_path = self._plugin_skill_path_by_name(name)
-        if plugin_path:
-            plugin_skill = Path(plugin_path)
-            if plugin_skill.is_file():
-                return plugin_skill.read_text(encoding="utf-8")
-
-        if name in self._managed_skill_names():
+        path = self._skill_path(name)
+        if path is None:
             return None
-
-        # Check built-in
-        builtin_skill = self._builtin_skill_path_by_name(name)
-        if builtin_skill:
-            return builtin_skill.read_text(encoding="utf-8")
-
-        return None
+        return self._read_skill_file(path)
 
     def load_skills_for_context(self, skill_names: list[str], *, loaded_skills: list[str] | None = None) -> str:
         """
@@ -241,7 +331,7 @@ class SkillsLoader:
         missing = []
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
-            if not shutil.which(b):
+            if not self._which_cached(b):
                 missing.append(f"CLI: {b}")
         for env in requires.get("env", []):
             if not os.environ.get(env):
@@ -275,7 +365,7 @@ class SkillsLoader:
         """Check if skill requirements are met (bins, env vars)."""
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
-            if not shutil.which(b):
+            if not self._which_cached(b):
                 return False
         for env in requires.get("env", []):
             if not os.environ.get(env):
@@ -307,22 +397,15 @@ class SkillsLoader:
         Returns:
             Metadata dict or None.
         """
-        content = self.load_skill(name)
+        path = self._skill_path(name)
+        if path is None:
+            return None
+        content = self._read_skill_file(path)
         if not content:
             return None
-
-        if content.startswith("---"):
-            match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
-            if match:
-                # Simple YAML parsing
-                metadata = {}
-                for line in match.group(1).split("\n"):
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        metadata[key.strip()] = value.strip().strip('"\'')
-                return metadata
-
-        return None
+        hit = _file_cache.get(str(path))
+        meta = hit[3] if hit is not None else self._parse_frontmatter(content)
+        return dict(meta) if meta is not None else None
 
     def _parse_frontmatter_list(self, raw: str | None) -> list[str]:
         """Parse a JSON array string from frontmatter (scenarios, aliases, etc.)."""

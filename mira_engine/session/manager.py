@@ -513,6 +513,22 @@ class SessionManager:
         timestamp: str | None = None,
     ) -> None:
         """Append one UI-visible event into the unified session event log."""
+        if key not in self._cache:
+            # Fast path: the log already exists on disk and nothing in this
+            # manager holds it in memory. Append the single event instead of
+            # parsing the whole (multi-MB) file just to write one line; the
+            # loader tolerates UI events after the last metadata record.
+            path = self._get_session_path(key)
+            if path.is_file():
+                event = {
+                    "role": role,
+                    "content": content,
+                    "type": msg_type,
+                    "timestamp": timestamp or datetime.now().isoformat(),
+                    "metadata": metadata or {},
+                }
+                self._append_event(path, self._ui_event(key, event))
+                return
         session = self.get_or_create(key)
         session.add_ui_event(
             role=role,

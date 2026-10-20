@@ -1,9 +1,11 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import asyncio
 import hashlib
 import os
 import secrets
 import string
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import json_repair
@@ -19,6 +21,14 @@ from mira_engine.providers.registry import find_by_model, find_gateway, model_ov
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
 _ANTHROPIC_EXTRA_KEYS = frozenset({"thinking_blocks"})
 _ALNUM = string.ascii_letters + string.digits
+_DEFAULT_STREAM_IDLE_TIMEOUT_S = 90
+
+
+def _stream_idle_timeout_seconds() -> float:
+    try:
+        return float(os.environ.get("MIRA_STREAM_IDLE_TIMEOUT_S", _DEFAULT_STREAM_IDLE_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return float(_DEFAULT_STREAM_IDLE_TIMEOUT_S)
 
 def _short_tool_id() -> str:
     """Generate a 9-char alphanumeric ID compatible with all providers (incl. Mistral)."""
@@ -252,29 +262,16 @@ class LiteLLMProvider(LLMProvider):
                 return nested_map.get(key)
         return None
 
-    async def chat(
+    def _build_request_kwargs(
         self,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        tool_choice: Any | None = None,
-        model: str | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        reasoning_effort: str | None = None,
-    ) -> LLMResponse:
-        """
-        Send a chat completion request via LiteLLM.
-
-        Args:
-            messages: List of message dicts with 'role' and 'content'.
-            tools: Optional list of tool definitions in OpenAI format.
-            model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
-            max_tokens: Maximum tokens in response.
-            temperature: Sampling temperature.
-
-        Returns:
-            LLMResponse with content and/or tool calls.
-        """
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any | None,
+        model: str | None,
+        max_tokens: int,
+        temperature: float,
+        reasoning_effort: str | None,
+    ) -> dict[str, Any]:
         original_model = model or self.default_model
         model = self._resolve_model(original_model)
         extra_msg_keys = self._extra_msg_keys(original_model, model)
@@ -319,6 +316,34 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice if tool_choice is not None else "auto"
 
+        return kwargs
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+    ) -> LLMResponse:
+        """
+        Send a chat completion request via LiteLLM.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'.
+            tools: Optional list of tool definitions in OpenAI format.
+            model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
+            max_tokens: Maximum tokens in response.
+            temperature: Sampling temperature.
+
+        Returns:
+            LLMResponse with content and/or tool calls.
+        """
+        kwargs = self._build_request_kwargs(
+            messages, tools, tool_choice, model, max_tokens, temperature, reasoning_effort,
+        )
         try:
             response = await acompletion(**kwargs)
             return self._parse_response(response)
@@ -328,6 +353,76 @@ class LiteLLMProvider(LLMProvider):
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: Any | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Stream the completion so the first token reaches the UI immediately.
+
+        Chunks are re-assembled with LiteLLM's ``stream_chunk_builder`` and
+        parsed exactly like a blocking response, so tool calls, usage and
+        reasoning fields behave the same on both paths. If the stream cannot be
+        opened, the blocking ``chat()`` request is used instead.
+        """
+        kwargs = self._build_request_kwargs(
+            messages, tools, tool_choice, model, max_tokens, temperature, reasoning_effort,
+        )
+        kwargs["stream"] = True
+        if self._supports_stream_usage(kwargs["model"]):
+            kwargs["stream_options"] = {"include_usage": True}
+        idle_timeout = _stream_idle_timeout_seconds()
+        chunks: list[Any] = []
+        try:
+            stream = await acompletion(**kwargs)
+            stream_iter = stream.__aiter__()
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=idle_timeout)
+                except StopAsyncIteration:
+                    break
+                chunks.append(chunk)
+                if on_content_delta and getattr(chunk, "choices", None):
+                    delta = getattr(chunk.choices[0], "delta", None)
+                    text = getattr(delta, "content", None) if delta is not None else None
+                    if isinstance(text, str) and text:
+                        await on_content_delta(text)
+        except asyncio.TimeoutError:
+            return LLMResponse(
+                content=f"Error calling LLM: stream stalled for more than {int(idle_timeout)} seconds",
+                finish_reason="error",
+                error_kind="timeout",
+            )
+        except Exception as e:
+            if not chunks:
+                logger.debug("LiteLLM streaming unavailable ({}); using blocking request", e)
+                return await self.chat(
+                    messages, tools=tools, tool_choice=tool_choice, model=model,
+                    max_tokens=max_tokens, temperature=temperature, reasoning_effort=reasoning_effort,
+                )
+            return LLMResponse(content=f"Error calling LLM: {str(e)}", finish_reason="error")
+        if not chunks:
+            return LLMResponse(content="Error calling LLM: empty stream", finish_reason="error")
+        try:
+            response = litellm.stream_chunk_builder(chunks, messages=kwargs["messages"])
+            return self._parse_response(response)
+        except Exception as e:
+            return LLMResponse(content=f"Error calling LLM: {str(e)}", finish_reason="error")
+
+    @staticmethod
+    def _supports_stream_usage(model: str) -> bool:
+        try:
+            supported = litellm.get_supported_openai_params(model=model) or []
+        except Exception:
+            return False
+        return "stream_options" in supported
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
