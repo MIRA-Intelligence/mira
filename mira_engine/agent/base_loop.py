@@ -14,29 +14,37 @@ from a clean baseline.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import hashlib
+import inspect
 import json
 import re
 import time
+import uuid
 import weakref
-from contextlib import AsyncExitStack, suppress
+from contextlib import AsyncExitStack, nullcontext, suppress
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from mira_engine.observability import correlation_id, diagnostic_context, emit_event, opaque_ref
+
 from mira_engine.agent.context import ContextBuilder
+from mira_engine.agent.token_usage import record_token_usage, track_token_usage
 from mira_engine.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from mira_engine.agent.memory import Consolidator, Dream, MemoryStore
 from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
-from mira_engine.agent.routing import ModelRouter, RoutedProviderManager
+from mira_engine.agent.routing import RoutedProviderManager
 from mira_engine.agent.runner import AgentRunner
+from mira_engine.agent.skill_events import skill_loaded, skill_read_details
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
 from mira_engine.agent.tools.community import build_community_tools
+from mira_engine.agent.tools.consult import ConsultRoleTool
 from mira_engine.agent.tools.cron import CronTool
+from mira_engine.agent.tools.knowledge import KnowledgeReadTool, KnowledgeScope, KnowledgeSearchTool
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
@@ -53,15 +61,49 @@ from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.command.router import CommandContext, CommandRouter
+from mira_engine.modules.tools import (
+    InitiationResearchResultTool,
+    PubMedSearchTool,
+    WorkflowArtifactTool,
+    WorkflowCompletionTool,
+    WorkflowExperimentTool,
+    WorkflowInteractionTool,
+)
 from mira_engine.projects import ProjectRef
 from mira_engine.providers.base import LLMProvider
 from mira_engine.session.manager import Session, SessionManager
+from mira_engine.utils.helpers import normalize_citations
 
 if TYPE_CHECKING:
-    from mira_engine.config.schema import ChannelsConfig, CommunityConfig, ExecToolConfig
+    from mira_engine.config.schema import ChannelsConfig, CommunityConfig, ExecToolConfig, KnowledgeConfig
     from mira_engine.cron.service import CronService
 
 UNIFIED_SESSION_KEY = "unified:default"
+
+# Whether the last _run_agent_loop in this task ended on text the model streamed.
+# Synthesized endings (iteration limit, stop guards, errors) are never streamed,
+# so the dispatcher must still publish them or the client keeps waiting.
+_final_content_streamed: ContextVar[bool] = ContextVar("mira_final_content_streamed", default=False)
+
+# Why the current turn ended, reported to the UI in its turn_finished event so
+# the client never has to infer the end of a turn from message text.
+TURN_COMPLETED = "completed"
+TURN_MAX_ITERATIONS = "max_iterations"
+TURN_MAX_TOKENS = "max_tokens"
+TURN_WAITING_INPUT = "waiting_input"
+TURN_BUDGET_EXCEEDED = "budget_exceeded"
+TURN_STOPPED = "stopped"
+TURN_ERROR = "error"
+_turn_stop_reason: ContextVar[str] = ContextVar("mira_turn_stop_reason", default=TURN_COMPLETED)
+
+
+# reconfigure_runtime: leave this setting as it is.
+_KEEP: Any = object()
+
+
+def set_turn_stop_reason(reason: str) -> None:
+    """Record why the turn running in this task ended (last writer wins)."""
+    _turn_stop_reason.set(reason)
 
 
 class BaseAgentLoop:
@@ -102,6 +144,7 @@ class BaseAgentLoop:
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        knowledge_config: KnowledgeConfig | None = None,
         cron_service: CronService | None = None,
         timezone: str | None = None,
         restrict_to_workspace: bool = False,
@@ -110,20 +153,22 @@ class BaseAgentLoop:
         channels_config: ChannelsConfig | None = None,
         community_config: CommunityConfig | None = None,
         provider_factory: Callable[[str], LLMProvider] | None = None,
-        model_router: ModelRouter | None = None,
+        model_candidates: list[str] | None = None,
+        role_provider_factory: "Callable[[str], tuple[LLMProvider, str, tuple[str, ...]]] | None" = None,
         context_window_tokens: int | None = None,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
     ):
-        from mira_engine.config.schema import ExecToolConfig
+        from mira_engine.config.schema import ExecToolConfig, KnowledgeConfig
         self.bus = bus
         self.channels_config = channels_config
         self.community_config = community_config
         self.provider_factory = provider_factory
-        self.model_router = model_router
+        self.role_provider_factory = role_provider_factory
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.model_candidates = list(model_candidates) if model_candidates else None
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -133,6 +178,8 @@ class BaseAgentLoop:
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.knowledge_config = knowledge_config or KnowledgeConfig()
+        self._knowledge_scope: KnowledgeScope | None = None
         self.cron_service = cron_service
         self.timezone = timezone
         self.restrict_to_workspace = restrict_to_workspace
@@ -159,7 +206,8 @@ class BaseAgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             provider_factory=provider_factory,
-            model_router=model_router,
+            model_candidates=self.model_candidates,
+            role_provider_factory=role_provider_factory,
         )
         self._session_model_runtimes: dict[str, RoutedProviderManager] = {}
         self._hook = CompositeHook(list(hooks)) if hooks else None
@@ -175,6 +223,9 @@ class BaseAgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._last_loop_tokens_used: int = 0
         self._processing_lock = asyncio.Lock()
+        # Runtime swap saved while a turn held the lock; applied when it ends.
+        self._pending_runtime_swap: Callable[[], Awaitable[None]] | None = None
+        self._runtime_swap_task: asyncio.Task[None] | None = None
         # Shared registry for `exec(background=true)` jobs. Lives for the whole
         # loop lifetime so the agent can monitor jobs across many iterations,
         # and is drained on shutdown so we don't leak processes.
@@ -235,7 +286,8 @@ class BaseAgentLoop:
         provider: LLMProvider,
         model: str,
         provider_factory: Callable[[str], LLMProvider] | None,
-        model_router: ModelRouter | None,
+        model_candidates: list[str] | None = None,
+        role_provider_factory: "Callable[[str], tuple[LLMProvider, str, tuple[str, ...]]] | None" = None,
         workspace: Path,
         max_iterations: int,
         max_tokens: int,
@@ -244,99 +296,179 @@ class BaseAgentLoop:
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        knowledge_config: KnowledgeConfig | None = None,
         timezone: str | None = None,
         channels_config: ChannelsConfig | None = None,
         community_config: CommunityConfig | None = None,
         context_window_tokens: int | None = None,
+        temperature: float | None | object = _KEEP,
+        auto_max_rounds: int | None = None,
     ) -> None:
-        """Apply UI-saved runtime config to the live agent loop."""
-        async with self._processing_lock:
-            next_workspace = workspace.expanduser()
-            workspace_changed = next_workspace != self.workspace
+        """Apply UI-saved runtime config to the live agent loop.
 
-            if self._mcp_stack:
+        Limits (iterations, tokens, reasoning, temperature, auto rounds) take
+        effect at once, even mid-turn: the loop reads them on every LLM call.
+        Swapping the provider, workspace, tools and MCP connections waits for
+        the running turn, but in the background, so saving settings never
+        blocks behind a long turn.
+        """
+        self._apply_runtime_limits(
+            max_iterations=max_iterations,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            temperature=temperature,
+            auto_max_rounds=auto_max_rounds,
+        )
+
+        async def _swap() -> None:
+            await self._swap_runtime(
+                provider=provider,
+                model=model,
+                provider_factory=provider_factory,
+                model_candidates=model_candidates,
+                role_provider_factory=role_provider_factory,
+                workspace=workspace,
+                restrict_to_workspace=restrict_to_workspace,
+                brave_api_key=brave_api_key,
+                web_proxy=web_proxy,
+                exec_config=exec_config,
+                knowledge_config=knowledge_config,
+                timezone=timezone,
+                channels_config=channels_config,
+                community_config=community_config,
+                context_window_tokens=context_window_tokens,
+            )
+
+        idle = not self._processing_lock.locked() and (
+            self._runtime_swap_task is None or self._runtime_swap_task.done()
+        )
+        if idle:
+            # Nothing running: swap now, so errors reach the caller as before.
+            self._pending_runtime_swap = None
+            async with self._processing_lock:
+                await _swap()
+            return
+        # Newest settings win if several saves arrive during one turn.
+        self._pending_runtime_swap = _swap
+        if self._runtime_swap_task is None or self._runtime_swap_task.done():
+            self._runtime_swap_task = asyncio.create_task(self._apply_pending_runtime_swap())
+        logger.info("Runtime limits applied; provider/workspace swap deferred until the current turn ends")
+
+    def _apply_runtime_limits(
+        self,
+        *,
+        max_iterations: int,
+        max_tokens: int,
+        reasoning_effort: str | None,
+        temperature: float | None | object = _KEEP,
+        auto_max_rounds: int | None = None,  # used by ResearchAgentLoop
+    ) -> None:
+        """Knobs the loop reads on every call, so changing them mid-turn is safe."""
+        self.max_iterations = max_iterations
+        self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
+        if temperature is not _KEEP:
+            self.temperature = temperature
+        subagents = getattr(self, "subagents", None)
+        if subagents is not None:
+            subagents.temperature = self.temperature
+            subagents.max_tokens = self.max_tokens
+            subagents.reasoning_effort = self.reasoning_effort
+
+    async def _apply_pending_runtime_swap(self) -> None:
+        while self._pending_runtime_swap is not None:
+            async with self._processing_lock:
+                swap, self._pending_runtime_swap = self._pending_runtime_swap, None
+                if swap is None:
+                    continue
                 try:
-                    await self._mcp_stack.aclose()
-                finally:
-                    self._mcp_stack = None
-                    self._mcp_connected = False
-                    self._mcp_connecting = False
+                    await swap()
+                except Exception:
+                    # Deferred: no caller is waiting to receive the error.
+                    logger.exception("Failed to apply the deferred runtime config update")
 
-            self.provider = provider
-            self.model = model or provider.get_default_model()
-            self.provider_factory = provider_factory
-            self.model_router = model_router
-            self.workspace = next_workspace
-            self.max_iterations = max_iterations
-            self.max_tokens = max_tokens
-            self.reasoning_effort = reasoning_effort
-            self.brave_api_key = brave_api_key
-            self.web_proxy = web_proxy
-            if exec_config is not None:
-                self.exec_config = exec_config
-            self.timezone = timezone
-            self.restrict_to_workspace = restrict_to_workspace
-            if channels_config is not None:
-                self.channels_config = channels_config
-            if community_config is not None:
-                self.community_config = community_config
-            if context_window_tokens is not None:
-                self.context_window_tokens = context_window_tokens
+    async def _swap_runtime(
+        self,
+        *,
+        provider: LLMProvider,
+        model: str,
+        provider_factory: Callable[[str], LLMProvider] | None,
+        model_candidates: list[str] | None,
+        role_provider_factory: "Callable[[str], tuple[LLMProvider, str, tuple[str, ...]]] | None",
+        workspace: Path,
+        restrict_to_workspace: bool,
+        brave_api_key: str | None,
+        web_proxy: str | None,
+        exec_config: ExecToolConfig | None,
+        knowledge_config: KnowledgeConfig | None,
+        timezone: str | None,
+        channels_config: ChannelsConfig | None,
+        community_config: CommunityConfig | None,
+        context_window_tokens: int | None,
+    ) -> None:
+        """Replace provider, workspace, tools and MCP connections (caller holds the lock)."""
+        next_workspace = workspace.expanduser()
+        workspace_changed = next_workspace != self.workspace
 
-            if workspace_changed:
-                self.context = ContextBuilder(next_workspace)
-                self.sessions = SessionManager(next_workspace)
-                self._project_sessions.clear()
+        if self._mcp_stack:
+            try:
+                await self._mcp_stack.aclose()
+            finally:
+                self._mcp_stack = None
+                self._mcp_connected = False
+                self._mcp_connecting = False
 
-            self._session_model_runtimes.clear()
+        self.provider = provider
+        self.model = model or provider.get_default_model()
+        self.provider_factory = provider_factory
+        self.model_candidates = list(model_candidates) if model_candidates else None
+        self.role_provider_factory = role_provider_factory
+        self.workspace = next_workspace
+        self.brave_api_key = brave_api_key
+        self.web_proxy = web_proxy
+        if exec_config is not None:
+            self.exec_config = exec_config
+        if knowledge_config is not None:
+            self.knowledge_config = knowledge_config
+        self.timezone = timezone
+        self.restrict_to_workspace = restrict_to_workspace
+        if channels_config is not None:
+            self.channels_config = channels_config
+        if community_config is not None:
+            self.community_config = community_config
+        if context_window_tokens is not None:
+            self.context_window_tokens = context_window_tokens
 
-            self.subagents.provider = provider
-            self.subagents.model = self.model
-            self.subagents.workspace = next_workspace
-            self.subagents.temperature = self.temperature
-            self.subagents.max_tokens = self.max_tokens
-            self.subagents.reasoning_effort = self.reasoning_effort
-            self.subagents.brave_api_key = self.brave_api_key
-            self.subagents.web_proxy = self.web_proxy
-            self.subagents.exec_config = self.exec_config
-            self.subagents.restrict_to_workspace = self.restrict_to_workspace
-            self.subagents.provider_factory = provider_factory
-            self.subagents.model_router = model_router
-            self.subagents.runner = AgentRunner(provider)
-            self.subagents._session_runtimes.clear()
+        if workspace_changed:
+            self.context = ContextBuilder(next_workspace)
+            self.sessions = SessionManager(next_workspace)
+            self._project_sessions.clear()
 
-            self.tools = ToolRegistry()
-            self._register_default_tools()
-            self._rebuild_memory_helpers()
+        self._session_model_runtimes.clear()
 
-            logger.info("Agent runtime reconfigured: model={}, workspace={}", self.model, self.workspace)
+        self.subagents.provider = provider
+        self.subagents.model = self.model
+        self.subagents.workspace = next_workspace
+        self.subagents.brave_api_key = self.brave_api_key
+        self.subagents.web_proxy = self.web_proxy
+        self.subagents.exec_config = self.exec_config
+        self.subagents.restrict_to_workspace = self.restrict_to_workspace
+        self.subagents.provider_factory = provider_factory
+        self.subagents.model_candidates = self.model_candidates
+        self.subagents.role_provider_factory = role_provider_factory
+        self.subagents.runner = AgentRunner(provider)
+        self.subagents._session_runtimes.clear()
+
+        self.tools = ToolRegistry()
+        self._register_default_tools()
+        self._rebuild_memory_helpers()
+
+        logger.info("Agent runtime reconfigured: model={}, workspace={}", self.model, self.workspace)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        skill_access_dirs: list[Path] = []
-        if self.restrict_to_workspace:
-            from mira_engine.agent.skills import SkillsLoader
-
-            def _add_skill_dir(path: Path) -> None:
-                try:
-                    resolved = path.resolve()
-                except Exception:
-                    return
-                if resolved != self.workspace and resolved not in skill_access_dirs:
-                    skill_access_dirs.append(resolved)
-
-            skills_loader = SkillsLoader(self.workspace)
-            for root in skills_loader.workspace_skills_roots:
-                _add_skill_dir(root)
-            if skills_loader.builtin_skills:
-                _add_skill_dir(skills_loader.builtin_skills)
-            for skill in skills_loader.list_skills(filter_unavailable=False):
-                skill_path = Path(skill["path"])
-                _add_skill_dir(skill_path.parent)
-                parent = skill_path.parent.parent
-                if parent != skill_path.parent:
-                    _add_skill_dir(parent)
+        skill_access_dirs = self._skill_access_dirs_for_workspace(self.workspace)
 
         supports_vision = self.provider.supports_vision(self.model)
         self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=skill_access_dirs, supports_vision=supports_vision))
@@ -363,6 +495,10 @@ class BaseAgentLoop:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
+                sandbox=self.exec_config.sandbox or None,
+                sandbox_network=self.exec_config.sandbox_network,
+                sandbox_read_only_paths=self.exec_config.sandbox_read_only_paths,
+                sandbox_extra_dirs=skill_access_dirs,
                 background_registry=self._bg_registry,
                 enable_background=True,
                 python_runtime=self.exec_config.python,
@@ -370,9 +506,20 @@ class BaseAgentLoop:
             self.tools.register(BgTool(registry=self._bg_registry))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        self.tools.register(PubMedSearchTool(proxy=self.web_proxy))
+        self._knowledge_scope = KnowledgeScope() if self.knowledge_config.enabled else None
+        if self._knowledge_scope is not None:
+            self.tools.register(KnowledgeSearchTool(self._knowledge_scope))
+            self.tools.register(KnowledgeReadTool(self._knowledge_scope))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SetPlanTool())
+        self.tools.register(WorkflowInteractionTool())
+        self.tools.register(InitiationResearchResultTool())
+        self.tools.register(WorkflowArtifactTool())
+        self.tools.register(WorkflowCompletionTool())
+        self.tools.register(WorkflowExperimentTool())
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(ConsultRoleTool(manager=self.subagents))
         if self.cron_service:
             cron_tool = CronTool(self.cron_service)
             setattr(cron_tool, "_default_timezone", self.timezone)
@@ -381,9 +528,11 @@ class BaseAgentLoop:
             self.tools.register(community_tool)
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
-        skill_access_dirs: list[Path] = []
-        if not self.restrict_to_workspace:
-            return skill_access_dirs
+        if not (self.restrict_to_workspace or self.exec_config.sandbox):
+            return []
+        from mira_engine.agent.skills import skill_access_dirs
+
+        return skill_access_dirs(workspace)
 
         from mira_engine.agent.skills import SkillsLoader
 
@@ -517,6 +666,7 @@ class BaseAgentLoop:
         message_id: str | None = None,
         project_ref: ProjectRef | None = None,
         session_key: str | None = None,
+        workflow_run_id: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         if project_ref is not None:
@@ -531,6 +681,8 @@ class BaseAgentLoop:
                     )
                 if hasattr(tool, "set_project_context"):
                     tool.set_project_context(project_ref.project_id, str(project_ref.project_dir))
+                if hasattr(tool, "set_workflow_run_context"):
+                    tool.set_workflow_run_context(workflow_run_id)
         else:
             for tool in getattr(self.tools, "_tools", {}).values():
                 if hasattr(tool, "clear_runtime_context"):
@@ -545,14 +697,18 @@ class BaseAgentLoop:
                 if session_key and hasattr(tool, "set_session_key"):
                     tool.set_session_key(session_key)
 
+        if session_key and (exec_tool := self.tools.get("exec")):
+            if hasattr(exec_tool, "set_session_context"):
+                exec_tool.set_session_context(session_key, message_id)
+
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
-        """Remove <think>…</think> blocks that some models embed in content."""
+        """Remove <think>…</think> blocks and normalize native citation markup."""
         if not text:
             return None
         cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
         cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
-        return cleaned.strip() or None
+        return normalize_citations(cleaned).strip() or None
 
     @staticmethod
     async def _emit_activity_ping(on_progress: Callable[..., Awaitable[None]]) -> None:
@@ -643,25 +799,6 @@ class BaseAgentLoop:
             "path": path,
         }
 
-    @staticmethod
-    def _route_hint(
-        tier: str,
-        model: str,
-        candidates: tuple[str, ...],
-        score: int | None,
-        source: str,
-        reason: str | None,
-    ) -> str:
-        """Format a visible routing hint for progress output."""
-        details = f", {source}"
-        if candidates and model != candidates[0]:
-            details += f", fallback_from={candidates[0]}"
-        if reason:
-            details += f", reason={reason[:80]}"
-        if score is None:
-            return f"router -> {tier} ({model}{details})"
-        return f"router -> {tier} ({model}, score={score}{details})"
-
     def _compose_extra_system(
         self,
         ui_system_instructions: object,
@@ -690,15 +827,39 @@ class BaseAgentLoop:
         sections = [chunk for chunk in (python_hint, base, notice, rules) if chunk]
         return "\n\n".join(sections) if sections else None
 
-    def _get_model_runtime(self, session_key: str) -> RoutedProviderManager:
+    def _with_knowledge(
+        self,
+        extra_system: str | None,
+        meta: dict[str, Any],
+        project_ref: ProjectRef | None,
+    ) -> str | None:
+        """Scope the kb tools to this turn's knowledge bases and describe them."""
+        scope = self._knowledge_scope
+        if scope is None:
+            return extra_system
+        section = scope.begin_turn(meta, project_ref.project_dir if project_ref else None)
+        return "\n\n".join(part for part in (extra_system, section) if part) or None
+
+    def _get_model_runtime(self, session_key: str, *, role: str | None = None) -> RoutedProviderManager:
         """Return the session-local model runtime, creating it on demand."""
+        if role and self.role_provider_factory is not None:
+            # Keep role routes separate: switching profile must not reuse the
+            # default route, nor change another concurrent project's provider.
+            session_key = f"{session_key}:role:{role}"
         runtime = self._session_model_runtimes.get(session_key)
         if runtime is None:
+            provider, model, candidates = self.provider, self.model, tuple(self.model_candidates or [self.model])
+            provider_factory = self.provider_factory
+            if role and self.role_provider_factory is not None:
+                provider, model, candidates = self.role_provider_factory(role)
+                # Role candidates belong to the role's explicit provider, not
+                # the possibly different globally forced provider.
+                provider_factory = None
             runtime = RoutedProviderManager(
-                default_provider=self.provider,
-                default_model=self.model,
-                router=self.model_router,
-                provider_factory=self.provider_factory,
+                default_provider=provider,
+                default_model=model,
+                provider_factory=provider_factory,
+                default_candidates=candidates,
             )
             self._session_model_runtimes[session_key] = runtime
         return runtime
@@ -711,6 +872,8 @@ class BaseAgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        completion_guard: Callable[[str | None], Awaitable[str | None]] | None = None,
+        turn_stop_guard: Callable[[], Awaitable[str | None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -721,15 +884,25 @@ class BaseAgentLoop:
         active_route = None
         loop_tokens_used = 0
         hook = getattr(self, "_hook", None)
+        _final_content_streamed.set(False)
+        set_turn_stop_reason(TURN_COMPLETED)
 
         while iteration < self.max_iterations:
+            if turn_stop_guard is not None:
+                stop_message = await turn_stop_guard()
+                if stop_message is not None:
+                    final_content = stop_message
+                    messages = self.context.add_assistant_message(messages, stop_message)
+                    set_turn_stop_reason(TURN_WAITING_INPUT)
+                    break
             hook_ctx = AgentHookContext(iteration=iteration, messages=messages)
             if hook:
                 await hook.before_iteration(hook_ctx)
             iteration += 1
+            iteration_streamed = False
 
             use_routed_runtime = model_runtime is not None and (
-                self.model_router is not None or self.provider_factory is not None
+                self.provider_factory is not None or self.role_provider_factory is not None
             )
             if not use_routed_runtime:
                 if on_stream is not None and hasattr(self.provider, "chat_stream_with_retry"):
@@ -763,6 +936,7 @@ class BaseAgentLoop:
                         on_content_delta=_stream_delta,
                     )
                     clean_streamed = self._strip_think(streamed_raw)
+                    iteration_streamed = bool(clean_streamed)
                     if response.content and clean_streamed:
                         response.content = clean_streamed
                     if on_stream_end:
@@ -811,6 +985,7 @@ class BaseAgentLoop:
                         on_content_delta=_stream_delta,
                     )
                     clean_streamed = self._strip_think(streamed_raw)
+                    iteration_streamed = bool(clean_streamed)
                     if response.content and clean_streamed:
                         response.content = clean_streamed
                     if on_stream_end:
@@ -824,6 +999,7 @@ class BaseAgentLoop:
                         max_tokens=self.max_tokens,
                         reasoning_effort=self.reasoning_effort,
                     )
+            await record_token_usage(response.usage, getattr(active_route, "model", None) or self.model)
             if isinstance(response.usage, dict):
                 self._last_usage = {
                     "prompt_tokens": int(response.usage.get("prompt_tokens", 0) or 0),
@@ -836,24 +1012,6 @@ class BaseAgentLoop:
             hook_ctx.response = response
             hook_ctx.usage = dict(response.usage or {})
             hook_ctx.tool_calls = list(response.tool_calls or [])
-
-            if (
-                iteration == 1
-                and on_progress
-                and self.model_router
-                and self.model_router.enabled
-                and active_route is not None
-            ):
-                await on_progress(
-                    self._route_hint(
-                        active_route.tier,
-                        active_route.model,
-                        active_route.candidates,
-                        active_route.score,
-                        active_route.source,
-                        active_route.reason,
-                    )
-                )
 
             if response.has_tool_calls:
                 if on_progress:
@@ -884,8 +1042,9 @@ class BaseAgentLoop:
 
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                    logger.info("Tool call: {} (arguments omitted)", tool_call.name)
+                    tool_started = time.monotonic()
+                    emit_event("tool.started", tool=tool_call.name)
                     if audit_hook:
                         skill_event = self._build_skill_invoked_event(
                             tool_name=tool_call.name,
@@ -897,8 +1056,20 @@ class BaseAgentLoop:
                     if on_progress:
                         ping_task = asyncio.create_task(self._activity_ping_loop(on_progress))
                     try:
-                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                        manager = getattr(self, "subagents", None)
+                        scope = manager.skill_audit_scope(audit_hook) if manager is not None else nullcontext()
+                        with scope:
+                            result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    except asyncio.CancelledError:
+                        # /stop and shutdown cancel tools; they are not tool failures.
+                        emit_event("tool.cancelled", tool=tool_call.name)
+                        raise
+                    except BaseException as exc:
+                        emit_event("tool.failed", level="ERROR", tool=tool_call.name, exception=exc)
+                        raise
                     finally:
+                        emit_event("tool.finished", tool=tool_call.name,
+                                   duration_ms=round((time.monotonic() - tool_started) * 1000, 2))
                         if ping_task is not None:
                             ping_task.cancel()
                             with suppress(asyncio.CancelledError):
@@ -906,14 +1077,32 @@ class BaseAgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    if audit_hook:
+                        loaded_event = skill_read_details(tool_call.name, tool_call.arguments, result)
+                        if loaded_event:
+                            await audit_hook(loaded_event)
                     hook_ctx.tool_results.append(result)
                     hook_ctx.tool_events.append(
                         {"name": tool_call.name, "status": "ok", "detail": str(result)}
                     )
+                # Finish the batch's tool-result protocol, but never ask the model
+                # to continue after a durable user-input/control boundary.
+                if turn_stop_guard is not None:
+                    stop_message = await turn_stop_guard()
+                    if stop_message is not None:
+                        final_content = stop_message
+                        messages = self.context.add_assistant_message(messages, stop_message)
+                        set_turn_stop_reason(TURN_WAITING_INPUT)
+                        hook_ctx.final_content = stop_message
+                        hook_ctx.stop_reason = "durable_boundary"
+                        if hook:
+                            await hook.after_iteration(hook_ctx)
+                        break
             else:
                 clean = self._strip_think(response.content)
                 if response.finish_reason == "error":
-                    logger.error("LLM returned error: {}", (clean or "")[:200])
+                    logger.error("LLM returned an error (response content omitted)")
+                    emit_event("provider.failed", level="ERROR", reason="error_finish_reason")
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     # Save a neutral placeholder so the session doesn't end
                     # with an orphaned user message (consecutive users cause
@@ -921,6 +1110,7 @@ class BaseAgentLoop:
                     messages = self.context.add_assistant_message(
                         messages, "(error — see previous log)"
                     )
+                    set_turn_stop_reason(TURN_ERROR)
                     hook_ctx.final_content = final_content
                     hook_ctx.stop_reason = "error"
                     if hook:
@@ -935,7 +1125,29 @@ class BaseAgentLoop:
                 )
                 if hook:
                     clean = hook.finalize_content(hook_ctx, clean)
+                if completion_guard is not None and iteration < self.max_iterations:
+                    continuation = await completion_guard(clean)
+                    if continuation:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"{self._AUTO_CONTINUE_MARKER}\n"
+                                    f"{continuation}"
+                                ),
+                            }
+                        )
+                        hook_ctx.final_content = None
+                        hook_ctx.stop_reason = "contract_continuation"
+                        if hook:
+                            await hook.after_iteration(hook_ctx)
+                        continue
                 final_content = clean
+                _final_content_streamed.set(iteration_streamed)
+                # "length": the reply was cut off by the output token limit.
+                set_turn_stop_reason(
+                    TURN_MAX_TOKENS if response.finish_reason == "length" else TURN_COMPLETED
+                )
                 hook_ctx.final_content = final_content
                 hook_ctx.stop_reason = "completed"
                 if hook:
@@ -948,9 +1160,14 @@ class BaseAgentLoop:
         if final_content is None and iteration >= self.max_iterations:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             final_content = (
-                f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
-                "without completing the task. You can try breaking the task into smaller steps."
+                f"I stopped before finishing: this turn reached the limit of "
+                f"{self.max_iterations} tool calls. Reply \"continue\" and I will pick up "
+                "where I left off, or break the task into smaller steps."
             )
+            # Close the turn in the transcript too, so the saved session does not
+            # end on a bare tool result and the next message reads as a follow-up.
+            messages = self.context.add_assistant_message(messages, final_content)
+            set_turn_stop_reason(TURN_MAX_ITERATIONS)
 
         self._last_loop_tokens_used = loop_tokens_used
         return final_content, tools_used, messages
@@ -1026,29 +1243,48 @@ class BaseAgentLoop:
                 return
             if exc is None:
                 return
-            logger.exception(
+            logger.opt(exception=exc).error(
                 "Unhandled error in dispatch for session {}", msg.session_key
             )
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 return
-            loop.create_task(self._publish_dispatch_failure(msg))
+            loop.create_task(self._publish_dispatch_failure(msg, exc))
 
         return _callback
 
-    async def _publish_dispatch_failure(self, msg: InboundMessage) -> None:
-        err_text = "Sorry, I encountered an error."
-        if msg.channel == "cli":
-            err_text += " Run `mira agent --logs` to view details."
-        await self.bus.publish_outbound(
-            OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=err_text,
-                metadata=dict(msg.metadata or {}),
-            )
+    def _build_error_outbound(
+        self, msg: InboundMessage, exc: BaseException
+    ) -> OutboundMessage:
+        """Build a user-facing error reply that explains *exc* concisely.
+
+        The English ``content`` serves channels without their own i18n (CLI,
+        Telegram, ...). The structured ``error_code``/``error_detail`` metadata
+        lets the UI localize the message via its own translation layer.
+        """
+        from mira_engine.utils.runtime import (
+            build_dispatch_error_text,
+            classify_exception,
+            error_detail_text,
         )
+
+        metadata = dict(msg.metadata or {})
+        metadata["_error"] = True
+        metadata["error_type"] = type(exc).__name__
+        metadata["error_code"] = classify_exception(exc)
+        metadata["error_detail"] = error_detail_text(exc)
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=build_dispatch_error_text(exc, channel=msg.channel),
+            metadata=metadata,
+        )
+
+    async def _publish_dispatch_failure(
+        self, msg: InboundMessage, exc: BaseException
+    ) -> None:
+        await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
 
     async def _handle_control(self, msg: InboundMessage, control: str) -> bool:
         """Hook for subclasses to handle ``_control`` metadata messages.
@@ -1061,6 +1297,15 @@ class BaseAgentLoop:
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
+        metadata = msg.metadata or {}
+        # /stop bypasses _dispatch, so it needs its own correlation scope.
+        with diagnostic_context(request_id=correlation_id(metadata.get("_diagnostic_request_id")),
+                                session_ref=opaque_ref(msg.session_key), channel=msg.channel):
+            emit_event("agent.stop.requested")
+            total = await self._handle_stop_with_context(msg)
+            emit_event("agent.stop.completed", count=total)
+
+    async def _handle_stop_with_context(self, msg: InboundMessage) -> int:
         project_ref = self._project_ref_from_metadata(msg.metadata)
         raw_key = (
             UNIFIED_SESSION_KEY
@@ -1068,6 +1313,27 @@ class BaseAgentLoop:
             else msg.session_key
         )
         scoped_key = self._scoped_session_key(project_ref, raw_key)
+        cancelled, sub_cancelled, background_cancelled = await self._cancel_session_work(
+            scoped_key
+        )
+        total = cancelled + sub_cancelled + background_cancelled
+        content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
+        metadata = dict(msg.metadata or {})
+        metadata.update({
+            "_stop_ack": True,
+            "request_id": metadata.get("_stop_request_id"),
+            "cancelled_agent_tasks": cancelled,
+            "cancelled_subagents": sub_cancelled,
+            "cancelled_background_jobs": background_cancelled,
+        })
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata=metadata,
+        ))
+        return total
+
+    async def _cancel_session_work(self, scoped_key: str) -> tuple[int, int, int]:
+        """Cancel agent, subagent and background work owned by a session."""
         tasks = self._active_tasks.pop(scoped_key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
         for t in tasks:
@@ -1076,26 +1342,99 @@ class BaseAgentLoop:
             except (asyncio.CancelledError, Exception):
                 pass
         sub_cancelled = await self.subagents.cancel_by_session(scoped_key)
-        total = cancelled + sub_cancelled
-        content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
-        await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=content,
-            metadata=dict(msg.metadata or {}),
-        ))
+        registry = getattr(self, "_bg_registry", None)
+        background_cancelled = (
+            await registry.kill_by_session(scoped_key) if registry is not None else 0
+        )
+        return cancelled, sub_cancelled, background_cancelled
 
     async def _dispatch(self, msg: InboundMessage) -> None:
+        metadata = msg.metadata or {}
+        request_id = correlation_id(metadata.get("_diagnostic_request_id"))
+        started = time.monotonic()
+        with diagnostic_context(request_id=request_id, run_id=correlation_id(),
+                                session_ref=opaque_ref(msg.session_key), channel=msg.channel,
+                                workflow_run_id=metadata.get("workflow_run_id")):
+            emit_event("agent.dispatch.started")
+            # Only the UI renders turn state; other channels would print the
+            # empty lifecycle messages.
+            lifecycle = msg.channel == "ui"
+            turn_id = metadata.get("turn_id") if isinstance(metadata.get("turn_id"), str) else None
+            turn_id = turn_id or f"turn-{uuid.uuid4().hex[:12]}"
+            if lifecycle:
+                await self._publish_turn_event(msg, turn_id, "started")
+            set_turn_stop_reason(TURN_COMPLETED)
+            stop_reason: str | None = None
+            try:
+                await self._dispatch_with_context(msg)
+            except asyncio.CancelledError:
+                stop_reason = TURN_STOPPED
+                emit_event("agent.dispatch.cancelled")
+                raise
+            except Exception as exc:
+                stop_reason = TURN_ERROR
+                emit_event("agent.dispatch.failed", level="ERROR", exception=exc)
+                raise
+            finally:
+                emit_event("agent.dispatch.finished",
+                           duration_ms=round((time.monotonic() - started) * 1000, 2))
+                # Exactly one turn_finished per turn, however it ended, so the
+                # client never keeps a "thinking" state for a finished turn.
+                if lifecycle:
+                    await self._publish_turn_event(
+                        msg, turn_id, "finished", stop_reason or _turn_stop_reason.get(),
+                    )
+
+    async def _publish_turn_event(
+        self,
+        msg: InboundMessage,
+        turn_id: str,
+        event: str,
+        stop_reason: str | None = None,
+    ) -> None:
+        metadata = dict(msg.metadata or {})
+        metadata.update({"_turn_event": event, "turn_id": turn_id})
+        if stop_reason is not None:
+            metadata["stop_reason"] = stop_reason
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content="", metadata=metadata,
+        ))
+
+    async def _dispatch_with_context(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
         if getattr(self, "_unified_session", False) and not msg.session_key_override:
             msg.session_key_override = UNIFIED_SESSION_KEY
 
         if bool((msg.metadata or {}).get("_wants_stream")):
             stream_meta = dict(msg.metadata or {})
+            _final_content_streamed.set(False)
             streamed_any = False
+            fallback_prefix = "MIRA_SKILL_FALLBACK_REQUIRED:"
+            inspect_fallback_prefix = bool(stream_meta.get("selected_skill_ids"))
+            pending_prefix = ""
+            fallback_detected = False
 
             async def _on_stream(delta: str) -> None:
-                nonlocal streamed_any
+                nonlocal streamed_any, inspect_fallback_prefix, pending_prefix, fallback_detected
                 if not delta:
                     return
+                if fallback_detected:
+                    pending_prefix += delta
+                    return
+                if inspect_fallback_prefix:
+                    pending_prefix += delta
+                    candidate = pending_prefix.lstrip()
+                    if candidate == fallback_prefix:
+                        fallback_detected = True
+                        return
+                    if fallback_prefix.startswith(candidate):
+                        return
+                    if candidate.startswith(fallback_prefix):
+                        fallback_detected = True
+                        return
+                    delta = pending_prefix
+                    pending_prefix = ""
+                    inspect_fallback_prefix = False
                 streamed_any = True
                 meta = dict(stream_meta)
                 meta["_stream_delta"] = True
@@ -1109,8 +1448,20 @@ class BaseAgentLoop:
                 )
 
             async def _on_stream_end(*, resuming: bool = False) -> None:
+                nonlocal streamed_any, pending_prefix
                 if resuming:
                     return
+                if pending_prefix and not fallback_detected:
+                    streamed_any = True
+                    meta = dict(stream_meta)
+                    meta["_stream_delta"] = True
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=pending_prefix,
+                        metadata=meta,
+                    ))
+                    pending_prefix = ""
                 meta = dict(stream_meta)
                 meta["_stream_end"] = True
                 await self.bus.publish_outbound(
@@ -1126,11 +1477,12 @@ class BaseAgentLoop:
                 response = await self._process_message(
                     msg, on_stream=_on_stream, on_stream_end=_on_stream_end
                 )
-                # Fallback: if the runtime never streamed (e.g. routed provider
-                # without token streaming), the deltas/end markers carry no
-                # content, so publish the final response normally so the client
-                # still receives the answer.
-                if not streamed_any and response is not None:
+                # Publish the final response unless its text already reached the
+                # client as deltas: the runtime may never have streamed (e.g. a
+                # routed provider without token streaming), or the turn ended
+                # on text the model never produced (iteration limit, a stop
+                # guard, an error), and without it the client keeps "thinking".
+                if response is not None and (not streamed_any or not _final_content_streamed.get()):
                     await self.bus.publish_outbound(response)
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
@@ -1139,16 +1491,11 @@ class BaseAgentLoop:
                 raise asyncio.CancelledError() from None
             except SystemExit:
                 raise asyncio.CancelledError() from None
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                err_text = "Sorry, I encountered an error."
-                if msg.channel == "cli":
-                    err_text += " Run `mira agent --logs` to view details."
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=err_text,
-                    metadata=dict(msg.metadata or {}),
-                ))
+                emit_event("agent.turn.failed", level="ERROR", exception=exc)
+                set_turn_stop_reason(TURN_ERROR)
+                await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
             return
         async with self._processing_lock:
             try:
@@ -1167,16 +1514,11 @@ class BaseAgentLoop:
                 raise asyncio.CancelledError() from None
             except SystemExit:
                 raise asyncio.CancelledError() from None
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                err_text = "Sorry, I encountered an error."
-                if msg.channel == "cli":
-                    err_text += " Run `mira agent --logs` to view details."
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=err_text,
-                    metadata=dict(msg.metadata or {}),
-                ))
+                emit_event("agent.turn.failed", level="ERROR", exception=exc)
+                set_turn_stop_reason(TURN_ERROR)
+                await self.bus.publish_outbound(self._build_error_outbound(msg, exc))
 
     async def _warm_skill_scan_cache(self) -> None:
         """Pre-scan built-in skills off the event loop so Ctrl+C stays responsive."""
@@ -1220,7 +1562,9 @@ class BaseAgentLoop:
         their own per-session caches (e.g. token totals).
         """
         self._session_model_runtimes.pop(session_key, None)
+        self._session_model_runtimes.pop(f"{session_key}:role:supervisor", None)
 
+    @track_token_usage
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1229,6 +1573,8 @@ class BaseAgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         audit_hook: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        completion_guard: Callable[[str | None], Awaitable[str | None]] | None = None,
+        turn_stop_guard: Callable[[], Awaitable[str | None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response.
 
@@ -1269,8 +1615,7 @@ class BaseAgentLoop:
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Processing message on {} (content length={})", msg.channel, len(msg.content))
 
         meta = msg.metadata or {}
         project_ref = self._project_ref_from_metadata(meta)
@@ -1358,9 +1703,12 @@ class BaseAgentLoop:
         self._set_tool_context(
             msg.channel,
             msg.chat_id,
-            meta.get("message_id"),
+            meta.get("turn_id") or meta.get("message_id"),
             project_ref=project_ref,
             session_key=key,
+            workflow_run_id=meta.get("workflow_run_id")
+            if isinstance(meta.get("workflow_run_id"), str)
+            else None,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -1368,12 +1716,23 @@ class BaseAgentLoop:
 
         await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
-        model_runtime = self._get_model_runtime(key)
+        profile = meta.get("agent_profile") or getattr(self, "_session_agent_profiles", {}).get(key)
+        model_runtime = self._get_model_runtime(key, role="supervisor" if profile == "team" else None)
         extra_system = self._compose_extra_system(
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
             channel=getattr(msg, "channel", None),
         )
+        extra_system = self._with_knowledge(extra_system, meta, project_ref)
+
+        raw_selected_skills = meta.get("selected_skill_ids")
+        selected_skills = [
+            name for name in (
+                str(item).strip() for item in raw_selected_skills
+                if isinstance(item, str)
+            )
+            if name and ctx.skills.load_skill(name)
+        ] if isinstance(raw_selected_skills, list) else []
 
         suggested_skills = ctx.skills.suggest_skills(
             msg.content,
@@ -1381,33 +1740,51 @@ class BaseAgentLoop:
             limit=3,
         )
         active_skills: list[str] = []
-        for name in [*recent_skill_names, *suggested_skills]:
+        for name in [*selected_skills, *suggested_skills]:
             if name not in active_skills:
                 active_skills.append(name)
-        active_skills = active_skills[-4:]
+        active_skills = active_skills[:8]
         skill_hint = ""
-        if suggested_skills:
+        if selected_skills:
+            fallback_instruction = (
+                "The user approved the previously proposed fallback for this turn. "
+                "Deviate only as narrowly as that proposal requires."
+                if meta.get("_skill_fallback_approved")
+                else "If their workflow cannot continue, stop using tools and reply with "
+                     "`MIRA_SKILL_FALLBACK_REQUIRED:` followed by the exact error and proposed "
+                     "fallback. Wait for explicit user approval before deviating."
+            )
             skill_hint = (
-                "Skill routing hint: this request likely matches one or more skills. "
-                "Before answering, use read_file to inspect these SKILL.md files if relevant:\n"
+                "User-selected skills are mandatory system-level instructions for this turn:\n"
+                + "\n".join(f"- {name}" for name in selected_skills)
+                + "\nFollow their documented workflow and recommended calls. Do not bypass them "
+                  "by inspecting implementation source, calling internal functions, or writing a "
+                  "replacement implementation. " + fallback_instruction
+            )
+        elif suggested_skills:
+            skill_hint = (
+                "Skill routing selected these active skills. Their full instructions are included "
+                "in the system prompt; prefer their documented workflow when relevant:\n"
                 + "\n".join(f"- {name}" for name in suggested_skills)
             )
-            if on_progress:
-                try:
-                    await on_progress(
-                        f"skill router -> {', '.join(suggested_skills)}",
-                        tool_hint=True,
-                    )
-                except TypeError:
-                    await on_progress(f"skill router -> {', '.join(suggested_skills)}")
+        if on_progress and (selected_skills or suggested_skills):
+            try:
+                await on_progress(
+                    f"skill -> {', '.join(selected_skills or suggested_skills)}",
+                    tool_hint=True,
+                )
+            except TypeError:
+                await on_progress(f"skill -> {', '.join(selected_skills or suggested_skills)}")
         if extra_system:
             extra_system = skill_hint + "\n\n" + extra_system if skill_hint else extra_system
         else:
             extra_system = skill_hint or None
+        loaded_skills: list[str] = []
         initial_messages = ctx.build_messages(
             history=history,
             current_message=msg.content,
             skill_names=active_skills or None,
+            loaded_skills=loaded_skills,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
@@ -1431,21 +1808,35 @@ class BaseAgentLoop:
 
         progress_cb = on_progress or _bus_progress
         current_turn_skills: set[str] = set()
+        loaded_this_turn: set[tuple[str | None, str]] = set()
         audit_cb = None
         emit_audit_to_channel = msg.channel == "ui" or bool(meta.get("_emit_skill_audit"))
         if emit_audit_to_channel or audit_hook:
             async def _audit(details: dict[str, Any]) -> None:
-                skill_name = details.get("skill_name")
-                if isinstance(skill_name, str) and skill_name.strip():
+                if details.get("loaded"):
+                    identity = (details.get("agent"), details.get("skill_name"))
+                    if identity in loaded_this_turn:
+                        return
+                    loaded_this_turn.add(identity)
+                audit_context = meta.get("_audit_context")
+                enriched_details = {
+                    **(audit_context if isinstance(audit_context, dict) else {}),
+                    **details,
+                }
+                skill_name = enriched_details.get("skill_name")
+                if not details.get("loaded") and isinstance(skill_name, str) and skill_name.strip():
                     current_turn_skills.add(skill_name.strip())
                 if audit_hook:
-                    await audit_hook(details)
+                    await audit_hook(enriched_details)
                 if not emit_audit_to_channel:
                     return
                 metadata = dict(msg.metadata or {})
                 metadata["_audit_only"] = True
-                metadata["_audit_event"] = "skill_invoked"
-                metadata["_audit_details"] = details
+                metadata["_audit_event"] = (
+                    "skill_loaded" if details.get("loaded") else
+                    "skill_selected" if details.get("selected") else "skill_invoked"
+                )
+                metadata["_audit_details"] = enriched_details
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
@@ -1454,11 +1845,24 @@ class BaseAgentLoop:
                 ))
 
             audit_cb = _audit
+        if audit_cb:
+            for name in loaded_skills:
+                source = "manual" if name in selected_skills else "auto" if name in suggested_skills else "recent" if name in recent_skill_names else "always"
+                await audit_cb(skill_loaded(name, source, tool="system_prompt"))
+            for selected_skill in selected_skills:
+                await audit_cb({
+                    "tool": "system_prompt",
+                    "skill_name": selected_skill,
+                    "selected": True,
+                })
         run_kwargs: dict[str, Any] = {
             "model_runtime": model_runtime,
             "on_progress": progress_cb,
             "audit_hook": audit_cb,
+            "completion_guard": completion_guard,
         }
+        if turn_stop_guard is not None:
+            run_kwargs["turn_stop_guard"] = turn_stop_guard
         if on_stream is not None:
             run_kwargs["on_stream"] = on_stream
         if on_stream_end is not None:
@@ -1470,13 +1874,9 @@ class BaseAgentLoop:
             final_content = "I've completed processing but have no response to give."
 
         if isinstance(session.metadata, dict):
-            prior = session.metadata.get("_recent_skills")
             merged: list[str] = []
-            if isinstance(prior, list):
-                for item in prior:
-                    if isinstance(item, str) and item not in merged:
-                        merged.append(item)
-            for item in sorted(current_turn_skills):
+            # Remember this task's skills, not an ever-growing list of old topics.
+            for item in [*(name for name in active_skills if name in loaded_skills), *sorted(current_turn_skills)]:
                 if item not in merged:
                     merged.append(item)
             session.metadata["_recent_skills"] = merged[-10:]
@@ -1487,11 +1887,16 @@ class BaseAgentLoop:
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Response on {} (content length={})", msg.channel, len(final_content))
+        outbound_meta = dict(msg.metadata or {})
+        fallback_prefix = "MIRA_SKILL_FALLBACK_REQUIRED:"
+        if selected_skills and final_content.lstrip().startswith(fallback_prefix):
+            final_content = final_content.lstrip()[len(fallback_prefix):].lstrip()
+            outbound_meta["_skill_fallback_required"] = True
+            outbound_meta["selected_skill_ids"] = selected_skills
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=dict(msg.metadata or {}),
+            metadata=outbound_meta,
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
@@ -1641,7 +2046,6 @@ class BaseAgentLoop:
         so callers can inject CLI flags (``run_mode``, ``agent_profile``,
         ``automation_policy``, ``project_dir``, …) that subclasses interpret.
         """
-        await self._connect_mcp()
         msg = InboundMessage(
             channel=channel,
             sender_id="user",
@@ -1649,12 +2053,26 @@ class BaseAgentLoop:
             content=content,
             metadata=dict(metadata or {}),
         )
-        response = await self._process_message(
-            msg,
-            session_key=session_key,
-            on_progress=on_progress,
-            audit_hook=audit_hook,
-        )
+        with diagnostic_context(run_id=correlation_id(), session_ref=opaque_ref(session_key), channel=channel):
+            emit_event("agent.direct.started")
+            started = time.monotonic()
+            try:
+                await self._connect_mcp()
+                response = await self._process_message(
+                    msg,
+                    session_key=session_key,
+                    on_progress=on_progress,
+                    audit_hook=audit_hook,
+                )
+            except asyncio.CancelledError:
+                emit_event("agent.direct.cancelled")
+                raise
+            except Exception as exc:
+                emit_event("agent.direct.failed", level="ERROR", exception=exc)
+                raise
+            finally:
+                emit_event("agent.direct.finished",
+                           duration_ms=round((time.monotonic() - started) * 1000, 2))
         if response is None:
             return ""
         if isinstance(response, OutboundMessage) and isinstance(content, str) and content.strip().startswith("/"):

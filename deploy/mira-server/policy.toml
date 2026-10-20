@@ -1,0 +1,35 @@
+# /etc/mira/policy.toml - host policy for every Mira engine on this host,
+# whether Mira Server, Remote-SSH or a person started it. Install it owned by
+# root, mode 0644:
+#
+#   sudo install -D -o root -g root -m 0644 deploy/mira-server/policy.toml /etc/mira/policy.toml
+#
+# Settings here override each user's ~/.mira/config.json and cannot be changed
+# from the app. The OS account is the boundary between users; this policy
+# protects each user's agent from prompt injection (no reading ~/.mira, other
+# projects or the gateway token) and limits what agents may do on the host.
+# An invalid file stops engines from starting; `mira-server check` validates it.
+# Reference: docs/server-edition/mira-server.md ("Agent isolation").
+
+[tools]
+# File and shell tools stay inside the current project.
+restrict_to_workspace = true
+# Set to false to disable the shell tool, MCP servers, or skill plugin installs.
+# exec = false
+# mcp = false
+# plugin_install = false
+
+[sandbox]
+# Run every shell command in a bubblewrap sandbox (needs the bubblewrap package
+# and unprivileged user namespaces). Commands are refused if it does not work.
+mode = "bwrap"
+# "none" gives commands no network at all (also no pip install or git clone).
+network = "full"
+# Host paths commands may read (shared datasets, software) or write (scratch).
+# read_only_paths = ["/data/shared"]
+# read_write_paths = ["/scratch"]
+
+# Members of a Unix group can get different settings; entries apply in order.
+# [[groups]]
+# name = "mira-trusted"
+# sandbox.read_write_paths = ["/data/projects"]

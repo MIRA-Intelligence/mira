@@ -45,6 +45,26 @@ def _validate_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
+def html_to_markdown(html_text: str) -> str:
+    """Convert readability HTML to compact markdown."""
+    text = re.sub(
+        r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
+        lambda m: f'[{_strip_tags(m[2])}]({m[1]})',
+        html_text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"<h([1-6])[^>]*>([\s\S]*?)</h\1>",
+        lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n',
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"<li[^>]*>([\s\S]*?)</li>", lambda m: f"\n- {_strip_tags(m[1])}", text, flags=re.I)
+    text = re.sub(r"</(p|div|section|article)>", "\n\n", text, flags=re.I)
+    text = re.sub(r"<(br|hr)\s*/?>", "\n", text, flags=re.I)
+    return _normalize(_strip_tags(text))
+
+
 class WebSearchTool(Tool):
     """Search the web via configured provider."""
 
@@ -319,19 +339,4 @@ class WebFetchTool(Tool):
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
 
     def _to_markdown(self, html_text: str) -> str:
-        text = re.sub(
-            r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
-            lambda m: f'[{_strip_tags(m[2])}]({m[1]})',
-            html_text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r"<h([1-6])[^>]*>([\s\S]*?)</h\1>",
-            lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(r"<li[^>]*>([\s\S]*?)</li>", lambda m: f"\n- {_strip_tags(m[1])}", text, flags=re.I)
-        text = re.sub(r"</(p|div|section|article)>", "\n\n", text, flags=re.I)
-        text = re.sub(r"<(br|hr)\s*/?>", "\n", text, flags=re.I)
-        return _normalize(_strip_tags(text))
+        return html_to_markdown(html_text)

@@ -82,15 +82,47 @@ jobs:
         run: |
           python <<'PY'
           from importlib import metadata as importlib_metadata
+          import os
 
           version = importlib_metadata.version("mira-engine")
           if version == "0.0.0":
               raise SystemExit("mira-engine metadata version resolved to 0.0.0")
+          if os.environ.get("GITHUB_REF_TYPE") == "tag" and version != os.environ["GITHUB_REF_NAME"].removeprefix("v"):
+              raise SystemExit(f"Package version {version} does not match release tag")
           print(f"Resolved mira-engine metadata version: {version}")
           PY
 
       - name: Build standalone mira-engine executable
         run: pyinstaller --clean mira-engine.spec
+
+      - name: Verify uv is embedded in the standalone build
+        shell: bash
+        run: |
+          python <<'PY'
+          import platform
+          from pathlib import Path
+
+          from PyInstaller.archive.readers import CArchiveReader
+
+          name = "uv.exe" if platform.system() == "Windows" else "uv"
+          hits = list(Path("dist").rglob(name))
+          if hits:
+              print("Bundled uv file:", hits[0])
+              raise SystemExit(0)
+
+          for executable in Path("dist").rglob("mira-engine*"):
+              if not executable.is_file():
+                  continue
+              try:
+                  archive = CArchiveReader(str(executable))
+              except Exception:
+                  continue
+              if name in archive.toc:
+                  print("Bundled uv archive entry:", executable)
+                  raise SystemExit(0)
+
+          raise SystemExit(f"{name} missing from dist/; fetch_uv.py output was not bundled")
+          PY
 
       - name: Smoke test standalone mira-engine executable
         shell: bash
@@ -109,7 +141,10 @@ jobs:
 
           port = 18790
           exe_name = "mira-engine.exe" if platform.system() == "Windows" else "mira-engine"
-          exe_path = Path("dist") / exe_name
+          if platform.system() == "Windows":
+              exe_path = Path("dist") / "mira-engine" / exe_name
+          else:
+              exe_path = Path("dist") / exe_name
           if not exe_path.exists():
               raise SystemExit(f"standalone executable missing: {exe_path}")
 
@@ -142,8 +177,11 @@ jobs:
           }
           config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
+          # The gateway requires a token (#163); pin one so the probes can authenticate.
+          token = "release-smoke-token-0123456789"
           env = os.environ.copy()
           env["MIRA_CONFIG_PATH"] = str(config_path)
+          env["MIRA_GATEWAY_TOKEN"] = token
           env["HOME"] = str(tmp_root)
           env["USERPROFILE"] = str(tmp_root)
 
@@ -159,7 +197,8 @@ jobs:
           ws_url = f"ws://127.0.0.1:{port}/ws"
 
           def fetch_json(url: str) -> dict:
-              with urllib.request.urlopen(url, timeout=5) as resp:
+              request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+              with urllib.request.urlopen(request, timeout=5) as resp:
                   return json.loads(resp.read().decode("utf-8"))
 
           try:
@@ -185,6 +224,8 @@ jobs:
               agent_version = version_payload.get("agent_version")
               if not agent_version or agent_version == "0.0.0":
                   raise RuntimeError(f"unexpected standalone version payload: {version_payload}")
+              if os.environ.get("GITHUB_REF_TYPE") == "tag" and agent_version != os.environ["GITHUB_REF_NAME"].removeprefix("v"):
+                  raise RuntimeError(f"standalone version does not match release tag: {version_payload}")
               if version_payload.get("api_contract") != "v1":
                   raise RuntimeError(f"unexpected api contract payload: {version_payload}")
 
@@ -192,7 +233,10 @@ jobs:
               if "runtime" not in config_payload or "providers" not in config_payload:
                   raise RuntimeError(f"unexpected config payload: {config_payload}")
 
-              ws = websocket.create_connection(ws_url, timeout=10)
+              # Not a browser: no Origin header, which the gateway's origin check would reject.
+              ws = websocket.create_connection(
+                  ws_url, timeout=10, header=[f"Authorization: Bearer {token}"], suppress_origin=True,
+              )
               try:
                   ws.send(json.dumps({
                       "type": "message",
@@ -202,11 +246,21 @@ jobs:
                       "media": [],
                       "mode": "manual",
                   }))
-                  raw = ws.recv()
+                  # Side events (skill_loaded, token_usage, ...) can arrive first;
+                  # wait for the agent to answer or report progress.
+                  seen = []
+                  ws_deadline = time.time() + 30
+                  payload = {}
+                  while time.time() < ws_deadline:
+                      payload = json.loads(ws.recv())
+                      seen.append(payload.get("type"))
+                      if payload.get("type") in {"response", "progress"}:
+                          break
+                  else:
+                      raise RuntimeError(f"no response or progress over the websocket; got {seen}")
               finally:
                   ws.close()
 
-              payload = json.loads(raw)
               if payload.get("type") not in {"response", "progress"}:
                   raise RuntimeError(f"unexpected websocket payload: {payload}")
           except Exception:
@@ -231,7 +285,21 @@ jobs:
         run: |
           mkdir -p release-artifacts
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp dist/mira-engine.exe release-artifacts/mira-engine-windows-x86_64.exe
+            python <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          src = Path("dist") / "mira-engine"
+          exe = src / "mira-engine.exe"
+          if not exe.is_file():
+              raise SystemExit(f"Windows one-dir executable missing: {exe}")
+
+          zip_path = Path("release-artifacts") / "mira-engine-windows-x86_64.zip"
+          with ZipFile(zip_path, "w", ZIP_DEFLATED) as zf:
+              for path in sorted(src.rglob("*")):
+                  if path.is_file():
+                      zf.write(path, path.relative_to(src.parent).as_posix())
+          PY
           elif [ "${{ matrix.os }}" = "macos-latest" ]; then
             ARCH="$(uname -m)"
             cp dist/mira-engine release-artifacts/mira-engine-macos-${ARCH}
@@ -242,21 +310,6 @@ jobs:
             cp dist/*.whl release-artifacts/
             cp dist/*.tar.gz release-artifacts/
           fi
-
-      - name: Generate SHA256 checksums
-        shell: bash
-        run: |
-          python - <<'PY'
-          from hashlib import sha256
-          from pathlib import Path
-
-          out = []
-          for path in sorted(Path("release-artifacts").glob("*")):
-              if path.is_file():
-                  digest = sha256(path.read_bytes()).hexdigest()
-                  out.append(f"{digest}  {path.name}")
-          Path("release-artifacts/SHA256SUMS.txt").write_text("\n".join(out) + "\n", encoding="utf-8")
-          PY
 
       - name: Upload per-OS artifacts
         uses: actions/upload-artifact@v4
@@ -307,10 +360,29 @@ jobs:
           merge-multiple: true
           path: release-assets
 
+      - name: Generate combined SHA256 checksums
+        shell: bash
+        run: |
+          python - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+
+          out = []
+          for path in sorted(Path("release-assets").glob("*")):
+              if path.is_file():
+                  digest = sha256(path.read_bytes()).hexdigest()
+                  out.append(f"{digest}  {path.name}")
+          if not out:
+              raise SystemExit("No release assets found for checksum generation")
+          Path("release-assets/SHA256SUMS.txt").write_text("\n".join(out) + "\n", encoding="utf-8")
+          PY
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, 'rc') }}
+          make_latest: ${{ contains(github.ref_name, 'rc') && 'false' || 'true' }}
           generate_release_notes: true
           files: |
             release-assets/*

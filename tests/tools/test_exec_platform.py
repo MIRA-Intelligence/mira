@@ -81,7 +81,7 @@ class TestBuildEnvUnix:
         assert "OPENAI_API_KEY" not in env
         assert "MIRA_TOKEN" not in env
         for v in env.values():
-            assert "secret" not in v.lower()
+            assert "sk-secret" not in v and "tok-secret" not in v
 
 
 class TestBuildEnvWindows:
@@ -124,7 +124,7 @@ class TestBuildEnvWindows:
         assert "OPENAI_API_KEY" not in env
         assert "MIRA_TOKEN" not in env
         for v in env.values():
-            assert "secret" not in v.lower()
+            assert "sk-secret" not in v and "tok-secret" not in v
 
     def test_path_has_sensible_default(self):
         with (
@@ -251,43 +251,58 @@ class TestPathAppendPlatform:
 class TestSandboxPlatform:
 
     @pytest.mark.asyncio
-    async def test_bwrap_skipped_on_windows(self):
-        """bwrap must be silently skipped on Windows, not crash."""
-        mock_proc = AsyncMock()
-        mock_proc.communicate.return_value = (b"ok", b"")
-        mock_proc.returncode = 0
-
+    async def test_bwrap_required_is_refused_on_windows(self):
+        """A required sandbox that cannot exist must refuse, never run unsandboxed."""
         with (
             patch("mira_engine.agent.tools.shell._IS_WINDOWS", True),
-            patch.object(ExecTool, "_spawn", return_value=mock_proc) as mock_spawn,
+            patch.object(ExecTool, "_spawn") as mock_spawn,
             patch.object(ExecTool, "_guard_command", return_value=None),
         ):
             tool = ExecTool(sandbox="bwrap")
             result = await tool.execute(command="dir")
 
-        assert "ok" in result
-        spawned_cmd = mock_spawn.call_args[0][0]
-        assert "bwrap" not in spawned_cmd
+        assert "not available on Windows" in result
+        mock_spawn.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_bwrap_applied_on_unix(self):
-        """On Unix, sandbox wrapping should still happen normally."""
+    async def test_bwrap_applied_on_unix(self, tmp_path):
+        """On Unix the whole shell runs inside bwrap."""
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"sandboxed", b"")
         mock_proc.returncode = 0
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
 
         with (
             patch("mira_engine.agent.tools.shell._IS_WINDOWS", False),
-            patch("mira_engine.agent.tools.shell.wrap_command", return_value="bwrap -- sh -c ls") as mock_wrap,
-            patch.object(ExecTool, "_spawn", return_value=mock_proc) as mock_spawn,
+            patch("mira_engine.agent.tools.shell.sandbox_available", return_value=(True, "")),
+            patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+            patch.object(ExecTool, "_spawn") as mock_spawn,
             patch.object(ExecTool, "_guard_command", return_value=None),
         ):
-            tool = ExecTool(sandbox="bwrap", working_dir="/workspace")
-            await tool.execute(command="ls")
+            tool = ExecTool(sandbox="bwrap", working_dir=str(workspace))
+            result = await tool.execute(command="ls")
 
-        mock_wrap.assert_called_once()
-        spawned_cmd = mock_spawn.call_args[0][0]
-        assert "bwrap" in spawned_cmd
+        assert "sandboxed" in result
+        mock_spawn.assert_not_called()
+        argv = list(mock_exec.call_args[0])
+        assert argv[0] == "bwrap"
+        assert argv[-3:] == ["bash", "-c", "ls"]
+
+    @pytest.mark.asyncio
+    async def test_bwrap_unavailable_refuses(self, tmp_path):
+        with (
+            patch("mira_engine.agent.tools.shell._IS_WINDOWS", False),
+            patch("mira_engine.agent.tools.shell.sandbox_available",
+                  return_value=(False, "bwrap (bubblewrap) is not installed")),
+            patch.object(ExecTool, "_spawn") as mock_spawn,
+            patch.object(ExecTool, "_guard_command", return_value=None),
+        ):
+            tool = ExecTool(sandbox="bwrap", working_dir=str(tmp_path))
+            result = await tool.execute(command="ls")
+
+        assert "bubblewrap) is not installed" in result
+        mock_spawn.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

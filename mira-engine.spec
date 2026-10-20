@@ -21,6 +21,7 @@ a = Analysis(
     binaries=_extra_binaries,
     datas=(
         collect_data_files('litellm')
+        + collect_data_files('jieba')
         + collect_data_files(
             'mira_engine',
             includes=[
@@ -35,29 +36,52 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Mira Server runs from a pip install on Linux hosts, never from the desktop bundle.
+    excludes=['mira_server', 'pam'],
     noarchive=False,
     optimize=0,
 )
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name='mira-engine',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=True,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
+_exe_kwargs = {
+    "name": "mira-engine",
+    "debug": False,
+    "bootloader_ignore_signals": False,
+    "strip": False,
+    "upx": True,
+    "upx_exclude": [],
+    "runtime_tmpdir": None,
+    "console": True,
+    "disable_windowed_traceback": False,
+    "argv_emulation": False,
+    "target_arch": None,
+    "codesign_identity": None,
+    "entitlements_file": None,
+}
+
+if sys.platform == "win32":
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        **_exe_kwargs,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        name="mira-engine",
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        **_exe_kwargs,
+    )

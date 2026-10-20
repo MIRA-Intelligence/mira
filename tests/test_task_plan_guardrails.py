@@ -443,6 +443,155 @@ def test_guard_task_plan_allows_existing_noncanonical_artifacts(tmp_path: Path) 
     assert result["blocking"] is False
 
 
+def test_guard_task_plan_allows_glob_artifact_paths_with_matching_files(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "PRJ-GLOB"
+    out_dir = project_dir / "experiments" / "outputs" / "exp010"
+    out_dir.mkdir(parents=True)
+    for name in (
+        "predictions_lovo_A_full.csv",
+        "predictions_lovo_B1_full.csv",
+        "predictions_lovo_B2_no_avail.csv",
+    ):
+        (out_dir / name).write_text("row\n", encoding="utf-8")
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "glob artifacts",
+                "status": "in_progress",
+                "experiments": [
+                    {
+                        "id": "Exp010",
+                        "status": "completed",
+                        "conclusion": "done",
+                        "results": {
+                            "metrics": {"auc": 0.9},
+                            "artifacts": [
+                                "experiments/outputs/exp010/predictions_lovo_*_*.csv"
+                            ],
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=False)
+    assert result["ok"] is True
+    assert result["blocking"] is False
+
+
+def test_guard_task_plan_missing_artifact_is_minor_and_tagged_not_blocking(
+    tmp_path: Path,
+) -> None:
+    """A missing artifact reference is a minor issue: it must not halt the loop,
+    and it is surfaced as a per-experiment ``guard_warnings`` marker."""
+    project_dir = tmp_path / "PRJ-GLOB-MISS"
+    (project_dir / "experiments" / "outputs" / "exp010").mkdir(parents=True)
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "glob artifacts missing",
+                "status": "in_progress",
+                "experiments": [
+                    {
+                        "id": "Exp010",
+                        "status": "completed",
+                        "conclusion": "done",
+                        "results": {
+                            "metrics": {"auc": 0.9},
+                            "artifacts": [
+                                "experiments/outputs/exp010/predictions_lovo_*_*.csv"
+                            ],
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=True)
+    assert result["blocking"] is False
+    assert result["ok"] is True
+    assert any("does not exist" in issue for issue in result["minor_issues"])
+    assert result["severe_issues"] == []
+
+    plan = json.loads((project_dir / "task_plan.json").read_text())
+    exp = plan["experiments"][0]
+    assert exp["guard_warnings"]
+    assert any("does not exist" in warning for warning in exp["guard_warnings"])
+
+
+def test_guard_task_plan_blocks_on_unsafe_artifact_path(tmp_path: Path) -> None:
+    """A path that escapes the workspace is severe and must block."""
+    project_dir = tmp_path / "PRJ-UNSAFE"
+    project_dir.mkdir(parents=True)
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "unsafe artifact",
+                "status": "in_progress",
+                "experiments": [
+                    {
+                        "id": "Exp001",
+                        "status": "completed",
+                        "conclusion": "done",
+                        "results": {
+                            "metrics": {"auc": 0.9},
+                            "artifacts": ["../../etc/passwd"],
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = guard_task_plan_file(project_dir, auto_fix=True)
+    assert result["blocking"] is True
+    assert any("unsafe artifact path" in issue for issue in result["severe_issues"])
+
+
+def test_guard_task_plan_clears_stale_guard_warnings_when_resolved(
+    tmp_path: Path,
+) -> None:
+    """Once the artifact exists, the stale warning marker is removed."""
+    project_dir = tmp_path / "PRJ-GLOB-RESOLVE"
+    out_dir = project_dir / "experiments" / "outputs" / "exp010"
+    out_dir.mkdir(parents=True)
+    (project_dir / "task_plan.json").write_text(
+        json.dumps(
+            {
+                "title": "resolve",
+                "status": "in_progress",
+                "experiments": [
+                    {
+                        "id": "Exp010",
+                        "status": "completed",
+                        "conclusion": "done",
+                        "guard_warnings": ["artifact path does not exist 'x.csv'"],
+                        "results": {
+                            "metrics": {"auc": 0.9},
+                            "artifacts": [
+                                "experiments/outputs/exp010/predictions_lovo_*_*.csv"
+                            ],
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (out_dir / "predictions_lovo_A_full.csv").write_text("row\n", encoding="utf-8")
+
+    guard_task_plan_file(project_dir, auto_fix=True)
+    plan = json.loads((project_dir / "task_plan.json").read_text())
+    assert "guard_warnings" not in plan["experiments"][0]
+
+
 def test_guard_task_plan_research_profile_contract_v1_allows_missing_evidence_fields(
     tmp_path: Path,
 ) -> None:
