@@ -132,7 +132,8 @@ class TestCommunityRulesInjection:
     @staticmethod
     def _loop(rules_text: str) -> SimpleNamespace:
         return SimpleNamespace(
-            exec_config=ExecToolConfig(),
+            # Pin the manager off: the dev default is uv (#177), which adds a venv hint.
+            exec_config=ExecToolConfig(python=PythonRuntimeConfig(manager="off")),
             community_config=SimpleNamespace(rules_text=rules_text),
         )
 
