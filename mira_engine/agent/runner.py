@@ -10,6 +10,7 @@ from typing import Any
 from loguru import logger
 
 from mira_engine.agent.hook import AgentHook, AgentHookContext
+from mira_engine.agent.token_usage import record_token_usage
 from mira_engine.utils.prompt_templates import render_template
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.providers.base import LLMProvider, ToolCallRequest
@@ -116,6 +117,7 @@ class AgentRunner:
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
             response = await self._request_model(spec, messages_for_model, hook, context)
+            await record_token_usage(response.usage, spec.model)
             raw_usage = self._usage_dict(response.usage)
             context.response = response
             context.usage = dict(raw_usage)
@@ -221,6 +223,7 @@ class AgentRunner:
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=False)
                 response = await self._request_finalization_retry(spec, messages_for_model)
+                await record_token_usage(response.usage, spec.model)
                 retry_usage = self._usage_dict(response.usage)
                 self._accumulate_usage(usage, retry_usage)
                 raw_usage = self._merge_usage(raw_usage, retry_usage)

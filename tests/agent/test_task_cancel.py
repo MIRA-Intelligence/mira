@@ -26,10 +26,25 @@ def _make_loop(*, exec_config=None):
 
     with patch("mira_engine.agent.base_loop.ContextBuilder"), \
          patch("mira_engine.agent.base_loop.SessionManager"), \
-         patch("mira_engine.agent.base_loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("mira_engine.agent.base_loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, exec_config=exec_config)
     return loop, bus
+
+
+async def _drain(bus) -> list:
+    """Everything published so far, in order."""
+    out = []
+    while not bus.outbound.empty():
+        out.append(await bus.consume_outbound())
+    return out
+
+
+def _turn_events(messages) -> list[tuple[str, str | None]]:
+    return [
+        (m.metadata["_turn_event"], m.metadata.get("stop_reason"))
+        for m in messages if m.metadata.get("_turn_event")
+    ]
 
 
 class TestHandleStop:
@@ -157,6 +172,147 @@ class TestDispatch:
         assert second.metadata["thread_root_event_id"] == "$root1"
         assert second.metadata["thread_reply_to_event_id"] == "$reply1"
         assert second.metadata["_stream_end"] is True
+
+    @pytest.mark.asyncio
+    async def test_dispatch_publishes_unstreamed_final_after_streamed_text(self):
+        """A turn that streamed earlier text but ended on a synthesized notice
+        (e.g. the tool-call limit) must still deliver it, or the UI keeps thinking."""
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui", sender_id="u1", chat_id="c1", content="go",
+            metadata={"_wants_stream": True},
+        )
+
+        async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
+            await on_stream("Let me run the experiments.")
+            await on_stream_end(resuming=False)
+            return OutboundMessage(channel="ui", chat_id="c1", content="limit reached")
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        started, delta, end, final, finished = await _drain(bus)
+        assert started.metadata["_turn_event"] == "started"
+        assert delta.metadata["_stream_delta"] is True
+        assert end.metadata["_stream_end"] is True
+        assert final.content == "limit reached"
+        assert finished.metadata["_turn_event"] == "finished"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_skips_final_already_streamed(self):
+        from mira_engine.agent import base_loop
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui", sender_id="u1", chat_id="c1", content="hi",
+            metadata={"_wants_stream": True},
+        )
+
+        async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
+            await on_stream("hello there")
+            await on_stream_end(resuming=False)
+            base_loop._final_content_streamed.set(True)
+            return OutboundMessage(channel="ui", chat_id="c1", content="hello there")
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        published = await _drain(bus)
+        assert [m.content for m in published if not m.metadata.get("_turn_event")] == ["hello there", ""]
+        assert published[-1].metadata["_turn_event"] == "finished"
+
+    @pytest.mark.asyncio
+    async def test_ui_turn_reports_why_it_ended(self):
+        from mira_engine.agent import base_loop
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui", sender_id="u1", chat_id="c1", content="go",
+            metadata={"turn_id": "turn-abc", "workflow_run_id": "run-1"},
+        )
+
+        async def fake_process(_msg, **kwargs):
+            base_loop.set_turn_stop_reason(base_loop.TURN_MAX_ITERATIONS)
+            return OutboundMessage(channel="ui", chat_id="c1", content="limit reached")
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        started, reply, finished = await _drain(bus)
+        assert started.metadata["turn_id"] == "turn-abc"
+        assert reply.content == "limit reached"
+        assert finished.metadata["turn_id"] == "turn-abc"
+        assert finished.metadata["workflow_run_id"] == "run-1"
+        assert finished.metadata["stop_reason"] == "max_iterations"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_ui_turn_still_finishes_as_stopped(self):
+        from mira_engine.bus.events import InboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(channel="ui", sender_id="u1", chat_id="c1", content="go")
+        entered = asyncio.Event()
+
+        async def slow_process(_msg, **kwargs):
+            entered.set()
+            await asyncio.sleep(60)
+
+        loop._process_message = slow_process
+        task = asyncio.create_task(loop._dispatch(msg))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert _turn_events(await _drain(bus)) == [("started", None), ("finished", "stopped")]
+
+    @pytest.mark.asyncio
+    async def test_other_channels_get_no_turn_events(self):
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="hi")
+        loop._process_message = AsyncMock(
+            return_value=OutboundMessage(channel="telegram", chat_id="c1", content="hello")
+        )
+        await loop._dispatch(msg)
+
+        assert [m.content for m in await _drain(bus)] == ["hello"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_buffers_streamed_skill_fallback_marker(self):
+        from mira_engine.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        msg = InboundMessage(
+            channel="ui",
+            sender_id="u1",
+            chat_id="c1",
+            content="hello",
+            metadata={"_wants_stream": True, "selected_skill_ids": ["mrstation"]},
+        )
+
+        async def fake_process(_msg, *, on_stream=None, on_stream_end=None, **kwargs):
+            await on_stream("MIRA_SKILL_")
+            await on_stream("FALLBACK_REQUIRED: command failed")
+            await on_stream_end(resuming=False)
+            return OutboundMessage(
+                channel="ui",
+                chat_id="c1",
+                content="command failed",
+                metadata={"_skill_fallback_required": True},
+            )
+
+        loop._process_message = fake_process
+        await loop._dispatch(msg)
+
+        _started, first, second, _finished = await _drain(bus)
+        assert first.metadata["_stream_end"] is True
+        assert second.metadata["_skill_fallback_required"] is True
 
     @pytest.mark.asyncio
     async def test_processing_lock_serializes(self):
@@ -402,3 +558,52 @@ class TestSubagentCancellation:
         assert cancelled.is_set()
         assert task.cancelled()
         mgr._announce_result.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_ack_arrives_while_glob_filesystem_io_is_pending(tmp_path, monkeypatch):
+    """Exercise the actual search tool and stop handler, not an async-sleep tool."""
+    import threading
+
+    from mira_engine.agent.tools.search import GlobTool
+    from mira_engine.bus.events import InboundMessage
+
+    loop, bus = _make_loop()
+    event_loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    continued = []
+
+    def slow_walk(root):
+        try:
+            event_loop.call_soon_threadsafe(started.set)
+            release.wait(2)
+            yield str(root), [], []
+            continued.append(True)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr('mira_engine.agent.tools.search.os.walk', slow_walk)
+    loop.tools.register(GlobTool(workspace=tmp_path, allowed_dir=tmp_path))
+    task = asyncio.create_task(loop.tools.execute('glob', {'pattern': '*.nii.gz'}))
+    loop._active_tasks['test:c1'] = [task]
+    msg = InboundMessage(
+        channel='test', sender_id='u1', chat_id='c1', content='/stop',
+        metadata={'_stop_request_id': 'stop-glob-1'},
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.wait_for(loop._handle_stop(msg), 0.5)
+        ack = await asyncio.wait_for(bus.consume_outbound(), 0.5)
+        assert ack.metadata['_stop_ack'] is True
+        assert ack.metadata['request_id'] == 'stop-glob-1'
+        assert ack.metadata['cancelled_agent_tasks'] == 1
+        assert task.cancelled()
+        assert not release.is_set()
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await asyncio.to_thread(finished.wait, 1)
+    assert not continued

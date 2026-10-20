@@ -13,6 +13,7 @@ from oauth_cli_kit import get_token as get_codex_token
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
+from mira_engine.providers.usage import extract_usage
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "mira"
@@ -88,20 +89,21 @@ class OpenAICodexProvider(LLMProvider):
 
             url = DEFAULT_CODEX_URL
             try:
-                content, tool_calls, finish_reason = await _request_codex(
+                content, tool_calls, finish_reason, usage = await _request_codex(
                     url, headers, body, verify=True, proxy=self.proxy
                 )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(
+                content, tool_calls, finish_reason, usage = await _request_codex(
                     url, headers, body, verify=False, proxy=self.proxy
                 )
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
+                usage=usage,
             )
         except Exception as e:
             logger.exception("Codex request failed: {}", _format_exception(e, self.proxy))
@@ -142,7 +144,7 @@ async def _request_codex(
     body: dict[str, Any],
     verify: bool,
     proxy: str | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
     try:
         return await _request_codex_once(url, headers, body, verify=verify, proxy=proxy)
     except httpx.ConnectTimeout:
@@ -166,7 +168,7 @@ async def _request_codex_once(
     verify: bool,
     proxy: str | None = None,
     force_ipv4: bool = False,
-) -> tuple[str, list[ToolCallRequest], str]:
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
     client_kwargs: dict[str, Any] = {
         "timeout": CODEX_TIMEOUT,
         "verify": verify,
@@ -338,11 +340,12 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
         buffer.append(line)
 
 
-async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str]:
+async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str, dict[str, int]]:
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
     finish_reason = "stop"
+    usage: dict[str, int] = {}
 
     async for event in _iter_sse(response):
         event_type = event.get("type")
@@ -386,13 +389,14 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                         arguments=args,
                     )
                 )
-        elif event_type == "response.completed":
+        elif event_type in {"response.completed", "response.incomplete"}:
             status = (event.get("response") or {}).get("status")
             finish_reason = _map_finish_reason(status)
+            usage = extract_usage(event.get("response") or {})
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError(_event_error_message(event) or "Codex response failed")
 
-    return content, tool_calls, finish_reason
+    return content, tool_calls, finish_reason, usage
 
 
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}

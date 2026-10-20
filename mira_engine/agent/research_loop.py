@@ -17,8 +17,15 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from mira_engine.agent.base_loop import UNIFIED_SESSION_KEY, BaseAgentLoop
+from mira_engine.agent.base_loop import (
+    TURN_BUDGET_EXCEEDED,
+    UNIFIED_SESSION_KEY,
+    BaseAgentLoop,
+    set_turn_stop_reason,
+)
 from mira_engine.agent.context import ContextBuilder
+from mira_engine.agent.skill_events import skill_loaded
+from mira_engine.agent.token_usage import track_token_usage
 from mira_engine.agent.tools.message import MessageTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.command.router import CommandContext
@@ -32,12 +39,21 @@ from mira_engine.task_plan.guardrails import (
 class ResearchAgentLoop(BaseAgentLoop):
     """Research-flavoured agent loop with auto-mode and task-plan contracts."""
 
-    _AUTO_MAX_ROUNDS = 20
+    # Fallback default used when no ``auto_max_rounds`` is supplied (e.g. the
+    # SDK facade or tests). The gateway threads the configured value through.
+    _AUTO_MAX_ROUNDS = 100
     _AUTO_GUARD_REPAIR_MAX = 1
     _AUTO_CHECKPOINT_REPAIR_MAX = 1
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, auto_max_rounds: int | None = None, **kwargs: Any
+    ) -> None:
         super().__init__(*args, **kwargs)
+        self._auto_max_rounds = (
+            auto_max_rounds
+            if isinstance(auto_max_rounds, int) and auto_max_rounds > 0
+            else self._AUTO_MAX_ROUNDS
+        )
         self._session_run_modes: dict[str, str] = {}
         self._session_agent_profiles: dict[str, str] = {}
         self._session_automation_policies: dict[str, dict[str, Any] | None] = {}
@@ -52,6 +68,11 @@ class ResearchAgentLoop(BaseAgentLoop):
         # (e.g. via the /new slash command). Lives in memory only; restoring
         # a session after engine restart starts the counter back at zero.
         self._session_tokens_used: dict[str, int] = {}
+
+    def _apply_runtime_limits(self, *, auto_max_rounds: int | None = None, **limits: Any) -> None:
+        super()._apply_runtime_limits(**limits)
+        if isinstance(auto_max_rounds, int) and auto_max_rounds > 0:
+            self._auto_max_rounds = auto_max_rounds
 
     # ------------------------------------------------------------------
     # Run-mode / agent-profile / automation-policy helpers
@@ -80,7 +101,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         """Parse agent profile, returning None when absent/invalid."""
         if isinstance(value, str):
             profile = value.strip().lower()
-            if profile in {"engineer", "research"}:
+            if profile in {"engineer", "research", "team"}:
                 return profile
         return None
 
@@ -221,6 +242,8 @@ class ResearchAgentLoop(BaseAgentLoop):
         """Map profile to its AGENTS bootstrap file."""
         if profile == "engineer":
             return "AGENTS_EG.md"
+        if profile == "team":
+            return "AGENTS_TM.md"
         if profile == "research":
             return "AGENTS_RS.md"
         return "AGENTS_RS.md"
@@ -591,11 +614,18 @@ class ResearchAgentLoop(BaseAgentLoop):
             if completed >= max_experiments:
                 return f"max experiments reached ({completed}/{max_experiments})"
 
-        max_tokens = policy.get("maxTokens")
-        if isinstance(max_tokens, int) and max_tokens > 0 and tokens_used >= max_tokens:
-            return f"token budget reached ({tokens_used}/{max_tokens})"
+        if cls._token_budget_reached(policy, tokens_used):
+            return f"token budget reached ({tokens_used}/{policy['maxTokens']})"
 
         return None
+
+    @staticmethod
+    def _token_budget_reached(policy: dict | None, tokens_used: int) -> bool:
+        max_tokens = policy.get("maxTokens") if isinstance(policy, dict) else None
+        return isinstance(max_tokens, int) and max_tokens > 0 and tokens_used >= max_tokens
+
+    def _auto_round_limit(self) -> int:
+        return getattr(self, "_auto_max_rounds", None) or self._AUTO_MAX_ROUNDS
 
     # ------------------------------------------------------------------
     # task_plan.result restore guard
@@ -1008,9 +1038,10 @@ class ResearchAgentLoop(BaseAgentLoop):
             return False, "awaiting plan approval"
         if not self._guard_task_plan_structure(project_dir, profile=agent_profile):
             return False, "task_plan guardrail blocking"
-        if auto_round >= self._AUTO_MAX_ROUNDS:
-            logger.warning("Auto mode max rounds ({}) reached", self._AUTO_MAX_ROUNDS)
-            return False, f"max rounds reached ({self._AUTO_MAX_ROUNDS})"
+        max_rounds = self._auto_round_limit()
+        if auto_round >= max_rounds:
+            logger.warning("Auto mode max rounds ({}) reached", max_rounds)
+            return False, f"max rounds reached ({max_rounds})"
         strict_heuristics = self._strict_heuristics_from_policy(automation_policy)
         if strict_heuristics and self._looks_like_provider_error(final_content):
             return False, "provider error"
@@ -1082,7 +1113,7 @@ class ResearchAgentLoop(BaseAgentLoop):
           replan up to that budget.
         - With a policy that only carries ``maxTokens`` /
           ``strictHeuristics`` and no goals/budget, default to replanning;
-          ``maxTokens`` and ``_AUTO_MAX_ROUNDS`` keep the loop bounded.
+          ``maxTokens`` and ``auto_max_rounds`` keep the loop bounded.
         """
         if cls._plan_has_pending_work(plan):
             return False
@@ -1174,6 +1205,7 @@ class ResearchAgentLoop(BaseAgentLoop):
     # _process_message override (research orchestration)
     # ------------------------------------------------------------------
 
+    @track_token_usage
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -1220,6 +1252,25 @@ class ResearchAgentLoop(BaseAgentLoop):
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = msg.metadata or {}
+        workflow_run_id = meta.get("workflow_run_id")
+        if isinstance(workflow_run_id, str) and workflow_run_id:
+            # ModuleRuns use concrete native executors over the workflow-neutral
+            # BaseAgentLoop. They must never enter legacy task_plan orchestration.
+            from mira_engine.modules.runtime import NativeModuleRuntime
+
+            runtime = getattr(self, "_native_module_runtime", None)
+            if runtime is None:
+                runtime = NativeModuleRuntime()
+                self._native_module_runtime = runtime
+            return await runtime.process(
+                self,
+                msg,
+                session_key=session_key,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                audit_hook=audit_hook,
+            )
         if meta.get("loop_mode") == "normal":
             base_meta = dict(meta)
             base_meta.pop("project_dir", None)
@@ -1364,7 +1415,7 @@ class ResearchAgentLoop(BaseAgentLoop):
         self._set_tool_context(
             msg.channel,
             msg.chat_id,
-            meta.get("message_id"),
+            meta.get("turn_id") or meta.get("message_id"),
             project_ref=project_ref,
             session_key=key,
         )
@@ -1377,12 +1428,24 @@ class ResearchAgentLoop(BaseAgentLoop):
 
         await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
-        model_runtime = self._get_model_runtime(key)
+        model_runtime = self._get_model_runtime(
+            key, role="supervisor" if agent_profile == "team" else None,
+        )
         extra_system = self._compose_extra_system(
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
             channel=getattr(msg, "channel", None),
         )
+        extra_system = self._with_knowledge(extra_system, meta, project_ref)
+
+        raw_selected_skills = meta.get("selected_skill_ids")
+        selected_skills = [
+            name for name in (
+                str(item).strip() for item in raw_selected_skills
+                if isinstance(item, str)
+            )
+            if name and ctx.skills.load_skill(name)
+        ] if isinstance(raw_selected_skills, list) else []
 
         suggested_skills = ctx.skills.suggest_skills(
             msg.content,
@@ -1390,33 +1453,51 @@ class ResearchAgentLoop(BaseAgentLoop):
             limit=3,
         )
         active_skills: list[str] = []
-        for name in [*recent_skill_names, *suggested_skills]:
+        for name in [*selected_skills, *suggested_skills]:
             if name not in active_skills:
                 active_skills.append(name)
-        active_skills = active_skills[-4:]
+        active_skills = active_skills[:8]
         skill_hint = ""
-        if suggested_skills:
+        if selected_skills:
+            fallback_instruction = (
+                "The user approved the previously proposed fallback for this turn. "
+                "Deviate only as narrowly as that proposal requires."
+                if meta.get("_skill_fallback_approved")
+                else "If their workflow cannot continue, stop using tools and reply with "
+                     "`MIRA_SKILL_FALLBACK_REQUIRED:` followed by the exact error and proposed "
+                     "fallback. Wait for explicit user approval before deviating."
+            )
             skill_hint = (
-                "Skill routing hint: this request likely matches one or more skills. "
-                "Before answering, use read_file to inspect these SKILL.md files if relevant:\n"
+                "User-selected skills are mandatory system-level instructions for this turn:\n"
+                + "\n".join(f"- {name}" for name in selected_skills)
+                + "\nFollow their documented workflow and recommended calls. Do not bypass them "
+                  "by inspecting implementation source, calling internal functions, or writing a "
+                  "replacement implementation. " + fallback_instruction
+            )
+        elif suggested_skills:
+            skill_hint = (
+                "Skill routing selected these active skills. Their full instructions are included "
+                "in the system prompt; prefer their documented workflow when relevant:\n"
                 + "\n".join(f"- {name}" for name in suggested_skills)
             )
-            if on_progress:
-                try:
-                    await on_progress(
-                        f"skill router -> {', '.join(suggested_skills)}",
-                        tool_hint=True,
-                    )
-                except TypeError:
-                    await on_progress(f"skill router -> {', '.join(suggested_skills)}")
+        if on_progress and (selected_skills or suggested_skills):
+            try:
+                await on_progress(
+                    f"skill -> {', '.join(selected_skills or suggested_skills)}",
+                    tool_hint=True,
+                )
+            except TypeError:
+                await on_progress(f"skill -> {', '.join(selected_skills or suggested_skills)}")
         if extra_system:
             extra_system = skill_hint + "\n\n" + extra_system if skill_hint else extra_system
         else:
             extra_system = skill_hint or None
+        loaded_skills: list[str] = []
         initial_messages = ctx.build_messages(
             history=history,
             current_message=msg.content,
             skill_names=active_skills or None,
+            loaded_skills=loaded_skills,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
@@ -1446,13 +1527,19 @@ class ResearchAgentLoop(BaseAgentLoop):
 
         progress_cb = on_progress or _bus_progress
         current_turn_skills: set[str] = set()
+        loaded_this_turn: set[tuple[str | None, str]] = set()
         audit_cb = None
         emit_audit_to_channel = msg.channel == "ui" or bool(meta.get("_emit_skill_audit"))
         allow_result_write = self._looks_like_result_request(msg.content, meta)
         if emit_audit_to_channel or audit_hook:
             async def _audit(details: dict[str, Any]) -> None:
+                if details.get("loaded"):
+                    identity = (details.get("agent"), details.get("skill_name"))
+                    if identity in loaded_this_turn:
+                        return
+                    loaded_this_turn.add(identity)
                 skill_name = details.get("skill_name")
-                if isinstance(skill_name, str) and skill_name.strip():
+                if not details.get("loaded") and isinstance(skill_name, str) and skill_name.strip():
                     current_turn_skills.add(skill_name.strip())
                 if audit_hook:
                     await audit_hook(details)
@@ -1460,7 +1547,10 @@ class ResearchAgentLoop(BaseAgentLoop):
                     return
                 metadata = dict(msg.metadata or {})
                 metadata["_audit_only"] = True
-                metadata["_audit_event"] = "skill_invoked"
+                metadata["_audit_event"] = (
+                    "skill_loaded" if details.get("loaded") else
+                    "skill_selected" if details.get("selected") else "skill_invoked"
+                )
                 metadata["_audit_details"] = details
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
@@ -1470,6 +1560,16 @@ class ResearchAgentLoop(BaseAgentLoop):
                 ))
 
             audit_cb = _audit
+        if audit_cb:
+            for name in loaded_skills:
+                source = "manual" if name in selected_skills else "auto" if name in suggested_skills else "recent" if name in recent_skill_names else "always"
+                await audit_cb(skill_loaded(name, source, tool="system_prompt"))
+            for selected_skill in selected_skills:
+                await audit_cb({
+                    "tool": "system_prompt",
+                    "skill_name": selected_skill,
+                    "selected": True,
+                })
         run_kwargs: dict[str, Any] = {
             "model_runtime": model_runtime,
             "on_progress": progress_cb,
@@ -1587,6 +1687,8 @@ class ResearchAgentLoop(BaseAgentLoop):
                     tokens_used=total_tokens_used,
                 )
                 if stop_reason:
+                    if self._token_budget_reached(automation_policy, total_tokens_used):
+                        set_turn_stop_reason(TURN_BUDGET_EXCEEDED)
                     await progress_cb(f"auto-run stop condition: {stop_reason}")
                     break
 
@@ -1661,6 +1763,8 @@ class ResearchAgentLoop(BaseAgentLoop):
                             )
                     continue
                 if current_mode == "auto" and continuation_reason:
+                    if auto_round >= self._auto_round_limit():
+                        set_turn_stop_reason(TURN_BUDGET_EXCEEDED)
                     detail = self._format_stop_reason_detail(
                         continuation_reason, final_content
                     )
@@ -1718,13 +1822,9 @@ class ResearchAgentLoop(BaseAgentLoop):
             final_content = "I've completed processing but have no response to give."
 
         if isinstance(session.metadata, dict):
-            prior = session.metadata.get("_recent_skills")
             merged: list[str] = []
-            if isinstance(prior, list):
-                for item in prior:
-                    if isinstance(item, str) and item not in merged:
-                        merged.append(item)
-            for item in sorted(current_turn_skills):
+            # Remember this task's skills, not an ever-growing list of old topics.
+            for item in [*(name for name in active_skills if name in loaded_skills), *sorted(current_turn_skills)]:
                 if item not in merged:
                     merged.append(item)
             session.metadata["_recent_skills"] = merged[-10:]
@@ -1750,6 +1850,11 @@ class ResearchAgentLoop(BaseAgentLoop):
         current_plan_phase = self._plan_phase(project_dir)
         if current_plan_phase:
             response_metadata["_plan_phase"] = current_plan_phase
+        fallback_prefix = "MIRA_SKILL_FALLBACK_REQUIRED:"
+        if selected_skills and final_content.lstrip().startswith(fallback_prefix):
+            final_content = final_content.lstrip()[len(fallback_prefix):].lstrip()
+            response_metadata["_skill_fallback_required"] = True
+            response_metadata["selected_skill_ids"] = selected_skills
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=response_metadata,

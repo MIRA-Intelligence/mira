@@ -3,7 +3,7 @@
 from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
 
-from mira_engine.agent.tools.base import Tool
+from mira_engine.agent.tools.base import UNSET, Tool, turn_value
 from mira_engine.bus.events import OutboundMessage
 
 
@@ -21,9 +21,9 @@ class MessageTool(Tool):
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
-        self._runtime_channel: ContextVar[str | None] = ContextVar("message_channel", default=None)
-        self._runtime_chat_id: ContextVar[str | None] = ContextVar("message_chat_id", default=None)
-        self._runtime_message_id: ContextVar[str | None] = ContextVar("message_id", default=None)
+        self._runtime_channel: ContextVar[str | None] = ContextVar("message_channel", default=UNSET)
+        self._runtime_chat_id: ContextVar[str | None] = ContextVar("message_chat_id", default=UNSET)
+        self._runtime_message_id: ContextVar[str | None] = ContextVar("message_id", default=UNSET)
         self._runtime_sent_in_turn: ContextVar[bool | None] = ContextVar(
             "message_sent_in_turn",
             default=None,
@@ -103,9 +103,9 @@ class MessageTool(Tool):
         media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
-        default_channel = self._runtime_channel.get() or self._default_channel
-        default_chat_id = self._runtime_chat_id.get() or self._default_chat_id
-        default_message_id = self._runtime_message_id.get() or self._default_message_id
+        default_channel = turn_value(self._runtime_channel, self._default_channel)
+        default_chat_id = turn_value(self._runtime_chat_id, self._default_chat_id)
+        default_message_id = turn_value(self._runtime_message_id, self._default_message_id)
         channel = channel or default_channel
         chat_id = chat_id or default_chat_id
         message_id = message_id or default_message_id

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import mimetypes
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -62,10 +63,14 @@ class _FsTool(Tool):
         allowed_dir: Path | None = None,
         extra_allowed_dirs: list[Path] | None = None,
         supports_vision: bool = True,
+        read_paths: tuple[Path, ...] = (),
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._extra_allowed_dirs = extra_allowed_dirs
+        self._read_paths: ContextVar[tuple[Path, ...]] = ContextVar(
+            f"{self.__class__.__name__}_read_paths", default=read_paths,
+        )
         # Whether the active model can accept image input. When False, image
         # reads degrade to a text placeholder instead of emitting base64 the
         # backend would reject.
@@ -106,19 +111,30 @@ class _FsTool(Tool):
     def _current_workspace(self) -> Path | None:
         return self._runtime_workspace.get() or self._workspace
 
+    @contextmanager
+    def allow_read_paths(self, paths: tuple[Path, ...]):
+        """Attempt-scoped grants; reset even when execution fails or is cancelled."""
+        token = self._read_paths.set(paths)
+        try:
+            yield
+        finally:
+            self._read_paths.reset(token)
+
     def _resolve(self, path: str) -> Path:
         workspace = self._current_workspace()
         allowed_dir = self._runtime_allowed_dir.get()
         extra_allowed_dirs = self._runtime_extra_allowed_dirs.get()
+        extra_allowed_dirs = list(extra_allowed_dirs if extra_allowed_dirs is not None else self._extra_allowed_dirs or [])
+        # Do not turn a read grant into write authority or impose restrictions
+        # on unrestricted tools. Persisted roots are canonical; retargeted links
+        # must not silently expand the original grant.
+        if self.name in {"read_file", "list_dir", "grep", "glob"} and (allowed_dir or self._allowed_dir):
+            extra_allowed_dirs.extend(p for p in self._read_paths.get() if p.resolve() == p)
         return _resolve_path(
             path,
             workspace=workspace,
             allowed_dir=allowed_dir if allowed_dir is not None else self._allowed_dir,
-            extra_allowed_dirs=(
-                extra_allowed_dirs
-                if extra_allowed_dirs is not None
-                else self._extra_allowed_dirs
-            ),
+            extra_allowed_dirs=extra_allowed_dirs,
         )
 
 
@@ -198,7 +214,9 @@ class ReadFileTool(_FsTool):
                     "Only UTF-8 text and images are supported."
                 )
 
-            if offset == 1 and limit is None and "\n" not in text_content:
+            # Keep skill instructions on the numbered-text path even for a
+            # one-line file, so successful loads have an unambiguous signature.
+            if offset == 1 and limit is None and "\n" not in text_content and fp.name.lower() != "skill.md":
                 if len(text_content) > self._MAX_CHARS:
                     return (
                         text_content[: self._MAX_CHARS]

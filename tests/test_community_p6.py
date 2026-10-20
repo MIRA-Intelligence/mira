@@ -110,7 +110,7 @@ async def test_agent_loop_skips_events_the_budget_does_not_admit(tmp_path, monke
     loop.community_config = SimpleNamespace(daily_token_budget=100, triage_model="", domains=[])
     ran = []
 
-    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None):
+    async def _fake_run(messages, model_runtime, on_progress=None, audit_hook=None, **_kwargs):
         ran.append(1)
         loop._last_loop_tokens_used = 90
         return "done", [], messages + [{"role": "assistant", "content": "done"}]

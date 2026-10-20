@@ -90,3 +90,26 @@ def test_registry_definitions_include_registered_tools() -> None:
     reg.register(_EchoTool())
     defs = reg.get_definitions()
     assert defs[0]["function"]["name"] == "echo"
+
+
+async def test_registry_task_local_scope_hides_and_blocks_tools() -> None:
+    reg = ToolRegistry()
+    reg.register(_EchoTool())
+    with reg.restrict_to(set()):
+        assert reg.get_definitions() == []
+        assert reg.get("echo") is None
+        result = await reg.execute("echo", {"value": 1})
+        assert "not found" in result
+    assert reg.get("echo") is not None
+
+
+async def test_registry_execution_guard_stops_before_tool_side_effect() -> None:
+    reg = ToolRegistry()
+    reg.register(_EchoTool())
+
+    async def guard(_name: str, _params: dict[str, Any]) -> str:
+        return '{"workflow_control":"acknowledged"}'
+
+    with reg.restrict_to({"echo"}, execution_guard=guard):
+        result = await reg.execute("echo", {"value": 1})
+    assert result == '{"workflow_control":"acknowledged"}'

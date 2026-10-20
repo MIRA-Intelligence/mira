@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import os
 import re
+import threading
+from contextvars import ContextVar
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, TypeVar
 
 from mira_engine.agent.tools.filesystem import ListDirTool, _FsTool
+
+_SEARCH_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
+    "search_cancel_event", default=None,
+)
+
+
+def _check_search_cancelled() -> None:
+    cancelled = _SEARCH_CANCEL_EVENT.get()
+    if cancelled is not None and cancelled.is_set():
+        raise asyncio.CancelledError()
+
 
 _DEFAULT_HEAD_LIMIT = 250
 T = TypeVar("T")
@@ -90,6 +104,30 @@ def _matches_type(name: str, file_type: str | None) -> bool:
 class _SearchTool(_FsTool):
     _IGNORE_DIRS = set(ListDirTool._IGNORE_DIRS)
 
+    async def execute(self, *args: Any, **kwargs: Any) -> str:
+        # Copy the per-turn filesystem ContextVars into the worker. Each call
+        # owns its cancellation event, even when a tool is shared by sessions.
+        cancelled = threading.Event()
+
+        def search() -> str:
+            token = _SEARCH_CANCEL_EVENT.set(cancelled)
+            try:
+                _check_search_cancelled()
+                return self._execute_sync(*args, **kwargs)
+            finally:
+                _SEARCH_CANCEL_EVENT.reset(token)
+
+        try:
+            return await asyncio.to_thread(search)
+        except asyncio.CancelledError:
+            # Cancelling to_thread alone only cancels the awaiting coroutine.
+            # Stop the worker at its next filesystem/scan checkpoint as well.
+            cancelled.set()
+            raise
+
+    def _execute_sync(self, *args: Any, **kwargs: Any) -> str:
+        raise NotImplementedError
+
     def _display_path(self, target: Path, root: Path) -> str:
         workspace = self._current_workspace()
         if workspace:
@@ -100,14 +138,17 @@ class _SearchTool(_FsTool):
         return target.relative_to(root).as_posix()
 
     def _iter_files(self, root: Path) -> Iterable[Path]:
+        _check_search_cancelled()
         if root.is_file():
             yield root
             return
 
         for dirpath, dirnames, filenames in os.walk(root):
+            _check_search_cancelled()
             dirnames[:] = sorted(d for d in dirnames if d not in self._IGNORE_DIRS)
             current = Path(dirpath)
             for filename in sorted(filenames):
+                _check_search_cancelled()
                 yield current / filename
 
     def _iter_entries(
@@ -117,19 +158,23 @@ class _SearchTool(_FsTool):
         include_files: bool,
         include_dirs: bool,
     ) -> Iterable[Path]:
+        _check_search_cancelled()
         if root.is_file():
             if include_files:
                 yield root
             return
 
         for dirpath, dirnames, filenames in os.walk(root):
+            _check_search_cancelled()
             dirnames[:] = sorted(d for d in dirnames if d not in self._IGNORE_DIRS)
             current = Path(dirpath)
             if include_dirs:
                 for dirname in dirnames:
+                    _check_search_cancelled()
                     yield current / dirname
             if include_files:
                 for filename in sorted(filenames):
+                    _check_search_cancelled()
                     yield current / filename
 
 
@@ -193,7 +238,7 @@ class GlobTool(_SearchTool):
             "required": ["pattern"],
         }
 
-    async def execute(
+    def _execute_sync(
         self,
         pattern: str,
         path: str = ".",
@@ -224,6 +269,11 @@ class GlobTool(_SearchTool):
                 include_files=include_files,
                 include_dirs=include_dirs,
             ):
+                _check_search_cancelled()
+                try:
+                    self._resolve(str(entry))
+                except PermissionError:
+                    continue
                 rel_path = entry.relative_to(root).as_posix()
                 if _match_glob(rel_path, entry.name, pattern):
                     display = self._display_path(entry, root)
@@ -238,6 +288,7 @@ class GlobTool(_SearchTool):
             if not matches:
                 return f"No paths matched pattern '{pattern}' in {path}"
 
+            _check_search_cancelled()
             matches.sort(key=lambda item: (-item[1], item[0]))
             ordered = [name for name, _ in matches]
             paged, truncated = _paginate(ordered, limit, offset)
@@ -377,7 +428,7 @@ class GrepTool(_SearchTool):
             block.append(f"{marker} {line_no}| {lines[line_no - 1]}")
         return "\n".join(block)
 
-    async def execute(
+    def _execute_sync(
         self,
         pattern: str,
         path: str = ".",
@@ -429,13 +480,20 @@ class GrepTool(_SearchTool):
             root = target if target.is_dir() else target.parent
 
             for file_path in self._iter_files(target):
+                _check_search_cancelled()
+                try:
+                    self._resolve(str(file_path))
+                except PermissionError:
+                    continue
                 rel_path = file_path.relative_to(root).as_posix()
                 if glob and not _match_glob(rel_path, file_path.name, glob):
                     continue
                 if not _matches_type(file_path.name, type):
                     continue
 
-                raw = file_path.read_bytes()
+                with file_path.open("rb") as source:
+                    raw = source.read(self._MAX_FILE_BYTES + 1)
+                _check_search_cancelled()
                 if len(raw) > self._MAX_FILE_BYTES:
                     skipped_large += 1
                     continue
@@ -456,6 +514,7 @@ class GrepTool(_SearchTool):
                 display_path = self._display_path(file_path, root)
                 file_had_match = False
                 for idx, line in enumerate(lines, start=1):
+                    _check_search_cancelled()
                     if not regex.search(line):
                         continue
                     file_had_match = True

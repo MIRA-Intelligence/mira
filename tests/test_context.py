@@ -2,18 +2,30 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mira_engine.agent import skill_plugins as skill_plugins_mod
 from mira_engine.agent.context import ContextBuilder
 from mira_engine.agent.skill_plugins import SkillPluginManager
 from mira_engine.agent.skills import SkillsLoader
-from mira_engine.agent import skill_plugins as skill_plugins_mod
 
 TAG = ContextBuilder._RUNTIME_CONTEXT_TAG
+
+
+def test_selected_skill_content_is_injected_into_system_prompt(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / "mrstation"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\ndescription: MRStation workflow\n---\n\nUSE_MRSTATION_RECOMMENDED_FLOW",
+        encoding="utf-8",
+    )
+    builder = ContextBuilder(tmp_path)
+    prompt = builder.build_system_prompt(skill_names=["mrstation"])
+    assert "USE_MRSTATION_RECOMMENDED_FLOW" in prompt
+    assert prompt.count("USE_MRSTATION_RECOMMENDED_FLOW") == 1
 
 
 def _tc(cid: str, name: str = "fn") -> dict:
@@ -268,6 +280,33 @@ class TestLoadBootstrapFiles:
         cb = ContextBuilder(tmp_path)
         out = cb._load_bootstrap_files()
         assert "base\n\nextra bit" in out
+
+    def test_global_persona_is_loaded_before_project_overlay(
+        self,
+        mock_builtin: MagicMock,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        import mira_engine.config.paths
+
+        global_workspace = tmp_path / "global"
+        project_workspace = tmp_path / "project"
+        global_workspace.mkdir()
+        project_workspace.mkdir()
+        (global_workspace / "SOUL.md").write_text("GLOBAL PERSONA", encoding="utf-8")
+        (project_workspace / "SOUL.md").write_text("PROJECT OVERLAY", encoding="utf-8")
+        monkeypatch.setattr(
+            mira_engine.config.paths,
+            "get_workspace_path",
+            lambda _value: global_workspace,
+        )
+        mock_builtin.return_value = ""
+
+        out = ContextBuilder(project_workspace)._load_bootstrap_files()
+
+        assert "GLOBAL PERSONA" in out
+        assert "PROJECT OVERLAY" in out
+        assert out.index("GLOBAL PERSONA") < out.index("PROJECT OVERLAY")
 
     def test_empty_content_skipped(self, mock_builtin: MagicMock, tmp_path: Path) -> None:
         mock_builtin.return_value = "   \n"

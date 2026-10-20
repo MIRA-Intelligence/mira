@@ -1,0 +1,19 @@
+# /etc/pam.d/mira-engine - PAM session for engines Mira Server starts.
+#
+# sudoers sends `engine-launch start` here (Defaults!MIRA_ENGINE_START
+# pam_service=mira-engine, printed by `mira-server install-launcher`). The
+# session stack's pam_systemd registers a logind session for the user, so the
+# engine runs in their user-<uid>.slice where per-user systemd limits apply,
+# and pam_limits applies /etc/security/limits.conf. The launcher keeps the
+# session open while the engine runs.
+#
+# sudo never asks for a password here (the sudoers rule is NOPASSWD), so the
+# auth stack only denies.
+auth     required  pam_deny.so
+@include common-account
+@include common-session
+
+# RHEL/Fedora equivalent:
+#   auth     required  pam_deny.so
+#   account  include   password-auth
+#   session  include   password-auth

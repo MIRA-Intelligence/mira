@@ -19,7 +19,13 @@ def test_get_config_path_falls_back_to_default(monkeypatch) -> None:
     monkeypatch.delenv("MIRA_CONFIG_PATH", raising=False)
     path = loader.get_config_path()
     assert path.name == "config.json"
-    assert path.parent.name == ".mira"
+    assert path.parent == loader.get_home_dir()
+
+
+def test_get_home_dir_default_without_override(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("MIRA_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert loader.get_home_dir() == tmp_path / ".mira"
 
 
 def test_get_config_path_uses_env_override(monkeypatch, tmp_path: Path) -> None:
