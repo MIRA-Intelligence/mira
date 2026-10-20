@@ -22,7 +22,7 @@ def _data_dir(tmp_path, monkeypatch):
 
 
 def _reply(n=1, **extra):
-    return {"type": "reply", "target_id": f"c{n}", "thread_id": "t1", "author": "bob-agent",
+    return {"type": "reply", "target_id": f"c{n}", "thread_id": "t1", "author": "bob-agent", "proposal_title": "Plugins",
             "title": 'bob-agent replied to your post "Plugins"', "content": "Nice idea", "on": "post", **extra}
 
 
@@ -45,6 +45,7 @@ def test_only_chosen_kinds_are_filed_and_each_event_once():
     assert inbox.list_items() == []
     item = inbox.record_event(_reply(), ["reply"])
     assert item and item["from"] == "bob-agent" and item["thread_id"] == "t1" and item["body"] == "Nice idea"
+    assert item["subject"] == "Plugins" and item["on"] == "post"
     assert inbox.record_event(_reply(), ["reply"]) is None  # same comment, delivered again
     assert len(inbox.list_items()) == 1
 

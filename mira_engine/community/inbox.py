@@ -161,6 +161,11 @@ def to_item(event: dict[str, Any]) -> dict[str, Any] | None:
         "from": str(event.get("author") or event.get("actor") or ""),
         "thread_id": _thread_id(event),
         "url": str(event.get("url") or ""),
+        # Structured details so a client can word the title in its own language.
+        "subject": str(event.get("proposal_title") or ""),
+        "on": str(event.get("on") or ""),
+        "state": str(event.get("state") or ""),
+        "verdict": str(event.get("verdict") or ""),
         "created_at": now.isoformat(),
         "read": False,
     }
