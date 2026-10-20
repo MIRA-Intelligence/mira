@@ -41,6 +41,7 @@ from mira_engine.agent.runner import AgentRunner
 from mira_engine.agent.skill_events import skill_loaded, skill_read_details
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
+from mira_engine.agent.tools.community import build_community_tools
 from mira_engine.agent.tools.consult import ConsultRoleTool
 from mira_engine.agent.tools.cron import CronTool
 from mira_engine.agent.tools.knowledge import KnowledgeReadTool, KnowledgeScope, KnowledgeSearchTool
@@ -60,6 +61,7 @@ from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.command.router import CommandContext, CommandRouter
+from mira_engine.community.privacy import COMMUNITY_CHANNEL
 from mira_engine.modules.tools import (
     InitiationResearchResultTool,
     PubMedSearchTool,
@@ -74,7 +76,7 @@ from mira_engine.session.manager import Session, SessionManager
 from mira_engine.utils.helpers import normalize_citations
 
 if TYPE_CHECKING:
-    from mira_engine.config.schema import ChannelsConfig, ExecToolConfig, KnowledgeConfig
+    from mira_engine.config.schema import ChannelsConfig, CommunityConfig, ExecToolConfig, KnowledgeConfig
     from mira_engine.cron.service import CronService
 
 UNIFIED_SESSION_KEY = "unified:default"
@@ -150,6 +152,7 @@ class BaseAgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        community_config: CommunityConfig | None = None,
         provider_factory: Callable[[str], LLMProvider] | None = None,
         model_candidates: list[str] | None = None,
         role_provider_factory: "Callable[[str], tuple[LLMProvider, str, tuple[str, ...]]] | None" = None,
@@ -160,6 +163,7 @@ class BaseAgentLoop:
         from mira_engine.config.schema import ExecToolConfig, KnowledgeConfig
         self.bus = bus
         self.channels_config = channels_config
+        self.community_config = community_config
         self.provider_factory = provider_factory
         self.role_provider_factory = role_provider_factory
         self.provider = provider
@@ -299,6 +303,7 @@ class BaseAgentLoop:
         knowledge_config: KnowledgeConfig | None = None,
         timezone: str | None = None,
         channels_config: ChannelsConfig | None = None,
+        community_config: CommunityConfig | None = None,
         context_window_tokens: int | None = None,
         temperature: float | None | object = _KEEP,
         auto_max_rounds: int | None = None,
@@ -334,6 +339,7 @@ class BaseAgentLoop:
                 knowledge_config=knowledge_config,
                 timezone=timezone,
                 channels_config=channels_config,
+                community_config=community_config,
                 context_window_tokens=context_window_tokens,
             )
 
@@ -401,6 +407,7 @@ class BaseAgentLoop:
         knowledge_config: KnowledgeConfig | None,
         timezone: str | None,
         channels_config: ChannelsConfig | None,
+        community_config: CommunityConfig | None,
         context_window_tokens: int | None,
     ) -> None:
         """Replace provider, workspace, tools and MCP connections (caller holds the lock)."""
@@ -431,6 +438,8 @@ class BaseAgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         if channels_config is not None:
             self.channels_config = channels_config
+        if community_config is not None:
+            self.community_config = community_config
         if context_window_tokens is not None:
             self.context_window_tokens = context_window_tokens
 
@@ -536,6 +545,8 @@ class BaseAgentLoop:
             cron_tool = CronTool(self.cron_service)
             setattr(cron_tool, "_default_timezone", self.timezone)
             self.tools.register(cron_tool)
+        for community_tool in build_community_tools(self.community_config, workspace=self.workspace):
+            self.tools.register(community_tool)
         self._register_plugin_tools()
 
     def _skill_access_dirs_for_workspace(self, workspace: Path) -> list[Path]:
@@ -814,9 +825,11 @@ class BaseAgentLoop:
         self,
         ui_system_instructions: object,
         guard_notice: object,
+        channel: str | None = None,
     ) -> str | None:
-        """Merge optional UI instructions, guardrail notices, and a venv
-        usage hint when ``tools.exec.python.manager`` is active."""
+        """Merge optional UI instructions, guardrail notices, a venv usage hint
+        when ``tools.exec.python.manager`` is active, and — for community turns —
+        the cached community rules the agent accepted on onboarding (#33)."""
         base = (
             ui_system_instructions.strip()
             if isinstance(ui_system_instructions, str) and ui_system_instructions.strip()
@@ -830,8 +843,41 @@ class BaseAgentLoop:
         python_hint = build_python_runtime_hint(
             getattr(getattr(self, "exec_config", None), "python", None)
         ) or ""
-        sections = [chunk for chunk in (python_hint, base, notice) if chunk]
+        rules = ""
+        if channel == "community":
+            rules = (getattr(self.community_config, "rules_text", "") or "").strip()
+        sections = [chunk for chunk in (python_hint, base, notice, rules) if chunk]
         return "\n\n".join(sections) if sections else None
+
+    def _community_budget(self):
+        from mira_engine.community.budget import CommunityBudget
+
+        return CommunityBudget(int(getattr(self.community_config, "daily_token_budget", 0) or 0))
+
+    async def _community_admit(self, msg: InboundMessage) -> tuple[bool, str]:
+        """Budget + triage gate for a community event (mira#213)."""
+        from mira_engine.community.budget import TRIAGE_PROMPT, should_handle
+
+        if self.community_config is None:
+            return True, "no community config"
+
+        event = (msg.metadata or {}).get("community_event")
+        triage = None
+        triage_model = (getattr(self.community_config, "triage_model", "") or "").strip()
+        if triage_model:
+            interests = ", ".join(getattr(self.community_config, "domains", None) or []) or "general"
+
+            async def triage(content: str) -> tuple[bool, int]:
+                resp = await self.provider.chat_with_retry(
+                    messages=[{"role": "user", "content": TRIAGE_PROMPT.format(interests=interests, event=content[:2000])}],
+                    model=triage_model,
+                    max_tokens=5,
+                    temperature=0,
+                )
+                tokens = int((resp.usage or {}).get("total_tokens", 0) or 0)
+                return "RESPOND" in (resp.content or "").upper(), tokens
+
+        return await should_handle(event, msg.content, self._community_budget(), triage=triage)
 
     def _with_knowledge(
         self,
@@ -1720,13 +1766,27 @@ class BaseAgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        await project_consolidator.maybe_consolidate_by_tokens(session)
+        # The user's community budget decides which events get a full turn
+        # (mira#213): priorities tighten as the day's tokens run down, and an
+        # optional cheap model triages low-priority events first.
+        if msg.channel == COMMUNITY_CHANNEL:
+            handle, why = await self._community_admit(msg)
+            if not handle:
+                logger.info("community event skipped: {}", why)
+                return None
+
+        # Community threads are public, untrusted input: never archive them into
+        # the long-term memory that Dream distils into USER.md/MEMORY.md
+        # (mira#203). Their sessions stay bounded by ``memory_window``.
+        if msg.channel != COMMUNITY_CHANNEL:
+            await project_consolidator.maybe_consolidate_by_tokens(session)
         history = session.get_history(max_messages=self.memory_window)
         profile = meta.get("agent_profile") or getattr(self, "_session_agent_profiles", {}).get(key)
         model_runtime = self._get_model_runtime(key, role="supervisor" if profile == "team" else None)
         extra_system = self._compose_extra_system(
             meta.get("_ui_system_instructions"),
             meta.get("_task_plan_guard_notice"),
+            channel=getattr(msg, "channel", None),
         )
         extra_system = self._with_knowledge(extra_system, meta, project_ref)
 
@@ -1874,6 +1934,8 @@ class BaseAgentLoop:
             run_kwargs["on_stream_end"] = on_stream_end
         await self._emit_activity_ping(progress_cb)
         final_content, _, all_msgs = await self._run_agent_loop(initial_messages, **run_kwargs)
+        if msg.channel == COMMUNITY_CHANNEL and self.community_config is not None:
+            self._community_budget().record_turn(self._last_loop_tokens_used)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."

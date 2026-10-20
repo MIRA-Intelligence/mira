@@ -74,6 +74,7 @@ def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
         ("mira_engine.channels.qq", "QQChannel"),
         ("mira_engine.channels.matrix", "MatrixChannel"),
         ("mira_engine.channels.ui", "UiChannel"),
+        ("mira_engine.channels.community", "CommunityChannel"),
     ):
         _install_channel_module(monkeypatch, module_name, cls_name)
 
@@ -92,6 +93,8 @@ def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
         "qq",
         "matrix",
         "ui",
+        # Always on (config.community.enabled defaults to True); idles until login.
+        "community",
     }
 
 
@@ -141,6 +144,9 @@ def test_ui_channel_receives_restrict_to_workspace_from_config(monkeypatch) -> N
 
 async def test_start_all_and_stop_all_with_channels(monkeypatch) -> None:
     _install_channel_module(monkeypatch, "mira_engine.channels.telegram", "TelegramChannel")
+    # The community channel is enabled by default and its real start() waits
+    # for credentials forever, so start_all() would never return without a stub.
+    _install_channel_module(monkeypatch, "mira_engine.channels.community", "CommunityChannel")
     cfg = Config()
     cfg.channels.telegram.enabled = True
     cfg.channels.telegram.allow_from = ["*"]

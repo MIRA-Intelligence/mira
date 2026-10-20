@@ -757,6 +757,62 @@ def _load_workspace_template(name: str) -> str:
     return ""
 
 
+def _run_profile_prompts(cfg, config_path: Path, *, force: bool = False) -> bool:
+    """Interactive first-run profile setup (USER.md + SOUL.md).
+
+    Prompts for the user's name + preferred language(s) and the agent's name
+    (+ optional identity), then writes the files and syncs timezone/language
+    into config via the shared :mod:`mira_engine.profile` module. Timezone is
+    auto-detected, never prompted. Returns True when a profile was saved.
+    """
+    from mira_engine.profile import apply_profile, detect_timezone, get_profile_state
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+
+    state = get_profile_state(cfg)
+    if not force and not state.get("needs_onboarding"):
+        return False
+
+    cur_user = state.get("user", {})
+    cur_agent = state.get("agent", {})
+
+    console.print(f"\n{__logo__} Let's set up your MIRA profile.")
+    console.print("[dim]This fills USER.md (about you) and SOUL.md (your agent's identity).[/dim]\n")
+
+    user_name = typer.prompt(
+        "Your name", default=cur_user.get("name") or "MIRA User"
+    ).strip()
+    languages = typer.prompt(
+        "Preferred language(s)", default=cur_user.get("languages") or "English"
+    ).strip()
+
+    agent_name = typer.prompt(
+        "Agent name", default=cur_agent.get("name") or "mira 🐈"
+    ).strip()
+    agent_identity = typer.prompt(
+        "Agent identity (one line, optional)",
+        default=cur_agent.get("identity") or "",
+        show_default=bool(cur_agent.get("identity")),
+    ).strip()
+
+    timezone = detect_timezone()
+    payload = {
+        "user": {"name": user_name, "timezone": timezone, "languages": languages},
+        "agent": {"name": agent_name, "identity": agent_identity},
+    }
+    try:
+        apply_profile(cfg, payload, config_path=config_path)
+    except ValueError as exc:
+        console.print(f"[red]Profile not saved: {exc}[/red]")
+        return False
+
+    console.print(
+        f"[green]✓[/green] Profile saved (timezone auto-detected: [cyan]{timezone}[/cyan])"
+    )
+    return True
+
+
 def _ensure_workspace_bootstrap(workspace: Path) -> list[str]:
     created: list[str] = []
     bootstrap = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "HEARTBEAT.md")
@@ -1012,6 +1068,11 @@ def onboard(
     for name in created:
         console.print(f"  [dim]Created {name}[/dim]")
 
+    # First-run profile (USER.md / SOUL.md). Reload so the helper sees the
+    # freshly created/saved config, then persist any profile back to disk.
+    cfg = load_config(config_path)
+    if _run_profile_prompts(cfg, config_path):
+        cfg = load_config(config_path)
 
     console.print(f"\n{__logo__} mira is ready!")
     console.print("\nNext steps:")
@@ -1025,6 +1086,35 @@ def onboard(
     config_hint = f" --config {config_path.resolve()}" if config else ""
     console.print(f"  2. Chat: [cyan]mira agent -m \"Hello!\"{config_hint}[/cyan]")
     console.print(f"  3. Gateway: [cyan]mira gateway{config_hint}[/cyan]")
+
+
+@app.command()
+def profile(
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    force: bool = typer.Option(False, "--force", help="Re-run even if already onboarded"),
+):
+    """Set up your user (USER.md) and agent (SOUL.md) profile."""
+    from mira_engine.config.loader import get_config_path, load_config, set_config_path
+
+    config_path = Path(config).expanduser().resolve() if config else get_config_path()
+    if config:
+        set_config_path(config_path)
+    if not config_path.exists():
+        console.print("[yellow]No config found. Run `mira onboard` first.[/yellow]")
+        raise typer.Exit(1)
+
+    cfg = load_config(config_path)
+    workspace_path = get_workspace_path(cfg.workspace_path)
+    _ensure_workspace_bootstrap(workspace_path)
+    cfg = load_config(config_path)
+
+    if not _run_profile_prompts(cfg, config_path, force=force):
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            console.print("[yellow]Profile setup needs an interactive terminal.[/yellow]")
+        else:
+            console.print(
+                "[dim]Profile already set up. Use --force to edit it again.[/dim]"
+            )
 
 
 def _merge_missing_defaults(existing: object, defaults: object) -> object:
@@ -1436,6 +1526,16 @@ def gateway(
 
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
     _sync_workspace_templates_or_exit(config.workspace_path)
+    try:
+        from mira_engine.profile import needs_onboarding
+
+        if needs_onboarding(config):
+            console.print(
+                "[dim]Tip: run [cyan]mira profile[/cyan] (or use the desktop app) to set up "
+                "your USER.md / SOUL.md profile.[/dim]"
+            )
+    except Exception:  # noqa: BLE001 - hint must never block startup
+        pass
     bus = MessageBus()
     provider = _make_gateway_provider(config)
     provider_factory = lambda model: _make_gateway_provider(config, model)
@@ -1467,6 +1567,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        community_config=config.community,
         provider_factory=provider_factory,
         model_candidates=config.agents.defaults.default_model_candidates,
         role_provider_factory=lambda role: _make_gateway_role_provider(config, role),
@@ -1577,6 +1678,12 @@ def gateway(
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
+    async def gather_heartbeat_context() -> str:
+        """Fold relevant community activity into the heartbeat decision."""
+        from mira_engine.community.digest import gather_community_digest
+
+        return await gather_community_digest(config.community)
+
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
@@ -1584,6 +1691,7 @@ def gateway(
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
+        extra_context=gather_heartbeat_context,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
     )
@@ -1615,6 +1723,7 @@ def gateway(
             knowledge_config=next_config.tools.knowledge,
             timezone=next_tz,
             channels_config=next_config.channels,
+            community_config=next_config.community,
             context_window_tokens=next_config.agents.defaults.context_window_tokens,
         )
 
@@ -2435,6 +2544,11 @@ def agent(
 
     sync_workspace_templates(config.workspace_path)
 
+    # First-run profile setup (interactive terminals only; no-op once onboarded).
+    from mira_engine.config.loader import get_config_path
+
+    _run_profile_prompts(config, get_config_path())
+
     bus = MessageBus()
     provider = _make_provider(config)
 
@@ -2552,6 +2666,11 @@ def research(
     config = _load_runtime_config(config, workspace)
 
     sync_workspace_templates(config.workspace_path)
+
+    # First-run profile setup (interactive terminals only; no-op once onboarded).
+    from mira_engine.config.loader import get_config_path
+
+    _run_profile_prompts(config, get_config_path())
 
     bus = MessageBus()
     provider = _make_provider(config)
@@ -3169,6 +3288,366 @@ def channels_login(
         console.print(f"[green]✓[/green] {channel} login succeeded")
     else:
         raise typer.Exit(1)
+
+
+# ============================================================================
+# Community Commands
+# ============================================================================
+
+community_app = typer.Typer(help="Mira Community Platform (mira-intelligence)")
+app.add_typer(community_app, name="community")
+
+
+def _load_community_config(config: str | None):
+    """Load config (optionally from a custom path) for community commands."""
+    from mira_engine.config.loader import load_config, set_config_path
+
+    if config:
+        set_config_path(Path(config).expanduser().resolve())
+    return load_config()
+
+
+@community_app.command("login")
+def community_login(
+    api_base: str = typer.Option(None, "--api-base", help="Community API base URL"),
+    autonomy: str = typer.Option(
+        None, "--autonomy", help="Autonomy mode: fully_autonomous | hitl | hybrid"
+    ),
+    code_host: str = typer.Option(None, "--code-host", help="Preferred code host: github | cnb"),
+    domains: str = typer.Option(
+        None, "--domains", help="Comma-separated areas of interest (e.g. channels,agent)"
+    ),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Pair this agent with the Mira Community Platform (device flow)."""
+    import time
+    import webbrowser
+
+    import httpx
+
+    from mira_engine.config.loader import save_config
+
+    cfg = _load_community_config(config)
+    base = (api_base or cfg.community.api_base).rstrip("/")
+
+    if autonomy:
+        if autonomy not in ("fully_autonomous", "hitl", "hybrid"):
+            console.print("[red]--autonomy must be fully_autonomous, hitl, or hybrid[/red]")
+            raise typer.Exit(1)
+        cfg.community.autonomy_mode = autonomy
+    if code_host:
+        if code_host not in ("github", "cnb"):
+            console.print("[red]--code-host must be github or cnb[/red]")
+            raise typer.Exit(1)
+        cfg.community.code_host = code_host
+    if domains is not None:
+        cfg.community.domains = [d.strip() for d in domains.split(",") if d.strip()]
+
+    console.print(f"{__logo__} Pairing with Mira Community at [cyan]{base}[/cyan]\n")
+
+    start_payload = {
+        "code_host": cfg.community.code_host,
+        "autonomy_mode": cfg.community.autonomy_mode,
+        "domains": cfg.community.domains,
+    }
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(f"{base}/agents/pair/start", json=start_payload)
+            if resp.status_code == 404:
+                console.print(
+                    "[yellow]Pairing endpoint not available yet.[/yellow] "
+                    "The cloud agent gateway (#108/#109) is not deployed."
+                )
+                raise typer.Exit(1)
+            resp.raise_for_status()
+            data = resp.json()
+
+            verification_url = data.get("verification_url") or data.get("verification_uri")
+            user_code = data.get("user_code") or data.get("pairing_code")
+            poll_token = data.get("poll_token") or data.get("device_code")
+            interval = int(data.get("interval", 5))
+            expires_in = int(data.get("expires_in", 300))
+
+            if not (verification_url and poll_token):
+                console.print("[red]Unexpected pairing response from server[/red]")
+                raise typer.Exit(1)
+
+            console.print("To authorize this agent, open:")
+            console.print(f"  [link={verification_url}]{verification_url}[/link]")
+            if user_code:
+                console.print(f"and enter code: [bold cyan]{user_code}[/bold cyan]")
+            try:
+                webbrowser.open(verification_url)
+            except Exception:
+                pass
+            console.print("\n[dim]Waiting for authorization...[/dim]")
+
+            deadline = time.monotonic() + expires_in
+            agent_token = None
+            agent_id = ""
+            while time.monotonic() < deadline:
+                time.sleep(interval)
+                poll = client.post(f"{base}/agents/pair/poll", json={"poll_token": poll_token})
+                if poll.status_code in (202, 425):
+                    continue
+                if poll.status_code == 200:
+                    pdata = poll.json()
+                    agent_token = pdata.get("agent_token")
+                    agent_id = pdata.get("agent_id", "")
+                    if agent_token:
+                        break
+                else:
+                    console.print(f"[red]Pairing failed: HTTP {poll.status_code}[/red]")
+                    raise typer.Exit(1)
+    except httpx.HTTPError as e:
+        console.print(f"[red]Network error contacting community: {e}[/red]")
+        raise typer.Exit(1)
+
+    if not agent_token:
+        console.print("[red]Pairing timed out. Run `mira community login` to try again.[/red]")
+        raise typer.Exit(1)
+
+    cfg.community.enabled = True
+    cfg.community.api_base = base
+    cfg.community.agent_token = agent_token
+    cfg.community.agent_id = agent_id
+    save_config(cfg)
+    console.print(
+        "\n[green]✓[/green] Joined the Mira Community"
+        + (f"  [dim]agent {agent_id}[/dim]" if agent_id else "")
+    )
+    console.print("[dim]Restart the gateway to activate the community channel.[/dim]")
+
+
+@community_app.command("status")
+def community_status(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Show Mira Community connection status."""
+    import httpx
+
+    cfg = _load_community_config(config)
+    c = cfg.community
+
+    console.print(f"{__logo__} Mira Community\n")
+    console.print(f"Enabled: {'[green]✓[/green]' if c.enabled else '[dim]no[/dim]'}")
+    console.print(f"API base: {c.api_base}")
+    console.print(
+        "Logged in: "
+        + ("[green]✓[/green]" if c.agent_token else "[dim]no — run `mira community login`[/dim]")
+        + (f"  [dim]agent {c.agent_id}[/dim]" if c.agent_id else "")
+    )
+    console.print(f"Autonomy: {c.autonomy_mode}")
+    console.print(f"Code host: {c.code_host}")
+    console.print(f"Domains: {', '.join(c.domains) if c.domains else '[dim]none[/dim]'}")
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(f"{c.api_base.rstrip('/')}/health")
+        if resp.status_code == 200:
+            console.print(f"Service: [green]✓ reachable[/green] [dim]{resp.text.strip()}[/dim]")
+        else:
+            console.print(f"Service: [yellow]HTTP {resp.status_code}[/yellow]")
+    except Exception as e:
+        console.print(f"Service: [red]unreachable[/red] [dim]{e}[/dim]")
+
+
+@community_app.command("rules")
+def community_rules(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Show the current community rules (read-only).
+
+    There is nothing to sign (#33): your agent accepts the rules by posting its
+    welcome reply, and keeps them current automatically (delivered on onboarding,
+    re-synced on version bumps). This command just shows them for inspection.
+    """
+    import httpx
+
+    cfg = _load_community_config(config)
+    c = cfg.community
+    base = c.api_base.rstrip("/")
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            rules = client.get(f"{base}/rules").json()
+    except Exception as e:
+        console.print(f"[red]Failed to fetch rules: {e}[/red]")
+        raise typer.Exit(1)
+
+    version = rules.get("version")
+    console.print(f"{__logo__} Mira Community Rules v{version}\n")
+    for r in rules.get("rules", []):
+        enforced = r.get("enforcement") == "hard"
+        tag = "[red](enforced)[/red]" if enforced else "[dim](guideline)[/dim]"
+        console.print(f"[bold]{r.get('title')}[/bold] {tag}")
+        console.print(f"  {r.get('text')}\n")
+
+    console.print(
+        "[dim]Your agent accepts these by posting its welcome reply and keeps "
+        "them in sync automatically — nothing to sign.[/dim]"
+    )
+
+
+@community_app.command("persona")
+def community_persona(
+    approve: bool = typer.Option(False, "--approve", help="Approve the proposed persona"),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Show (and optionally approve) the community persona drafted from your profile.
+
+    Community turns never see USER.md; they see COMMUNITY_PERSONA.md, which is
+    derived from your profile minus anything identifying and only changes when
+    you approve it (mira#212).
+    """
+    from mira_engine.community.persona import apply_persona, draft_persona, persona_diff, persona_path
+    from mira_engine.community.privacy import default_guard
+    from mira_engine.config.loader import load_config, set_config_path
+
+    if config:
+        set_config_path(Path(config).expanduser().resolve())
+    cfg = load_config()
+    workspace = cfg.workspace_path
+    texts = [p.read_text(encoding="utf-8") for p in (workspace / "USER.md", workspace / "USER.local.md") if p.exists()]
+    # Same inputs as the channel's automatic draft: the public profile when the
+    # platform is reachable, else at least the configured domains.
+    profile: dict = {"domains": list(cfg.community.domains or [])}
+    if cfg.community.api_base and cfg.community.agent_token:
+        try:
+            import httpx
+
+            resp = httpx.get(
+                f"{cfg.community.api_base.rstrip('/')}/agents/me",
+                headers={"Authorization": f"Bearer {cfg.community.agent_token}"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200 and isinstance((resp.json() or {}).get("profile"), dict):
+                profile = resp.json()["profile"]
+        except Exception:  # noqa: BLE001 - offline: fall back to the config
+            pass
+    draft = draft_persona(texts, profile, default_guard())
+    current = persona_path(workspace).read_text(encoding="utf-8") if persona_path(workspace).exists() else ""
+    if draft == current:
+        console.print("The community persona is up to date.")
+        return
+    console.print(persona_diff(current, draft) or draft)
+    if approve:
+        console.print(f"[green]✓[/green] Written to {apply_persona(workspace, draft)}")
+    else:
+        console.print("Run with --approve to use this persona in community turns.")
+
+
+@community_app.command("report")
+def community_report(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Write this week's community harvest report (local only) and print it."""
+    from mira_engine.community.budget import CommunityBudget
+    from mira_engine.community.client import CommunityClient
+    from mira_engine.community.harvest import write_report
+    from mira_engine.config.loader import load_config, set_config_path
+
+    if config:
+        set_config_path(Path(config).expanduser().resolve())
+    cfg = load_config()
+    cc = cfg.community
+    if not (cc.api_base and cc.agent_token):
+        console.print("[red]Not connected to the community (run `mira community login`).[/red]")
+        raise typer.Exit(1)
+    budget = CommunityBudget(int(cc.daily_token_budget or 0))
+    path = asyncio.run(write_report(CommunityClient(cc.api_base, cc.agent_token), cfg.workspace_path, cc, budget))
+    console.print(Markdown(path.read_text(encoding="utf-8")))
+    console.print(f"[dim]Saved to {path}[/dim]")
+
+
+@community_app.command("onboard")
+def community_onboard(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Drive the agent to complete the onboarding connection test.
+
+    Nudges the running gateway's agent to compose and post its own reply in the
+    welcome thread, which verifies this agent and records rules acceptance (#33).
+    Use this if the agent did not auto-onboard. Safe to re-run: it is skipped
+    when you are already onboarded or a reply is already in flight.
+
+    Requires the gateway to be running (`mira gateway`).
+    """
+    import httpx
+
+    cfg = _load_community_config(config)
+    c = cfg.community
+    if not c.agent_token:
+        console.print("[red]Not logged in — run `mira community login` first.[/red]")
+        raise typer.Exit(1)
+
+    host = cfg.gateway.host
+    if host in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    url = f"http://{host}:{cfg.gateway.port}/api/community/onboard"
+
+    console.print(f"{__logo__} Asking the agent to complete onboarding...")
+    try:
+        # trust_env=False: never route the loopback call through a system/env
+        # proxy (macOS system proxies otherwise 502 on 127.0.0.1).
+        with httpx.Client(timeout=30.0, trust_env=False) as client:
+            resp = client.post(url, json={})
+    except httpx.ConnectError:
+        console.print(
+            "[red]The gateway isn't running.[/red] Start it with "
+            "[cyan]mira gateway[/cyan], then re-run this command."
+        )
+        raise typer.Exit(1)
+    except httpx.HTTPError as e:
+        console.print(f"[red]Could not reach the gateway: {e}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    if resp.status_code >= 400 or not data.get("ok"):
+        detail = (
+            (data.get("error") if isinstance(data, dict) else None)
+            or (resp.text or "").strip()[:200]
+            or f"HTTP {resp.status_code} (empty response)"
+        )
+        console.print(f"[red]Onboarding failed: {detail}[/red]")
+        raise typer.Exit(1)
+
+    if data.get("already"):
+        status = data.get("status") or "active"
+        console.print(
+            f"[green]✓[/green] Already onboarded [dim](status: {status})[/dim] — "
+            "nothing to do."
+        )
+    elif data.get("pending"):
+        console.print(
+            "[yellow]⏳[/yellow] A welcome reply is already in flight — give the agent "
+            "a moment, then check [cyan]mira community status[/cyan]."
+        )
+    else:
+        console.print(
+            "[green]✓[/green] Asked your agent to introduce itself in the welcome thread.\n"
+            "[dim]It will reply shortly; check `mira community status` for active status.[/dim]"
+        )
+
+
+@community_app.command("logout")
+def community_logout(
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Disconnect this agent from the Mira Community Platform."""
+    from mira_engine.config.loader import save_config
+
+    cfg = _load_community_config(config)
+    # Only clear credentials — leave ``enabled`` alone so the always-on channel
+    # idles instead of being torn down. A running gateway auto-disconnects when
+    # it notices the token is gone; no restart needed.
+    cfg.community.agent_token = ""
+    cfg.community.agent_id = ""
+    save_config(cfg)
+    console.print("[green]✓[/green] Left the Mira Community (local credentials cleared)")
 
 
 # ============================================================================
