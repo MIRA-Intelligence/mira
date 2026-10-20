@@ -226,6 +226,8 @@ async def test_welcome_reply_without_the_acknowledgement_is_completed_and_repost
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/rules"):
             return httpx.Response(200, json={"version": 6, "onboarding_thread_id": _UUID})
+        if request.url.path.endswith("/agents/me"):
+            return httpx.Response(200, json={"status": "pending"})
         content = json.loads(request.content)["content"]
         posted.append(content)
         if "I acknowledge the Mira Community Rules v6" not in content:
@@ -249,7 +251,7 @@ async def test_welcome_reply_without_the_acknowledgement_is_completed_and_repost
     assert synced and synced[0]["version"] == 6  # activation delivers the rules
 
 
-def _posting_channel(posted: list[dict]):
+def _posting_channel(posted: list[dict], status: str = "pending"):
     import json
 
     import httpx
@@ -257,6 +259,8 @@ def _posting_channel(posted: list[dict]):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/rules"):
             return httpx.Response(200, json={"version": 6, "onboarding_thread_id": _UUID})
+        if request.url.path.endswith("/agents/me"):
+            return httpx.Response(200, json={"status": status})
         posted.append(json.loads(request.content))
         return httpx.Response(200, json={"ok": True, "comment_id": "c1"})
 
@@ -297,3 +301,14 @@ def test_events_tell_the_agent_where_and_how_to_answer():
     assert f"community_comment with thread_id {_UUID2} and reply_to {_UUID}" in text
     badge = CommunityChannel._format_event({"type": "badge_earned", "title": "Badge"})
     assert "not posted to the community" in badge and "thread_id" not in badge
+
+
+async def test_no_closing_note_after_the_agent_posted_its_own_introduction():
+    from mira_engine.bus.events import OutboundMessage
+
+    # The agent introduced itself with community_comment, which activated it;
+    # its final message must not follow as a second welcome-thread comment.
+    posted: list[dict] = []
+    ch = _posting_channel(posted, status="active")
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID, content="Onboarding reply posted."))
+    assert posted == []

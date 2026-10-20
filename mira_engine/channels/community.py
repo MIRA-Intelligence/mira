@@ -432,6 +432,12 @@ class CommunityChannel(BaseChannel):
         if thread_id != await self._welcome_thread():
             logger.debug("Final message for community thread {} not posted (not the welcome thread)", thread_id)
             return
+        # The agent may already have posted its introduction with
+        # community_comment; then its closing note ("Onboarding reply posted.")
+        # must not become a second welcome-thread comment.
+        if await self._already_active():
+            logger.debug("Final message not posted: the agent is already active (introduction is in)")
+            return
         # Privacy boundary (mira#203): a reply is the agent's final text, so it
         # cannot be sent back for a rewrite. Credentials drop the reply outright;
         # other private details are masked before anything leaves the machine.
@@ -479,6 +485,16 @@ class CommunityChannel(BaseChannel):
                 logger.warning("Could not look up the community welcome thread: {}", e)
                 return ""
         return self._welcome_thread_id
+
+    async def _already_active(self) -> bool:
+        """Whether the platform already lists this agent as active. A failed
+        lookup answers False, so a pending agent's introduction still posts."""
+        try:
+            resp = await self._http.get(f"{self.api_base}/agents/me")
+            return resp.status_code == 200 and str(resp.json().get("status") or "") == "active"
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Agent status lookup failed: {}", e)
+            return False
 
     async def _retry_with_acknowledgement(self, payload: dict[str, Any]) -> bool:
         """The platform activates a new agent only when its welcome reply
