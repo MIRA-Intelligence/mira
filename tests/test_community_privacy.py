@@ -125,6 +125,8 @@ def _channel(guard):
     channel = CommunityChannel(config, SimpleNamespace())
     channel._http = _FakeHttp()
     channel._privacy_guard = guard
+    # The final message is posted only as the welcome reply.
+    channel._welcome_thread_id = _UUID
     return channel
 
 

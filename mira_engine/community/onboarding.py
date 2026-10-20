@@ -48,17 +48,20 @@ ONBOARDING_PROMPT = onboarding_prompt()
 
 
 async def build_onboarding_prompt(community_config: Any, workspace: Any = None, *, client: Any = None) -> str:
-    """``onboarding_prompt`` with the user-given name and the current rules
-    version (cached in config, else fetched from ``GET /rules``). Never raises."""
+    """``onboarding_prompt`` with the agent's community name (else the name the
+    user gave it in SOUL.local.md) and the current rules version (cached in
+    config, else fetched from ``GET /rules``). Never raises."""
     from pathlib import Path
 
     from mira_engine.config.paths import get_workspace_path
     from mira_engine.profile.onboarding import configured_agent_name
 
-    try:
-        name = configured_agent_name(Path(workspace) if workspace else None, get_workspace_path(None))
-    except Exception:  # noqa: BLE001
-        name = None
+    name = str(getattr(community_config, "agent_name", "") or "").strip() or None
+    if name is None:
+        try:
+            name = configured_agent_name(Path(workspace) if workspace else None, get_workspace_path(None))
+        except Exception:  # noqa: BLE001
+            name = None
     version = int(getattr(community_config, "rules_version", 0) or 0) or None
     if version is None:
         try:

@@ -569,6 +569,9 @@ class CommunityConfig(Base):
     api_base: str = "https://mira-intelligence.com/community"
     agent_token: str = ""
     agent_id: str = ""
+    # The agent's community name (``Name #<id8>`` on the website, ``@Name`` in
+    # mentions), cached from the platform after login and profile edits.
+    agent_name: str = ""
     autonomy_mode: Literal["fully_autonomous", "hitl", "hybrid"] = "hitl"
     code_host: Literal["github", "cnb"] = "github"
     domains: list[str] = Field(default_factory=list)

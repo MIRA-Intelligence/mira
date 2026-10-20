@@ -225,7 +225,9 @@ async def test_welcome_reply_without_the_acknowledgement_is_completed_and_repost
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/rules"):
-            return httpx.Response(200, json={"version": 6})
+            return httpx.Response(200, json={"version": 6, "onboarding_thread_id": _UUID})
+        if request.url.path.endswith("/agents/me"):
+            return httpx.Response(200, json={"status": "pending"})
         content = json.loads(request.content)["content"]
         posted.append(content)
         if "I acknowledge the Mira Community Rules v6" not in content:
@@ -247,3 +249,66 @@ async def test_welcome_reply_without_the_acknowledgement_is_completed_and_repost
     assert len(posted) == 2
     assert posted[1] == "Hi, I'm Nova. I acknowledge the rules.\n\nI acknowledge the Mira Community Rules v6."
     assert synced and synced[0]["version"] == 6  # activation delivers the rules
+
+
+def _posting_channel(posted: list[dict], status: str = "pending"):
+    import json
+
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rules"):
+            return httpx.Response(200, json={"version": 6, "onboarding_thread_id": _UUID})
+        if request.url.path.endswith("/agents/me"):
+            return httpx.Response(200, json={"status": status})
+        posted.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "comment_id": "c1"})
+
+    ch, _ = _channel()
+    ch._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return ch
+
+
+async def test_only_the_welcome_reply_is_posted_from_the_final_message():
+    from mira_engine.bus.events import OutboundMessage
+
+    posted: list[dict] = []
+    ch = _posting_channel(posted)
+    # Elsewhere the agent already answered with community_comment; its closing
+    # summary must not become a second comment.
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID2, content="Answered Nova on the thread."))
+    assert posted == []
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID, content="Hi, I'm Nova. I acknowledge the Mira Community Rules v6."))
+    assert [p["thread_id"] for p in posted] == [_UUID]
+
+
+async def test_engine_errors_are_never_posted():
+    from mira_engine.bus.events import OutboundMessage
+
+    posted: list[dict] = []
+    ch = _posting_channel(posted)
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID, content="Model call failed", metadata={"error_type": "X"}))
+    assert posted == []
+
+
+def test_events_tell_the_agent_where_and_how_to_answer():
+    text = CommunityChannel._format_event({
+        "type": "mention", "author": "Nova", "content": "@MIRAI thoughts?",
+        "thread_id": _UUID2, "target_id": _UUID,
+    })
+    assert f"thread_id: {_UUID2}" in text and f"comment_id: {_UUID}" in text
+    assert "final message in this turn is not posted" in text
+    assert f"community_comment with thread_id {_UUID2} and reply_to {_UUID}" in text
+    badge = CommunityChannel._format_event({"type": "badge_earned", "title": "Badge"})
+    assert "not posted to the community" in badge and "thread_id" not in badge
+
+
+async def test_no_closing_note_after_the_agent_posted_its_own_introduction():
+    from mira_engine.bus.events import OutboundMessage
+
+    # The agent introduced itself with community_comment, which activated it;
+    # its final message must not follow as a second welcome-thread comment.
+    posted: list[dict] = []
+    ch = _posting_channel(posted, status="active")
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID, content="Onboarding reply posted."))
+    assert posted == []

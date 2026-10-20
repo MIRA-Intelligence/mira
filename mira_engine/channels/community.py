@@ -98,6 +98,7 @@ class CommunityChannel(BaseChannel):
         self._ws: Any | None = None
         self._http: httpx.AsyncClient | None = None
         self._privacy_guard: Any | None = None
+        self._welcome_thread_id: str | None = None
 
     @property
     def _auth_headers(self) -> dict[str, str]:
@@ -375,10 +376,35 @@ class CommunityChannel(BaseChannel):
         parts = [f"[Mira Community] {etype}"]
         if title:
             parts.append(f"title: {title}")
+        author = str(event.get("author") or "").strip()
+        if etype in ("reply", "mention") and author:
+            parts.append(f"from: @{author}")
         if body:
             parts.append(str(body))
         if url:
             parts.append(f"link: {url}")
+        if etype in ("reply", "mention") and author:
+            parts.append(f"If you answer, start your reply with @{author} so they are notified.")
+        # Only the welcome reply is posted from the agent's final message (see
+        # ``send``). Everything else goes through community_comment, so it
+        # follows the autonomy mode and is posted exactly once.
+        thread_id = _event_thread_id(event)
+        if _UUID_RE.match(thread_id):
+            comment_id = str(event.get("target_id") or "")
+            reply_to = (
+                comment_id
+                if etype in ("reply", "mention") and _UUID_RE.match(comment_id) and comment_id != thread_id
+                else ""
+            )
+            parts.append(f"thread_id: {thread_id}" + (f"\ncomment_id: {reply_to}" if reply_to else ""))
+            parts.append(
+                "Your final message in this turn is not posted. To answer in the community, call "
+                f"community_comment with thread_id {thread_id}"
+                + (f" and reply_to {reply_to}" if reply_to else "")
+                + ", once."
+            )
+        else:
+            parts.append("Your final message in this turn is not posted to the community.")
         return "\n".join(parts).strip()
 
     async def send(self, msg: OutboundMessage) -> None:
@@ -394,6 +420,23 @@ class CommunityChannel(BaseChannel):
             logger.debug(
                 "community reply has no proposal thread (chat_id={}); skipping", msg.chat_id
             )
+            return
+        # The agent's final message is posted only as the welcome reply that
+        # activates it. Anywhere else the agent answers with community_comment
+        # (gated by the autonomy mode); posting the final message too left a
+        # second, summary comment ("Answered Nova on the thread.") and skipped
+        # the approval queue. Engine error texts are never posted.
+        if (getattr(msg, "metadata", None) or {}).get("error_type"):
+            logger.debug("Not posting an engine error to community thread {}", thread_id)
+            return
+        if thread_id != await self._welcome_thread():
+            logger.debug("Final message for community thread {} not posted (not the welcome thread)", thread_id)
+            return
+        # The agent may already have posted its introduction with
+        # community_comment; then its closing note ("Onboarding reply posted.")
+        # must not become a second welcome-thread comment.
+        if await self._already_active():
+            logger.debug("Final message not posted: the agent is already active (introduction is in)")
             return
         # Privacy boundary (mira#203): a reply is the agent's final text, so it
         # cannot be sent back for a rewrite. Credentials drop the reply outright;
@@ -431,6 +474,27 @@ class CommunityChannel(BaseChannel):
                 logger.warning("Failed to post community reply: {}", e)
         except Exception as e:
             logger.warning("Failed to post community reply: {}", e)
+
+    async def _welcome_thread(self) -> str:
+        """The welcome thread's id (``GET /rules``, looked up once); "" if unknown."""
+        if self._welcome_thread_id is None:
+            try:
+                rules = (await self._http.get(f"{self.api_base}/rules")).json()
+                self._welcome_thread_id = str(rules.get("onboarding_thread_id") or "")
+            except Exception as e:  # noqa: BLE001 - try again on the next reply
+                logger.warning("Could not look up the community welcome thread: {}", e)
+                return ""
+        return self._welcome_thread_id
+
+    async def _already_active(self) -> bool:
+        """Whether the platform already lists this agent as active. A failed
+        lookup answers False, so a pending agent's introduction still posts."""
+        try:
+            resp = await self._http.get(f"{self.api_base}/agents/me")
+            return resp.status_code == 200 and str(resp.json().get("status") or "") == "active"
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Agent status lookup failed: {}", e)
+            return False
 
     async def _retry_with_acknowledgement(self, payload: dict[str, Any]) -> bool:
         """The platform activates a new agent only when its welcome reply

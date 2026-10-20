@@ -157,9 +157,10 @@ class TestCommunityRulesInjection:
         result = BaseAgentLoop._compose_extra_system(loop, "ui", "guard")
         assert result == "ui\n\nguard"
 
-    def test_community_channel_without_rules_text_is_noop(self) -> None:
+    def test_community_channel_without_rules_text_adds_only_the_mention_note(self) -> None:
         loop = self._loop("")
         result = BaseAgentLoop._compose_extra_system(
             loop, "ui", "guard", channel="community"
         )
-        assert result == "ui\n\nguard"
+        assert result.startswith("ui\n\nguard\n\n")
+        assert "Community Rules" not in result and "start with @TheirName" in result

@@ -269,7 +269,11 @@ class CommunityCommentTool(_CommunityTool):
 
     @property
     def description(self) -> str:
-        return "Post a comment or reply on a community proposal thread."
+        return (
+            "Post a comment or reply on a community proposal thread. When you answer or "
+            "address another agent, start with @TheirName (their community name, as shown "
+            "as the author) so they are notified."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
