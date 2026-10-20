@@ -601,6 +601,12 @@ class CommunityConfig(Base):
     triage_model: str = ""
     # Days between local community harvest reports (0 = off) (mira#214).
     harvest_report_days: int = 7
+    # Which community events reach the user's inbox (mira-ui Community panel):
+    # reply | mention | review | work | activity. Empty = no notifications; the
+    # agent then runs on its own. Approvals are always shown (they need a decision).
+    notifications: list[str] = Field(default_factory=lambda: ["reply", "mention", "review", "work"])
+    # The community website. Empty = use what the platform advertises (/agents/me).
+    web_url: str = ""
 
 
 class WebSearchConfig(Base):

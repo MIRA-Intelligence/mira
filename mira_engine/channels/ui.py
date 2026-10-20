@@ -41,6 +41,7 @@ from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.community import approvals as community_approvals
+from mira_engine.community import inbox as community_inbox
 from mira_engine.config import loader as config_loader
 from mira_engine.config import team_layer
 from mira_engine.config.paths import get_runtime_subdir, get_workspace_path
@@ -979,6 +980,9 @@ def _merge_recovered_results(existing: Any, recovered_metrics: Any, artifacts: l
 
 _WS_CLOSE_TIMEOUT_S = 2.0
 _HTTP_SHUTDOWN_TIMEOUT_S = 3.0
+# Every method a route uses must be listed, or browsers block the request in
+# the CORS preflight ("Load failed") before it reaches the handler.
+_CORS_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 
 
 class UiChannel(BaseChannel):
@@ -1349,6 +1353,9 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/community/status", self._handle_community_status)
         self._app.router.add_post("/api/community/autonomy", self._handle_community_autonomy)
         self._app.router.add_get("/api/community/approvals", self._handle_community_approvals)
+        self._app.router.add_get("/api/community/inbox", self._handle_community_inbox)
+        self._app.router.add_post("/api/community/inbox/read", self._handle_community_inbox_read)
+        self._app.router.add_put("/api/community/notifications", self._handle_community_notifications)
         self._app.router.add_post(
             "/api/community/approvals/{approval_id}/decide", self._handle_community_decide
         )
@@ -1924,7 +1931,7 @@ class UiChannel(BaseChannel):
         elif origin in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
 
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = _CORS_METHODS
         resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Mira-Request-Id"
         resp.headers["Access-Control-Expose-Headers"] = "X-Mira-Request-Id"
         return resp
@@ -3079,20 +3086,39 @@ class UiChannel(BaseChannel):
             # False until the user set up USER.local.md (desktop wizard or
             # `mira profile`); the UI offers it right after joining.
             "profile_onboarded": bool(cfg.profile.onboarded),
+            # Kinds of community events the user receives (empty = none).
+            "notifications": list(c.notifications or []),
         }
 
     async def _handle_community_status(self, _request: web.Request) -> web.Response:
         cfg = config_loader.load_config(config_loader.get_config_path().expanduser().resolve())
         payload = self._community_status_payload(cfg)
         payload["pending_count"] = len(community_approvals.list_approvals(status="pending"))
-        payload["member_status"] = await self._fetch_member_status(cfg)
+        me = await self._fetch_agent_me(cfg)
+        status = me.get("status") if me else None
+        payload["member_status"] = str(status) if status else None
+        payload["web_url"] = self._community_web_url(cfg, me)
+        payload["unread"] = community_inbox.unread_counts()
         return web.json_response(payload)
 
     @staticmethod
-    async def _fetch_member_status(cfg: Config) -> str | None:
-        """Best-effort lookup of the agent's server-side lifecycle status
-        (pending/active/suspended), used by the UI to surface an Onboard action.
-        Returns None when not logged in or the service is unreachable."""
+    def _community_web_url(cfg: Config, me: dict[str, Any] | None) -> str:
+        """The community website: config override, else what the platform
+        advertises, else the production site for the production API."""
+        c = cfg.community
+        if c.web_url:
+            return c.web_url.rstrip("/")
+        if me and isinstance(me.get("web_url"), str) and me["web_url"]:
+            return me["web_url"].rstrip("/")
+        if (c.api_base or "").rstrip("/") == "https://mira-intelligence.com/community":
+            return "https://community.mira-intelligence.com"
+        return ""
+
+    @staticmethod
+    async def _fetch_agent_me(cfg: Config) -> dict[str, Any] | None:
+        """Best-effort ``GET /agents/me``: lifecycle status (pending/active/
+        suspended, for the Onboard action) and the advertised website. None
+        when not logged in or the service is unreachable."""
         c = cfg.community
         base = (c.api_base or "").rstrip("/")
         if not (base and c.agent_token):
@@ -3109,8 +3135,60 @@ class UiChannel(BaseChannel):
         except (ClientError, asyncio.TimeoutError, json.JSONDecodeError):
             return None
         agent = data.get("agent", data) if isinstance(data, dict) else {}
-        status = agent.get("status") if isinstance(agent, dict) else None
-        return str(status) if status else None
+        return agent if isinstance(agent, dict) else None
+
+    async def _handle_community_inbox(self, request: web.Request) -> web.Response:
+        """The user's notifications, newest first (``?kind=``, ``?unread=1``)."""
+        kind = request.query.get("kind") or None
+        if kind is not None and kind not in community_inbox.NOTIFICATION_KINDS:
+            return web.json_response({"error": "invalid kind"}, status=400)
+        unread_only = request.query.get("unread", "").lower() in ("1", "true", "yes")
+        return web.json_response(
+            {
+                "items": community_inbox.list_items(kind=kind, unread_only=unread_only),
+                "unread": community_inbox.unread_counts(),
+            }
+        )
+
+    async def _handle_community_inbox_read(self, request: web.Request) -> web.Response:
+        """Mark notifications read: ``{"ids": [...]}``, ``{"kind": ...}`` or ``{"all": true}``."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be an object"}, status=400)
+        ids = body.get("ids")
+        kind = body.get("kind")
+        everything = body.get("all") is True
+        if ids is not None and not (isinstance(ids, list) and all(isinstance(i, str) for i in ids)):
+            return web.json_response({"error": "ids must be a list of strings"}, status=400)
+        if kind is not None and kind not in community_inbox.NOTIFICATION_KINDS:
+            return web.json_response({"error": "invalid kind"}, status=400)
+        if not (ids or kind or everything):
+            return web.json_response({"error": "give ids, kind or all"}, status=400)
+        changed = community_inbox.mark_read(ids, kind=kind, everything=everything)
+        return web.json_response({"changed": changed, "unread": community_inbox.unread_counts()})
+
+    async def _handle_community_notifications(self, request: web.Request) -> web.Response:
+        """Choose which kinds reach the inbox: ``{"kinds": [...]}`` ([] = none)."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        try:
+            kinds = community_inbox.normalize_kinds((body or {}).get("kinds") if isinstance(body, dict) else None)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        cfg = config_loader.load_config(config_path)
+        cfg.community.notifications = kinds
+        try:
+            config_loader.save_config(cfg, config_path)
+        except OSError as exc:
+            return web.json_response({"error": f"failed to persist config: {exc}"}, status=500)
+        self._audit(source="ui", action="community_notifications_updated", details={"kinds": kinds})
+        return web.json_response({"notifications": kinds})
 
     async def _handle_community_onboard(self, _request: web.Request) -> web.Response:
         """Nudge the running agent to compose and post its own welcome reply,
