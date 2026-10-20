@@ -392,7 +392,7 @@ class AnthropicProvider(LLMProvider):
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["max_tokens"] = max(max_tokens, budget + 4096)
             kwargs["temperature"] = 1.0
-        else:
+        elif temperature is not None:
             kwargs["temperature"] = temperature
 
         if anthropic_tools:
@@ -451,7 +451,7 @@ class AnthropicProvider(LLMProvider):
                 if val:
                     usage[attr] = val
             # Normalize to cached_tokens for downstream consistency.
-            if cache_read:
+            if type(getattr(response.usage, "cache_read_input_tokens", None)) is int and cache_read >= 0:
                 usage["cached_tokens"] = cache_read
 
         return LLMResponse(

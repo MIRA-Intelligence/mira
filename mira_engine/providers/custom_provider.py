@@ -9,6 +9,7 @@ import json_repair
 from openai import AsyncOpenAI
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from mira_engine.providers.usage import extract_usage
 
 _DEFAULT_ACCEPT_ENCODING = "identity"
 
@@ -49,8 +50,10 @@ class CustomProvider(LLMProvider):
                 self._sanitize_empty_content(messages), self._ALLOWED_KEYS,
             ),
             "max_tokens": max(1, max_tokens),
-            "temperature": temperature,
         }
+        # None => omit temperature entirely (for models that reject the param).
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
         if tools:
@@ -68,10 +71,9 @@ class CustomProvider(LLMProvider):
                             arguments=json_repair.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments)
             for tc in (msg.tool_calls or [])
         ]
-        u = response.usage
         return LLMResponse(
             content=msg.content, tool_calls=tool_calls, finish_reason=choice.finish_reason or "stop",
-            usage={"prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens, "total_tokens": u.total_tokens} if u else {},
+            usage=extract_usage(response),
             reasoning_content=getattr(msg, "reasoning_content", None) or None,
         )
 

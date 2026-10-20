@@ -12,6 +12,11 @@ from mira_engine.cli.agent_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_service_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("MIRA_HOME", str(tmp_path / ".mira"))
+
+
 def _fake_completed(returncode=0, stdout="", stderr=""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
@@ -24,7 +29,7 @@ def _make_install_fake_run(calls, *, bootstrap_returncode=0, bootstrap_stderr=""
     than blocking the test for 15s. Other subcommands default to success.
     """
 
-    def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
         calls.append(cmd)
         subcommand = cmd[1] if len(cmd) > 1 else ""
         if subcommand == "print":
@@ -146,7 +151,7 @@ def test_launchd_teardown_waits_for_launchd_to_release_label(monkeypatch, tmp_pa
     print_calls = {"count": 0}
     bootstrap_attempts = {"count": 0}
 
-    def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
         subcommand = cmd[1] if len(cmd) > 1 else ""
         if subcommand == "print":
             print_calls["count"] += 1
@@ -237,13 +242,14 @@ def test_launchd_status_includes_launchd_metadata(monkeypatch, tmp_path):
 
     install_done = {"flag": False}
 
-    def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+    def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
         subcommand = cmd[1] if len(cmd) > 1 else ""
         if subcommand == "print":
             # During install teardown we want to report "label unloaded" so the
             # wait exits immediately. After install, `status()` queries print
             # and expects success (label loaded) to report running=True.
-            return _fake_completed(returncode=0 if install_done["flag"] else 113)
+            return _fake_completed(returncode=0 if install_done["flag"] else 113,
+                                   stdout="state = running\npid = 12345\n" if install_done["flag"] else "")
         return _fake_completed(returncode=0)
 
     monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)

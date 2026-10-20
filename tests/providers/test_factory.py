@@ -205,3 +205,37 @@ def test_make_provider_routes_nvidia_with_custom_api_base() -> None:
 
     assert provider.__class__.__name__ == "NvidiaProvider"
     assert provider.api_base == "https://proxy.example/v1"
+
+
+def test_make_provider_routes_to_additional_custom_provider() -> None:
+    from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
+
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"provider": "custom_gw", "model": "gw-model"}},
+            "providers": {
+                "custom": {"apiBase": "http://localhost:8000/v1"},
+                "customProviders": {
+                    "custom_gw": {"name": "Gateway", "apiBase": "https://gw.example/v1", "apiKey": "sk-gw"},
+                },
+            },
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert isinstance(provider, OpenAICompatProvider)
+    assert provider._effective_base == "https://gw.example/v1"
+    assert provider.api_key == "sk-gw"
+
+
+def test_make_provider_names_additional_custom_provider_missing_api_base() -> None:
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"provider": "custom_gw", "model": "gw-model"}},
+            "providers": {"customProviders": {"custom_gw": {"name": "Gateway"}}},
+        }
+    )
+
+    with pytest.raises(ValueError, match="Custom provider 'Gateway' requires an API base URL"):
+        make_provider(config)

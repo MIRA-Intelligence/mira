@@ -20,6 +20,39 @@ def test_write_long_term_round_trip(tmp_path) -> None:
     assert store.memory_file.read_text(encoding="utf-8") == "alpha\nbeta"
 
 
+def test_consolidation_does_not_overwrite_newer_memory(tmp_path) -> None:
+    first = MemoryStore(tmp_path)
+    second = MemoryStore(tmp_path)
+    first.write_long_term("initial")
+    expected_local = first.read_long_term()
+    expected_global = first.read_global_term()
+
+    second.write_long_term("newer instance")
+
+    committed = first.commit_consolidated_memories(
+        expected_local=expected_local,
+        local_update="stale consolidation",
+        expected_global=expected_global,
+        global_update=None,
+    )
+    assert committed is False
+    assert first.read_long_term() == "newer instance"
+
+
+def test_default_workspace_local_memory_does_not_bypass_global_lock(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import mira_engine.config.paths
+
+    monkeypatch.setattr(mira_engine.config.paths, "get_workspace_path", lambda _value: tmp_path)
+    store = MemoryStore(tmp_path)
+    store.write_long_term("local")
+
+    assert store.memory_file.read_text(encoding="utf-8") == "local"
+    assert not store.global_memory_file.exists()
+
+
 def test_append_history_format_and_accumulation(tmp_path) -> None:
     store = MemoryStore(tmp_path)
     store.append_history("first")
