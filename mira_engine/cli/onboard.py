@@ -906,7 +906,9 @@ def _get_channel_info() -> dict[str, tuple[str, type[BaseModel]]]:
     result: dict[str, tuple[str, type[BaseModel]]] = {}
     for name, channel_cls in discover_all().items():
         try:
-            mod = importlib.import_module(f"mira_engine.channels.{name}")
+            # The channel's own module: a built-in under mira_engine.channels
+            # or a plugin package (mira#209).
+            mod = importlib.import_module(channel_cls.__module__)
             config_name = channel_cls.__name__.replace("Channel", "Config")
             config_cls = getattr(mod, config_name, None)
             if config_cls and isinstance(config_cls, type) and issubclass(config_cls, BaseModel):
