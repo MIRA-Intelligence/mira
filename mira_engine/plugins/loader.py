@@ -11,10 +11,11 @@ Guarantees:
   is recorded with a status and reason; nothing else is affected and the
   engine always starts.
 * **Trust is not self-declared** — bundled plugins are ``core-bundled``; a
-  user-installed plugin is at most ``community`` whatever its manifest says
-  (``verified`` comes from the platform registry later). ``experimental``
-  plugins and ``isolation: subprocess`` need the out-of-process runner (P5)
-  and are not loaded in-process.
+  user-installed plugin gets the tier the platform registry issued for it,
+  else the source's default (``experimental`` for ``~/.mira/plugins``),
+  whatever its manifest says. ``experimental`` plugins and
+  ``isolation: subprocess`` run out of process (:mod:`.isolation`) and may
+  only provide tools and skills.
 * **Mutating hooks need trust** — only ``core-bundled``/``verified`` plugins
   may register ``mode: mutate`` hooks.
 * **Guarded execution** — tools and hooks are wrapped in the plugin's
@@ -35,7 +36,7 @@ import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from loguru import logger
 
@@ -71,10 +72,13 @@ class LoadedPlugin:
 
 @dataclass(frozen=True)
 class PluginSource:
-    """A directory of plugin directories, and the tier its plugins get."""
+    """A directory of plugin directories, and the tier its plugins get.
+    ``from_config``: take the tier from ``plugins.default_user_tier`` instead
+    (read only once a plugin is actually found there)."""
 
     path: Path
     tier: Tier
+    from_config: bool = False
 
 
 def bundled_plugins_dir() -> Path | None:
@@ -98,20 +102,34 @@ def user_plugins_dir() -> Path:
     return get_data_dir() / "plugins"
 
 
+_UNSET = object()
+
+
+def _load_config_or_none() -> Any:
+    try:
+        from mira_engine.config.loader import load_config
+
+        return load_config()
+    except Exception:  # noqa: BLE001 - defaults when config can't be read
+        return None
+
+
 def default_sources() -> list[PluginSource]:
     sources: list[PluginSource] = []
     bundled = bundled_plugins_dir()
     if bundled:
         sources.append(PluginSource(bundled, "core-bundled"))
-    sources.append(PluginSource(user_plugins_dir(), "community"))
+    sources.append(PluginSource(user_plugins_dir(), "experimental", from_config=True))
     return sources
 
 
-def _effective_tier(manifest: PluginManifest, source_tier: Tier) -> Tier:
+def _effective_tier(manifest: PluginManifest, source_tier: Tier, registry_tier: str | None = None) -> Tier:
     if source_tier == "core-bundled":
         return "core-bundled"
-    # Self-declared trust is ignored; only "experimental" (less trust) is honoured.
-    return "experimental" if manifest.declared_tier == "experimental" else "community"
+    # The platform registry decides (mira#211); a manifest can only ask for less trust.
+    if registry_tier in ("verified", "community", "experimental"):
+        return registry_tier  # type: ignore[return-value]
+    return "experimental" if manifest.declared_tier == "experimental" else source_tier
 
 
 def _ensure_namespace() -> None:
@@ -165,11 +183,46 @@ def _instantiate(obj: object, base: type, entry: str) -> object:
 class PluginRuntime:
     """Discovers, loads and holds every plugin for this process."""
 
-    def __init__(self, sources: list[PluginSource] | None = None, state: PluginState | None = None):
+    def __init__(
+        self,
+        sources: list[PluginSource] | None = None,
+        state: PluginState | None = None,
+        *,
+        workspace: Path | None = None,
+        allow_unsandboxed: bool | None = None,
+    ):
         self.sources = sources if sources is not None else default_sources()
         self.state = state or PluginState()
+        # Config is read lazily — only when a user plugin is actually found —
+        # so an engine without user plugins never touches it here.
+        self._workspace = workspace
+        self._allow_unsandboxed = allow_unsandboxed
+        self._config: Any = _UNSET
         self.plugins: list[LoadedPlugin] = []
         self._breakers: dict[str, CircuitBreaker] = {}
+
+    def _cfg(self) -> Any:
+        if self._config is _UNSET:
+            self._config = _load_config_or_none()
+        return self._config
+
+    @property
+    def workspace(self) -> Path | None:
+        if self._workspace is None and self._cfg() is not None:
+            self._workspace = self._cfg().workspace_path
+        return self._workspace
+
+    @property
+    def allow_unsandboxed(self) -> bool:
+        if self._allow_unsandboxed is None:
+            self._allow_unsandboxed = bool(getattr(getattr(self._cfg(), "plugins", None), "unsandboxed_experimental", False))
+        return self._allow_unsandboxed
+
+    def _source_tier(self, source: PluginSource) -> Tier:
+        if not source.from_config:
+            return source.tier
+        tier = getattr(getattr(self._cfg(), "plugins", None), "default_user_tier", source.tier)
+        return tier if tier in ("community", "experimental") else source.tier
 
     def breaker(self, plugin_id: str, version: str | None = None) -> CircuitBreaker:
         if plugin_id not in self._breakers:
@@ -185,7 +238,10 @@ class PluginRuntime:
                 children = sorted(p for p in source.path.iterdir() if p.is_dir())
             except OSError:
                 continue
-            found.extend((d, source.tier) for d in children if (d / MANIFEST_FILENAME).is_file())
+            plugin_dirs = [d for d in children if (d / MANIFEST_FILENAME).is_file()]
+            if plugin_dirs:
+                tier = self._source_tier(source)
+                found.extend((d, tier) for d in plugin_dirs)
         return found
 
     # -- loading --------------------------------------------------------------
@@ -207,7 +263,7 @@ class PluginRuntime:
             manifest = load_manifest(plugin_dir)
         except ManifestError as e:
             return LoadedPlugin(plugin_dir, "invalid", str(e))
-        tier = _effective_tier(manifest, source_tier)
+        tier = _effective_tier(manifest, source_tier, self.state.registry_tier(manifest.id) if source_tier != "core-bundled" else None)
         result = LoadedPlugin(plugin_dir, "failed", manifest=manifest, tier=tier)
 
         if manifest.id in seen:
@@ -234,9 +290,7 @@ class PluginRuntime:
             result.status, result.reason = "disabled", "not enabled (mira plugin enable <id>)"
             return result
         if manifest.has_code and (tier == "experimental" or manifest.isolation == "subprocess"):
-            result.status = "unsupported"
-            result.reason = "experimental / subprocess plugins need the out-of-process runner (not available yet)"
-            return result
+            return self._load_isolated(result, manifest)
         if tier not in _TRUSTED and any(h.mode == "mutate" for h in manifest.hooks):
             result.reason = f"mutate hooks need a verified or core-bundled plugin (this one is {tier})"
             return result
@@ -264,6 +318,37 @@ class PluginRuntime:
             return result
 
         result.status = "loaded"
+        return result
+
+    def _load_isolated(self, result: LoadedPlugin, manifest: PluginManifest) -> LoadedPlugin:
+        """Serve the plugin's tools from a separate (sandboxed) process (mira#211)."""
+        from mira_engine.plugins import isolation
+
+        if manifest.channels or manifest.hooks:
+            result.reason = "out-of-process plugins may only provide tools and skills"
+            return result
+        try:
+            sandbox = isolation.plan(manifest, workspace=self.workspace, allow_unsandboxed=self.allow_unsandboxed)
+        except isolation.IsolationUnavailable as e:
+            result.status, result.reason = "unsupported", str(e)
+            return result
+        try:
+            definitions = isolation.describe(manifest, workspace=self.workspace, sandbox=sandbox)
+        except Exception as e:  # noqa: BLE001 - the plugin's problem, not the engine's
+            result.reason = f"{type(e).__name__}: {e}"
+            return result
+        declared = {ep.name for ep in manifest.tools}
+        served = {str(d.get("name")) for d in definitions}
+        if declared != served:
+            result.reason = f"manifest declares tools {sorted(declared)} but the plugin serves {sorted(served)}"
+            return result
+        client = isolation.PluginHostClient(
+            manifest.id, isolation.host_argv(manifest, workspace=self.workspace, sandbox=sandbox)
+        )
+        breaker = self.breaker(manifest.id, manifest.version)
+        result.tools = [GuardedTool(isolation.SubprocessTool(client, d), breaker) for d in definitions]
+        result.status = "loaded"
+        result.reason = "out of process" + ("" if sandbox else " (unsandboxed)")
         return result
 
     # -- views ----------------------------------------------------------------

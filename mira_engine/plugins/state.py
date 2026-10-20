@@ -67,6 +67,19 @@ class PluginState:
         self._data.setdefault(plugin_id, {})["tripped"] = {"reason": reason, "at": int(time.time())}
         self._write()
 
+    # -- platform-issued tiers (mira#211) -------------------------------------
+
+    def registry_tier(self, plugin_id: str) -> str | None:
+        tier = (self._data.get("_registry_tiers") or {}).get(plugin_id)
+        return tier if tier in ("verified", "community", "experimental") else None
+
+    def set_registry_tiers(self, tiers: dict[str, str]) -> bool:
+        if (self._data.get("_registry_tiers") or {}) == tiers:
+            return False
+        self._data["_registry_tiers"] = tiers
+        self._write()
+        return True
+
     # -- remote disable list (mira#210) --------------------------------------
 
     def remote_reason(self, plugin_id: str, version: str | None) -> str | None:
