@@ -250,3 +250,28 @@ def test_persona_cli_uses_the_same_inputs_as_the_channel(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["community", "persona"])
     assert result.exit_code == 0, result.output
     assert "**Domains**: rag, ai" in result.output and "Dana" not in result.output
+
+
+def test_template_defaults_never_pose_as_the_users_interests(tmp_path):
+    """An untouched USER.md (older installs copied the template) says nothing about the user."""
+    from mira_engine.profile.onboarding import load_template
+
+    template = load_template("USER.md")
+    draft = draft_persona([template], None, _guard())
+    assert "General research assistance" not in draft and "Clear, practical, and respectful" not in draft
+    # The user's own lines next to the defaults still come through.
+    mine = template.replace("- General research assistance", "- General research assistance\n- Tide-pool photogrammetry")
+    assert "Tide-pool photogrammetry" in draft_persona([mine], None, _guard())
+
+
+def test_an_empty_persona_is_never_queued_for_approval(tmp_path):
+    from mira_engine.profile.onboarding import load_template
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    assert propose_persona_update(ws, None, _guard()) is None  # no profile files at all
+    (ws / "USER.md").write_text(load_template("USER.md"))
+    assert propose_persona_update(ws, {"domains": [], "tech_stack": []}, _guard()) is None  # template only
+    assert approvals.list_approvals(status="pending") == []
+    # As soon as there is something to say (here: the public profile), it is proposed.
+    assert propose_persona_update(ws, {"domains": ["plugins"]}, _guard())
