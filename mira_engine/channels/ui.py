@@ -1470,6 +1470,17 @@ class UiChannel(BaseChannel):
             return f"ui:{chat_id}:run:{run_id}"
         return f"ui:{chat_id}"
 
+    # Inbound metadata is echoed on every outbound frame. These keys are
+    # engine-internal prompt material (the UI instructions blob alone is
+    # ~18 KB) and must not ride along on each token or into the session log.
+    _WIRE_METADATA_DROP: frozenset[str] = frozenset({"_ui_system_instructions"})
+
+    @classmethod
+    def _wire_metadata(cls, metadata: dict[str, Any]) -> dict[str, Any]:
+        if not any(key in metadata for key in cls._WIRE_METADATA_DROP):
+            return metadata
+        return {k: v for k, v in metadata.items() if k not in cls._WIRE_METADATA_DROP}
+
     async def send(self, msg: OutboundMessage) -> None:
         metadata = msg.metadata or {}
         if metadata.get("_turn_event"):
@@ -1540,7 +1551,25 @@ class UiChannel(BaseChannel):
                         logger.debug("Skill event delivery deferred to history: {}", exc)
             return
 
-        metadata = msg.metadata or {}
+        metadata = self._wire_metadata(msg.metadata or {})
+
+        # A provider retry or model fallback restarted generation: withdraw the
+        # partial reply (both the client's live bubble and our pending buffer).
+        if metadata.get("_stream_reset"):
+            if msg.chat_id:
+                self._stream_buffers.pop(msg.chat_id, None)
+                ws = self._clients.get(msg.chat_id)
+                if ws is not None and not ws.closed:
+                    try:
+                        await ws.send_json({
+                            "type": "stream_reset",
+                            "session_id": msg.chat_id,
+                            "content": "",
+                            "metadata": metadata,
+                        })
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Failed to send stream reset to {}: {}", msg.chat_id, e)
+            return
 
         # Streaming token deltas: forward to the client live and accumulate so
         # the completed turn can be persisted on stream end. Deltas/end markers

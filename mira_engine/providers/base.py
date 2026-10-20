@@ -653,6 +653,7 @@ class LLMProvider(ABC):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_reset: Callable[[], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         if max_tokens is self._SENTINEL:
             max_tokens = self.generation.max_tokens
@@ -662,6 +663,27 @@ class LLMProvider(ABC):
             reasoning_effort = self.generation.reasoning_effort
 
         messages = self._strip_images_if_text_only(messages, model)
+
+        # A retry after a partially streamed attempt would otherwise append the
+        # second attempt's tokens behind the first's. Track whether the current
+        # attempt emitted anything and let the caller discard it before the
+        # next attempt starts.
+        emitted_this_attempt = False
+        wrapped_delta: Callable[[str], Awaitable[None]] | None = None
+        if on_content_delta is not None:
+            async def wrapped_delta(text: str) -> None:  # type: ignore[no-redef]
+                nonlocal emitted_this_attempt
+                emitted_this_attempt = True
+                await on_content_delta(text)
+
+        async def call(**call_kw: Any) -> LLMResponse:
+            nonlocal emitted_this_attempt
+            if emitted_this_attempt:
+                emitted_this_attempt = False
+                if on_stream_reset is not None:
+                    await on_stream_reset()
+            return await self._safe_chat_stream(**call_kw)
+
         kw: dict[str, Any] = dict(
             messages=messages,
             tools=tools,
@@ -670,10 +692,10 @@ class LLMProvider(ABC):
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
-            on_content_delta=on_content_delta,
+            on_content_delta=wrapped_delta,
         )
         return await self._run_with_retry(
-            self._safe_chat_stream,
+            call,
             kw,
             messages,
             retry_mode=retry_mode,
