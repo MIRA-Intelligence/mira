@@ -157,10 +157,18 @@ def test_community_prompt_excludes_profile_memory_and_history(tmp_path):
     assert "Dana Quill" in private and "Initech" in private and "launch email" in private
 
     community = builder.build_system_prompt(channel="community")
-    # "## USER.md" is the bootstrap section header; the bare file name is also
-    # mentioned by the default AGENTS.md template, which community turns do see.
-    for secret in ("Dana Quill", "Initech", "launch email", "## USER.md", "# Memory", "# Recent History"):
+    # Check the builder's own sections, not bare words: the default AGENTS.md
+    # template names USER.md and bundled skill docs contain "# Memory" headings,
+    # and community turns legitimately see both of those.
+    for secret in (
+        "Dana Quill",
+        "Initech",
+        "launch email",
+        "## USER.md",
+        "# Memory\n\nThe user works on Project Bluefin",
+    ):
         assert secret not in community
+    assert "# Recent History" in private
     assert "## SOUL.md" in community
 
 
