@@ -845,7 +845,9 @@ class BaseAgentLoop:
         ) or ""
         rules = ""
         if channel == "community":
-            rules = (getattr(self.community_config, "rules_text", "") or "").strip()
+            from mira_engine.community.rules import rules_for_prompt
+
+            rules = rules_for_prompt(getattr(self.community_config, "rules_text", "") or "")
         sections = [chunk for chunk in (python_hint, base, notice, rules) if chunk]
         return "\n\n".join(sections) if sections else None
 

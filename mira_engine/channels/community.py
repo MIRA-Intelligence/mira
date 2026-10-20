@@ -266,9 +266,7 @@ class CommunityChannel(BaseChannel):
             # nudges the agent into a canned acknowledgement. Drive an authentic
             # self-introduction instead — the same prompt the manual `mira
             # community onboard` nudge uses, so both paths behave identically.
-            from mira_engine.community.onboarding import ONBOARDING_PROMPT
-
-            content = ONBOARDING_PROMPT
+            content = await self._onboarding_prompt()
             domains = list(getattr(self.config, "domains", None) or [])
             if domains:
                 content += f"\nThe areas in your public profile: {', '.join(domains)}."
@@ -285,6 +283,19 @@ class CommunityChannel(BaseChannel):
             metadata={"community_event": event},
         )
         await self.bus.publish_inbound(msg)
+
+    async def _onboarding_prompt(self) -> str:
+        """The welcome-reply prompt with the user-given name and current rules
+        version (read live: login may have just written them)."""
+        from mira_engine.community.onboarding import ONBOARDING_PROMPT, build_onboarding_prompt
+        from mira_engine.config.loader import load_config
+
+        try:
+            cfg = load_config()
+            return await build_onboarding_prompt(cfg.community, cfg.workspace_path)
+        except Exception as e:  # noqa: BLE001 - fall back to the generic prompt
+            logger.debug("Onboarding prompt fell back to the default: {}", e)
+            return ONBOARDING_PROMPT
 
     @staticmethod
     def _notify_user(event: dict[str, Any]) -> None:
@@ -421,6 +432,27 @@ class CommunityChannel(BaseChannel):
         except Exception as e:
             logger.warning("Failed to post community reply: {}", e)
 
+    async def _retry_with_acknowledgement(self, payload: dict[str, Any]) -> bool:
+        """The platform activates a new agent only when its welcome reply
+        contains "I acknowledge the Mira Community Rules vN". When the agent's
+        introduction left it out, add the sentence and post once more, so a
+        reworded acknowledgement cannot leave the agent pending."""
+        from mira_engine.community.onboarding import rules_acknowledgement
+
+        try:
+            version = int((await self._http.get(f"{self.api_base}/rules")).json()["version"])
+            content = f"{str(payload.get('content') or '').rstrip()}\n\n{rules_acknowledgement(version)}"
+            resp = await self._http.post(
+                f"{self.api_base}/agents/messages", json={**payload, "content": content}
+            )
+            resp.raise_for_status()
+            await self._cache_rules_from_reply(resp)
+            logger.info("Welcome reply lacked the rules acknowledgement; added it and posted")
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Posting the welcome reply with the rules acknowledgement failed: {}", e)
+            return False
+
     async def _cache_rules_from_reply(self, resp: httpx.Response) -> None:
         """When a reply completes onboarding the server returns the accepted
         rules (#33). Cache them so the agent acts by them right away, instead of
@@ -473,6 +505,9 @@ class CommunityChannel(BaseChannel):
             except Exception as e:  # noqa: BLE001
                 logger.warning("Rules auto-ack/retry failed: {}", e)
                 return False
+
+        if rule_id == "onboarding" and body.get("error") == "rules acknowledgement required":
+            return await self._retry_with_acknowledgement(payload)
 
         # Other rules need agent-level action; surface the hint instead of a
         # bare warning so it shows up actionably in the logs/heartbeat.

@@ -3202,7 +3202,7 @@ class UiChannel(BaseChannel):
                 {"error": "not logged in — pair the agent first"}, status=400
             )
 
-        from mira_engine.community.onboarding import ONBOARDING_PROMPT, check_onboarding_needed
+        from mira_engine.community.onboarding import build_onboarding_prompt, check_onboarding_needed
 
         check = await check_onboarding_needed(cfg.community)
         if check.get("error"):
@@ -3226,7 +3226,7 @@ class UiChannel(BaseChannel):
             channel="community",
             sender_id="community",
             chat_id=str(check["thread_id"]),
-            content=ONBOARDING_PROMPT,
+            content=await build_onboarding_prompt(cfg.community, cfg.workspace_path),
             metadata={"onboarding": True},
         )
         await self.bus.publish_inbound(msg)

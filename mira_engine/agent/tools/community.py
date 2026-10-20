@@ -33,9 +33,11 @@ class _CommunityTool(Tool):
         if self._gate.requires_approval(action):
             approval_id = self._gate.enqueue_approval(action, payload)
             return (
-                f"Held for human approval (autonomy mode: {self._gate.mode}). "
-                f"Queued community action '{action}' as approval {approval_id}; "
-                "it will run once a maintainer approves it."
+                f"Held for your user's approval (autonomy mode: {self._gate.mode}). "
+                f"Queued community action '{action}' as approval {approval_id}. "
+                "Your user reviews it in the Mira app (Community → Approvals) and it "
+                "runs once they approve it; community maintainers are not involved. "
+                "Do not submit it again."
             )
         return await self._run_with_rules_autoack(run)
 
@@ -232,7 +234,35 @@ class CommunityPostProposalTool(_CommunityTool):
         )
 
 
+_WELCOME_THREAD_DONE = (
+    "Not posted: you are already an active member. Activation (one "
+    "self-introduction acknowledging the rules in the Welcome / Connection Test "
+    "thread) happens once, so there is nothing more to post there. Carry on with "
+    "the rest of your task."
+)
+
+
 class CommunityCommentTool(_CommunityTool):
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._welcome_thread_id: str | None = None
+
+    async def _is_finished_welcome_thread(self, thread_id: str) -> bool:
+        """True when ``thread_id`` is the welcome thread and this agent is
+        already active there, so a comment would only repeat the connection
+        test. Any lookup failure lets the comment through to the platform."""
+        try:
+            if self._welcome_thread_id is None:
+                rules = await self._client.get_rules()
+                self._welcome_thread_id = str(rules.get("onboarding_thread_id") or "")
+            if not self._welcome_thread_id or thread_id != self._welcome_thread_id:
+                return False
+            me = await self._client.get_me()
+            return str(me.get("status") or "") == "active"
+        except Exception as e:  # noqa: BLE001 - the platform still governs
+            logger.debug("Welcome-thread check skipped: {}", e)
+            return False
+
     @property
     def name(self) -> str:
         return "community_comment"
@@ -259,6 +289,9 @@ class CommunityCommentTool(_CommunityTool):
     async def execute(
         self, thread_id: str, content: str, reply_to: str | None = None, **_: Any
     ) -> str:
+        if await self._is_finished_welcome_thread(thread_id):
+            return _WELCOME_THREAD_DONE
+
         async def run() -> str:
             res = await self._client.post_comment(thread_id, content, reply_to)
             # The welcome-thread reply completes onboarding and the server returns
@@ -897,7 +930,8 @@ def build_community_tools(community_config: Any, workspace: Any = None) -> list[
         return []
 
     client = CommunityClient(api_base, agent_token)
-    gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hitl"))
+    # Live: a mode changed in the app applies to the next action, no restart.
+    gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hitl"), live=True)
     return [
         CommunityReadFeedTool(client, gate, community_config),
         CommunityPostTool(client, gate, community_config),

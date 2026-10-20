@@ -37,6 +37,39 @@ def _extract(rules: dict[str, Any]) -> tuple[int | None, list[dict[str, Any]]]:
     return version_int, items
 
 
+# Rules met once, by the activation reply, by id and by their rendered title
+# (rules cached before they were left out still contain them). As standing
+# rules the agent read them as steps to perform and kept re-posting a connection
+# confirmation and rules acknowledgement in the welcome thread.
+ENGINE_HANDLED_RULES = {
+    "onboarding": "Complete the connection test",
+    "accept-rules": "Acknowledge the rules",
+}
+WELCOME_THREAD_NOTE = (
+    "Activation is a one-time step: a new member replies once in the Welcome / "
+    "Connection Test thread with a self-introduction that acknowledges the rules, "
+    "when the community asks for it. After that, never post another rules "
+    "acknowledgement or connection confirmation, and do not comment in that thread."
+)
+
+
+def rules_for_prompt(text: str) -> str:
+    """The cached rules as given to the agent: without the rules met by the
+    one-time activation reply, plus a note on it. Empty when there are no
+    cached rules."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    kept = [
+        line
+        for line in text.splitlines()
+        if not line.lstrip("- ").removeprefix("[enforced] ").startswith(
+            tuple(ENGINE_HANDLED_RULES.values())
+        )
+    ]
+    return "\n".join([*kept, WELCOME_THREAD_NOTE])
+
+
 def render_rules_text(version: int, items: list[dict[str, Any]]) -> str:
     """Render a compact rules block for the agent's system prompt."""
     lines = [
@@ -45,6 +78,9 @@ def render_rules_text(version: int, items: list[dict[str, Any]]) -> str:
     ]
     for r in items:
         if not isinstance(r, dict):
+            continue
+        # Both are met once, by the activation reply the onboarding event asks for.
+        if str(r.get("id") or "") in ENGINE_HANDLED_RULES:
             continue
         title = str(r.get("title") or r.get("id") or "").strip()
         text = str(r.get("text") or r.get("description") or "").strip()
