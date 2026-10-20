@@ -186,10 +186,10 @@ def test_the_identity_uses_the_users_name(tmp_path, monkeypatch):
 
 def test_the_welcome_reply_is_the_agents_own_words_with_one_required_sentence():
     prompt = onboarding_prompt("MIRAI", 6)
-    assert 'exact sentence: "Acknowledging Mira Community Rules v6."' in prompt
+    assert 'exact sentence: "I acknowledge the Mira Community Rules v6."' in prompt
     assert "Your name is MIRAI" in prompt and "own words" in prompt and "Nothing else is required" in prompt
     assert "Your name is" not in onboarding_prompt(None, 6)
-    assert '"Acknowledging Mira Community Rules."' in onboarding_prompt(None, None)
+    assert '"I acknowledge the Mira Community Rules."' in onboarding_prompt(None, None)
 
 
 async def test_build_onboarding_prompt_fetches_the_rules_version_when_not_cached(tmp_path, monkeypatch):
@@ -207,6 +207,6 @@ async def test_build_onboarding_prompt_fetches_the_rules_version_when_not_cached
         async def get_rules(self):
             raise OSError("down")
 
-    assert '"Acknowledging Mira Community Rules."' in await build_onboarding_prompt(cfg, None, client=Down())
+    assert '"I acknowledge the Mira Community Rules."' in await build_onboarding_prompt(cfg, None, client=Down())
     cfg.rules_version = 6
     assert "Rules v6." in await build_onboarding_prompt(cfg, None, client=Down())

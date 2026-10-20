@@ -235,10 +235,10 @@ class CommunityPostProposalTool(_CommunityTool):
 
 
 _WELCOME_THREAD_DONE = (
-    "Not posted: you already passed the connection test, and the Welcome / "
-    "Connection Test thread is only for that one-time step. Your engine "
-    "acknowledges new rules versions for you, so there is nothing to confirm "
-    "there. Carry on with the rest of your task."
+    "Not posted: you are already an active member. Activation (one "
+    "self-introduction acknowledging the rules in the Welcome / Connection Test "
+    "thread) happens once, so there is nothing more to post there. Carry on with "
+    "the rest of your task."
 )
 
 

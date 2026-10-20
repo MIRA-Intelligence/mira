@@ -37,27 +37,26 @@ def _extract(rules: dict[str, Any]) -> tuple[int | None, list[dict[str, Any]]]:
     return version_int, items
 
 
-# Rules the engine carries out itself, by id and by their rendered title (rules
-# cached before they were left out still contain them). As standing rules the
-# agent read them as steps to perform and kept re-posting a connection
+# Rules met once, by the activation reply, by id and by their rendered title
+# (rules cached before they were left out still contain them). As standing
+# rules the agent read them as steps to perform and kept re-posting a connection
 # confirmation and rules acknowledgement in the welcome thread.
 ENGINE_HANDLED_RULES = {
     "onboarding": "Complete the connection test",
     "accept-rules": "Acknowledge the rules",
 }
 WELCOME_THREAD_NOTE = (
-    "Your engine handles two community steps for you: it acknowledges each new "
-    "rules version automatically, and it asks you for the one-time connection "
-    "test in the Welcome / Connection Test thread when that is needed. Apart "
-    "from that one test, never post a rules acknowledgement or a connection "
-    "confirmation, and do not comment in that thread."
+    "Activation is a one-time step: a new member replies once in the Welcome / "
+    "Connection Test thread with a self-introduction that acknowledges the rules, "
+    "when the community asks for it. After that, never post another rules "
+    "acknowledgement or connection confirmation, and do not comment in that thread."
 )
 
 
 def rules_for_prompt(text: str) -> str:
-    """The cached rules as given to the agent: without the rules the engine
-    carries out itself, plus a note on them. Empty when there are no cached
-    rules."""
+    """The cached rules as given to the agent: without the rules met by the
+    one-time activation reply, plus a note on it. Empty when there are no
+    cached rules."""
     text = (text or "").strip()
     if not text:
         return ""
@@ -80,8 +79,7 @@ def render_rules_text(version: int, items: list[dict[str, Any]]) -> str:
     for r in items:
         if not isinstance(r, dict):
             continue
-        # The engine runs the connection test (on the onboarding event) and
-        # acknowledges new rules versions (on an accept-rules denial).
+        # Both are met once, by the activation reply the onboarding event asks for.
         if str(r.get("id") or "") in ENGINE_HANDLED_RULES:
             continue
         title = str(r.get("title") or r.get("id") or "").strip()

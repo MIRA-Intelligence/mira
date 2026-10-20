@@ -16,8 +16,9 @@ from __future__ import annotations
 from typing import Any
 
 def rules_acknowledgement(rules_version: int | None) -> str:
-    """The one sentence a welcome reply must contain."""
-    return f"Acknowledging Mira Community Rules v{rules_version}." if rules_version else "Acknowledging Mira Community Rules."
+    """The one sentence a welcome reply must contain; the platform activates the
+    agent only when it names the current rules version."""
+    return f"I acknowledge the Mira Community Rules v{rules_version}." if rules_version else "I acknowledge the Mira Community Rules."
 
 
 def onboarding_prompt(agent_name: str | None = None, rules_version: int | None = None) -> str:

@@ -174,7 +174,7 @@ async def test_onboarding_event_routes_reply_to_thread(monkeypatch, tmp_path):
     from mira_engine.community.onboarding import onboarding_prompt
 
     assert bus.published[0].content == onboarding_prompt(None, 6)
-    assert 'exact sentence: "Acknowledging Mira Community Rules v6."' in bus.published[0].content
+    assert 'exact sentence: "I acknowledge the Mira Community Rules v6."' in bus.published[0].content
     assert "introduce yourself" in bus.published[0].content.lower()
 
 
@@ -212,3 +212,38 @@ async def test_ready_and_error_events_do_not_spawn_turn(monkeypatch):
 
     # Neither the connection greeting nor a denial envelope becomes an agent turn.
     assert bus.published == []
+
+
+async def test_welcome_reply_without_the_acknowledgement_is_completed_and_reposted(monkeypatch):
+    import json
+
+    import httpx
+
+    from mira_engine.bus.events import OutboundMessage
+
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rules"):
+            return httpx.Response(200, json={"version": 6})
+        content = json.loads(request.content)["content"]
+        posted.append(content)
+        if "I acknowledge the Mira Community Rules v6" not in content:
+            return httpx.Response(403, json={
+                "error": "rules acknowledgement required", "rule_id": "onboarding",
+                "reason": "x", "how_to_resolve": "y",
+            })
+        return httpx.Response(200, json={"ok": True, "comment_id": "c1", "rules": {"version": 6, "items": []}})
+
+    synced: list[dict] = []
+
+    async def fake_sync(config, *, rules=None, **_):
+        synced.append(rules)
+
+    monkeypatch.setattr(rules_mod, "sync_community_rules", fake_sync)
+    ch, _ = _channel()
+    ch._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID, content="Hi, I'm Nova. I acknowledge the rules."))
+    assert len(posted) == 2
+    assert posted[1] == "Hi, I'm Nova. I acknowledge the rules.\n\nI acknowledge the Mira Community Rules v6."
+    assert synced and synced[0]["version"] == 6  # activation delivers the rules
