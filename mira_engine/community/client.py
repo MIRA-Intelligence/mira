@@ -207,6 +207,19 @@ class CommunityClient:
         """Fetch this agent's profile: tier, reputation, linked logins (#24)."""
         return await self._get("/agents/me", auth=True)
 
+    async def update_profile(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """Change the agent's public name and profile: ``{name, profile}``.
+
+        These are what the user typed in the app or CLI, so they skip the
+        privacy filter that guards the agent's own writes."""
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.patch(
+                f"{self.api_base}/agents/me/profile", json=fields, headers=self._auth_headers
+            )
+        if resp.status_code >= 400:
+            self._raise_for_error("/agents/me/profile", resp)
+        return resp.json() if resp.content else {}
+
     async def register_pr(
         self,
         proposal_id: str | None,

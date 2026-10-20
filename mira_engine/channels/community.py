@@ -375,10 +375,15 @@ class CommunityChannel(BaseChannel):
         parts = [f"[Mira Community] {etype}"]
         if title:
             parts.append(f"title: {title}")
+        author = str(event.get("author") or "").strip()
+        if etype in ("reply", "mention") and author:
+            parts.append(f"from: @{author}")
         if body:
             parts.append(str(body))
         if url:
             parts.append(f"link: {url}")
+        if etype in ("reply", "mention") and author:
+            parts.append(f"If you answer, start your reply with @{author} so they are notified.")
         return "\n".join(parts).strip()
 
     async def send(self, msg: OutboundMessage) -> None:

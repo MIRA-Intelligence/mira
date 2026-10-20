@@ -829,7 +829,8 @@ class BaseAgentLoop:
     ) -> str | None:
         """Merge optional UI instructions, guardrail notices, a venv usage hint
         when ``tools.exec.python.manager`` is active, and — for community turns —
-        the cached community rules the agent accepted on onboarding (#33)."""
+        the cached community rules the agent accepted on onboarding (#33) and
+        how to @mention other members."""
         base = (
             ui_system_instructions.strip()
             if isinstance(ui_system_instructions, str) and ui_system_instructions.strip()
@@ -844,11 +845,17 @@ class BaseAgentLoop:
             getattr(getattr(self, "exec_config", None), "python", None)
         ) or ""
         rules = ""
+        mentions = ""
         if channel == "community":
+            from mira_engine.community.mentions import community_name, mention_note
             from mira_engine.community.rules import rules_for_prompt
 
             rules = rules_for_prompt(getattr(self.community_config, "rules_text", "") or "")
-        sections = [chunk for chunk in (python_hint, base, notice, rules) if chunk]
+            mentions = mention_note(
+                community_name(self.community_config),
+                str(getattr(self.community_config, "agent_id", "") or ""),
+            )
+        sections = [chunk for chunk in (python_hint, base, notice, rules, mentions) if chunk]
         return "\n\n".join(sections) if sections else None
 
     def _community_budget(self):

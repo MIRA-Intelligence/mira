@@ -3343,6 +3343,9 @@ def community_login(
         None, "--participation", help="Public profile: any of answer,review,develop,discuss (default: all)"
     ),
     bio: str = typer.Option(None, "--bio", help="Public profile: one or two sentences about you"),
+    name: str = typer.Option(
+        None, "--name", help="Your agent's community name (default: the name in SOUL.local.md)"
+    ),
     no_input: bool = typer.Option(False, "--no-input", help="Do not prompt; use only the options given"),
     config: str | None = typer.Option(None, "--config", help="Path to config.json"),
 ):
@@ -3356,6 +3359,7 @@ def community_login(
         PublicProfileError,
         normalize_public_profile,
         pairing_payload,
+        suggested_agent_name,
     )
     from mira_engine.config.loader import get_config_path, save_config
 
@@ -3374,13 +3378,14 @@ def community_login(
             raise typer.Exit(1)
         cfg.community.code_host = code_host
     raw_profile: dict = {
+        "name": name if name is not None else suggested_agent_name(cfg.workspace_path),
         "domains": domains if domains is not None else list(cfg.community.domains),
         "tech_stack": tech_stack,
         "languages": languages,
         "participation": participation,
         "bio": bio,
     }
-    if interactive and not any(v is not None for v in (domains, tech_stack, languages, participation, bio)):
+    if interactive and not any(v is not None for v in (name, domains, tech_stack, languages, participation, bio)):
         raw_profile = _prompt_public_profile(raw_profile)
     try:
         public_profile = normalize_public_profile(raw_profile)
@@ -3460,10 +3465,17 @@ def community_login(
     cfg.community.api_base = base
     cfg.community.agent_token = agent_token
     cfg.community.agent_id = agent_id
+    # The platform has the final say on the name (it falls back to a default).
+    try:
+        me = httpx.get(f"{base}/agents/me", headers={"Authorization": f"Bearer {agent_token}"}, timeout=10.0)
+        cfg.community.agent_name = str((me.json() or {}).get("name") or "") if me.status_code == 200 else ""
+    except Exception:  # noqa: BLE001 - the status endpoints refresh it later
+        cfg.community.agent_name = public_profile.get("name", "")
     save_config(cfg)
     console.print(
         "\n[green]✓[/green] Joined the Mira Community"
         + (f"  [dim]agent {agent_id}[/dim]" if agent_id else "")
+        + (f"  [dim]as {cfg.community.agent_name}[/dim]" if cfg.community.agent_name else "")
     )
     console.print("[dim]A running gateway connects within a few seconds; no restart needed.[/dim]")
 
@@ -3492,6 +3504,7 @@ def _prompt_public_profile(defaults: dict) -> dict:
         return typer.prompt(f"  {label}", default=shown, show_default=bool(shown)).strip()
 
     return {
+        "name": ask("Your agent's community name (no spaces)", defaults.get("name")),
         "domains": ask("Areas you care about (comma-separated)", defaults.get("domains")),
         "tech_stack": ask("Tech stack (e.g. python, react)", defaults.get("tech_stack")),
         "languages": ask("Languages you work in (e.g. en, zh)", defaults.get("languages")),
@@ -3500,6 +3513,73 @@ def _prompt_public_profile(defaults: dict) -> dict:
         ),
         "bio": ask("One line about you", defaults.get("bio")),
     }
+
+
+@community_app.command("profile")
+def community_profile(
+    name: str = typer.Option(None, "--name", help="New community name (no spaces)"),
+    bio: str = typer.Option(None, "--bio", help="New bio ('' clears it)"),
+    domains: str = typer.Option(None, "--domains", help="Comma-separated areas ('' clears them)"),
+    tech_stack: str = typer.Option(None, "--tech-stack", help="Comma-separated tech ('' clears it)"),
+    languages: str = typer.Option(None, "--languages", help="Comma-separated languages ('' clears them)"),
+    participation: str = typer.Option(
+        None, "--participation", help="Any of answer,review,develop,discuss"
+    ),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """Show your agent's community name and public profile, or change them."""
+    import httpx
+
+    from mira_engine.community.public_profile import PublicProfileError, normalize_profile_patch
+    from mira_engine.config.loader import save_config
+
+    cfg = _load_community_config(config)
+    c = cfg.community
+    if not c.agent_token:
+        console.print("[red]Not logged in. Run `mira community login` first.[/red]")
+        raise typer.Exit(1)
+    base = c.api_base.rstrip("/")
+    headers = {"Authorization": f"Bearer {c.agent_token}"}
+    raw = {
+        key: value
+        for key, value in (
+            ("name", name), ("bio", bio), ("domains", domains), ("tech_stack", tech_stack),
+            ("languages", languages), ("participation", participation),
+        )
+        if value is not None
+    }
+    try:
+        fields = normalize_profile_patch(raw)
+    except PublicProfileError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            if fields:
+                resp = client.patch(f"{base}/agents/me/profile", json=fields, headers=headers)
+                if resp.status_code >= 400:
+                    detail = resp.json().get("error") if resp.headers.get("content-type", "").startswith("application/json") else resp.text
+                    console.print(f"[red]The community rejected the change: {detail}[/red]")
+                    raise typer.Exit(1)
+            me = client.get(f"{base}/agents/me", headers=headers)
+            me.raise_for_status()
+            data = me.json()
+    except httpx.HTTPError as e:
+        console.print(f"[red]Network error contacting community: {e}[/red]")
+        raise typer.Exit(1)
+    profile = data.get("profile") or {}
+    c.agent_name = str(data.get("name") or c.agent_name or "")
+    if isinstance(profile.get("domains"), list):
+        c.domains = list(profile["domains"])
+    if fields:
+        save_config(cfg)
+        console.print("[green]✓[/green] Profile saved\n")
+    agent_id = str(data.get("id") or c.agent_id or "")
+    console.print(f"Name: [bold]{c.agent_name or '-'}[/bold]" + (f" [dim]#{agent_id[:8]}[/dim]" if agent_id else ""))
+    for label, key in (("Areas", "domains"), ("Tech stack", "tech_stack"), ("Languages", "languages"), ("Takes part in", "participation")):
+        values = profile.get(key) or []
+        console.print(f"{label}: {', '.join(values) if values else '[dim]none[/dim]'}")
+    console.print(f"Bio: {profile.get('bio') or '[dim]none[/dim]'}")
 
 
 @community_app.command("notifications")

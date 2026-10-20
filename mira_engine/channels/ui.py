@@ -42,6 +42,13 @@ from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.community import approvals as community_approvals
 from mira_engine.community import inbox as community_inbox
+from mira_engine.community.public_profile import (
+    PublicProfileError,
+    normalize_profile_patch,
+    normalize_public_profile,
+    pairing_payload,
+    suggested_agent_name,
+)
 from mira_engine.config import loader as config_loader
 from mira_engine.config import team_layer
 from mira_engine.config.paths import get_runtime_subdir, get_workspace_path
@@ -1353,6 +1360,8 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/community/inbox", self._handle_community_inbox)
         self._app.router.add_post("/api/community/inbox/read", self._handle_community_inbox_read)
         self._app.router.add_put("/api/community/notifications", self._handle_community_notifications)
+        self._app.router.add_get("/api/community/profile", self._handle_community_profile)
+        self._app.router.add_put("/api/community/profile", self._handle_community_profile_update)
         self._app.router.add_post(
             "/api/community/approvals/{approval_id}/decide", self._handle_community_decide
         )
@@ -3076,6 +3085,10 @@ class UiChannel(BaseChannel):
             "enabled": bool(c.enabled),
             "logged_in": bool(c.agent_token),
             "agent_id": c.agent_id or "",
+            # Community name (``Name #<id8>`` on the website, ``@Name`` in mentions).
+            "agent_name": c.agent_name or "",
+            # The name the user gave the agent, as the join form's default.
+            "suggested_name": suggested_agent_name(cfg.workspace_path) or "",
             "api_base": c.api_base,
             "autonomy_mode": c.autonomy_mode,
             "code_host": c.code_host,
@@ -3094,6 +3107,8 @@ class UiChannel(BaseChannel):
         me = await self._fetch_agent_me(cfg)
         status = me.get("status") if me else None
         payload["member_status"] = str(status) if status else None
+        if me and isinstance(me.get("name"), str) and me["name"]:
+            payload["agent_name"] = me["name"]
         payload["web_url"] = self._community_web_url(cfg, me)
         payload["unread"] = community_inbox.unread_counts()
         return web.json_response(payload)
@@ -3186,6 +3201,81 @@ class UiChannel(BaseChannel):
             return web.json_response({"error": f"failed to persist config: {exc}"}, status=500)
         self._audit(source="ui", action="community_notifications_updated", details={"kinds": kinds})
         return web.json_response({"notifications": kinds})
+
+    @staticmethod
+    def _community_profile_payload(cfg: Config, me: dict[str, Any]) -> dict[str, Any]:
+        profile = me.get("profile") if isinstance(me.get("profile"), dict) else {}
+        return {
+            "agent_id": str(me.get("id") or cfg.community.agent_id or ""),
+            "name": str(me.get("name") or cfg.community.agent_name or ""),
+            "profile": profile,
+        }
+
+    async def _handle_community_profile(self, _request: web.Request) -> web.Response:
+        """The agent's community name and public profile, as the platform has them."""
+        cfg = config_loader.load_config(config_loader.get_config_path().expanduser().resolve())
+        if not cfg.community.agent_token:
+            return web.json_response({"error": "not logged in to the community"}, status=409)
+        me = await self._fetch_agent_me(cfg)
+        if me is None:
+            return web.json_response(
+                {"error": "could not load the profile from the community service"}, status=502
+            )
+        return web.json_response(self._community_profile_payload(cfg, me))
+
+    async def _handle_community_profile_update(self, request: web.Request) -> web.Response:
+        """Change the community name and public profile: only the fields sent
+        change. Saved on the platform, then cached locally."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        try:
+            fields = normalize_profile_patch(body)
+        except PublicProfileError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not fields:
+            return web.json_response({"error": "nothing to change"}, status=400)
+        config_path = config_loader.get_config_path().expanduser().resolve()
+        cfg = config_loader.load_config(config_path)
+        c = cfg.community
+        if not c.agent_token:
+            return web.json_response({"error": "not logged in to the community"}, status=409)
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=15)) as session:
+                async with session.patch(
+                    f"{(c.api_base or '').rstrip('/')}/agents/me/profile",
+                    json=fields,
+                    headers={"Authorization": f"Bearer {c.agent_token}"},
+                ) as resp:
+                    try:
+                        data = await resp.json(content_type=None)
+                    except (json.JSONDecodeError, ValueError):
+                        data = None
+                    if resp.status >= 400:
+                        detail = data.get("error") if isinstance(data, dict) else None
+                        return web.json_response(
+                            {"error": f"the community rejected the change: {detail or f'HTTP {resp.status}'}"},
+                            status=400 if resp.status == 400 else 502,
+                        )
+        except (ClientError, asyncio.TimeoutError) as exc:
+            return web.json_response({"error": f"network error: {exc}"}, status=502)
+        data = data if isinstance(data, dict) else {}
+        profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+        # An older platform ignores ``name``: keep the cached name unless the
+        # platform confirms the new one.
+        if isinstance(data.get("name"), str) and data["name"]:
+            c.agent_name = data["name"]
+        if isinstance(profile.get("domains"), list):
+            c.domains = [str(d) for d in profile["domains"]]
+        try:
+            config_loader.save_config(cfg, config_path)
+        except OSError as exc:
+            return web.json_response({"error": f"failed to persist config: {exc}"}, status=500)
+        self._audit(source="ui", action="community_profile_updated", details={"fields": sorted(fields)})
+        return web.json_response(
+            {"agent_id": c.agent_id or "", "name": c.agent_name or "", "profile": profile}
+        )
 
     async def _handle_community_onboard(self, _request: web.Request) -> web.Response:
         """Nudge the running agent to compose and post its own welcome reply,
@@ -3319,15 +3409,14 @@ class UiChannel(BaseChannel):
         code_host = body.get("code_host")
         if code_host in ("github", "cnb"):
             cfg.community.code_host = code_host
-        from mira_engine.community.public_profile import (
-            PublicProfileError,
-            normalize_public_profile,
-            pairing_payload,
-        )
-
         raw_profile = body.get("profile") if isinstance(body.get("profile"), dict) else {}
         if isinstance(body.get("domains"), list) and "domains" not in raw_profile:
             raw_profile = {**raw_profile, "domains": body["domains"]}
+        if not raw_profile.get("name"):
+            # The name the user gave the agent, unless the form named it.
+            suggested = suggested_agent_name(cfg.workspace_path)
+            if suggested:
+                raw_profile = {**raw_profile, "name": suggested}
         try:
             public_profile = normalize_public_profile(raw_profile)
         except PublicProfileError as exc:
@@ -3410,6 +3499,9 @@ class UiChannel(BaseChannel):
         cfg.community.api_base = api_base
         cfg.community.agent_token = agent_token
         cfg.community.agent_id = data.get("agent_id", "")
+        # The platform has the final say on the name (it falls back to a default).
+        me = await self._fetch_agent_me(cfg)
+        cfg.community.agent_name = str((me or {}).get("name") or "")
         try:
             config_loader.save_config(cfg, config_path)
         except OSError as exc:
