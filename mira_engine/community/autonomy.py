@@ -33,11 +33,54 @@ _LOW_IMPACT = frozenset(
 )
 
 
-class AutonomyGate:
-    """Decide whether a community action may run now or needs human approval."""
+_MODES = ("fully_autonomous", "hitl", "hybrid")
 
-    def __init__(self, mode: AutonomyMode):
-        self.mode = mode
+
+def live_autonomy_mode() -> AutonomyMode | None:
+    """The mode saved in config.json right now (None if unreadable).
+
+    Reads just this field from the file (no full config load), so checking it
+    on every community write is cheap and logs nothing.
+    """
+    import json
+
+    from mira_engine.config.loader import get_config_path
+
+    try:
+        data = json.loads(get_config_path().expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    community = data.get("community") if isinstance(data, dict) else None
+    if not isinstance(community, dict):
+        return None
+    mode = community.get("autonomyMode") or community.get("autonomy_mode")
+    return mode if mode in _MODES else None
+
+
+class AutonomyGate:
+    """Decide whether a community action may run now or needs human approval.
+
+    With ``live=True`` the mode is read from config.json on every check, so a
+    change made in the desktop app or with ``mira community`` applies to the
+    agent's next action without restarting the gateway. ``mode`` is then the
+    fallback when the file cannot be read.
+    """
+
+    def __init__(self, mode: AutonomyMode, *, live: bool = False):
+        self._mode = mode
+        self._live = live
+
+    @property
+    def mode(self) -> AutonomyMode:
+        if self._live:
+            current = live_autonomy_mode()
+            if current is not None:
+                return current
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: AutonomyMode) -> None:
+        self._mode = value
 
     def is_read_only(self, action: str) -> bool:
         return action == "read_feed"

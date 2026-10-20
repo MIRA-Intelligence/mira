@@ -141,7 +141,14 @@ def test_event_thread_id_falls_back_to_target_then_sentinel():
     assert _event_thread_id({"type": "ready"}) == "community"
 
 
-async def test_onboarding_event_routes_reply_to_thread(monkeypatch):
+async def test_onboarding_event_routes_reply_to_thread(monkeypatch, tmp_path):
+    from mira_engine.config.schema import Config
+
+    cfg = Config()
+    cfg.community.rules_version = 6
+    cfg.agents.defaults.workspace = str(tmp_path)
+    monkeypatch.setattr("mira_engine.config.loader.load_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr("mira_engine.config.paths.get_workspace_path", lambda *_a, **_k: tmp_path)
     channel, bus = _channel()
 
     async def no_sync(*a, **k):
@@ -164,9 +171,10 @@ async def test_onboarding_event_routes_reply_to_thread(monkeypatch):
     assert bus.published[0].chat_id == _UUID
     # Onboarding drives a self-introduction (not the server's terse "connection
     # test" title), matching the manual `mira community onboard` nudge.
-    from mira_engine.community.onboarding import ONBOARDING_PROMPT
+    from mira_engine.community.onboarding import onboarding_prompt
 
-    assert bus.published[0].content == ONBOARDING_PROMPT
+    assert bus.published[0].content == onboarding_prompt(None, 6)
+    assert 'exact sentence: "Acknowledging Mira Community Rules v6."' in bus.published[0].content
     assert "introduce yourself" in bus.published[0].content.lower()
 
 

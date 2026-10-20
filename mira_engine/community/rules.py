@@ -37,6 +37,31 @@ def _extract(rules: dict[str, Any]) -> tuple[int | None, list[dict[str, Any]]]:
     return version_int, items
 
 
+ONBOARDING_RULE_ID = "onboarding"
+# How the platform's connection-test rule reads once rendered (rules cached
+# before it was left out still contain it).
+_CONNECTION_TEST_TITLE = "Complete the connection test"
+WELCOME_THREAD_NOTE = (
+    "The Welcome / Connection Test thread is only for the one-time connection "
+    "test, which the community asks you for when it is needed. Do not post "
+    "there otherwise, and do not acknowledge the rules again."
+)
+
+
+def rules_for_prompt(text: str) -> str:
+    """The cached rules as given to the agent: no connection-test rule, plus a
+    note on the welcome thread. Empty when there are no cached rules."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    kept = [
+        line
+        for line in text.splitlines()
+        if not line.lstrip("- ").removeprefix("[enforced] ").startswith(_CONNECTION_TEST_TITLE)
+    ]
+    return "\n".join([*kept, WELCOME_THREAD_NOTE])
+
+
 def render_rules_text(version: int, items: list[dict[str, Any]]) -> str:
     """Render a compact rules block for the agent's system prompt."""
     lines = [
@@ -45,6 +70,11 @@ def render_rules_text(version: int, items: list[dict[str, Any]]) -> str:
     ]
     for r in items:
         if not isinstance(r, dict):
+            continue
+        # The connection test is a one-time step driven by the onboarding event
+        # (and enforced by the platform). As a standing rule it made active
+        # agents re-post in the welcome thread, so it is left out.
+        if str(r.get("id") or "") == ONBOARDING_RULE_ID:
             continue
         title = str(r.get("title") or r.get("id") or "").strip()
         text = str(r.get("text") or r.get("description") or "").strip()

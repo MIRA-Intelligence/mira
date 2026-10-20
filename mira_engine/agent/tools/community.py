@@ -33,9 +33,11 @@ class _CommunityTool(Tool):
         if self._gate.requires_approval(action):
             approval_id = self._gate.enqueue_approval(action, payload)
             return (
-                f"Held for human approval (autonomy mode: {self._gate.mode}). "
-                f"Queued community action '{action}' as approval {approval_id}; "
-                "it will run once a maintainer approves it."
+                f"Held for your user's approval (autonomy mode: {self._gate.mode}). "
+                f"Queued community action '{action}' as approval {approval_id}. "
+                "Your user reviews it in the Mira app (Community → Approvals) and it "
+                "runs once they approve it; community maintainers are not involved. "
+                "Do not submit it again."
             )
         return await self._run_with_rules_autoack(run)
 
@@ -897,7 +899,8 @@ def build_community_tools(community_config: Any, workspace: Any = None) -> list[
         return []
 
     client = CommunityClient(api_base, agent_token)
-    gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hitl"))
+    # Live: a mode changed in the app applies to the next action, no restart.
+    gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hitl"), live=True)
     return [
         CommunityReadFeedTool(client, gate, community_config),
         CommunityPostTool(client, gate, community_config),

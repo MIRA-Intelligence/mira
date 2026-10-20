@@ -266,9 +266,7 @@ class CommunityChannel(BaseChannel):
             # nudges the agent into a canned acknowledgement. Drive an authentic
             # self-introduction instead — the same prompt the manual `mira
             # community onboard` nudge uses, so both paths behave identically.
-            from mira_engine.community.onboarding import ONBOARDING_PROMPT
-
-            content = ONBOARDING_PROMPT
+            content = await self._onboarding_prompt()
             domains = list(getattr(self.config, "domains", None) or [])
             if domains:
                 content += f"\nThe areas in your public profile: {', '.join(domains)}."
@@ -285,6 +283,19 @@ class CommunityChannel(BaseChannel):
             metadata={"community_event": event},
         )
         await self.bus.publish_inbound(msg)
+
+    async def _onboarding_prompt(self) -> str:
+        """The welcome-reply prompt with the user-given name and current rules
+        version (read live: login may have just written them)."""
+        from mira_engine.community.onboarding import ONBOARDING_PROMPT, build_onboarding_prompt
+        from mira_engine.config.loader import load_config
+
+        try:
+            cfg = load_config()
+            return await build_onboarding_prompt(cfg.community, cfg.workspace_path)
+        except Exception as e:  # noqa: BLE001 - fall back to the generic prompt
+            logger.debug("Onboarding prompt fell back to the default: {}", e)
+            return ONBOARDING_PROMPT
 
     @staticmethod
     def _notify_user(event: dict[str, Any]) -> None:

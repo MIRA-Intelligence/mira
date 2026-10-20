@@ -183,6 +183,18 @@ def render_user_local(fields: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def configured_agent_name(*workspaces: Path | None) -> str | None:
+    """The name the user gave their agent in ``SOUL.local.md``, from the first
+    workspace that sets one; None when none does."""
+    for ws in workspaces:
+        if ws is None:
+            continue
+        name, _identity = _parse_soul(_read(Path(ws).expanduser(), SOUL_LOCAL_FILE))
+        if name and name.strip():
+            return name.strip()
+    return None
+
+
 def render_soul_local(fields: dict[str, Any]) -> str:
     """Render ``SOUL.local.md`` (user-configured agent identity)."""
     name = str(fields.get("name") or "").strip()

@@ -113,7 +113,18 @@ class ContextBuilder:
             workspace_path=workspace_path,
             platform_policy=platform_policy.strip(),
             channel=channel,
+            agent_name=self._agent_name(),
         ).strip()
+
+    def _agent_name(self) -> str | None:
+        """The name the user gave this agent (project overlay first, then global)."""
+        from mira_engine.config.paths import get_workspace_path
+        from mira_engine.profile.onboarding import configured_agent_name
+
+        try:
+            return configured_agent_name(self.workspace, get_workspace_path(None))
+        except Exception:  # noqa: BLE001 - a missing name must never break the prompt
+            return None
 
     def _build_recent_history_section(self) -> str:
         """Build unprocessed history section for prompt cache continuity."""
