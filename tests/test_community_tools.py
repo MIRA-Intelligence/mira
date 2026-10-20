@@ -106,6 +106,9 @@ def test_build_returns_full_set_when_connected():
         "community_review_pr",
         "community_start_contribution",
         "community_review_code",
+        "community_list_work_orders",
+        "community_claim_work_order",
+        "community_work_order_lease",
     }
 
 
@@ -392,3 +395,126 @@ async def test_review_pr_by_id_shows_head_lane_and_findings():
     out = await tool.execute(pr_id="pr1")
     assert "head_sha=abc123def4567" in out and "lane=plugin" in out
     assert "too big" in out and "bob=approve" in out
+
+
+class _WorkOrderClient(_ContribClient):
+    def __init__(self, wo=None, claims=None):
+        super().__init__()
+        self.wo = wo or {
+            "id": "wo1", "title": "Edit events", "kind": "plugin_feature", "lane": "plugin",
+            "repo": "o/r", "allowed_paths": ["plugins/telegram/**"], "reward": 5,
+        }
+        self.claims = claims or []
+
+    async def get_work_order(self, wid):
+        return {"work_order": self.wo}
+
+    async def list_work_orders(self):
+        return {"claimable": [self.wo], "claims": self.claims}
+
+    async def claim_work_order(self, wid):
+        self.calls.append(("claim", wid))
+        return {"claim": {"expires_at": "2026-10-22T00:00:00Z"}}
+
+    async def heartbeat_work_order(self, wid, progress=""):
+        self.calls.append(("heartbeat", wid, progress))
+        return {"claim": {"expires_at": "later"}}
+
+    async def release_work_order(self, wid):
+        self.calls.append(("release", wid))
+        return {}
+
+
+async def test_claim_respects_the_users_kinds_and_lanes():
+    client = _WorkOrderClient()
+    cfg = SimpleNamespace(work_order_kinds=["docs"], contribution_lanes=["plugin", "core"], max_active_work_orders=1)
+    tool = community_tools.CommunityClaimWorkOrderTool(client, AutonomyGate("fully_autonomous"), cfg)
+    out = await tool.execute(work_order_id="wo1")
+    assert out.startswith("Not claiming") and client.calls == []
+    cfg = SimpleNamespace(work_order_kinds=[], contribution_lanes=["core"], max_active_work_orders=1)
+    tool = community_tools.CommunityClaimWorkOrderTool(client, AutonomyGate("fully_autonomous"), cfg)
+    assert (await tool.execute(work_order_id="wo1")).startswith("Not claiming")
+
+
+async def test_claim_respects_the_active_limit():
+    client = _WorkOrderClient(claims=[{"status": "active", "work_order": {}}])
+    cfg = SimpleNamespace(work_order_kinds=[], contribution_lanes=["plugin"], max_active_work_orders=1)
+    tool = community_tools.CommunityClaimWorkOrderTool(client, AutonomyGate("fully_autonomous"), cfg)
+    out = await tool.execute(work_order_id="wo1")
+    assert "1 active work order" in out and client.calls == []
+
+
+async def test_claim_is_high_impact_in_hybrid(monkeypatch):
+    queued = []
+    gate = AutonomyGate("hybrid")
+    monkeypatch.setattr(gate, "enqueue_approval", lambda action, payload: queued.append(action) or "a1")
+    client = _WorkOrderClient()
+    cfg = SimpleNamespace(work_order_kinds=[], contribution_lanes=["plugin"], max_active_work_orders=1)
+    out = await community_tools.CommunityClaimWorkOrderTool(client, gate, cfg).execute(work_order_id="wo1")
+    assert queued == ["claim_work_order"] and "approval" in out and client.calls == []
+
+
+async def test_claim_then_start_contribution_takes_scope_from_the_order(monkeypatch, tmp_path):
+    from mira_engine.community import contribute
+
+    client = _WorkOrderClient()
+    cfg = SimpleNamespace(work_order_kinds=[], contribution_lanes=["plugin"], max_active_work_orders=1)
+    out = await community_tools.CommunityClaimWorkOrderTool(client, AutonomyGate("fully_autonomous"), cfg).execute(
+        work_order_id="wo1"
+    )
+    assert ("claim", "wo1") in client.calls and "community_start_contribution" in out
+
+    seen = {}
+
+    async def fake_start(**kw):
+        seen.update(kw)
+        return tmp_path, contribute.ContributionScope(repo=kw["repo"], landing_branch="contrib", branch="mira/x")
+
+    monkeypatch.setattr(contribute, "start_contribution", fake_start)
+    tool = community_tools.CommunityStartContributionTool(client, AutonomyGate("hitl"), cfg, tmp_path)
+    await tool.execute(work_order_id="wo1")
+    assert seen["repo"] == "o/r" and seen["allowed_paths"] == ["plugins/telegram/**"]
+    assert seen["work_order_id"] == "wo1"
+
+
+async def test_lease_renew_and_release_are_low_impact():
+    client = _WorkOrderClient()
+    tool = community_tools.CommunityWorkOrderLeaseTool(client, AutonomyGate("hybrid"))
+    assert "renewed" in await tool.execute(work_order_id="wo1", action="renew", progress="half")
+    assert "released" in await tool.execute(work_order_id="wo1", action="release")
+    assert client.calls == [("heartbeat", "wo1", "half"), ("release", "wo1")]
+
+
+async def test_list_marks_orders_the_user_does_not_allow():
+    client = _WorkOrderClient()
+    cfg = SimpleNamespace(work_order_kinds=["docs"], contribution_lanes=["plugin"])
+    out = await community_tools.CommunityListWorkOrdersTool(client, AutonomyGate("hitl"), cfg).execute()
+    assert "wo1" in out and "not allowed" in out
+
+
+async def test_open_pr_registers_the_workspace_work_order(monkeypatch, tmp_path):
+    import json as _json
+
+    from mira_engine.community import contribute
+
+    ws = tmp_path / "ws"
+    (ws / ".git").mkdir(parents=True)
+    contribute.scope_path(ws).write_text(
+        _json.dumps({"repo": "o/r", "landing_branch": "contrib", "branch": "mira/x", "work_order_id": "wo1"})
+    )
+
+    async def fake_open(**kw):
+        return contribute.OpenPrResult(url="https://github.com/o/r/pull/9", number=9, branch="mira/x", login="alice")
+
+    monkeypatch.setattr(contribute, "open_pr_github", fake_open)
+    registered = {}
+
+    class _C:
+        async def register_pr(self, *args, **kw):
+            registered.update(kw, args=args)
+            return {"pr": {"id": "p9", "state": "open"}}
+
+    tool = community_tools.CommunityOpenPrTool(_C(), AutonomyGate("fully_autonomous"))
+    out = await tool.execute(working_dir=str(ws), title="t")
+    assert registered["work_order_id"] == "wo1" and registered["args"][1] == "o/r"
+    assert "p9" in out

@@ -174,6 +174,10 @@ async def execute_approval(record: dict[str, Any], community_config: Any) -> dic
         if action == "vote":
             res = await client.vote(payload.get("proposal_id", ""), int(payload.get("value", 1)))
             return {"ok": True, "detail": f"vote cast ({res.get('score', '?')})"}
+        if action == "claim_work_order":
+            res = await client.claim_work_order(payload.get("work_order_id", ""))
+            claim = res.get("claim") or {}
+            return {"ok": True, "detail": f"work order claimed (lease until {claim.get('expires_at', '?')})"}
         if action == "review":
             res = await client.review_pr(
                 payload.get("pr_id", ""),

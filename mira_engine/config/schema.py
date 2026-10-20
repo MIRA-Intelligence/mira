@@ -588,6 +588,11 @@ class CommunityConfig(Base):
     contribution_lanes: list[Literal["plugin", "core"]] = Field(
         default_factory=lambda: ["plugin", "core"]
     )
+    # Work orders the agent may claim on this user's behalf (mira#205): kinds
+    # (empty = any) and how many it may hold at once. Claiming is high-impact,
+    # so in hitl/hybrid mode it also waits for the user's approval.
+    work_order_kinds: list[str] = Field(default_factory=list)
+    max_active_work_orders: int = 1
 
 
 class WebSearchConfig(Base):
