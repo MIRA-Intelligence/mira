@@ -987,6 +987,9 @@ def _merge_recovered_results(existing: Any, recovered_metrics: Any, artifacts: l
 
 _WS_CLOSE_TIMEOUT_S = 2.0
 _HTTP_SHUTDOWN_TIMEOUT_S = 3.0
+# Every method a route uses must be listed, or browsers block the request in
+# the CORS preflight ("Load failed") before it reaches the handler.
+_CORS_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 
 
 class UiChannel(BaseChannel):
@@ -1937,7 +1940,7 @@ class UiChannel(BaseChannel):
         elif origin in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
 
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = _CORS_METHODS
         resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Mira-Request-Id"
         resp.headers["Access-Control-Expose-Headers"] = "X-Mira-Request-Id"
         return resp
