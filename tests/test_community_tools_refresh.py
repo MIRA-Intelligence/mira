@@ -64,3 +64,11 @@ def test_the_live_key_reads_both_spellings_and_tolerates_a_bad_file(tmp_path, mo
     assert live_community_login_key() is None
     _save(path, api_base=" http://c.test ", agent_token="t", enabled=False)
     assert live_community_login_key() == (False, "http://c.test", "t")
+
+
+def test_new_members_start_in_hybrid_mode():
+    from mira_engine.community.autonomy import AutonomyGate
+
+    gate = AutonomyGate(CommunityConfig().autonomy_mode)
+    assert gate.mode == "hybrid"
+    assert not gate.requires_approval("comment") and gate.requires_approval("post_proposal")

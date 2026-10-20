@@ -1173,7 +1173,7 @@ def build_community_tools(community_config: Any, workspace: Any = None) -> list[
 
     client = CommunityClient(api_base, agent_token)
     # Live: a mode changed in the app applies to the next action, no restart.
-    gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hitl"), live=True)
+    gate = AutonomyGate(getattr(community_config, "autonomy_mode", "hybrid"), live=True)
     return [
         CommunityReadFeedTool(client, gate, community_config),
         CommunityPostTool(client, gate, community_config),
