@@ -17,6 +17,8 @@ from mira_engine.profile.onboarding import configured_agent_name, render_soul_lo
 V6_ITEMS = [
     {"id": "onboarding", "title": "Complete the connection test", "enforcement": "hard",
      "text": "Before participating, reply once in the Welcome / Connection Test thread to confirm your agent is connected."},
+    {"id": "accept-rules", "title": "Acknowledge the rules", "enforcement": "hard",
+     "text": "Acknowledge the current rules version before writing to the community."},
     {"id": "no-private-data", "title": "Keep private data private", "enforcement": "hard", "text": "Never post secrets."},
 ]
 
@@ -81,17 +83,64 @@ def test_live_mode_reads_only_the_field(config_file, monkeypatch):
 # ------------------------------------------------------------------ rules
 
 
-def test_the_connection_test_is_not_a_standing_rule():
+def test_steps_the_engine_runs_are_not_standing_rules():
     text = render_rules_text(6, V6_ITEMS)
-    assert "connection test" not in text.lower() and "Keep private data private" in text
+    assert "connection test" not in text.lower() and "Acknowledge the rules" not in text
+    assert "Keep private data private" in text
 
 
-def test_rules_cached_before_this_change_lose_the_connection_test_in_the_prompt():
-    old = "Mira Community Rules (v6) — ...:\n- [enforced] Complete the connection test: Before participating, reply once...\n- [enforced] Keep private data private: Never post secrets."
+def test_rules_cached_before_this_change_lose_those_steps_in_the_prompt():
+    old = (
+        "Mira Community Rules (v6) — ...:\n"
+        "- [enforced] Complete the connection test: Before participating, reply once...\n"
+        "- [enforced] Acknowledge the rules: Acknowledge the current rules version before writing to the community.\n"
+        "- [enforced] Keep private data private: Never post secrets."
+    )
     prompt = rules_for_prompt(old)
-    assert "Complete the connection test" not in prompt
+    assert "Complete the connection test" not in prompt and "Acknowledge the rules:" not in prompt
     assert "Keep private data private" in prompt and prompt.endswith(WELCOME_THREAD_NOTE)
     assert rules_for_prompt("") == ""
+
+
+class _WelcomeClient:
+    def __init__(self, status):
+        self.status = status
+        self.calls = []
+
+    async def get_rules(self):
+        self.calls.append("get_rules")
+        return {"version": 6, "onboarding_thread_id": "welcome"}
+
+    async def get_me(self):
+        self.calls.append("get_me")
+        return {"status": self.status}
+
+    async def post_comment(self, thread_id, content, reply_to=None):
+        self.calls.append(("post_comment", thread_id))
+        return {"comment_id": "c1"}
+
+
+async def test_an_active_agent_cannot_repeat_the_connection_test():
+    client = _WelcomeClient("active")
+    tool = community_tools.CommunityCommentTool(client, AutonomyGate("hitl"))
+    out = await tool.execute(thread_id="welcome", content="Connected. I acknowledge the rules v6.")
+    assert out.startswith("Not posted") and ("post_comment", "welcome") not in client.calls
+    # Nor is it queued for the user's approval.
+    assert "approval" not in out
+
+
+async def test_a_pending_agent_can_reply_in_the_welcome_thread():
+    client = _WelcomeClient("pending")
+    tool = community_tools.CommunityCommentTool(client, AutonomyGate("fully_autonomous"))
+    assert "Comment posted" in await tool.execute(thread_id="welcome", content="hi")
+
+
+async def test_other_threads_skip_the_status_lookup():
+    client = _WelcomeClient("active")
+    tool = community_tools.CommunityCommentTool(client, AutonomyGate("fully_autonomous"))
+    assert "Comment posted" in await tool.execute(thread_id="other", content="hi")
+    assert "Comment posted" in await tool.execute(thread_id="other", content="hi again")
+    assert client.calls.count("get_rules") == 1 and "get_me" not in client.calls
 
 
 def test_community_turns_get_the_filtered_rules():
@@ -100,10 +149,14 @@ def test_community_turns_get_the_filtered_rules():
 
     loop = SimpleNamespace(
         exec_config=ExecToolConfig(python=PythonRuntimeConfig(manager="off")),
-        community_config=SimpleNamespace(rules_text=render_rules_text(6, V6_ITEMS) + "\n- [enforced] Complete the connection test: x"),
+        community_config=SimpleNamespace(
+            rules_text=render_rules_text(6, V6_ITEMS)
+            + "\n- [enforced] Complete the connection test: x\n- [enforced] Acknowledge the rules: y"
+        ),
     )
     out = BaseAgentLoop._compose_extra_system(loop, None, None, channel="community")
-    assert "Complete the connection test" not in out and WELCOME_THREAD_NOTE in out
+    assert "Complete the connection test" not in out and "Acknowledge the rules:" not in out
+    assert WELCOME_THREAD_NOTE in out
 
 
 # ------------------------------------------------------------------ name + onboarding

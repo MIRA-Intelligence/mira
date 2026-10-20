@@ -37,27 +37,36 @@ def _extract(rules: dict[str, Any]) -> tuple[int | None, list[dict[str, Any]]]:
     return version_int, items
 
 
-ONBOARDING_RULE_ID = "onboarding"
-# How the platform's connection-test rule reads once rendered (rules cached
-# before it was left out still contain it).
-_CONNECTION_TEST_TITLE = "Complete the connection test"
+# Rules the engine carries out itself, by id and by their rendered title (rules
+# cached before they were left out still contain them). As standing rules the
+# agent read them as steps to perform and kept re-posting a connection
+# confirmation and rules acknowledgement in the welcome thread.
+ENGINE_HANDLED_RULES = {
+    "onboarding": "Complete the connection test",
+    "accept-rules": "Acknowledge the rules",
+}
 WELCOME_THREAD_NOTE = (
-    "The Welcome / Connection Test thread is only for the one-time connection "
-    "test, which the community asks you for when it is needed. Do not post "
-    "there otherwise, and do not acknowledge the rules again."
+    "Your engine handles two community steps for you: it acknowledges each new "
+    "rules version automatically, and it asks you for the one-time connection "
+    "test in the Welcome / Connection Test thread when that is needed. Apart "
+    "from that one test, never post a rules acknowledgement or a connection "
+    "confirmation, and do not comment in that thread."
 )
 
 
 def rules_for_prompt(text: str) -> str:
-    """The cached rules as given to the agent: no connection-test rule, plus a
-    note on the welcome thread. Empty when there are no cached rules."""
+    """The cached rules as given to the agent: without the rules the engine
+    carries out itself, plus a note on them. Empty when there are no cached
+    rules."""
     text = (text or "").strip()
     if not text:
         return ""
     kept = [
         line
         for line in text.splitlines()
-        if not line.lstrip("- ").removeprefix("[enforced] ").startswith(_CONNECTION_TEST_TITLE)
+        if not line.lstrip("- ").removeprefix("[enforced] ").startswith(
+            tuple(ENGINE_HANDLED_RULES.values())
+        )
     ]
     return "\n".join([*kept, WELCOME_THREAD_NOTE])
 
@@ -71,10 +80,9 @@ def render_rules_text(version: int, items: list[dict[str, Any]]) -> str:
     for r in items:
         if not isinstance(r, dict):
             continue
-        # The connection test is a one-time step driven by the onboarding event
-        # (and enforced by the platform). As a standing rule it made active
-        # agents re-post in the welcome thread, so it is left out.
-        if str(r.get("id") or "") == ONBOARDING_RULE_ID:
+        # The engine runs the connection test (on the onboarding event) and
+        # acknowledges new rules versions (on an accept-rules denial).
+        if str(r.get("id") or "") in ENGINE_HANDLED_RULES:
             continue
         title = str(r.get("title") or r.get("id") or "").strip()
         text = str(r.get("text") or r.get("description") or "").strip()
