@@ -1769,6 +1769,10 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     from mira_engine.cli.gateway_shutdown import GatewayShutdown, run_bounded
+    from mira_engine.plugins.remote import poller_from_config
+
+    # Remote kill switch for plugin versions (mira#210).
+    plugin_poller = poller_from_config(config)
 
     shutdown = GatewayShutdown(on_force_exit=engine_lease.release)
 
@@ -1783,6 +1787,8 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
+            if plugin_poller is not None:
+                plugin_poller.start()
             main = asyncio.gather(agent.run(), channels.start_all())
             done, _ = await asyncio.wait({main, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
             if main in done:
@@ -1800,6 +1806,8 @@ def gateway(
             await run_bounded("channels", channels.stop_all(), deadline)
             heartbeat.stop()
             cron.stop()
+            if plugin_poller is not None:
+                plugin_poller.stop()
             agent.stop()
             await run_bounded("MCP servers", agent.close_mcp(), deadline)
             if main is not None and not main.done():

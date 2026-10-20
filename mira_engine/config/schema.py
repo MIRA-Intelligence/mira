@@ -738,6 +738,16 @@ class ProfileConfig(Base):
     onboarded: bool = False
 
 
+class PluginsConfig(Base):
+    """Plugin kernel settings (mira#206, #210)."""
+
+    # Where the plugin registry lives. Its public disable list lets a bad
+    # plugin version be switched off on every install, community member or not.
+    registry_url: str = "https://mira-intelligence.com/community"
+    remote_disable: bool = True
+    poll_interval_s: int = 600
+
+
 class Config(BaseSettings):
     """Root configuration for mira."""
 
@@ -749,6 +759,7 @@ class Config(BaseSettings):
     community: CommunityConfig = Field(default_factory=CommunityConfig)
     profile: ProfileConfig = Field(default_factory=ProfileConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    plugins: PluginsConfig = Field(default_factory=PluginsConfig)
 
     # The user's own values of settings the host policy overrides
     # (security/host_policy.py), keyed by config.json path; save_config writes

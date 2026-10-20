@@ -46,7 +46,9 @@ from mira_engine.plugins.guard import CircuitBreaker, GuardedHook, GuardedTool
 from mira_engine.plugins.manifest import MANIFEST_FILENAME, ManifestError, PluginManifest, Tier, load_manifest
 from mira_engine.plugins.state import PluginState
 
-Status = Literal["loaded", "disabled", "incompatible", "invalid", "failed", "tripped", "unsupported"]
+Status = Literal[
+    "loaded", "disabled", "incompatible", "invalid", "failed", "tripped", "remote-disabled", "unsupported"
+]
 _TRUSTED: tuple[Tier, ...] = ("core-bundled", "verified")
 _PACKAGE_ROOT = "mira_plugins"
 
@@ -169,9 +171,9 @@ class PluginRuntime:
         self.plugins: list[LoadedPlugin] = []
         self._breakers: dict[str, CircuitBreaker] = {}
 
-    def breaker(self, plugin_id: str) -> CircuitBreaker:
+    def breaker(self, plugin_id: str, version: str | None = None) -> CircuitBreaker:
         if plugin_id not in self._breakers:
-            self._breakers[plugin_id] = CircuitBreaker(plugin_id, self.state)
+            self._breakers[plugin_id] = CircuitBreaker(plugin_id, self.state, version=version)
         return self._breakers[plugin_id]
 
     # -- discovery ------------------------------------------------------------
@@ -216,6 +218,11 @@ class PluginRuntime:
             result.status = "incompatible"
             result.reason = f"needs plugin API {manifest.plugin_api}; this engine provides {PLUGIN_API_VERSION}"
             return result
+        remote = self.state.remote_reason(manifest.id, manifest.version)
+        if remote:
+            result.status = "remote-disabled"
+            result.reason = f"disabled by the plugin registry: {remote}"
+            return result
         tripped = self.state.tripped(manifest.id)
         if tripped:
             result.status = "tripped"
@@ -234,7 +241,7 @@ class PluginRuntime:
             result.reason = f"mutate hooks need a verified or core-bundled plugin (this one is {tier})"
             return result
 
-        breaker = self.breaker(manifest.id)
+        breaker = self.breaker(manifest.id, manifest.version)
         try:
             for ep in manifest.channels:
                 from mira_engine.channels.base import BaseChannel

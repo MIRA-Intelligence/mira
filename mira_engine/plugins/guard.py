@@ -33,15 +33,26 @@ class PluginTripped(Exception):
 
 
 class CircuitBreaker:
-    def __init__(self, plugin_id: str, state: PluginState, threshold: int = DEFAULT_TRIP_THRESHOLD):
+    def __init__(
+        self,
+        plugin_id: str,
+        state: PluginState,
+        threshold: int = DEFAULT_TRIP_THRESHOLD,
+        version: str | None = None,
+    ):
         self.plugin_id = plugin_id
+        self.version = version
         self.state = state
         self.threshold = threshold
         self.consecutive_failures = 0
 
     @property
     def tripped(self) -> bool:
-        return self.state.tripped(self.plugin_id) is not None
+        """Off because it kept failing, or because the platform disabled it."""
+        return (
+            self.state.tripped(self.plugin_id) is not None
+            or self.state.remote_reason(self.plugin_id, self.version) is not None
+        )
 
     def success(self) -> None:
         self.consecutive_failures = 0
