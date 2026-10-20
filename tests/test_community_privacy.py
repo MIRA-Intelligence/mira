@@ -157,14 +157,17 @@ def test_community_prompt_excludes_profile_memory_and_history(tmp_path):
     assert "Dana Quill" in private and "Initech" in private and "launch email" in private
 
     community = builder.build_system_prompt(channel="community")
-    for secret in ("Dana Quill", "Initech", "launch email", "USER.md", "# Memory", "# Recent History"):
+    # "## USER.md" is the bootstrap section header; the bare file name is also
+    # mentioned by the default AGENTS.md template, which community turns do see.
+    for secret in ("Dana Quill", "Initech", "launch email", "## USER.md", "# Memory", "# Recent History"):
         assert secret not in community
     assert "## SOUL.md" in community
 
 
 def test_community_prompt_uses_the_approved_persona(tmp_path):
     ws = _workspace(tmp_path)
-    (ws / "COMMUNITY_PERSONA.md").write_text("Interested in medical imaging and retry strategies.")
+    # A phrase no bundled skill description uses, so the negative check is meaningful.
+    (ws / "COMMUNITY_PERSONA.md").write_text("Interested in tide-pool photogrammetry and retry strategies.")
     community = ContextBuilder(ws).build_system_prompt(channel="community")
-    assert "medical imaging and retry strategies" in community
-    assert "medical imaging" not in ContextBuilder(ws).build_system_prompt(channel="ui")
+    assert "tide-pool photogrammetry and retry strategies" in community
+    assert "tide-pool photogrammetry" not in ContextBuilder(ws).build_system_prompt(channel="ui")

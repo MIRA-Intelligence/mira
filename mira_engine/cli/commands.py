@@ -8,6 +8,7 @@ import signal
 import socket
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
@@ -39,21 +40,21 @@ from rich.text import Text
 from loguru import logger
 
 from mira_engine import __logo__, __version__
-from mira_engine.agent.routing import ModelRouter
+from mira_engine.cli.remote import remote_app
+from mira_engine.cli.workflow import workflow_app
 from mira_engine.config.paths import get_workspace_path
 from mira_engine.config.schema import Config
-from mira_engine.providers.factory import make_provider
+from mira_engine.providers.factory import make_provider, make_role_provider
 from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
 from mira_engine.utils.helpers import sync_workspace_templates
-from mira_engine.utils.migration import run_startup_migrations
-
-run_startup_migrations()
 
 app = typer.Typer(
     name="mira",
     help=f"{__logo__} mira - Personal AI Assistant",
     no_args_is_help=True,
 )
+app.add_typer(workflow_app, name="workflow")
+app.add_typer(remote_app, name="remote")
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
@@ -141,6 +142,11 @@ _PROVIDER_MODEL_EXAMPLES: dict[str, tuple[str, ...]] = {
     "gemini": ("gemini-2.5-pro", "gemini-2.5-flash"),
     "dashscope": ("qwen-plus", "qwen-max"),
     "moonshot": ("kimi-k2.5", "moonshot-v1-8k"),
+    "kimi_code": ("kimi-for-coding", "k3"),
+    "zhipu_coding_plan": ("glm-5.3",),
+    "minimax_token_plan": ("MiniMax-M3",),
+    "volcengine_agent_plan": ("ark-code-latest",),
+    "xai": ("grok-4.5",),
     "mistral": ("mistral-large-latest", "ministral-8b-latest"),
     "groq": ("llama-3.3-70b-versatile", "mixtral-8x7b-32768"),
     "ollama": ("llama3.2", "qwen2.5"),
@@ -506,7 +512,10 @@ class MiraCompleter(Completer):
                 for part in rel.parts
             ):
                 continue
-            entries.append((str(rel), f))
+            # Emit POSIX-style separators so completions are consistent across
+            # platforms (Windows ``str(rel)`` would yield backslashes, breaking
+            # "@dir/file" matching and downstream "/"-style path references).
+            entries.append((rel.as_posix(), f))
         entries.sort(key=lambda e: e[0])
         self._file_cache = entries
         return [p for p, _ in entries]
@@ -725,7 +734,10 @@ def main(
     ),
 ):
     """mira - Personal AI Assistant."""
-    pass
+    from mira_engine.cli.launcher import ensure_launcher
+
+    # Keeps <MIRA_HOME>/bin/mira pointing at a working install for Remote-SSH.
+    ensure_launcher()
 
 
 # ============================================================================
@@ -1137,6 +1149,49 @@ def _make_provider_for_model(config: Config, model: str):
         raise typer.Exit(1) from exc
 
 
+def _make_gateway_provider(config: Config, model: str | None = None):
+    """Create a provider for the long-running gateway.
+
+    Unlike the one-shot CLI helpers, the gateway must stay alive even when no
+    provider is configured yet so the UI (Providers page / onboarding) can
+    finish setup. When matching fails we fall back to the bundle-setup
+    placeholder, which returns an actionable message on every request instead
+    of crashing the gateway at boot.
+    """
+    from mira_engine.providers.factory import BundleSetupRequiredProvider
+
+    try:
+        return make_provider(config, model)
+    except ValueError as exc:
+        console.print(
+            f"[yellow]Warning: {exc} Gateway will start unconfigured — open the "
+            "Providers settings to add a provider.[/yellow]"
+        )
+        return BundleSetupRequiredProvider()
+
+
+def _make_gateway_role_provider(config: Config, role: str):
+    """Role provider factory for the gateway that tolerates an unconfigured setup."""
+    from mira_engine.providers.factory import BundleSetupRequiredProvider
+
+    defaults = config.agents.defaults
+    try:
+        return make_role_provider(config, role)
+    except ValueError:
+        model = defaults.role_model(role)
+        candidates = tuple(defaults.role_model_candidates(role))
+        return BundleSetupRequiredProvider(), model, candidates
+
+
+def _routing_kwargs(config: Config) -> dict[str, object]:
+    """Provider/model fallback + team role provider wiring for agent loops."""
+    return dict(
+        provider_factory=lambda model: _make_provider_for_model(config, model),
+        model_candidates=config.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(config, role),
+    )
+
+
 def _workspace_cron_store(config: Config) -> Path:
     return config.workspace_path / "cron" / "jobs.json"
 
@@ -1185,6 +1240,95 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
     return loaded
 
 
+def _ui_enabled_in_config_file(config_path: Path | None) -> bool | None:
+    """Return the explicit ``channels.ui.enabled`` from disk, or ``None`` if unset.
+
+    We inspect the raw JSON instead of the parsed config so we can tell the
+    difference between "user never configured the UI channel" (``None`` →
+    gateway turns it on) and "user explicitly disabled it" (``False`` → leave
+    it off). The legacy ``web`` alias is honored for older configs.
+    """
+    if not config_path or not config_path.exists():
+        return None
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    channels = payload.get("channels")
+    if not isinstance(channels, dict):
+        return None
+    for key in ("ui", "web"):
+        section = channels.get(key)
+        if isinstance(section, dict) and "enabled" in section:
+            return bool(section["enabled"])
+    return None
+
+
+def _resolve_gateway_ui_enabled(explicit: bool | None, no_ui: bool) -> bool:
+    """Decide whether the gateway should run the local control-plane UI channel.
+
+    ``--no-ui`` always wins (headless/messaging-only deployments). Otherwise an
+    explicit on-disk value is respected, and an unset value defaults the UI on
+    so the desktop/browser app and the Providers onboarding page work without a
+    prior ``mira onboard``.
+    """
+    if no_ui:
+        return False
+    if explicit is None:
+        return True
+    return explicit
+
+
+def _prepare_gateway_ui_channel(config: Config, *, no_ui: bool) -> None:
+    """Ensure the gateway exposes the UI channel and bootstraps a config file.
+
+    The UI channel is the control plane for the desktop/browser client. Without
+    it there is no way to reach onboarding or the Providers settings page, so the
+    gateway turns it on by default (unless explicitly disabled or ``--no-ui``).
+    On a fresh home with no ``config.json`` we also persist the defaults so the
+    setup no longer depends on running ``mira onboard`` first.
+    """
+    from mira_engine.config.loader import get_config_path, save_config
+    from mira_engine.config.schema import UiChannelConfig
+
+    config_path = get_config_path()
+    explicit = _ui_enabled_in_config_file(config_path)
+    enabled = _resolve_gateway_ui_enabled(explicit, no_ui)
+
+    # ``channels.ui`` is a typed model on a freshly built config, but a raw dict
+    # when loaded from disk (ChannelsConfig keeps channels as extra fields).
+    # Normalize to the typed model so downstream access and serialization are
+    # consistent, then store it back in the channels extras.
+    section = getattr(config.channels, "ui", None)
+    if isinstance(section, UiChannelConfig):
+        ui = section
+    elif isinstance(section, dict):
+        ui = UiChannelConfig.model_validate(section)
+    else:
+        ui = UiChannelConfig()
+    ui.enabled = enabled
+    # An enabled UI channel with an empty allowFrom denies everyone and aborts
+    # startup; fall back to the local-control-plane default of "*".
+    if ui.enabled and not ui.allow_from:
+        ui.allow_from = ["*"]
+    extras = config.channels.__pydantic_extra__
+    if extras is None:
+        extras = {}
+        object.__setattr__(config.channels, "__pydantic_extra__", extras)
+    extras["ui"] = ui
+
+    if not config_path.exists():
+        try:
+            save_config(config, config_path)
+        except OSError:
+            # Non-fatal: the UI's own save path will create the file later.
+            return
+        console.print(
+            f"[green]✓[/green] Created default config at {config_path} "
+            "— open MIRA and use the Providers page to add a model provider."
+        )
+
+
 def _sync_workspace_templates_or_exit(workspace: Path) -> None:
     """Initialize workspace templates or fail with an actionable config error."""
     try:
@@ -1208,37 +1352,67 @@ def _sync_workspace_templates_or_exit(workspace: Path) -> None:
 
 
 def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool = False) -> None:
-    """Check for existing Mira instances by PID file and port."""
+    from mira_engine.config.loader import get_home_dir
+    from mira_engine.utils.locks import interprocess_lock
+
+    # Serialize check + publish, not just each individual file write.
+    with interprocess_lock(get_home_dir() / "runtime" / "gateway-reservation"):
+        _reserve_gateway_endpoint(gateway_host, gateway_port, verbose)
+
+
+def _reserve_gateway_endpoint(gateway_host: str, gateway_port: int, verbose: bool = False) -> None:
+    """Reserve one gateway endpoint without blocking gateways on other ports."""
     import atexit
+    import hashlib
     import os
     import socket
-    from pathlib import Path
 
     import psutil
 
     if os.environ.get("MIRA_SKIP_GATEWAY_FAILSAVE"):
         return
 
-    pid_file = Path("~/.mira/runtime/gateway.pid").expanduser()
+    from mira_engine.cli.gateway_lifecycle import is_gateway_command
+    from mira_engine.config.loader import get_config_path, get_home_dir
+    from mira_engine.utils.locks import locked_update_text, locked_write_text
+
+    runtime_dir = get_home_dir() / "runtime"
+    endpoint = f"{gateway_host}:{gateway_port}"
+    endpoint_key = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:16]
+    pid_file = runtime_dir / "gateways" / f"{endpoint_key}.pid"
+    discovery_file = runtime_dir / "gateways.json"
     pid_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. 检查 PID 文件
+    # 1. Check only this endpoint's PID reservation. Other ports may coexist.
     if pid_file.exists():
         try:
             old_pid = int(pid_file.read_text().strip())
             if psutil.pid_exists(old_pid):
                 proc = psutil.Process(old_pid)
-                if "mira" in " ".join(proc.cmdline()):
+                record = None
+                if discovery_file.exists():
+                    try:
+                        discovery = json.loads(discovery_file.read_text(encoding="utf-8"))
+                        record = discovery.get("instances", {}).get(endpoint_key)
+                    except (ValueError, AttributeError):
+                        pass
+                same_process = not isinstance(record, dict) or record.get("create_time") is None or (
+                    record.get("pid") == old_pid and abs(proc.create_time() - record["create_time"]) < 0.01
+                )
+                if same_process and is_gateway_command(proc.cmdline()):
                     # Note: Using basic print here as it is before main gateway loop setup
                     print(f"错误: Mira 已经在运行中 (PID: {old_pid})。")
-                    print("提示: 请先停止旧进程，或使用 `mira-engine stop`。")
+                    print("提示: 系统服务请使用 `mira-engine stop`；独立 gateway 请在相同 MIRA_HOME 下使用 `mira-engine stop --gateway`。")
                     raise typer.Exit(1)
-        except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied, typer.Exit):
-            if isinstance(sys.exc_info()[1], typer.Exit):
-                raise
-            pass
+        except typer.Exit:
+            raise
+        except psutil.AccessDenied:
+            print("无法确认已有 PID 的归属；请检查权限，不会删除其运行记录。")
+            raise typer.Exit(1)
+        except (ValueError, psutil.NoSuchProcess):
+            pid_file.unlink(missing_ok=True)
 
-    # 2. 检查端口占用
+    # 2. Check the actual endpoint in case its owner did not create a PID file.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
@@ -1253,9 +1427,55 @@ def _gateway_failsafe_check(gateway_host: str, gateway_port: int, verbose: bool 
         if verbose:
             print(f"端口探测异常: {e}")
 
-    # 3. 写入当前 PID
-    pid_file.write_text(str(os.getpid()))
-    atexit.register(lambda: pid_file.unlink(missing_ok=True))
+    # 3. Atomically publish this gateway for local discovery.
+    current_pid = os.getpid()
+    locked_write_text(pid_file, str(current_pid))
+
+    def update_discovery(current_text: str) -> str:
+        try:
+            payload = json.loads(current_text) if current_text.strip() else {}
+        except json.JSONDecodeError:
+            payload = {}
+        instances = payload.get("instances") if isinstance(payload, dict) else None
+        if not isinstance(instances, dict):
+            instances = {}
+        instances[endpoint_key] = {
+            "host": gateway_host,
+            "port": gateway_port,
+            "pid": current_pid,
+            "endpoint": endpoint,
+            "create_time": psutil.Process(current_pid).create_time(),
+            "config_path": str(get_config_path().resolve()),
+            "mira_home": str(get_home_dir().resolve()),
+            "launch_mode": os.environ.get("MIRA_SERVICE_MODE", "standalone"),
+        }
+        return json.dumps({"instances": instances}, indent=2, ensure_ascii=False) + "\n"
+
+    locked_update_text(discovery_file, update_discovery)
+
+    def release_endpoint() -> None:
+        try:
+            if pid_file.exists() and pid_file.read_text().strip() == str(current_pid):
+                pid_file.unlink(missing_ok=True)
+
+            def remove_from_discovery(current_text: str) -> str:
+                try:
+                    payload = json.loads(current_text) if current_text.strip() else {}
+                except json.JSONDecodeError:
+                    payload = {}
+                instances = payload.get("instances") if isinstance(payload, dict) else None
+                if not isinstance(instances, dict):
+                    instances = {}
+                current = instances.get(endpoint_key)
+                if isinstance(current, dict) and current.get("pid") == current_pid:
+                    instances.pop(endpoint_key, None)
+                return json.dumps({"instances": instances}, indent=2, ensure_ascii=False) + "\n"
+
+            locked_update_text(discovery_file, remove_from_discovery)
+        except OSError:
+            pass
+
+    atexit.register(release_endpoint)
 
 
 @app.command()
@@ -1265,6 +1485,11 @@ def gateway(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    no_ui: bool = typer.Option(
+        False,
+        "--no-ui",
+        help="Do not start the UI channel (headless / messaging-only gateway)",
+    ),
 ):
     """Start the mira gateway."""
     from mira_engine.agent.loop import AgentLoop
@@ -1280,6 +1505,10 @@ def gateway(
         logging.basicConfig(level=logging.DEBUG)
 
     config = _load_runtime_config(config, workspace)
+    from mira_engine.observability import configure_runtime_logging, emit_event
+
+    diagnostics = configure_runtime_logging(mode="gateway")
+    _prepare_gateway_ui_channel(config, no_ui=no_ui)
 
     if host is not None:
         config.gateway.host = host
@@ -1290,6 +1519,9 @@ def gateway(
     gateway_host = config.gateway.host
     gateway_port = config.gateway.port
 
+    _refuse_exposed_remote_engine(gateway_host)
+    engine_lease = _acquire_engine_lease_or_exit(gateway_host, gateway_port)
+    _free_gateway_port_or_exit(gateway_host, gateway_port)
     _gateway_failsafe_check(gateway_host, gateway_port, verbose)
 
     console.print(f"{__logo__} Starting mira gateway on {gateway_host}:{gateway_port}...")
@@ -1305,9 +1537,8 @@ def gateway(
     except Exception:  # noqa: BLE001 - hint must never block startup
         pass
     bus = MessageBus()
-    provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
-    provider_factory = lambda model: _make_provider_for_model(config, model)
+    provider = _make_gateway_provider(config)
+    provider_factory = lambda model: _make_gateway_provider(config, model)
     default_tz = config.agents.defaults.timezone
     session_manager = SessionManager(config.workspace_path)
 
@@ -1329,6 +1560,7 @@ def gateway(
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        knowledge_config=config.tools.knowledge,
         cron_service=cron,
         timezone=default_tz,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -1337,7 +1569,9 @@ def gateway(
         channels_config=config.channels,
         community_config=config.community,
         provider_factory=provider_factory,
-        model_router=model_router,
+        model_candidates=config.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: _make_gateway_role_provider(config, role),
+        auto_max_rounds=config.agents.defaults.auto_max_rounds,
     )
 
     # Set cron callback (needs agent)
@@ -1463,11 +1697,10 @@ def gateway(
     )
 
     async def on_ui_runtime_config_updated(next_config: Config, projects_root: Path) -> None:
-        nonlocal config, provider, model_router, provider_factory, default_tz, session_manager
+        nonlocal config, provider, provider_factory, default_tz, session_manager
 
-        next_provider = _make_provider(next_config)
-        next_model_router = ModelRouter(next_config.agents.defaults)
-        next_provider_factory = lambda model: _make_provider_for_model(next_config, model)
+        next_provider = _make_gateway_provider(next_config)
+        next_provider_factory = lambda model: _make_gateway_provider(next_config, model)
         next_tz = next_config.agents.defaults.timezone
         next_workspace = projects_root.expanduser()
 
@@ -1475,15 +1708,19 @@ def gateway(
             provider=next_provider,
             model=next_config.agents.defaults.primary_model,
             provider_factory=next_provider_factory,
-            model_router=next_model_router,
+            model_candidates=next_config.agents.defaults.default_model_candidates,
+            role_provider_factory=lambda role: _make_gateway_role_provider(next_config, role),
             workspace=next_workspace,
             max_iterations=next_config.agents.defaults.max_tool_iterations,
             max_tokens=next_config.agents.defaults.max_tokens,
             reasoning_effort=next_config.agents.defaults.reasoning_effort,
+            temperature=next_config.agents.defaults.temperature,
+            auto_max_rounds=next_config.agents.defaults.auto_max_rounds,
             restrict_to_workspace=next_config.tools.restrict_to_workspace,
             brave_api_key=next_config.tools.web.search.api_key or None,
             web_proxy=next_config.tools.web.proxy or None,
             exec_config=next_config.tools.exec,
+            knowledge_config=next_config.tools.knowledge,
             timezone=next_tz,
             channels_config=next_config.channels,
             community_config=next_config.community,
@@ -1497,9 +1734,15 @@ def gateway(
         heartbeat.enabled = next_config.gateway.heartbeat.enabled
         session_manager = agent.sessions
 
+        # Keep the live UI channel's workspace-access policy in sync so the
+        # data-path visibility check reflects the latest setting without a
+        # gateway restart.
+        ui_channel = channels.channels.get("ui")
+        if ui_channel is not None and hasattr(ui_channel, "restrict_to_workspace"):
+            ui_channel.restrict_to_workspace = next_config.tools.restrict_to_workspace
+
         config = next_config
         provider = next_provider
-        model_router = next_model_router
         provider_factory = next_provider_factory
         default_tz = next_tz
         logger.info("Gateway runtime config reloaded from UI settings")
@@ -1523,24 +1766,129 @@ def gateway(
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
+    from mira_engine.cli.gateway_shutdown import GatewayShutdown, run_bounded
+
+    shutdown = GatewayShutdown(on_force_exit=engine_lease.release)
+
     async def run():
+        loop = asyncio.get_running_loop()
+        if diagnostics is not None:
+            diagnostics.install_asyncio_handler(loop)
+        stop_requested = shutdown.bind(loop)
+        emit_event("gateway.starting", host=gateway_host, port=gateway_port)
+        main: asyncio.Future | None = None
+        stop_wait = asyncio.create_task(stop_requested.wait())
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            main = asyncio.gather(agent.run(), channels.start_all())
+            done, _ = await asyncio.wait({main, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if main in done:
+                main.result()
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+        except Exception as exc:
+            emit_event("gateway.failed", level="CRITICAL", exception=exc)
+            raise
         finally:
-            await agent.close_mcp()
+            stop_wait.cancel()
+            # Leave a margin inside the watchdog budget for asyncio's own teardown.
+            deadline = loop.time() + max(1.0, shutdown.timeout_s - 2.0)
+            # Stop accepting connections and close WebSockets first, so no new work arrives.
+            await run_bounded("channels", channels.stop_all(), deadline)
             heartbeat.stop()
             cron.stop()
             agent.stop()
-            await channels.stop_all()
+            await run_bounded("MCP servers", agent.close_mcp(), deadline)
+            if main is not None and not main.done():
+                main.cancel()
+                await run_bounded("agent loop", asyncio.gather(main, return_exceptions=True), deadline)
+            engine_lease.release()
+            emit_event("gateway.stopped", signal=shutdown.signum)
 
-    asyncio.run(run())
+    shutdown.install()
+    try:
+        asyncio.run(run())
+    finally:
+        shutdown.restore()
+        engine_lease.release()
+
+
+def _refuse_exposed_remote_engine(gateway_host: str) -> None:
+    """Remote-SSH engines are reached through an SSH tunnel and must never listen publicly."""
+    from mira_engine.cli.remote import LAUNCH_MODE_ENV, REMOTE_LAUNCH_MODE
+    from mira_engine.security.gateway_auth import is_loopback_host
+
+    if os.environ.get(LAUNCH_MODE_ENV) == REMOTE_LAUNCH_MODE and not is_loopback_host(gateway_host):
+        typer.echo(f"Error: a Remote-SSH engine must bind a loopback address, not {gateway_host}.", err=True)
+        raise typer.Exit(2)
+
+
+def _acquire_engine_lease_or_exit(gateway_host: str, gateway_port: int):
+    """Take the single-engine lease for MIRA_HOME before touching its data."""
+    import atexit
+
+    from mira_engine.cli.engine_lease import (
+        LEASE_CONFLICT_EXIT_CODE,
+        LeaseConflictError,
+        acquire_engine_lease,
+    )
+
+    try:
+        lease = acquire_engine_lease(host=gateway_host, port=gateway_port)
+    except LeaseConflictError as exc:
+        typer.echo(f"Error: {exc}.", err=True)
+        typer.echo("Inspect it with `mira remote status`. Stop it with `mira remote stop`, "
+                   "or `mira-engine stop` for the system service.", err=True)
+        raise typer.Exit(LEASE_CONFLICT_EXIT_CODE) from None
+    # Covers exits before the event loop starts; release() is idempotent.
+    atexit.register(lease.release)
+    return lease
+
+
+def _free_gateway_port_or_exit(gateway_host: str, gateway_port: int) -> None:
+    """Stop only a provably stale engine for this MIRA_HOME on our port; refuse anything else."""
+    from mira_engine.cli.port_guard import (
+        PORT_IN_USE_EXIT_CODE,
+        PortInUseError,
+        free_port_from_stale_engine,
+    )
+
+    try:
+        free_port_from_stale_engine(gateway_host, gateway_port)
+    except PortInUseError as exc:
+        typer.echo(f"Error: {exc}.", err=True)
+        typer.echo("Mira only stops a leftover engine for this MIRA_HOME. Stop that process, "
+                   "or start the gateway on another port with --port.", err=True)
+        raise typer.Exit(PORT_IN_USE_EXIT_CODE) from None
+
+
+@app.command("gateway-token")
+def gateway_token(
+    rotate: bool = typer.Option(False, "--rotate", help="Generate a new token file (restart the gateway to apply)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Print the UI gateway auth token (created on first use)."""
+    from mira_engine.config.loader import load_config
+    from mira_engine.security.gateway_auth import (
+        TOKEN_ENV,
+        ensure_token_file,
+        gateway_token_path,
+        resolve_gateway_token,
+    )
+
+    config_path = Path(config).expanduser().resolve() if config else None
+    if config_path is not None and not config_path.exists():
+        typer.echo(f"Error: Config file not found: {config_path}", err=True)
+        raise typer.Exit(1)
+    configured = load_config(config_path).gateway.auth_token
+    if rotate:
+        ensure_token_file(gateway_token_path(), rotate=True)
+        if os.environ.get(TOKEN_ENV, "").strip() or configured.strip():
+            typer.echo(f"Warning: {TOKEN_ENV} or gateway.authToken overrides the rotated token file.",
+                       err=True)
+    # stdout carries only the token so scripts can capture it.
+    typer.echo(resolve_gateway_token(configured))
 
 
 @app.command()
@@ -1555,15 +1903,18 @@ def serve(
     from aiohttp import web
 
     from mira_engine.agent.loop import AgentLoop
-    from mira_engine.api.server import create_app
+    from mira_engine.api.server import create_app, warn_if_exposed
     from mira_engine.bus.queue import MessageBus
+    from mira_engine.security.api_auth import api_allowed_origins, resolve_api_keys
     from mira_engine.session.manager import SessionManager
 
     cfg = _load_runtime_config(config, workspace)
+    from mira_engine.observability import configure_runtime_logging
+
+    diagnostics = configure_runtime_logging(mode="api")
     sync_workspace_templates(cfg.workspace_path)
 
     provider = _make_provider(cfg)
-    model_router = ModelRouter(cfg.agents.defaults)
     default_tz = cfg.agents.defaults.timezone
     agent_loop = AgentLoop(
         bus=MessageBus(),
@@ -1578,23 +1929,36 @@ def serve(
         brave_api_key=cfg.tools.web.search.api_key or None,
         web_proxy=cfg.tools.web.proxy or None,
         exec_config=cfg.tools.exec,
+        knowledge_config=cfg.tools.knowledge,
         timezone=default_tz,
         restrict_to_workspace=cfg.tools.restrict_to_workspace,
         session_manager=SessionManager(cfg.workspace_path),
         mcp_servers=cfg.tools.mcp_servers,
         channels_config=cfg.channels,
         provider_factory=lambda model: _make_provider_for_model(cfg, model),
-        model_router=model_router,
+        model_candidates=cfg.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(cfg, role),
+        auto_max_rounds=cfg.agents.defaults.auto_max_rounds,
     )
 
     api_host = host if host is not None else cfg.api.host
     api_port = port if port is not None else cfg.api.port
     request_timeout = timeout if timeout is not None else cfg.api.timeout
+    api_keys, key_source = resolve_api_keys(cfg.api.keys, cfg.gateway.auth_token)
+    origins = api_allowed_origins(cfg.api.cors_origins)
+    logger.info("API server accepts {} key(s) from {}", len(api_keys), key_source)
+    warn_if_exposed(api_host, origins)
     api_app = create_app(
         agent_loop=agent_loop,
         model_name=cfg.agents.defaults.primary_model,
         request_timeout=request_timeout,
+        api_keys=api_keys,
+        allowed_origins=origins,
     )
+    if diagnostics is not None:
+        async def configure_api_diagnostics(_app):
+            diagnostics.install_asyncio_handler(asyncio.get_running_loop())
+        api_app.on_startup.append(configure_api_diagnostics)
     web.run_app(api_app, host=api_host, port=api_port, print=None)
 
 
@@ -1631,7 +1995,6 @@ def _build_agent_loop_kwargs(
     provider,
     config: Config,
     cron_service=None,
-    model_router=None,
 ) -> dict[str, object]:
     """Common keyword arguments shared by ``mira agent`` and ``mira research``."""
     default_tz = config.agents.defaults.timezone
@@ -1648,13 +2011,15 @@ def _build_agent_loop_kwargs(
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        knowledge_config=config.tools.knowledge,
         cron_service=cron_service,
         timezone=default_tz,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         provider_factory=lambda model: _make_provider_for_model(config, model),
-        model_router=model_router,
+        model_candidates=config.agents.defaults.default_model_candidates,
+        role_provider_factory=lambda role: make_role_provider(config, role),
     )
 
 
@@ -2129,10 +2494,34 @@ def _build_research_inbound_metadata(
     return metadata
 
 
+def _resolve_cli_session_id(session_id: str | None, *, prefix: str) -> str:
+    """Resolve the session id for an interactive CLI invocation.
+
+    Each CLI process must default to its *own* isolated session so that two
+    concurrently running ``mira`` instances never append to the same session
+    transcript (which would interleave/cross-contaminate their conversations).
+
+    - When the user passes ``--session``/``-s`` explicitly, honour it verbatim
+      so an existing conversation can be resumed.
+    - Otherwise mint a unique, per-process session id (``<prefix>:<uuid>``),
+      mirroring how Cursor/Codex/Claude Code give every instance a fresh
+      session while still sharing global config/persona/long-term memory.
+    """
+    if session_id is not None and session_id.strip():
+        return session_id.strip()
+    return f"{prefix}:{uuid.uuid4().hex[:12]}"
+
+
 @app.command()
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
-    session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
+    session_id: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Session ID to resume. Defaults to a unique per-instance session so "
+        "concurrent CLIs stay isolated.",
+    ),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
@@ -2144,6 +2533,8 @@ def agent(
     from mira_engine.agent.base_loop import BaseAgentLoop
     from mira_engine.bus.queue import MessageBus
     from mira_engine.cron.service import CronService
+
+    session_id = _resolve_cli_session_id(session_id, prefix="cli")
 
     if workspace is None and sys.stdin.isatty():
         if typer.confirm("Do you want to use the current directory as a project workspace?"):
@@ -2160,7 +2551,6 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
 
     cron_store_path = _workspace_cron_store(config)
     cron = CronService(cron_store_path)
@@ -2178,7 +2568,6 @@ def agent(
             provider=provider,
             config=config,
             cron_service=cron,
-            model_router=model_router,
         ),
     )
 
@@ -2200,7 +2589,13 @@ def agent(
 @app.command()
 def research(
     message: str = typer.Option(None, "--message", help="Message to send to the research agent"),
-    session_id: str = typer.Option("cli:research", "--session", "-s", help="Session ID"),
+    session_id: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Session ID to resume. Defaults to a unique per-instance session so "
+        "concurrent CLIs stay isolated.",
+    ),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     mode: str = typer.Option(
@@ -2215,7 +2610,7 @@ def research(
         "--profile",
         "-p",
         case_sensitive=False,
-        help="Agent profile: default | engineer | research. Selects AGENTS_*.md bootstrap.",
+        help="Agent profile: default | engineer | research | team. Selects AGENTS_*.md bootstrap.",
     ),
     max_tokens: int | None = typer.Option(
         None,
@@ -2242,6 +2637,8 @@ def research(
     from mira_engine.bus.queue import MessageBus
     from mira_engine.cron.service import CronService
 
+    session_id = _resolve_cli_session_id(session_id, prefix="research")
+
     mode_value = (mode or "manual").strip().lower()
     if mode_value not in {"manual", "auto"}:
         console.print(
@@ -2249,10 +2646,10 @@ def research(
         )
         raise typer.Exit(1)
     profile_value = (profile or "default").strip().lower()
-    if profile_value not in {"default", "engineer", "research"}:
+    if profile_value not in {"default", "engineer", "research", "team"}:
         console.print(
             f"[red]Invalid --profile value: {profile!r}. "
-            "Expected one of: default, engineer, research.[/red]"
+            "Expected one of: default, engineer, research, team.[/red]"
         )
         raise typer.Exit(1)
     if max_tokens is not None and max_tokens <= 0:
@@ -2277,7 +2674,6 @@ def research(
 
     bus = MessageBus()
     provider = _make_provider(config)
-    model_router = ModelRouter(config.agents.defaults)
 
     cron_store_path = _workspace_cron_store(config)
     cron = CronService(cron_store_path)
@@ -2292,8 +2688,8 @@ def research(
             provider=provider,
             config=config,
             cron_service=cron,
-            model_router=model_router,
         ),
+        auto_max_rounds=config.agents.defaults.auto_max_rounds,
     )
 
     inbound_metadata = _build_research_inbound_metadata(
@@ -3233,13 +3629,10 @@ def status():
         active_provider = (
             config.get_provider_name(config.agents.defaults.model) or config.agents.defaults.provider
         ).replace("-", "_")
-        if config.agents.defaults.route_by_complexity:
-            console.print("Routing: [green]enabled[/green]")
-            console.print(f"  small: {_format_model_selection(config.agents.defaults.small_model)}")
-            console.print(f"  medium: {_format_model_selection(config.agents.defaults.medium_model)}")
-            console.print(f"  large: {_format_model_selection(config.agents.defaults.large_model)}")
-        else:
-            console.print("Routing: [dim]disabled[/dim]")
+        for _role in ("supervisor", "student", "critic"):
+            _role_model = getattr(config.agents.defaults, f"{_role}_model", None)
+            if _role_model:
+                console.print(f"Team {_role}: {_format_model_selection(_role_model)}")
 
         # Check API keys from registry
         for spec in PROVIDERS:

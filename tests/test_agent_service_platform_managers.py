@@ -3,6 +3,8 @@ import plistlib
 from types import SimpleNamespace
 from unittest.mock import mock_open
 
+import pytest
+
 from mira_engine.cli.agent_service import (
     EXIT_ERROR,
     EXIT_OK,
@@ -15,6 +17,14 @@ from mira_engine.cli.agent_service import (
     WindowsBackgroundProcessManager,
     WindowsServiceManager,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_service_platform(monkeypatch, tmp_path):
+    import psutil
+    monkeypatch.setenv("MIRA_HOME", str(tmp_path / ".mira"))
+    monkeypatch.delattr(psutil, "win_service_get", raising=False)
+    monkeypatch.setattr("mira_engine.cli.agent_service._endpoint_gateway", lambda host, port: None)
 
 
 def _cp(returncode=0, stdout="", stderr=""):
@@ -68,6 +78,8 @@ def test_launchd_manager_writes_bundle_environment(monkeypatch, tmp_path):
 
     def fake_run(cmd, capture_output, text, check, **_kwargs):  # noqa: ANN001
         calls.append(cmd)
+        if cmd[1] == "print":
+            return _cp(returncode=113)
         return _cp(returncode=0)
 
     monkeypatch.setattr("mira_engine.cli.agent_service.subprocess.run", fake_run)
@@ -99,6 +111,8 @@ def test_launchd_manager_writes_bundle_environment(monkeypatch, tmp_path):
     assert payload["EnvironmentVariables"] == {
         "HOME": str(tmp_path),
         "MIRA_CONFIG_PATH": str(config_path),
+        "MIRA_HOME": str(tmp_path / ".mira"),
+        "MIRA_SERVICE_MODE": "launchd",
         "PYINSTALLER_RESET_ENVIRONMENT": "1",
         "PYTHONUNBUFFERED": "1",
     }
@@ -143,6 +157,12 @@ def test_windows_background_manager_install_and_status(monkeypatch, tmp_path):
     monkeypatch.setattr("mira_engine.cli.agent_service.time.sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("builtins.open", mock_open())
     manager = WindowsBackgroundProcessManager(AgentPaths.default())
+    monkeypatch.setattr(manager, "_ready", lambda: True)
+    fake_identity = SimpleNamespace(create_time=lambda: 123.0)
+    monkeypatch.setattr(agent_service.psutil, "Process", lambda pid: fake_identity)
+    monkeypatch.setattr("mira_engine.cli.gateway_lifecycle.verified_process",
+                        lambda state, root: fake_identity if state.get("pid") else None)
+    monkeypatch.setattr(agent_service, "_gateway_healthy", lambda *args: True)
 
     code, _ = manager.install_service()
     assert code == EXIT_OK
@@ -158,7 +178,8 @@ def test_windows_background_manager_install_and_status(monkeypatch, tmp_path):
     assert popen_calls
     assert popen_calls[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
     assert popen_calls[0][1]["env"]["PYTHONUNBUFFERED"] == "1"
-    assert any(cmd[:2] == ["tasklist", "/FI"] for cmd in calls)
+    assert popen_calls[0][1]["env"]["MIRA_HOME"] == str(manager.paths.root)
+    assert popen_calls[0][1]["env"]["MIRA_CONFIG_PATH"] == str(manager.paths.root / "config.json")
 
 
 def test_windows_service_manager_installs_winsw_service(monkeypatch, tmp_path):
@@ -202,6 +223,7 @@ def test_windows_service_manager_installs_winsw_service(monkeypatch, tmp_path):
     assert "run-gateway --host 127.0.0.1 --port 18790" in xml
     assert f'name="USERPROFILE" value="{tmp_path}"' in xml
 
+    monkeypatch.setattr(manager, "_ready", lambda: True)
     start_code, _ = manager.start()
     assert start_code == EXIT_OK
 

@@ -36,7 +36,9 @@ def ensure_oauth_state_dirs_for_runtime() -> None:
         return
 
     # Container images run as /home/mira and mount ~/.mira for persistence.
-    writable_home = Path.home() / ".mira"
+    from mira_engine.config.loader import get_home_dir
+
+    writable_home = get_home_dir()
     writable_home.mkdir(parents=True, exist_ok=True)
     (writable_home / ".config" / "litellm").mkdir(parents=True, exist_ok=True)
     (writable_home / ".local" / "share").mkdir(parents=True, exist_ok=True)

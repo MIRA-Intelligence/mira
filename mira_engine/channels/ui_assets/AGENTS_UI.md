@@ -171,7 +171,7 @@ When the user explicitly requests export or another final deliverable, populate
 the `result` section in `task_plan.json`:
 - `summary`: a concise summary of all findings
 - `output_path`: the file path to the generated deliverable (relative to project dir)
-- `output_type`: one of `paper`, `report`, `analysis`, `code`
+- `output_type`: one of `paper`, `report`, `analysis`, `code`, `slides` (self-contained HTML deck), `notebook` (executed .ipynb)
 - `sections`: structured content sections (title + content pairs)
 - Do NOT mark the top-level project `status` as `completed` unless this explicit
   export/final-deliverable request is being fulfilled.

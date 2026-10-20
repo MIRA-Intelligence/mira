@@ -527,6 +527,28 @@ def test_openai_compat_build_kwargs_uses_gpt5_safe_parameters() -> None:
     assert "temperature" not in kwargs
 
 
+def test_openai_compat_build_kwargs_omits_temperature_when_none() -> None:
+    spec = find_by_name("deepseek")
+    with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(
+            api_key="sk-test-key",
+            default_model="deepseek-chat",
+            spec=spec,
+        )
+
+    kwargs = provider._build_kwargs(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        model="deepseek-chat",
+        max_tokens=4096,
+        temperature=None,
+        reasoning_effort=None,
+        tool_choice=None,
+    )
+
+    assert "temperature" not in kwargs
+
+
 def test_openai_compat_preserves_message_level_reasoning_fields() -> None:
     with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
         provider = OpenAICompatProvider()

@@ -14,20 +14,20 @@ from mira_engine.config.schema import ExecToolConfig, PythonRuntimeConfig
 class TestPythonRuntimeConfigDefaults:
 
     def test_default_factory_disabled(self) -> None:
-        """Out-of-the-box config keeps the legacy 'off' behaviour."""
+        """Out-of-the-box config manages a uv venv pinned to the project minimum."""
         cfg = PythonRuntimeConfig()
-        assert cfg.manager == "off"
+        assert cfg.manager == "uv"
         assert cfg.auto_bootstrap is True
         assert cfg.venv_dir == ".venv"
         assert cfg.cache_dir == ""
         assert cfg.link_mode == "hardlink"
         assert cfg.baseline_requirements == []
-        assert cfg.python_version == ""
+        assert cfg.python_version == "3.11"
 
     def test_exec_tool_config_embeds_python(self) -> None:
         cfg = ExecToolConfig()
         assert isinstance(cfg.python, PythonRuntimeConfig)
-        assert cfg.python.manager == "off"
+        assert cfg.python.manager == "uv"
 
 
 class TestPythonRuntimeConfigValidation:
@@ -119,4 +119,4 @@ class TestExecToolConfigEmbedsPython:
         cfg = ExecToolConfig.model_validate(
             {"enable": True, "timeout": 60, "pathAppend": "", "sandbox": ""}
         )
-        assert cfg.python.manager == "off"
+        assert cfg.python.manager == "uv"

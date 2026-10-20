@@ -1,0 +1,19 @@
+# /etc/apparmor.d/mira-bwrap - lets bubblewrap create the user namespaces the
+# Mira agent sandbox needs on hosts that restrict unprivileged user namespaces
+# (Ubuntu 23.10+, kernel.apparmor_restrict_unprivileged_userns=1). Only
+# /usr/bin/bwrap gets the permission. Install with:
+#
+#   sudo install -m 0644 deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+#   sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
+#
+# If the distribution ships its own profile for bwrap (for example
+# bwrap-userns-restrict), use that one instead.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile mira-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/mira-bwrap>
+}

@@ -34,13 +34,25 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # bubblewrap: the agent sandbox tests run it for real (tests/tools/test_sandbox.py).
+          sudo apt-get install -y -qq bubblewrap
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
       - name: Lint with ruff
-        run: ruff check mira_engine --select F401,F841
+        run: ruff check mira_engine mira_server --select F401,F841
+
+      - name: Allow bwrap to create user namespaces (Ubuntu AppArmor)
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          ls /etc/apparmor.d /usr/share/apparmor/extra-profiles 2>/dev/null | grep -i bwrap || true
+          sudo install -m 0644 deploy/mira-server/apparmor-bwrap /etc/apparmor.d/mira-bwrap
+          sudo apparmor_parser -r /etc/apparmor.d/mira-bwrap
+          bwrap --ro-bind / / --unshare-pid --proc /proc true && echo "bwrap works"
 
       - name: Run tests with coverage
+        env:
+          MIRA_REQUIRE_BWRAP: "1"
         run: |
           python -m pytest tests/ \
             --cov=mira_engine \

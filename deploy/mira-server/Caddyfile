@@ -1,0 +1,27 @@
+# Mira Server behind Caddy (automatic HTTPS). Replace mira.example.com; for a
+# separate file, `import` it from /etc/caddy/Caddyfile.
+#
+# Caddy writes no access log unless a site has a `log` block. With one, it
+# logs the full URI, and image, download and WebSocket URLs carry the access
+# token as ?access_token=, so the filter below deletes that parameter.
+# (Caddy already redacts Authorization and Cookie headers.) In
+# mira-server.toml set trusted_proxies = ["127.0.0.1", "::1"].
+
+mira.example.com {
+	reverse_proxy 127.0.0.1:8740 {
+		# Streaming responses (chat, SSE) pass through unbuffered.
+		flush_interval -1
+	}
+
+	log {
+		output file /var/log/caddy/mira-server.access.log
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					delete access_token
+				}
+			}
+		}
+	}
+}

@@ -90,7 +90,7 @@ class AzureOpenAIProvider(LLMProvider):
         if system_prompt:
             body["instructions"] = system_prompt
 
-        if self._supports_temperature(deployment_name, reasoning_effort):
+        if temperature is not None and self._supports_temperature(deployment_name, reasoning_effort):
             body["temperature"] = temperature
         if reasoning_effort:
             body["reasoning"] = {"effort": reasoning_effort}

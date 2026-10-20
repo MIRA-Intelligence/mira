@@ -19,7 +19,7 @@ from mira_engine.config.schema import ExecToolConfig, PythonRuntimeConfig
 class TestBuildPythonRuntimeHint:
 
     def test_returns_none_when_manager_off(self) -> None:
-        assert build_python_runtime_hint(PythonRuntimeConfig()) is None
+        assert build_python_runtime_hint(PythonRuntimeConfig(manager="off")) is None
 
     def test_returns_none_when_runtime_is_none(self) -> None:
         assert build_python_runtime_hint(None) is None
@@ -37,6 +37,8 @@ class TestBuildPythonRuntimeHint:
         assert ".venv" in hint
         # Discourages bare pip.
         assert "Do **not** call `pip install` directly" in hint
+        assert "Never search the filesystem for a Python interpreter" in hint
+        assert "`where python`" in hint
 
     def test_section_includes_pinned_python_version(self) -> None:
         hint = build_python_runtime_hint(
@@ -46,7 +48,9 @@ class TestBuildPythonRuntimeHint:
         assert "3.11.10" in hint
 
     def test_section_omits_python_version_line_when_unset(self) -> None:
-        hint = build_python_runtime_hint(PythonRuntimeConfig(manager="uv"))
+        hint = build_python_runtime_hint(
+            PythonRuntimeConfig(manager="uv", python_version="")
+        )
         assert hint is not None
         assert "interpreter is pinned" not in hint
 
@@ -82,7 +86,7 @@ class TestComposeExtraSystem:
         return SimpleNamespace(exec_config=exec_config)
 
     def test_no_python_hint_when_manager_off(self) -> None:
-        loop = self._loop(ExecToolConfig())
+        loop = self._loop(ExecToolConfig(python=PythonRuntimeConfig(manager="off")))
         result = BaseAgentLoop._compose_extra_system(loop, "ui-instr", "guard")
         assert result is not None
         assert "## Python environment" not in result
@@ -98,7 +102,7 @@ class TestComposeExtraSystem:
         assert "\n\nui-instr\n\nguard" in result
 
     def test_returns_none_when_everything_empty_and_manager_off(self) -> None:
-        loop = self._loop(ExecToolConfig())
+        loop = self._loop(ExecToolConfig(python=PythonRuntimeConfig(manager="off")))
         assert BaseAgentLoop._compose_extra_system(loop, None, None) is None
 
     def test_returns_only_python_hint_when_others_empty(self) -> None:
@@ -111,7 +115,7 @@ class TestComposeExtraSystem:
 
     def test_handles_non_string_inputs(self) -> None:
         """Pre-existing contract: opaque inputs are coerced/ignored."""
-        loop = self._loop(ExecToolConfig())
+        loop = self._loop(ExecToolConfig(python=PythonRuntimeConfig(manager="off")))
         assert BaseAgentLoop._compose_extra_system(loop, 12345, None) is None
 
     def test_handles_missing_python_attr_on_exec_config(self) -> None:
@@ -128,7 +132,8 @@ class TestCommunityRulesInjection:
     @staticmethod
     def _loop(rules_text: str) -> SimpleNamespace:
         return SimpleNamespace(
-            exec_config=ExecToolConfig(),
+            # Pin the manager off: the dev default is uv (#177), which adds a venv hint.
+            exec_config=ExecToolConfig(python=PythonRuntimeConfig(manager="off")),
             community_config=SimpleNamespace(rules_text=rules_text),
         )
 

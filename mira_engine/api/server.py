@@ -10,12 +10,14 @@ import asyncio
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from aiohttp import web
 from loguru import logger
 
 from mira_engine.projects import ProjectRef, ProjectRegistry
+from mira_engine.security.api_auth import EXEMPT_PATHS, bearer_token, key_matches
+from mira_engine.security.gateway_auth import is_loopback_host, origin_allowed
 from mira_engine.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 API_SESSION_KEY = "api:default"
@@ -157,7 +159,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     session_locks: dict[str, asyncio.Lock] = request.app["session_locks"]
     session_lock = session_locks.setdefault(f"{lock_project}:{session_key}", asyncio.Lock())
 
-    logger.info("API request session_key={} content={}", session_key, user_content[:80])
+    logger.info("API request received (content length={})", len(user_content))
 
     fallback = EMPTY_FINAL_RESPONSE_MESSAGE
 
@@ -229,6 +231,59 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+@web.middleware
+async def _cors_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+    """Answer preflights and add CORS headers for allowlisted browser origins only."""
+    origin = request.headers.get("Origin")
+    allowed = request.app["allowed_origins"]
+    if request.method == "OPTIONS":
+        if not origin_allowed(origin, allowed):
+            return _error_json(403, "Origin not allowed", err_type="permission_error")
+        resp: web.StreamResponse = web.Response(status=204)
+    else:
+        try:
+            resp = await handler(request)
+        except web.HTTPException as exc:
+            resp = exc
+    if origin is not None and origin_allowed(origin, allowed):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Authorization, Content-Type, X-Mira-Request-Id"
+        )
+        resp.headers["Access-Control-Expose-Headers"] = "X-Mira-Request-Id"
+    return resp
+
+
+@web.middleware
+async def _auth_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+    """Reject non-allowlisted browser origins and requests without a valid API key."""
+    if request.method in {"GET", "HEAD"} and request.path in EXEMPT_PATHS:
+        return await handler(request)
+    if not origin_allowed(request.headers.get("Origin"), request.app["allowed_origins"]):
+        return _error_json(403, "Origin not allowed", err_type="permission_error")
+    if not key_matches(request.app["api_keys"], bearer_token(request)):
+        resp = _error_json(401, "Invalid or missing API key", err_type="authentication_error")
+        resp.headers["WWW-Authenticate"] = "Bearer"
+        return resp
+    return await handler(request)
+
+
+def warn_if_exposed(host: str, origins: Iterable[str]) -> None:
+    if not is_loopback_host(host):
+        logger.warning(
+            "API server is listening on non-loopback address {}; it is reachable from the "
+            "network and protected only by its API keys", host,
+        )
+    if "*" in origins:
+        logger.warning("API server corsOrigins contains '*'; any website origin is accepted")
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -237,6 +292,9 @@ def create_app(
     model_name: str = "mira",
     request_timeout: float = 120.0,
     project_registry: ProjectRegistry | None = None,
+    *,
+    api_keys: Iterable[str],
+    allowed_origins: Iterable[str] = (),
 ) -> web.Application:
     """Create the aiohttp application.
 
@@ -244,8 +302,21 @@ def create_app(
         agent_loop: An initialized AgentLoop instance.
         model_name: Model name reported in responses.
         request_timeout: Per-request timeout in seconds.
+        api_keys: Bearer keys accepted on every route except ``/health``.
+        allowed_origins: Browser origins allowed to call the API (``*`` for any).
     """
-    app = web.Application()
+    from mira_engine.observability import request_middleware
+
+    keys = [key for key in api_keys if key]
+    if not keys:
+        raise ValueError("the API server requires at least one API key")
+    # CORS outermost so 401/403 stay readable by allowed browser clients; auth
+    # innermost so rejected requests are still logged.
+    app = web.Application(
+        middlewares=[_cors_middleware, request_middleware(), _auth_middleware],
+    )
+    app["api_keys"] = keys
+    app["allowed_origins"] = list(allowed_origins)
     app["agent_loop"] = agent_loop
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout

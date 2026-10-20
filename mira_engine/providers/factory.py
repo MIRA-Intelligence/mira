@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mira_engine.config.schema import Config, primary_model_candidate
+from mira_engine.config.schema import Config, is_custom_provider_id, primary_model_candidate
 from mira_engine.providers.base import LLMProvider, LLMResponse
 
 _BUNDLE_SETUP_MODEL = "custom/mira-ui-bundle-setup"
@@ -42,8 +42,36 @@ def resolve_provider_proxy(config: Config) -> str | None:
     return config.providers.proxy or config.tools.web.proxy or None
 
 
-def make_provider(config: Config, model: str | None = None) -> LLMProvider:
-    """Create the appropriate provider for the given model."""
+def make_role_provider(config: Config, role: str) -> tuple[LLMProvider, str, tuple[str, ...]]:
+    """Build the provider/model/candidates for a ``team`` role.
+
+    Honors the role's ``*_provider`` override so a role can target a provider
+    that differs from the global ``agents.defaults.provider``.
+    """
+    defaults = config.agents.defaults
+    model = defaults.role_model(role)
+    candidates = tuple(defaults.role_model_candidates(role))
+    override = defaults.role_provider(role)
+    # A provider override only makes sense alongside the role's own model. When
+    # the role has no explicit model it inherits the *primary* model, which is
+    # served by the global provider; forcing the role's override onto it would
+    # route e.g. a deepseek primary model to the NVIDIA endpoint. Inherit the
+    # global provider (None) so the role behaves exactly like the primary.
+    if not getattr(defaults, f"{role}_model", None):
+        override = None
+    provider = make_provider(config, model, provider_override=override)
+    return provider, model, candidates
+
+
+def make_provider(
+    config: Config, model: str | None = None, provider_override: str | None = None
+) -> LLMProvider:
+    """Create the appropriate provider for the given model.
+
+    ``provider_override`` pins the provider regardless of the global
+    ``agents.defaults.provider`` (used by ``team`` roles for cross-provider
+    setups). Pass ``"auto"`` to force auto-detection.
+    """
     from mira_engine.providers.azure_openai_provider import AzureOpenAIProvider
     from mira_engine.providers.github_copilot_provider import GitHubCopilotProvider
     from mira_engine.providers.litellm_provider import LiteLLMProvider
@@ -55,8 +83,8 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
     resolved_model = primary_model_candidate(model, config.agents.defaults.primary_model)
     if not resolved_model:
         raise ValueError("No model configured. Set agents.defaults.model in config.json.")
-    provider_name = config.get_provider_name(resolved_model)
-    provider_config = config.get_provider(resolved_model)
+    provider_name = config.get_provider_name(resolved_model, provider_override)
+    provider_config = config.get_provider(resolved_model, provider_override)
     if not provider_name:
         raise ValueError(
             f"Unable to match provider for model '{resolved_model}'. "
@@ -71,17 +99,20 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
     if provider_name == "github_copilot" or resolved_model.startswith("github-copilot/"):
         return GitHubCopilotProvider(
             default_model=resolved_model,
-            api_base=config.get_api_base(resolved_model),
+            api_base=config.get_api_base(resolved_model, provider_override),
             proxy=resolve_provider_proxy(config),
         )
 
-    if provider_name == "custom":
-        api_base = config.get_api_base(resolved_model)
+    if is_custom_provider_id(provider_name):
+        api_base = config.get_api_base(resolved_model, provider_override)
         normalized_base = api_base.rstrip("/") if isinstance(api_base, str) else ""
         if resolved_model == _BUNDLE_SETUP_MODEL or normalized_base == _BUNDLE_SETUP_API_BASE.rstrip("/"):
             return BundleSetupRequiredProvider(default_model=resolved_model)
         # Require explicit apiBase configuration for custom provider
         if not api_base:
+            if provider_name != "custom":
+                label = (provider_config.name if provider_config else None) or provider_name
+                raise ValueError(f"Custom provider '{label}' requires an API base URL.")
             raise ValueError(
                 "Custom provider requires 'providers.custom.apiBase' to be configured. "
                 "Please set the API base URL (e.g., 'http://localhost:8000/v1' or 'https://api.example.com/v1') "
@@ -114,7 +145,7 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
 
     if provider_name == "nvidia":
         nvidia_spec = spec or find_by_name("nvidia")
-        api_base = config.get_api_base(resolved_model)
+        api_base = config.get_api_base(resolved_model, provider_override)
         if not api_base and nvidia_spec:
             api_base = nvidia_spec.default_api_base or None
         return NvidiaProvider(
@@ -131,7 +162,7 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
     # DeepSeek's OpenAI-compatible endpoint directly.
     if provider_name == "deepseek" or resolved_model.startswith("deepseek/"):
         deepseek_spec = spec or find_by_name("deepseek")
-        api_base = config.get_api_base(resolved_model)
+        api_base = config.get_api_base(resolved_model, provider_override)
         if not api_base and deepseek_spec:
             api_base = deepseek_spec.default_api_base or None
         return OpenAICompatProvider(
@@ -144,7 +175,7 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
 
     return LiteLLMProvider(
         api_key=provider_config.api_key if provider_config else None,
-        api_base=config.get_api_base(resolved_model),
+        api_base=config.get_api_base(resolved_model, provider_override),
         default_model=resolved_model,
         extra_headers=provider_config.extra_headers if provider_config else None,
         provider_name=provider_name,

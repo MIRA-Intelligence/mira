@@ -93,7 +93,12 @@ class Session:
                 found_user = True
                 break
         if not found_user:
-            return []
+            # One turn ran longer than the window (e.g. hundreds of tool calls).
+            # Keep the request that started it plus the turn's tail, so a
+            # follow-up such as "continue" still knows what the task was.
+            sliced = self._long_turn_tail(sliced)
+            if not sliced:
+                return []
 
         # --- Pass 1: collect entries and track tool-call linkage ---
         out: list[dict[str, Any]] = []
@@ -138,6 +143,21 @@ class Session:
             out = self._collapse_consecutive_roles(out)
 
         return out
+
+    def _long_turn_tail(self, tail: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Prefix *tail* (a window with no user message) with its turn's user message."""
+        start = len(self.messages) - len(tail)
+        request = next(
+            (m for m in reversed(self.messages[:start]) if m.get("role") == "user"),
+            None,
+        )
+        if request is None:
+            return []
+        # Resume at an assistant message; leading tool results have lost their call.
+        for i, m in enumerate(tail):
+            if m.get("role") == "assistant":
+                return [request, *tail[i:]]
+        return [request]
 
     @staticmethod
     def _strip_incomplete_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
