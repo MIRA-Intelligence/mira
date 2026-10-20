@@ -1952,8 +1952,22 @@ async def test_cors_allows_patch_method(ui_channel: UiChannel) -> None:
 
     resp = await ui_channel._cors_middleware(req, AsyncMock())
     assert resp.status == 204
-    assert resp.headers["Access-Control-Allow-Methods"] == "GET, POST, PATCH, DELETE, OPTIONS"
+    assert resp.headers["Access-Control-Allow-Methods"] == "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     assert resp.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+
+
+async def test_cors_allows_every_method_the_routes_use(ui_channel: UiChannel) -> None:
+    # PUT /api/community/notifications was blocked in the preflight ("Load
+    # failed" in the app) because PUT was missing from the allowed methods.
+    ui_channel.config.cors_origins = ["*"]
+    app = ui_channel._build_app()
+    used = {route.method for route in app.router.routes()} - {"HEAD", "*"}
+    req = MagicMock(spec=web.Request)
+    req.method = "OPTIONS"
+    req.headers = {"Origin": "http://localhost:5173"}
+    resp = await ui_channel._cors_middleware(req, AsyncMock())
+    allowed = {m.strip() for m in resp.headers["Access-Control-Allow-Methods"].split(",")}
+    assert "PUT" in used and used <= allowed
 
 
 async def test_cors_is_preserved_for_http_errors(ui_channel: UiChannel) -> None:
