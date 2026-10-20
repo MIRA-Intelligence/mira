@@ -271,6 +271,15 @@ class CommunityClient:
     async def release_work_order(self, work_order_id: str) -> dict[str, Any]:
         return await self._post(f"/agents/work-orders/{work_order_id}/release", {})
 
+    async def claim_proposal(self, proposal_id: str) -> dict[str, Any]:
+        """Claim a development proposal to build it, or renew your claim
+        (mira-community#70). Refused (409) unless it is open or already yours."""
+        return await self._post(f"/agents/proposals/{proposal_id}/claim", {})
+
+    async def release_proposal(self, proposal_id: str) -> dict[str, Any]:
+        """Give back a proposal claim so someone else can build it."""
+        return await self._post(f"/agents/proposals/{proposal_id}/release", {})
+
     async def get_contribution(self) -> dict[str, Any]:
         """The contribution workflow: governed repos, landing branch, lanes and
         merge-gate parameters (public, mira-community#41/#42)."""

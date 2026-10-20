@@ -15,7 +15,7 @@ from loguru import logger
 from mira_engine.agent.tools.base import Tool
 from mira_engine.community.autonomy import AutonomyGate
 from mira_engine.community.client import CommunityClient, CommunityRuleError
-from mira_engine.community.proposals import post_link, proposal_next_step
+from mira_engine.community.proposals import claimed_next_step, post_link, proposal_next_step
 from mira_engine.config.paths import get_workspace_path
 
 
@@ -208,11 +208,12 @@ class CommunityPostTool(_CommunityTool):
         )
 
 
-class CommunityPostProposalTool(_CommunityTool):
+class _FollowedUp(_CommunityTool):
+    """Remembers the conversation the agent is in, so an approval the user makes
+    later in the app is followed up there (the agent loop sets the context)."""
+
     def __init__(self, client, gate, community_config=None):
         super().__init__(client, gate, community_config)
-        # The conversation asking for the proposal, so an approval made later in
-        # the app is followed up there.
         self._channel = ""
         self._chat_id = ""
         self._project_id = ""
@@ -227,13 +228,16 @@ class CommunityPostProposalTool(_CommunityTool):
         self._project_id = ""
 
     def _origin(self) -> dict[str, str] | None:
-        # A proposal made on the agent's own community turn has no user to tell.
+        # An action from the agent's own community turn has no user to tell.
         if not self._channel or not self._chat_id or self._channel in ("community", "system"):
             return None
         origin = {"channel": self._channel, "chat_id": self._chat_id}
         if self._project_id:
             origin["project_id"] = self._project_id
         return origin
+
+
+class CommunityPostProposalTool(_FollowedUp):
 
     @property
     def name(self) -> str:
@@ -842,6 +846,121 @@ class CommunityWorkOrderLeaseTool(_CommunityTool):
         )
 
 
+_CLAIM_REFUSALS = ("proposal-claimed", "proposal-not-claimable", "claim-limit")
+
+
+async def _read_proposal(client: CommunityClient, proposal_id: str) -> dict[str, Any]:
+    return (await client.get_proposal(proposal_id)).get("proposal") or {}
+
+
+def _builder(proposal: dict[str, Any]) -> str:
+    agent_id = str(proposal.get("claimed_by_agent_id") or "")
+    name = proposal.get("claimed_by_name") or "another member"
+    return f"{name} #{agent_id[:8]}" if agent_id else "another member"
+
+
+class CommunityClaimProposalTool(_FollowedUp):
+    @property
+    def name(self) -> str:
+        return "community_claim_proposal"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Claim a development proposal before building it, so no one else builds it at "
+            "the same time. Only an open proposal can be claimed; it then shows as being "
+            "built by you, under a lease you renew with community_proposal_lease. Anyone may "
+            "build a proposal, its author included. High-impact: may require your user's "
+            "approval. After claiming, call community_start_contribution with the proposal_id."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"proposal_id": {"type": "string", "description": "Development proposal id."}},
+            "required": ["proposal_id"],
+        }
+
+    async def execute(self, proposal_id: str, **_: Any) -> str:
+        try:
+            proposal = await _read_proposal(self._client, proposal_id)
+        except Exception as e:  # noqa: BLE001 - surface, don't crash the turn
+            return f"Could not read proposal {proposal_id}: {e}"
+        title = str(proposal.get("title") or proposal_id)
+        status = str(proposal.get("status") or "")
+        if proposal.get("category") != "development":
+            return "Not claiming: only development proposals are built and claimed."
+        if status == "building":
+            try:
+                mine = proposal.get("claimed_by_agent_id") == (await self._client.get_me()).get("id")
+            except Exception:  # noqa: BLE001 - the platform decides below
+                mine = False
+            if not mine:
+                return (
+                    f'Not claiming: {_builder(proposal)} is already building "{title}". Pick another '
+                    "proposal, or comment on this one to work with them."
+                )
+        elif status not in ("open", "voting"):
+            return f'Not claiming: "{title}" is {status or "not open"}; only an open proposal can be claimed.'
+
+        async def run() -> str:
+            try:
+                res = await self._client.claim_proposal(proposal_id)
+            except CommunityRuleError as e:
+                if e.rule_id in _CLAIM_REFUSALS:
+                    return f"Not claimed: {e.reason or e}"
+                raise
+            claim = res.get("claim") or {}
+            return claimed_next_step(proposal_id, title, str(claim.get("claim_expires_at") or ""))
+
+        return await self._gated(
+            "claim_proposal", {"proposal_id": proposal_id, "title": title}, run, origin=self._origin(),
+            held_note="Once your user approves it, you will be told in this conversation and can start.",
+        )
+
+
+class CommunityProposalLeaseTool(_CommunityTool):
+    @property
+    def name(self) -> str:
+        return "community_proposal_lease"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Renew your claim on a development proposal you are building, or release it if "
+            "you stop so someone else can build it. A claim held by your open PR needs no renewal."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string"},
+                "action": {"type": "string", "enum": ["renew", "release"]},
+            },
+            "required": ["proposal_id", "action"],
+        }
+
+    async def execute(self, proposal_id: str, action: str, **_: Any) -> str:
+        if action not in ("renew", "release"):
+            return "action must be renew or release"
+
+        async def run() -> str:
+            try:
+                if action == "renew":
+                    res = await self._client.claim_proposal(proposal_id)
+                    expires = (res.get("claim") or {}).get("claim_expires_at")
+                    return f"Claim renewed until {expires}." if expires else "Your open PR holds the claim; nothing to renew."
+                await self._client.release_proposal(proposal_id)
+                return "Claim released; the proposal is open for others again."
+            except CommunityRuleError as e:
+                return f"Not done: {e.reason or e}"
+
+        return await self._gated(f"{action}_proposal_claim", {"proposal_id": proposal_id}, run)
+
+
 class CommunityStartContributionTool(_CommunityTool):
     """Create the isolated workspace every code contribution happens in (mira#204)."""
 
@@ -857,8 +976,8 @@ class CommunityStartContributionTool(_CommunityTool):
     def description(self) -> str:
         return (
             "Start a code contribution to a MIRA repo — for a work order you claimed "
-            "(pass work_order_id) or a development proposal (pass proposal_id and repo; "
-            "the PR is then linked to it). Clones the repo at the community "
+            "(pass work_order_id) or a development proposal you claimed with "
+            "community_claim_proposal (pass proposal_id and repo; the PR is then linked to it). Clones the repo at the community "
             "landing branch into a fresh, isolated contribution workspace and returns its "
             "path and scope. Make ALL changes for the PR inside that workspace (never in "
             "your user's own projects), then call community_open_pr with it. Prefer "
@@ -921,11 +1040,21 @@ class CommunityStartContributionTool(_CommunityTool):
             repo = wo.get("repo") or repo
             title = title or wo.get("title") or "work-order"
             allowed_paths = list(wo.get("allowed_paths") or [])
-        if proposal_id and not title:
+        if proposal_id and not work_order_id:
+            # One builder per proposal: build only what you claimed.
             try:
-                title = str((await self._client.get_proposal(proposal_id)).get("title") or "")
+                proposal = await _read_proposal(self._client, proposal_id)
+                me = str((await self._client.get_me()).get("id") or "")
             except Exception as e:  # noqa: BLE001
                 return f"Could not read proposal {proposal_id}: {e}"
+            if proposal.get("status") != "building" or proposal.get("claimed_by_agent_id") != me:
+                if proposal.get("status") == "building":
+                    return f"Not starting: {_builder(proposal)} is building this proposal."
+                return (
+                    "Not starting: claim the proposal first with community_claim_proposal, so no "
+                    "one else builds it at the same time."
+                )
+            title = title or str(proposal.get("title") or "")
         if not repo or not title:
             return (
                 "Pass work_order_id; or proposal_id and repo to build a proposal; or repo "
@@ -1025,6 +1154,8 @@ def build_community_tools(community_config: Any, workspace: Any = None) -> list[
         CommunityListWorkOrdersTool(client, gate, community_config),
         CommunityClaimWorkOrderTool(client, gate, community_config),
         CommunityWorkOrderLeaseTool(client, gate, community_config),
+        CommunityClaimProposalTool(client, gate, community_config),
+        CommunityProposalLeaseTool(client, gate, community_config),
         CommunityStartContributionTool(client, gate, community_config, workspace),
         CommunityReviewCodeTool(client, gate, community_config),
     ]

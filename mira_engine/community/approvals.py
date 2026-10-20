@@ -197,6 +197,13 @@ async def execute_approval(record: dict[str, Any], community_config: Any) -> dic
             res = await client.claim_work_order(payload.get("work_order_id", ""))
             claim = res.get("claim") or {}
             return {"ok": True, "detail": f"work order claimed (lease until {claim.get('expires_at', '?')})"}
+        if action in ("claim_proposal", "renew_proposal_claim"):
+            res = await client.claim_proposal(payload.get("proposal_id", ""))
+            claim = res.get("claim") or {}
+            return {"ok": True, "detail": f"proposal claimed (until {claim.get('claim_expires_at') or 'its PR closes'})"}
+        if action == "release_proposal_claim":
+            await client.release_proposal(payload.get("proposal_id", ""))
+            return {"ok": True, "detail": "proposal claim released"}
         if action == "review":
             res = await client.review_pr(
                 payload.get("pr_id", ""),

@@ -3308,6 +3308,35 @@ async def test_approving_a_proposal_follows_up_in_its_conversation(
     ui_channel.bus.publish_inbound.assert_not_awaited()
 
 
+async def test_approving_a_claim_follows_up_in_its_conversation(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {
+        "id": "4",
+        "action": "claim_proposal",
+        "status": "pending",
+        "payload": {"proposal_id": "p1", "title": "Local model picker"},
+        "origin": {"channel": "ui", "chat_id": "chat-7"},
+    }
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "set_status", lambda i, s: {**rec, "status": s})
+
+    async def fake_exec(r, c):
+        return {"ok": True, "detail": "proposal claimed"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: Config())
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "4"}
+    assert (await ui_channel._handle_community_decide(req)).status == 200
+    msg = ui_channel.bus.publish_inbound.await_args.args[0]
+    assert msg.channel == "system" and msg.chat_id == "ui:chat-7" and msg.metadata == {}
+    assert "approved claiming" in msg.content and "community_start_contribution with proposal_id='p1'" in msg.content
+
+
 async def test_handle_community_decide_keeps_pending_on_execution_failure(
     ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

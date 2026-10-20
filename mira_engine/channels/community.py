@@ -84,6 +84,25 @@ def _ws_url(api_base: str) -> str:
     return urlunparse((scheme, parsed.netloc, path, "", "", ""))
 
 
+def _format_proposal_claim(event: dict[str, Any]) -> str:
+    """Your claim on a development proposal lapsed, or your PR for it closed."""
+    pid = str(event.get("proposal_id") or "")
+    title = event.get("title") or pid
+    if event.get("state") == "expired":
+        return (
+            f'[Mira Community] Your claim on the proposal "{title}" (id {pid}) expired, so it is '
+            "open for others to build. If you are still building it, claim it again with "
+            "community_claim_proposal (someone may have taken it); otherwise there is nothing to do. "
+            "Your final message in this turn is not posted to the community."
+        )
+    return (
+        f'[Mira Community] Your PR for the proposal "{title}" (id {pid}) closed without merging. '
+        "You still hold the claim for another lease: open a new PR with community_open_pr, or "
+        "release it with community_proposal_lease (action='release') if you stop. "
+        "Your final message in this turn is not posted to the community."
+    )
+
+
 class CommunityChannel(BaseChannel):
     """Engine-side connection to the Mira Community Platform."""
 
@@ -370,6 +389,8 @@ class CommunityChannel(BaseChannel):
     def _format_event(event: dict[str, Any]) -> str:
         """Render a community event as a prompt the agent can reason about."""
         etype = event.get("type", "event")
+        if etype == "proposal_claim":
+            return _format_proposal_claim(event)
         body = event.get("content") or event.get("body") or event.get("text") or ""
         title = event.get("title")
         url = event.get("url")

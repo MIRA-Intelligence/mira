@@ -3390,36 +3390,43 @@ class UiChannel(BaseChannel):
             action="community_approval_approved",
             details={"id": approval_id, "action": record.get("action")},
         )
-        await self._follow_up_approved_proposal(record, result, cfg)
+        await self._follow_up_approval(record, result, cfg)
         return web.json_response({"ok": True, "approval": updated, "result": result.get("detail")})
 
-    async def _follow_up_approved_proposal(
+    async def _follow_up_approval(
         self, record: dict[str, Any], result: dict[str, Any], cfg: Config
     ) -> None:
-        """Back in the conversation that asked for it, the agent tells the user an
-        approved proposal is live and offers to start building it."""
-        origin = record.get("origin") or {}
-        post_id = str(result.get("post_id") or "")
-        payload = record.get("payload") or {}
-        if (
-            record.get("action") != "post_proposal"
-            or payload.get("category", "development") != "development"
-            or not post_id
-            or not origin.get("channel")
-            or not origin.get("chat_id")
-        ):
-            return
+        """Back in the conversation that asked for it, the agent picks up after an
+        approval: a posted proposal is offered for building, a claimed one is built."""
         from mira_engine.community.client import CommunityClient
-        from mira_engine.community.proposals import approved_proposal_prompt, post_link
+        from mira_engine.community.proposals import (
+            approved_claim_prompt,
+            approved_proposal_prompt,
+            post_link,
+        )
 
-        client = CommunityClient(cfg.community.api_base, cfg.community.agent_token)
-        link = await post_link(client, cfg.community, post_id)
+        origin = record.get("origin") or {}
+        payload = record.get("payload") or {}
+        if not origin.get("channel") or not origin.get("chat_id"):
+            return
+        action = record.get("action")
+        title = str(payload.get("title") or "")
+        if action == "post_proposal" and payload.get("category", "development") == "development":
+            post_id = str(result.get("post_id") or "")
+            if not post_id:
+                return
+            client = CommunityClient(cfg.community.api_base, cfg.community.agent_token)
+            content = approved_proposal_prompt(title, post_id, await post_link(client, cfg.community, post_id))
+        elif action == "claim_proposal" and payload.get("proposal_id"):
+            content = approved_claim_prompt(title, str(payload["proposal_id"]))
+        else:
+            return
         await self.bus.publish_inbound(
             InboundMessage(
                 channel="system",
                 sender_id="community",
                 chat_id=f"{origin['channel']}:{origin['chat_id']}",
-                content=approved_proposal_prompt(str(payload.get("title") or ""), post_id, link),
+                content=content,
                 metadata={"project_id": origin["project_id"]} if origin.get("project_id") else {},
             )
         )

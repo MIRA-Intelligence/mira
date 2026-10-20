@@ -8,20 +8,36 @@ from mira_engine.agent.tools import community as community_tools
 from mira_engine.community import approvals, contribute
 from mira_engine.community.autonomy import AutonomyGate
 
+ME = "a1b2c3d4-0000-4000-8000-000000000001"
+OTHER = "f0e1d2c3-0000-4000-8000-000000000002"
+
 
 class _Client:
-    def __init__(self):
+    def __init__(self, status="building", claimed_by=ME, category="development", claim_error=None):
         self.calls = []
+        self.proposal = {"id": "p1", "title": "Local model picker", "category": category,
+                         "status": status, "claimed_by_agent_id": claimed_by, "claimed_by_name": "Nova"}
+        self.claim_error = claim_error
 
     async def create_proposal(self, title, body, category="development", tags=None):
         self.calls.append(("create_proposal", title))
         return {"id": "p1", "category": category}
 
     async def get_me(self):
-        return {"web_url": "http://web.test/"}
+        return {"id": ME, "web_url": "http://web.test/"}
 
     async def get_proposal(self, proposal_id):
-        return {"id": proposal_id, "title": "Local model picker"}
+        return {"proposal": self.proposal, "comments": [], "prs": []}
+
+    async def claim_proposal(self, proposal_id):
+        self.calls.append(("claim_proposal", proposal_id))
+        if self.claim_error:
+            raise self.claim_error
+        return {"claim": {"proposal_id": proposal_id, "status": "building", "claim_expires_at": "2026-10-23T12:00:00Z"}}
+
+    async def release_proposal(self, proposal_id):
+        self.calls.append(("release_proposal", proposal_id))
+        return {"claim": {}}
 
     async def get_contribution(self):
         return {"landing_branch": "contrib", "lanes": {"plugin": {"paths": ["plugins/**"]}}}
@@ -39,7 +55,7 @@ async def test_a_posted_proposal_tells_the_agent_to_offer_building_it():
     out = await _tool("fully_autonomous").execute(title="T", body="B")
     assert "p1" in out and "http://web.test/proposals/p1" in out
     assert "do not need to wait for votes" in out
-    assert "community_start_contribution with proposal_id='p1'" in out and "Ask first" in out
+    assert "community_claim_proposal with proposal_id='p1'" in out and "Ask first" in out
 
 
 async def test_the_configured_website_wins():
@@ -118,3 +134,121 @@ def test_an_old_scope_file_still_loads(tmp_path):
     (tmp_path / ".git").mkdir()
     contribute.scope_path(tmp_path).write_text(json.dumps({"repo": "o/r", "landing_branch": "contrib", "branch": "b"}))
     assert contribute.load_scope(tmp_path).proposal_id is None
+
+
+# ------------------------------------------------------------------ claims
+
+
+def _claim_tool(client, mode="fully_autonomous"):
+    return community_tools.CommunityClaimProposalTool(client, AutonomyGate(mode), SimpleNamespace())
+
+
+async def test_an_open_proposal_is_claimed_and_the_agent_is_told_what_next():
+    client = _Client(status="open", claimed_by=None)
+    out = await _claim_tool(client).execute(proposal_id="p1")
+    assert ("claim_proposal", "p1") in client.calls
+    assert 'Claimed "Local model picker"' in out and "2026-10-23" in out
+    assert "community_start_contribution with proposal_id='p1'" in out and "community_proposal_lease" in out
+
+
+async def test_a_proposal_someone_else_is_building_is_not_claimed():
+    client = _Client(status="building", claimed_by=OTHER)
+    out = await _claim_tool(client).execute(proposal_id="p1")
+    assert out.startswith("Not claiming") and "Nova #f0e1d2c3" in out
+    assert ("claim_proposal", "p1") not in client.calls
+
+
+async def test_only_open_development_proposals_are_claimed():
+    for client in (_Client(status="merged", claimed_by=None), _Client(status="open", category="question")):
+        out = await _claim_tool(client).execute(proposal_id="p1")
+        assert out.startswith("Not claiming") and not client.calls
+
+
+async def test_your_own_claim_is_renewed():
+    client = _Client(status="building", claimed_by=ME)
+    assert "Claimed" in await _claim_tool(client).execute(proposal_id="p1")
+    assert ("claim_proposal", "p1") in client.calls
+
+
+async def test_losing_a_race_reports_the_platforms_reason():
+    from mira_engine.community.client import CommunityRuleError
+
+    err = CommunityRuleError("x", rule_id="proposal-claimed", reason="Ada #12345678 is building it.", status_code=409)
+    out = await _claim_tool(_Client(status="open", claimed_by=None, claim_error=err)).execute(proposal_id="p1")
+    assert out == "Not claimed: Ada #12345678 is building it."
+
+
+async def test_a_held_claim_remembers_the_conversation(monkeypatch):
+    tool = _claim_tool(_Client(status="open", claimed_by=None), mode="hybrid")
+    queued = []
+    monkeypatch.setattr(tool._gate, "enqueue_approval", lambda a, p, o=None: queued.append((a, p, o)) or "a1")
+    tool.set_context("ui", "chat-7")
+    out = await tool.execute(proposal_id="p1")
+    assert queued == [("claim_proposal", {"proposal_id": "p1", "title": "Local model picker"}, {"channel": "ui", "chat_id": "chat-7"})]
+    assert "you will be told in this conversation" in out
+
+
+async def test_renewing_and_releasing_a_claim():
+    client = _Client()
+    tool = community_tools.CommunityProposalLeaseTool(client, AutonomyGate("hybrid"))
+    assert "renewed until 2026-10-23" in await tool.execute(proposal_id="p1", action="renew")
+    assert "open for others again" in await tool.execute(proposal_id="p1", action="release")
+    assert client.calls == [("claim_proposal", "p1"), ("release_proposal", "p1")]
+    assert "must be renew or release" in await tool.execute(proposal_id="p1", action="drop")
+
+
+async def test_building_needs_your_claim(monkeypatch, tmp_path):
+    started = []
+
+    async def fake_start(**kw):
+        started.append(kw)
+
+    monkeypatch.setattr(contribute, "start_contribution", fake_start)
+    for client, expected in (
+        (_Client(status="open", claimed_by=None), "claim the proposal first"),
+        (_Client(status="building", claimed_by=OTHER), "Nova #f0e1d2c3 is building"),
+    ):
+        tool = community_tools.CommunityStartContributionTool(client, AutonomyGate("hitl"), SimpleNamespace(), tmp_path)
+        out = await tool.execute(repo="o/r", proposal_id="p1")
+        assert out.startswith("Not starting") and expected in out
+    assert not started
+
+
+async def test_approved_claims_run(monkeypatch):
+    calls = []
+
+    async def claim(self, proposal_id):
+        calls.append(("claim", proposal_id))
+        return {"claim": {"claim_expires_at": "2026-10-23T12:00:00Z"}}
+
+    async def release(self, proposal_id):
+        calls.append(("release", proposal_id))
+        return {}
+
+    monkeypatch.setattr("mira_engine.community.client.CommunityClient.claim_proposal", claim)
+    monkeypatch.setattr("mira_engine.community.client.CommunityClient.release_proposal", release)
+    cfg = SimpleNamespace(api_base="http://x", agent_token="t")
+    for action in ("claim_proposal", "renew_proposal_claim", "release_proposal_claim"):
+        res = await approvals.execute_approval({"action": action, "payload": {"proposal_id": "p1"}}, cfg)
+        assert res["ok"], res
+    assert calls == [("claim", "p1"), ("claim", "p1"), ("release", "p1")]
+
+
+def test_claim_and_renew_tiers():
+    hybrid = AutonomyGate("hybrid")
+    assert hybrid.requires_approval("claim_proposal")
+    assert not hybrid.requires_approval("renew_proposal_claim") and not hybrid.requires_approval("release_proposal_claim")
+
+
+def test_claim_events_reach_the_inbox_as_work_and_prompt_the_agent():
+    from mira_engine.channels.community import CommunityChannel
+    from mira_engine.community import inbox
+
+    expired = {"type": "proposal_claim", "proposal_id": "p1", "title": "Picker", "state": "expired"}
+    reopened = {**expired, "state": "reopened"}
+    assert inbox.kind_of(expired) == "work"
+    assert inbox._title(expired) == 'Your claim on "Picker" expired; it is open to others again'
+    assert "still hold the claim" in inbox._title(reopened)
+    text = CommunityChannel._format_event(expired)
+    assert "community_claim_proposal" in text and "community_comment" not in text
+    assert "community_open_pr" in CommunityChannel._format_event(reopened)

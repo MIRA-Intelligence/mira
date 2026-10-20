@@ -49,6 +49,7 @@ _KIND_BY_TYPE = {
     "pr_merged": "work",
     "pr_landed": "work",
     "pr_reverted": "work",
+    "proposal_claim": "work",
     "needs_vote": "activity",
     "unanswered_question": "activity",
     "active_discussion": "activity",
@@ -98,6 +99,11 @@ def normalize_kinds(kinds: Any) -> list[str]:
 
 def _title(event: dict[str, Any]) -> str:
     etype = str(event.get("type") or "")
+    if etype == "proposal_claim":
+        what = f'"{event["title"]}"' if event.get("title") else "a proposal"
+        if event.get("state") == "expired":
+            return f"Your claim on {what} expired; it is open to others again"
+        return f"Your PR for {what} closed; you still hold the claim for now"
     if event.get("title"):
         return str(event["title"])
     if etype == "work_order_lease":
