@@ -496,3 +496,82 @@ async def test_persistent_retry_aborts_after_ten_identical_transient_errors(monk
     assert response.content == "429 rate limit"
     assert provider.calls == 10
     assert delays == [1, 2, 4, 4, 4, 4, 4, 4, 4]
+
+
+class ScriptedStreamProvider(ScriptedProvider):
+    """Streams a scripted prefix before each scripted response."""
+
+    def __init__(self, responses, prefixes):
+        super().__init__(responses)
+        self._prefixes = list(prefixes)
+
+    async def chat_stream(self, *args, on_content_delta=None, **kwargs) -> LLMResponse:
+        prefix = self._prefixes.pop(0)
+        if prefix and on_content_delta is not None:
+            await on_content_delta(prefix)
+        return await self.chat(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_with_retry_resets_partial_stream_before_retrying(monkeypatch) -> None:
+    provider = ScriptedStreamProvider(
+        [
+            LLMResponse(content="429 rate limit", finish_reason="error"),
+            LLMResponse(content="final answer"),
+        ],
+        prefixes=["partial ", "final answer"],
+    )
+
+    async def _fake_sleep(delay: int) -> None:
+        return None
+
+    monkeypatch.setattr("mira_engine.providers.base.asyncio.sleep", _fake_sleep)
+
+    events: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        events.append(f"delta:{text}")
+
+    async def on_reset() -> None:
+        events.append("reset")
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=on_delta,
+        on_stream_reset=on_reset,
+    )
+
+    assert response.content == "final answer"
+    # The partial text from the failed attempt is withdrawn before the retry streams.
+    assert events == ["delta:partial ", "reset", "delta:final answer"]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_with_retry_does_not_reset_when_nothing_streamed(monkeypatch) -> None:
+    provider = ScriptedStreamProvider(
+        [
+            LLMResponse(content="429 rate limit", finish_reason="error"),
+            LLMResponse(content="ok"),
+        ],
+        prefixes=["", "ok"],
+    )
+
+    async def _fake_sleep(delay: int) -> None:
+        return None
+
+    monkeypatch.setattr("mira_engine.providers.base.asyncio.sleep", _fake_sleep)
+    resets: list[int] = []
+
+    async def on_reset() -> None:
+        resets.append(1)
+
+    async def on_delta(text: str) -> None:
+        return None
+
+    response = await provider.chat_stream_with_retry(
+        messages=[{"role": "user", "content": "hello"}],
+        on_content_delta=on_delta,
+        on_stream_reset=on_reset,
+    )
+    assert response.content == "ok"
+    assert resets == []

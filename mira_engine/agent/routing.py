@@ -162,14 +162,29 @@ class RoutedProviderManager:
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_stream_reset: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[LLMResponse, RoutedModel]:
         """Call the routed model with token streaming when the client requests it."""
         candidates = self._ordered_candidate_models(tuple(route.candidates) or (route.model,))
         last_response: LLMResponse | None = None
         last_error: Exception | None = None
 
+        # Tokens already streamed by a failed candidate must be withdrawn before
+        # the fallback model starts, or the client shows both replies joined.
+        emitted = False
+        wrapped_delta: Callable[[str], Awaitable[None]] | None = None
+        if on_content_delta is not None:
+            async def wrapped_delta(text: str) -> None:  # type: ignore[no-redef]
+                nonlocal emitted
+                emitted = True
+                await on_content_delta(text)
+
         for index, model in enumerate(candidates):
             provider = self._provider_for_model(model)
+            if emitted:
+                emitted = False
+                if on_stream_reset is not None:
+                    await on_stream_reset()
             try:
                 response = await provider.chat_stream_with_retry(
                     messages=messages,
@@ -178,7 +193,8 @@ class RoutedProviderManager:
                     max_tokens=max_tokens,
                     temperature=temperature,
                     reasoning_effort=reasoning_effort,
-                    on_content_delta=on_content_delta,
+                    on_content_delta=wrapped_delta,
+                    on_stream_reset=on_stream_reset,
                 )
             except Exception as exc:
                 last_error = exc

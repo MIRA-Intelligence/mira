@@ -12,8 +12,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
+import httpx
 import json_repair
 
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -24,6 +26,8 @@ _DEFAULT_API_BASE = "https://inference-api.nvidia.com/v1"
 _CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 _DEFAULT_TIMEOUT_S = 120.0
+_DEFAULT_STREAM_IDLE_TIMEOUT_S = 90
+_DEFAULT_CONNECT_TIMEOUT_S = 30.0
 _DEFAULT_RATE_LIMIT_RETRIES = 2
 _DEFAULT_RATE_LIMIT_BACKOFF_S = 15.0
 
@@ -47,6 +51,13 @@ def _timeout_seconds() -> float:
         return float(os.environ.get("MIRA_NVIDIA_TIMEOUT_S", _DEFAULT_TIMEOUT_S))
     except (TypeError, ValueError):
         return _DEFAULT_TIMEOUT_S
+
+
+def _stream_idle_timeout_seconds() -> float:
+    try:
+        return float(os.environ.get("MIRA_STREAM_IDLE_TIMEOUT_S", _DEFAULT_STREAM_IDLE_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return float(_DEFAULT_STREAM_IDLE_TIMEOUT_S)
 
 
 def _rate_limit_retries() -> int:
@@ -174,9 +185,25 @@ class NvidiaProvider(LLMProvider):
         self.default_model = default_model
         self.api_base = _normalize_base_url(api_base)
         self.extra_headers = extra_headers or {}
+        # Shared keep-alive client for the streaming path. The blocking
+        # ``chat()`` path keeps urllib (one connection per call) as a fallback.
+        self._http: httpx.AsyncClient | None = None
 
     def get_default_model(self) -> str:
         return self.default_model
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            total = _timeout_seconds()
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(total, connect=_DEFAULT_CONNECT_TIMEOUT_S, read=total),
+                limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+            )
+        return self._http
+
+    async def aclose(self) -> None:
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
 
     def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         sanitized = self._sanitize_request_messages(
@@ -425,3 +452,169 @@ class NvidiaProvider(LLMProvider):
                 return self._parse_error(status_code=status, headers=headers, body=body)
             return self._parse_success(body)
         return self._parse_error(status_code=status, headers=headers, body=body)
+
+    # ── streaming ──────────────────────────────────────────────────
+
+    @staticmethod
+    async def _iter_sse_data(response: httpx.Response, idle_timeout: float) -> AsyncIterator[str]:
+        """Yield the ``data:`` payload of each server-sent event.
+
+        A stall longer than *idle_timeout* between lines raises
+        ``asyncio.TimeoutError`` so a dead upstream never hangs a turn.
+        """
+        lines = response.aiter_lines().__aiter__()
+        buffer: list[str] = []
+        while True:
+            try:
+                line = await asyncio.wait_for(lines.__anext__(), timeout=idle_timeout)
+            except StopAsyncIteration:
+                break
+            if line == "":
+                if buffer:
+                    yield "\n".join(buffer)
+                    buffer = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                buffer.append(line[5:].lstrip())
+        if buffer:
+            yield "\n".join(buffer)
+
+    @classmethod
+    def _parse_stream_chunks(cls, chunks: list[dict[str, Any]]) -> LLMResponse:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_bufs: dict[int, dict[str, str]] = {}
+        finish_reason = "stop"
+        usage: dict[str, int] = {}
+        for chunk in chunks:
+            if chunk.get("usage"):
+                usage = cls._extract_usage(chunk) or usage
+            choices = chunk.get("choices") or []
+            if not choices or not isinstance(choices[0], dict):
+                continue
+            choice = choices[0]
+            if choice.get("finish_reason"):
+                finish_reason = str(choice["finish_reason"])
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            text = cls._extract_text_content(delta.get("content"))
+            if text:
+                content_parts.append(text)
+            reasoning = cls._extract_text_content(delta.get("reasoning_content") or delta.get("reasoning"))
+            if reasoning:
+                reasoning_parts.append(reasoning)
+            for position, raw_tc in enumerate(delta.get("tool_calls") or []):
+                if not isinstance(raw_tc, dict):
+                    continue
+                index = raw_tc.get("index")
+                buf = tool_bufs.setdefault(index if isinstance(index, int) else position, {"id": "", "name": "", "arguments": ""})
+                if raw_tc.get("id"):
+                    buf["id"] = str(raw_tc["id"])
+                fn = raw_tc.get("function") if isinstance(raw_tc.get("function"), dict) else {}
+                if fn.get("name"):
+                    buf["name"] = str(fn["name"])
+                if fn.get("arguments"):
+                    buf["arguments"] += str(fn["arguments"])
+        tool_calls = []
+        for buf in tool_bufs.values():
+            args: Any = json_repair.loads(buf["arguments"]) if buf["arguments"] else {}
+            tool_calls.append(
+                ToolCallRequest(
+                    id=buf["id"],
+                    name=buf["name"],
+                    arguments=args if isinstance(args, dict) else {},
+                )
+            )
+        return LLMResponse(
+            content="".join(content_parts) or None,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+            reasoning_content="".join(reasoning_parts) or None,
+        )
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: Any | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Stream a chat completion, forwarding content deltas as they arrive.
+
+        Falls back to the blocking ``chat()`` request when the stream cannot be
+        opened at all (connection/TLS failures), so behaviour never regresses
+        below the non-streaming path.
+        """
+        if not self.api_key:
+            return LLMResponse(
+                content="Error: NVIDIA API key is required.",
+                finish_reason="error",
+                error_type="missing_api_key",
+            )
+        endpoint = _chat_completions_url(self.api_base)
+        payload = self._build_payload(
+            messages, tools, tool_choice, model, max_tokens, temperature, reasoning_effort,
+        )
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        headers = self._request_headers()
+        headers["Accept"] = "text/event-stream"
+        idle_timeout = _stream_idle_timeout_seconds()
+        chunks: list[dict[str, Any]] = []
+        try:
+            async with self._http_client().stream("POST", endpoint, json=payload, headers=headers) as response:
+                content_type = response.headers.get("content-type", "")
+                if response.status_code >= 300 or "text/event-stream" not in content_type:
+                    raw = (await response.aread()).decode("utf-8", errors="replace")
+                    body = _try_parse_json(raw)
+                    response_headers = dict(response.headers.items())
+                    if 200 <= response.status_code < 300 and isinstance(body, dict) and "choices" in body:
+                        # Upstream ignored ``stream`` and answered in one piece.
+                        return self._parse_success(body)
+                    return self._parse_error(status_code=response.status_code, headers=response_headers, body=body)
+                async for data in self._iter_sse_data(response, idle_timeout):
+                    if data.strip() == "[DONE]":
+                        break
+                    parsed = _try_parse_json(data)
+                    if not isinstance(parsed, dict):
+                        continue
+                    if "error" in parsed and "choices" not in parsed:
+                        return self._parse_error(
+                            status_code=response.status_code,
+                            headers=dict(response.headers.items()),
+                            body=parsed,
+                        )
+                    chunks.append(parsed)
+                    if on_content_delta:
+                        choices = parsed.get("choices") or []
+                        delta = choices[0].get("delta") if choices and isinstance(choices[0], dict) else None
+                        text = self._extract_text_content(delta.get("content")) if isinstance(delta, dict) else None
+                        if text:
+                            await on_content_delta(text)
+        except asyncio.TimeoutError:
+            return LLMResponse(
+                content=f"Error calling NVIDIA API: stream stalled for more than {int(idle_timeout)} seconds",
+                finish_reason="error",
+                error_kind="timeout",
+            )
+        except Exception as exc:
+            if not chunks:
+                return await self.chat(
+                    messages, tools=tools, tool_choice=tool_choice, model=model,
+                    max_tokens=max_tokens, temperature=temperature, reasoning_effort=reasoning_effort,
+                )
+            error_name = exc.__class__.__name__.lower()
+            return LLMResponse(
+                content=f"Error calling NVIDIA API: {exc}",
+                finish_reason="error",
+                error_kind="timeout" if "timeout" in error_name else "connection",
+            )
+        if not chunks:
+            return LLMResponse(content="Error: NVIDIA API returned an empty stream.", finish_reason="error")
+        return self._parse_stream_chunks(chunks)

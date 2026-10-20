@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -24,6 +25,7 @@ _PROJECT_OVERRIDES_FILENAME = "plugin_overrides.json"
 _BUILTIN_PLUGIN_ID = "builtin-skills"
 _BUILTIN_PLUGIN_NAME = "Built-in Skills"
 _BUILTIN_MANIFEST_UNCACHED = object()
+_PLUGINS_CACHE_TTL_S = 5.0
 # Directories skipped when scanning built-in skills (keeps startup/interrupt responsive).
 _BUILTIN_SCAN_SKIP_DIRS = frozenset({
     ".git",
@@ -97,6 +99,10 @@ class SkillPluginManager:
         self.project_overrides_path = self.project_skills_dir / _PROJECT_OVERRIDES_FILENAME
         self.builtin_skills_dir = Path(__file__).parent.parent / "skills"
         self._builtin_manifest_cache: dict[str, Any] | None | object = _BUILTIN_MANIFEST_UNCACHED
+        # list_plugins() re-reads both state files and every installed plugin
+        # manifest; it is called hundreds of times per agent turn. Memoise on
+        # the mtimes of those inputs (plus a short TTL as a safety net).
+        self._plugins_cache: tuple[float, tuple[Any, ...], list[dict[str, Any]]] | None = None
 
     def warm_builtin_manifest_cache(self) -> None:
         """Build and cache the built-in skill manifest (safe to call from a worker thread)."""
@@ -153,6 +159,17 @@ class SkillPluginManager:
 
     def _write_state(self, path: Path, state: dict[str, Any]) -> None:
         self._write_json(path, state)
+        self._plugins_cache = None
+
+    def _plugins_fingerprint(self) -> tuple[Any, ...]:
+        signature: list[Any] = []
+        for path in (self.global_state_path, self.project_overrides_path, self.plugins_root):
+            try:
+                st = path.stat()
+                signature.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                signature.append(None)
+        return tuple(signature)
 
     def _iter_plugin_dirs(self) -> list[Path]:
         if not self.plugins_root.exists():
@@ -657,6 +674,7 @@ class SkillPluginManager:
         if destination.exists():
             shutil.rmtree(destination)
         staging.rename(destination)
+        self._plugins_cache = None
         self._write_plugin_source(destination, source_type=source_type, source_path=source_path)
 
         installed_manifest = self._load_manifest(destination)
@@ -701,6 +719,7 @@ class SkillPluginManager:
         if not plugin_dir.is_dir():
             raise SkillPluginError(f"Plugin not installed: {plugin_id}")
         shutil.rmtree(plugin_dir)
+        self._plugins_cache = None
         for state_path in (self.global_state_path, self.project_overrides_path):
             state = self._read_state(state_path)
             plugins = state.get("plugins", {})
@@ -764,6 +783,16 @@ class SkillPluginManager:
         self._write_state(state_path, state)
 
     def list_plugins(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        fingerprint = self._plugins_fingerprint()
+        cached = self._plugins_cache
+        if cached is not None and now - cached[0] < _PLUGINS_CACHE_TTL_S and cached[1] == fingerprint:
+            return copy.deepcopy(cached[2])
+        plugins = self._list_plugins_uncached()
+        self._plugins_cache = (now, fingerprint, copy.deepcopy(plugins))
+        return plugins
+
+    def _list_plugins_uncached(self) -> list[dict[str, Any]]:
         global_state = self._read_state(self.global_state_path).get("plugins", {})
         project_state = self._read_state(self.project_overrides_path).get("plugins", {})
 

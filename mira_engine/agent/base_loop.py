@@ -696,9 +696,15 @@ class BaseAgentLoop:
         """Remove <think>…</think> blocks and normalize native citation markup."""
         if not text:
             return None
-        cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
-        cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
-        return normalize_citations(cleaned).strip() or None
+        # Called once per streamed token on the accumulated text; the regex
+        # passes only run when their markers are actually present.
+        cleaned = text
+        if "<think>" in cleaned:
+            cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned)
+            cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
+        if "\ue200" in cleaned or "\ue201" in cleaned or "\ue202" in cleaned:
+            cleaned = normalize_citations(cleaned)
+        return cleaned.strip() or None
 
     @staticmethod
     async def _emit_activity_ping(on_progress: Callable[..., Awaitable[None]]) -> None:
@@ -911,6 +917,18 @@ class BaseAgentLoop:
                         if out and on_stream:
                             await on_stream(out)
 
+                    async def _stream_reset() -> None:
+                        # A provider retry/fallback restarts generation; drop
+                        # the partial text so it is not duplicated.
+                        nonlocal streamed_raw, streamed_clean
+                        streamed_raw = ""
+                        streamed_clean = ""
+                        if on_stream_end:
+                            try:
+                                await on_stream_end(resuming=False, reset=True)
+                            except TypeError:
+                                pass
+
                     response = await self.provider.chat_stream_with_retry(
                         model=self.model,
                         messages=messages,
@@ -919,6 +937,7 @@ class BaseAgentLoop:
                         max_tokens=self.max_tokens,
                         reasoning_effort=self.reasoning_effort,
                         on_content_delta=_stream_delta,
+                        on_stream_reset=_stream_reset,
                     )
                     clean_streamed = self._strip_think(streamed_raw)
                     iteration_streamed = bool(clean_streamed)
@@ -960,6 +979,18 @@ class BaseAgentLoop:
                         if out and on_stream:
                             await on_stream(out)
 
+                    async def _stream_reset() -> None:
+                        # A provider retry/fallback restarts generation; drop
+                        # the partial text so it is not duplicated.
+                        nonlocal streamed_raw, streamed_clean
+                        streamed_raw = ""
+                        streamed_clean = ""
+                        if on_stream_end:
+                            try:
+                                await on_stream_end(resuming=False, reset=True)
+                            except TypeError:
+                                pass
+
                     response, active_route = await model_runtime.chat_stream_with_retry(
                         active_route,
                         messages=messages,
@@ -968,6 +999,7 @@ class BaseAgentLoop:
                         max_tokens=self.max_tokens,
                         reasoning_effort=self.reasoning_effort,
                         on_content_delta=_stream_delta,
+                        on_stream_reset=_stream_reset,
                     )
                     clean_streamed = self._strip_think(streamed_raw)
                     iteration_streamed = bool(clean_streamed)
@@ -1432,9 +1464,26 @@ class BaseAgentLoop:
                     )
                 )
 
-            async def _on_stream_end(*, resuming: bool = False) -> None:
-                nonlocal streamed_any, pending_prefix
+            async def _on_stream_end(*, resuming: bool = False, reset: bool = False) -> None:
+                nonlocal streamed_any, pending_prefix, inspect_fallback_prefix, fallback_detected
                 if resuming:
+                    return
+                if reset:
+                    # Withdraw the partial reply the client already shows.
+                    streamed_any = False
+                    pending_prefix = ""
+                    fallback_detected = False
+                    inspect_fallback_prefix = bool(stream_meta.get("selected_skill_ids"))
+                    meta = dict(stream_meta)
+                    meta["_stream_reset"] = True
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="",
+                            metadata=meta,
+                        )
+                    )
                     return
                 if pending_prefix and not fallback_detected:
                     streamed_any = True

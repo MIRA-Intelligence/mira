@@ -231,3 +231,23 @@ def test_clear_resets_session() -> None:
     s.clear()
     assert s.messages == []
     assert s.last_consolidated == 0
+
+
+def test_append_ui_event_on_existing_log_appends_without_reloading(manager: SessionManager, tmp_path: Path) -> None:
+    manager.append_ui_event(key="ui:PRJ-FAST", role="user", content="first", metadata={})
+    path = manager._get_session_path("ui:PRJ-FAST")
+    lines_before = path.read_text(encoding="utf-8").splitlines()
+
+    # A fresh manager (as the UI channel creates per event) must not parse the
+    # whole file to add one event: exactly one line is appended.
+    with patch("mira_engine.session.manager.get_legacy_sessions_dir", return_value=tmp_path / "legacy"):
+        fresh = SessionManager(tmp_path)
+    with patch.object(SessionManager, "_load", side_effect=AssertionError("should not reload")):
+        fresh.append_ui_event(key="ui:PRJ-FAST", role="assistant", content="second", metadata={"a": 1})
+    lines_after = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines_after) == len(lines_before) + 1
+    assert json.loads(lines_after[-1])["event"]["content"] == "second"
+
+    entries = SessionManager(tmp_path).get_ui_history("ui:PRJ-FAST")
+    assert [e["content"] for e in entries] == ["first", "second"]
+    assert entries[1]["metadata"] == {"a": 1}

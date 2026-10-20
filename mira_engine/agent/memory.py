@@ -802,6 +802,37 @@ class Consolidator:
             self.store.raw_archive(messages)
             return True
 
+    def _probe_upper_bound(self, session, budget: int) -> int | None:
+        """Cheap upper bound on the prompt size, or None when a real probe is due.
+
+        The exact probe builds the whole system prompt and runs the tokenizer
+        over the full history before every turn. Once one exact estimate is
+        known for a session, later turns only add a few messages; bounding
+        their size by their character count (>= their token count) tells us
+        whether the window can possibly be exceeded without rebuilding.
+        """
+        cache = getattr(self, "_probe_cache", None)
+        if cache is None:
+            cache = self._probe_cache = {}
+        hit = cache.get(session.key)
+        if hit is None:
+            return None
+        estimated, msg_count, consolidated = hit
+        if consolidated != session.last_consolidated or len(session.messages) < msg_count:
+            return None
+        added = session.messages[msg_count:]
+        try:
+            added_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in added)
+        except (TypeError, ValueError):
+            return None
+        return estimated + added_chars
+
+    def _remember_probe(self, session, estimated: int) -> None:
+        cache = getattr(self, "_probe_cache", None)
+        if cache is None:
+            cache = self._probe_cache = {}
+        cache[session.key] = (estimated, len(session.messages), session.last_consolidated)
+
     async def maybe_consolidate_by_tokens(self, session) -> None:
         if not session.messages or self.context_window_tokens <= 0:
             return
@@ -811,9 +842,14 @@ class Consolidator:
                 self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
             )
             target = budget // 2
+            upper = self._probe_upper_bound(session, budget)
+            if upper is not None and upper < budget:
+                return
             estimated, source = await asyncio.to_thread(
                 self.estimate_session_prompt_tokens, session
             )
+            if estimated > 0:
+                self._remember_probe(session, estimated)
             if estimated <= 0 or estimated < budget:
                 return
 
