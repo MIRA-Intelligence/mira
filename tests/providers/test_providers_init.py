@@ -10,8 +10,6 @@ def test_importing_providers_package_is_lazy(monkeypatch) -> None:
     monkeypatch.delitem(sys.modules, "mira_engine.providers", raising=False)
     monkeypatch.delitem(sys.modules, "mira_engine.providers.anthropic_provider", raising=False)
     monkeypatch.delitem(sys.modules, "mira_engine.providers.openai_compat_provider", raising=False)
-    monkeypatch.delitem(sys.modules, "mira_engine.providers.openai_codex_provider", raising=False)
-    monkeypatch.delitem(sys.modules, "mira_engine.providers.github_copilot_provider", raising=False)
     monkeypatch.delitem(sys.modules, "mira_engine.providers.azure_openai_provider", raising=False)
     monkeypatch.delitem(sys.modules, "mira_engine.providers.nvidia_provider", raising=False)
 
@@ -19,8 +17,6 @@ def test_importing_providers_package_is_lazy(monkeypatch) -> None:
 
     assert "mira_engine.providers.anthropic_provider" not in sys.modules
     assert "mira_engine.providers.openai_compat_provider" not in sys.modules
-    assert "mira_engine.providers.openai_codex_provider" not in sys.modules
-    assert "mira_engine.providers.github_copilot_provider" not in sys.modules
     assert "mira_engine.providers.azure_openai_provider" not in sys.modules
     assert "mira_engine.providers.nvidia_provider" not in sys.modules
     assert providers.__all__ == [
@@ -28,8 +24,6 @@ def test_importing_providers_package_is_lazy(monkeypatch) -> None:
         "LLMResponse",
         "AnthropicProvider",
         "OpenAICompatProvider",
-        "OpenAICodexProvider",
-        "GitHubCopilotProvider",
         "AzureOpenAIProvider",
         "NvidiaProvider",
     ]

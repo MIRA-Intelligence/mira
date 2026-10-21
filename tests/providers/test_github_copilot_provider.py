@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 from oauth_cli_kit.models import OAuthToken
 
-import mira_engine.providers.github_copilot_provider as github_provider
+import mira_plugins.github_copilot.provider as github_provider
 
 
 def test_github_copilot_storage_prepares_oauth_state(monkeypatch) -> None:

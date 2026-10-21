@@ -14,7 +14,7 @@ from mira_engine.cli.commands import _make_provider, app
 from mira_engine.config.schema import Config
 from mira_engine.cron.types import CronJob, CronPayload
 from mira_engine.providers.model_fetch import ModelCache, ModelInfo, write_model_cache
-from mira_engine.providers.openai_codex_provider import _strip_model_prefix
+from mira_plugins.openai_codex.provider import _strip_model_prefix
 from mira_engine.providers.registry import find_by_name
 
 runner = CliRunner()
@@ -315,7 +315,7 @@ def test_status_reports_oauth_authenticated_only_when_token_exists(tmp_path, mon
 
 def test_oauth_login_status_reads_github_copilot_token(monkeypatch):
     from mira_engine.cli import commands
-    import mira_engine.providers.github_copilot_provider as github_provider
+    import mira_plugins.github_copilot.provider as github_provider
 
     monkeypatch.setattr(
         github_provider,
@@ -327,13 +327,13 @@ def test_oauth_login_status_reads_github_copilot_token(monkeypatch):
 
 
 def test_oauth_login_status_reads_openai_codex_token(monkeypatch):
-    import oauth_cli_kit
+    import mira_plugins.openai_codex.provider as codex_provider
     from mira_engine.cli import commands
 
-    monkeypatch.setattr(commands, "ensure_oauth_state_dirs_for_runtime", lambda: None)
+    monkeypatch.setattr(codex_provider, "ensure_oauth_state_dirs_for_runtime", lambda: None)
     monkeypatch.setattr(
-        oauth_cli_kit,
-        "get_token",
+        codex_provider,
+        "get_codex_token",
         lambda: SimpleNamespace(access="codex-token", account_id="acct-123"),
     )
 
@@ -342,7 +342,7 @@ def test_oauth_login_status_reads_openai_codex_token(monkeypatch):
 
 def test_oauth_login_status_treats_missing_token_as_logged_out(monkeypatch):
     from mira_engine.cli import commands
-    import mira_engine.providers.github_copilot_provider as github_provider
+    import mira_plugins.github_copilot.provider as github_provider
 
     monkeypatch.setattr(github_provider, "get_github_copilot_login_status", lambda: None)
 
@@ -552,7 +552,7 @@ def test_make_provider_uses_github_copilot_backend():
 
 
 def test_github_copilot_provider_strips_prefixed_model_name():
-    from mira_engine.providers.github_copilot_provider import GitHubCopilotProvider
+    from mira_plugins.github_copilot.provider import GitHubCopilotProvider
 
     with patch("mira_engine.providers.openai_compat_provider.AsyncOpenAI"):
         provider = GitHubCopilotProvider(default_model="github-copilot/gpt-5.1")
@@ -572,7 +572,7 @@ def test_github_copilot_provider_strips_prefixed_model_name():
 
 @pytest.mark.asyncio
 async def test_github_copilot_provider_refreshes_client_api_key_before_chat():
-    from mira_engine.providers.github_copilot_provider import GitHubCopilotProvider
+    from mira_plugins.github_copilot.provider import GitHubCopilotProvider
 
     mock_client = MagicMock()
     mock_client.api_key = "no-key"
@@ -605,33 +605,36 @@ def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
 
 
 def test_login_openai_codex_prepares_oauth_state(monkeypatch):
+    import mira_plugins.openai_codex.provider as codex_provider
     from mira_engine.cli import commands
 
     calls: list[str] = []
-    monkeypatch.setattr(commands, "ensure_oauth_state_dirs_for_runtime", lambda: calls.append("prepare"))
+    monkeypatch.setattr(codex_provider, "ensure_oauth_state_dirs_for_runtime", lambda: calls.append("prepare"))
     monkeypatch.setattr(
-        "oauth_cli_kit.get_token",
+        codex_provider,
+        "get_codex_token",
         lambda: SimpleNamespace(access="access-token", account_id="account-id"),
     )
 
-    commands._login_openai_codex()
+    # Login runs the `login` hook of the plugin that provides the provider.
+    commands._run_oauth_login("openai_codex")
 
     assert calls == ["prepare"]
 
 
 def test_login_github_copilot_prepares_oauth_state(monkeypatch):
     from mira_engine.cli import commands
-    import mira_engine.providers.github_copilot_provider as github_provider
+    import mira_plugins.github_copilot.provider as github_provider
 
     calls: list[str] = []
-    monkeypatch.setattr(commands, "ensure_oauth_state_dirs_for_runtime", lambda: calls.append("prepare"))
+    monkeypatch.setattr(github_provider, "ensure_oauth_state_dirs_for_runtime", lambda: calls.append("prepare"))
     monkeypatch.setattr(
         github_provider,
         "login_github_copilot",
         lambda print_fn: SimpleNamespace(access="access-token", account_id="account-id"),
     )
 
-    commands._login_github_copilot()
+    commands._run_oauth_login("github_copilot")
 
     assert calls == ["prepare"]
 

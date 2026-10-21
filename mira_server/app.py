@@ -534,7 +534,7 @@ class MiraServer:
         body = await self._config_body(request)
         body = body if isinstance(body, dict) else {}
         config = self.team.engine_config()
-        provider_cfg = getattr(config.providers, spec.name, None)
+        provider_cfg = config.providers.entry(spec.name)
         if provider_cfg is None:
             return web.json_response({"error": f"unknown provider: {name}"}, status=400)
         # Transient credentials for this test only, never saved.

@@ -63,6 +63,49 @@ def make_role_provider(config: Config, role: str) -> tuple[LLMProvider, str, tup
     return provider, model, candidates
 
 
+def _plugin_spec_for(provider_name: str, model: str) -> Any:
+    """The plugin-contributed provider serving this request: the matched one,
+    or the one an explicit model prefix names (``openai-codex/...``)."""
+    from mira_engine.providers.registry import find_by_name
+
+    spec = find_by_name(provider_name)
+    if spec is not None and spec.plugin_id:
+        return spec
+    if "/" in model:
+        prefixed = find_by_name(model.split("/", 1)[0])
+        if prefixed is not None and prefixed.plugin_id:
+            return prefixed
+    return None
+
+
+def _make_plugin_provider(config: Config, spec: Any, model: str, provider_override: str | None) -> LLMProvider:
+    """Build a provider through the plugin that contributes it (its ``entry``
+    hook, run as that plugin)."""
+    from mira_engine.plugins import get_runtime
+
+    runtime = get_runtime()
+    create = runtime.provider_hook(spec.name, "entry")
+    if create is None:
+        plugin = runtime.get(spec.plugin_id)
+        why = f"{plugin.status}: {plugin.reason}" if plugin is not None else "not installed"
+        raise ValueError(f"{spec.label} comes from the plugin '{spec.plugin_id}', which isn't loaded ({why}).")
+    provider_config = config.providers.entry(spec.name)
+    api_base = config.get_api_base(model, provider_override)
+    if not api_base and provider_config is not None:
+        api_base = provider_config.api_base
+    provider = create(
+        spec=spec,
+        model=model,
+        api_key=provider_config.api_key if provider_config else None,
+        api_base=api_base or None,
+        extra_headers=provider_config.extra_headers if provider_config else None,
+        proxy=resolve_provider_proxy(config),
+    )
+    if not isinstance(provider, LLMProvider):
+        raise ValueError(f"plugin '{spec.plugin_id}' returned {type(provider).__name__}, not an LLMProvider")
+    return provider
+
+
 def make_provider(
     config: Config, model: str | None = None, provider_override: str | None = None
 ) -> LLMProvider:
@@ -73,10 +116,8 @@ def make_provider(
     setups). Pass ``"auto"`` to force auto-detection.
     """
     from mira_engine.providers.azure_openai_provider import AzureOpenAIProvider
-    from mira_engine.providers.github_copilot_provider import GitHubCopilotProvider
     from mira_engine.providers.litellm_provider import LiteLLMProvider
     from mira_engine.providers.nvidia_provider import NvidiaProvider
-    from mira_engine.providers.openai_codex_provider import OpenAICodexProvider
     from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
     from mira_engine.providers.registry import find_by_name
 
@@ -91,17 +132,9 @@ def make_provider(
             "Set agents.defaults.provider explicitly in config.json."
         )
 
-    if provider_name == "openai_codex" or resolved_model.startswith("openai-codex/"):
-        return OpenAICodexProvider(
-            default_model=resolved_model,
-            proxy=resolve_provider_proxy(config),
-        )
-    if provider_name == "github_copilot" or resolved_model.startswith("github-copilot/"):
-        return GitHubCopilotProvider(
-            default_model=resolved_model,
-            api_base=config.get_api_base(resolved_model, provider_override),
-            proxy=resolve_provider_proxy(config),
-        )
+    plugin_spec = _plugin_spec_for(provider_name, resolved_model)
+    if plugin_spec is not None:
+        return _make_plugin_provider(config, plugin_spec, resolved_model, provider_override)
 
     if is_custom_provider_id(provider_name):
         api_base = config.get_api_base(resolved_model, provider_override)

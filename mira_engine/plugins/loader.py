@@ -181,6 +181,22 @@ def _instantiate(obj: object, base: type, entry: str, ctx: PluginContext | None 
     return instantiate(obj, base, entry, ctx)
 
 
+def _run_granted(fn: Any, grant: Grant) -> Any:
+    """``fn`` (sync or async) called under ``grant``."""
+    if inspect.iscoroutinefunction(fn):
+        async def call_async(*args: Any, **kwargs: Any) -> Any:
+            with granted(grant):
+                return await fn(*args, **kwargs)
+
+        return call_async
+
+    def call(*args: Any, **kwargs: Any) -> Any:
+        with granted(grant):
+            return fn(*args, **kwargs)
+
+    return call
+
+
 def _importable(module: str) -> bool:
     try:
         return importlib.util.find_spec(module) is not None
@@ -368,6 +384,10 @@ class PluginRuntime:
         if tier not in _TRUSTED and any(h.mode == "mutate" for h in manifest.hooks):
             result.reason = f"mutate hooks need a verified or core-bundled plugin (this one is {tier})"
             return result
+        if tier not in _TRUSTED and manifest.providers:
+            # A provider sees every prompt and holds the user's model keys.
+            result.reason = f"LLM providers need a verified or core-bundled plugin (this one is {tier})"
+            return result
 
         breaker = self.breaker(manifest.id, manifest.version, tier=tier)
         # Built once here to validate the entries (and for status and the
@@ -408,7 +428,7 @@ class PluginRuntime:
         """Serve the plugin's tools from a separate (sandboxed) process (mira#211)."""
         from mira_engine.plugins import isolation
 
-        if manifest.channels or manifest.hooks:
+        if manifest.channels or manifest.hooks or manifest.providers:
             result.reason = "out-of-process plugins may only provide tools and skills"
             return result
         try:
@@ -471,6 +491,26 @@ class PluginRuntime:
             cls.__mira_plugin_id__ = plugin.id  # type: ignore[attr-defined]
             plugin.channels[name] = cls
         return plugin.channels
+
+    def provider_hook(self, name: str, hook: str = "entry") -> Any:
+        """A loaded plugin's provider hook (``entry``, ``login``, ``login_status``,
+        ``models``) for provider ``name``, imported on first use; None when no
+        loaded plugin provides it or the hook isn't declared. The hook runs
+        under the plugin's grant (``plugins.permissions``)."""
+        for p in self.loaded():
+            assert p.manifest is not None
+            for entry in p.manifest.providers:
+                if entry.name != name:
+                    continue
+                target = getattr(entry, hook, None)
+                if not target:
+                    return None
+                with granted(p.grant):
+                    fn = _resolve(p.manifest, target)
+                if p.grant is None:
+                    return fn
+                return _run_granted(fn, p.grant)
+        return None
 
     def channel_grant(self, cls: type) -> Grant | None:
         """What a plugin channel's code runs under (None for the engine's own)."""

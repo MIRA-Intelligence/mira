@@ -35,6 +35,7 @@ def list_plugins() -> None:
                 *(f"channel:{e.name}" for e in m.channels),
                 *(f"tool:{e.name}" for e in m.tools),
                 *(f"hook:{e.mode}" for e in m.hooks),
+                *(f"provider:{e.name}" for e in m.providers),
                 *(["skills"] if m.skills else []),
             ]
             provides = ", ".join(parts)

@@ -8,7 +8,7 @@ from mira_engine.config.schema import Config
 from mira_engine.config.ui_runtime import build_ui_runtime_payload
 from mira_engine.providers.factory import make_provider
 from mira_engine.providers.litellm_provider import LiteLLMProvider
-from mira_engine.providers.registry import PROVIDERS, find_by_name
+from mira_engine.providers.registry import all_providers, find_by_name
 
 PLANS = [
     # (provider id, config key, model, expected resolved model, default api base)
@@ -125,7 +125,8 @@ def test_xai_matches_grok_models_and_prefixes_for_litellm() -> None:
 
 
 def test_subscription_flag_marks_plans_and_subscription_logins() -> None:
-    subscriptions = {spec.name for spec in PROVIDERS if spec.is_subscription}
+    # Including the subscription logins first-party plugins contribute.
+    subscriptions = {spec.name for spec in all_providers() if spec.is_subscription}
 
     assert subscriptions == {
         "volcengine_coding_plan",
@@ -142,7 +143,7 @@ def test_subscription_flag_marks_plans_and_subscription_logins() -> None:
 
 def test_every_registry_provider_has_a_config_entry() -> None:
     config = Config()
-    for spec in PROVIDERS:
+    for spec in all_providers():
         assert config.providers.entry(spec.name) is not None, spec.name
 
 

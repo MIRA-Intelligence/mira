@@ -58,8 +58,7 @@ class Upstream:
 
 
 def _provider_names() -> tuple[str, ...]:
-    return tuple(name for name in ProvidersConfig.model_fields
-                 if name not in {"proxy", "model_params", "custom_providers"})
+    return tuple(ProvidersConfig().provider_names())
 
 
 def _custom_records(providers: dict[str, Any]) -> dict[str, Any]:

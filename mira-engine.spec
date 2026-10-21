@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 
 # Optional: a pre-fetched ``uv`` binary placed under ``bundled/`` (see
@@ -59,6 +59,11 @@ a = Analysis(
         # Engine modules only the bundled plugins (plugins/web, plugins/mira-hub) import.
         'mira_engine.agent.tools.web',
         'mira_engine.agent.tools.hub',
+        # plugins/openai-codex and plugins/github-copilot (OAuth providers).
+        'mira_engine.providers.oauth_state',
+        'mira_engine.providers.openai_compat_provider',
+        'mira_engine.providers.usage',
+        *collect_submodules('oauth_cli_kit'),
     ],
     hookspath=[],
     hooksconfig={},

@@ -25,7 +25,7 @@ def test_match_provider_prefix_wins_for_oauth_provider() -> None:
     cfg.agents.defaults.provider = "auto"
     provider, name = cfg._match_provider("github-copilot/claude-sonnet")
     assert name == "github_copilot"
-    assert provider is cfg.providers.github_copilot
+    assert provider is cfg.providers.entry("github_copilot")
 
 
 def test_match_provider_by_keyword_with_api_key() -> None:
