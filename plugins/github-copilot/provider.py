@@ -358,7 +358,7 @@ class GitHubCopilotProvider(OpenAICompatProvider):
 
 
 def create(*, spec, model, api_key, api_base, extra_headers, proxy):
-    return GitHubCopilotProvider(default_model=model or "github-copilot/gpt-4.1", api_base=api_base, proxy=proxy)
+    return GitHubCopilotProvider(default_model=model, api_base=api_base, proxy=proxy)
 
 
 def login(print_fn, prompt_fn) -> None:
@@ -402,8 +402,10 @@ async def fetch_models(*, model, api_base, proxy):
         headers={**provider.extra_headers, "Authorization": f"Bearer {token}", "Accept": "application/json"},
         proxy=provider.proxy,
     )
-    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
-        payload = {**payload, "data": [m for m in payload["data"] if not isinstance(m, dict) or _is_supported_chat_model(m)]}
+    # Only the chat models this account may use (listed under "data", or "models").
+    key = "models" if isinstance(payload, dict) and "data" not in payload else "data"
+    if isinstance(payload, dict) and isinstance(payload.get(key), list):
+        payload = {**payload, key: [m for m in payload[key] if not isinstance(m, dict) or _is_supported_chat_model(m)]}
     return model_fetch._new_cache(
         provider="github_copilot",
         models=model_fetch._parse_openai_compatible_models(payload, "github_copilot"),

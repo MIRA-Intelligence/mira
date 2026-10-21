@@ -78,17 +78,26 @@ def _plugin_spec_for(provider_name: str, model: str) -> Any:
     return None
 
 
+def plugin_provider_unavailable(spec: Any) -> str | None:
+    """Why a plugin-contributed provider can't be used right now (its plugin
+    isn't loaded: not installed, switched off, SDK missing...), or None."""
+    from mira_engine.plugins import get_runtime
+
+    plugin = get_runtime().get(spec.plugin_id)
+    if plugin is not None and plugin.status == "loaded":
+        return None
+    why = f"{plugin.status}: {plugin.reason}" if plugin is not None else "not installed"
+    return f"{spec.label} comes from the plugin '{spec.plugin_id}', which isn't loaded ({why})."
+
+
 def _make_plugin_provider(config: Config, spec: Any, model: str, provider_override: str | None) -> LLMProvider:
     """Build a provider through the plugin that contributes it (its ``entry``
     hook, run as that plugin)."""
     from mira_engine.plugins import get_runtime
 
-    runtime = get_runtime()
-    create = runtime.provider_hook(spec.name, "entry")
+    create = get_runtime().provider_hook(spec.name, "entry")
     if create is None:
-        plugin = runtime.get(spec.plugin_id)
-        why = f"{plugin.status}: {plugin.reason}" if plugin is not None else "not installed"
-        raise ValueError(f"{spec.label} comes from the plugin '{spec.plugin_id}', which isn't loaded ({why}).")
+        raise ValueError(plugin_provider_unavailable(spec) or f"plugin '{spec.plugin_id}' declares no entry for {spec.label}.")
     provider_config = config.providers.entry(spec.name)
     api_base = config.get_api_base(model, provider_override)
     if not api_base and provider_config is not None:

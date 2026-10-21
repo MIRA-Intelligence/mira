@@ -79,6 +79,16 @@ def test_catalog_follows_state_and_manifest_changes(dirs):
     assert catalog.get("pack").manifest.version == "2.0.0"
 
 
+def test_catalog_skips_invalid_manifests_and_staging_dirs(dirs):
+    _, user = dirs
+    (user / "broken").mkdir()
+    (user / "broken" / "plugin.json").write_text("{}")
+    _kernel_plugin(user, ".tmp-pack-1700000000", id="pack")  # an installer's staging copy
+    _kernel_plugin(user, "pack")
+    assert [e.id for e in catalog.entries()] == ["pack"]
+    assert catalog.get("pack").root == user / "pack"
+
+
 def test_kernel_plugin_skills_are_listed_toggled_and_loaded(dirs, tmp_path):
     bundled, user = dirs
     _kernel_plugin(bundled, "bundled-skills", skills=("alpha",))

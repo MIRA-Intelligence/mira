@@ -4,7 +4,8 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from loguru import logger
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -524,10 +525,16 @@ class ProvidersConfig(Base):
     @model_validator(mode="after")
     def _plugin_provider_sections(self) -> "ProvidersConfig":
         # Extra keys are plugin providers' sections: give them the same shape
-        # as a field (camelCase keys accepted, serialised with the rest).
+        # as a field (camelCase keys accepted, serialised with the rest). One
+        # that isn't a provider section is kept as written but not used; it
+        # must not take the whole config down.
         for key, value in list((self.model_extra or {}).items()):
             if isinstance(value, dict):
-                self.model_extra[key] = ProviderConfig.model_validate(value)
+                try:
+                    self.model_extra[key] = ProviderConfig.model_validate(value)
+                except ValidationError as e:
+                    problems = "; ".join(str(err.get("msg", "")) for err in e.errors()[:3])
+                    logger.warning("providers.{} is not a provider section and is ignored: {}", key, problems)
         return self
 
     def entry(self, name: str, *, create: bool = False) -> ProviderConfig | None:
@@ -539,16 +546,16 @@ class ProvidersConfig(Base):
             return self.custom_providers[name]
         if name in {"proxy", "model_params", "custom_providers"}:
             return None
-        key = re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
+        from mira_engine.providers.registry import find_by_name, provider_key
+
+        key = provider_key(name)
         if key in type(self).model_fields:
             value = getattr(self, key, None)
             return value if isinstance(value, ProviderConfig) else None
         extras = self.model_extra if self.model_extra is not None else {}
         for extra_key, value in extras.items():
-            if re.sub(r"(?<!^)(?=[A-Z])", "_", extra_key).replace("-", "_").lower() == key:
+            if provider_key(extra_key) == key:
                 return value if isinstance(value, ProviderConfig) else None
-        from mira_engine.providers.registry import find_by_name
-
         spec = find_by_name(key)
         if spec is None or not spec.plugin_id:
             return None

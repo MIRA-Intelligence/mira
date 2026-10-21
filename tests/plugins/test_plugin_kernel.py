@@ -323,7 +323,8 @@ def test_agent_loop_registers_plugin_tools_and_hooks_without_replacing_builtins(
     assert loop._hook is not None and any(getattr(h, "mode", None) == "observe" for h in loop._hook._hooks)
 
 
-def test_subagents_get_the_plugin_tools_their_role_allows(tmp_path):
+def test_subagents_only_get_the_plugin_tools_their_role_names(tmp_path, monkeypatch):
+    from mira_engine.agent import subagent as subagent_mod
     from mira_engine.agent.subagent import ROLE_CONFIGS, SubagentManager
     from mira_engine.config.schema import ExecToolConfig
     from mira_engine.plugins import set_runtime_for_tests
@@ -336,12 +337,75 @@ def test_subagents_get_the_plugin_tools_their_role_allows(tmp_path):
         def get_default_model(self):
             return "dummy/default"
 
+    web = TOOL.replace('name = "echo_plugin"', 'name = "web_search"')
     _plugin(tmp_path / "plugins", "echo", TOOL_MANIFEST, {"tool.py": TOOL})
+    _plugin(tmp_path / "plugins", "web", {"provides": {"tools": [{"name": "web_search", "entry": "tool:Echo"}]}}, {"tool.py": web})
     set_runtime_for_tests(_runtime(tmp_path))
     manager = SubagentManager(
         provider=_Provider(), workspace=tmp_path / "ws", bus=None, model="dummy/default",
         exec_config=ExecToolConfig(timeout=5),
     )
-    assert manager._build_tools(tmp_path / "ws").has("echo_plugin")
+    # No role / a role without an allowlist: the web tools, as before plugins —
+    # not every plugin tool (hub_install, community plugins) the main loop has.
+    open_role = next(role for role, cfg in ROLE_CONFIGS.items() if cfg.get("allowed_tools") is None)
+    for role in (None, open_role):
+        tools = manager._build_tools(tmp_path / "ws", role)
+        assert tools.has("web_search") and not tools.has("echo_plugin")
     limited = next(role for role, cfg in ROLE_CONFIGS.items() if cfg.get("allowed_tools"))
     assert not manager._build_tools(tmp_path / "ws", limited).has("echo_plugin")
+    # A role that names a plugin tool gets it.
+    monkeypatch.setitem(ROLE_CONFIGS, "tester", {"allowed_tools": {"read_file", "echo_plugin"}})
+    assert manager._build_tools(tmp_path / "ws", "tester").has("echo_plugin")
+    assert subagent_mod.SUBAGENT_PLUGIN_TOOLS == {"web_search", "web_fetch"}
+
+
+UNAVAILABLE_TOOL = {"provides": {"tools": [{"name": "echo_plugin", "entry": "tool:Echo"}]}, "requires": ["no_such_module_for_mira_tests"]}
+
+
+def test_a_plugin_whose_requirement_is_missing_is_unavailable_not_failed(tmp_path):
+    _plugin(tmp_path / "plugins", "needy", UNAVAILABLE_TOOL, {"tool.py": TOOL})
+    _plugin(tmp_path / "plugins", "fine", TOOL_MANIFEST, {"tool.py": TOOL})
+    rt = _runtime(tmp_path)
+    needy = rt.get("needy")
+    assert needy.status == "unavailable" and "needs no_such_module_for_mira_tests (not installed)" in needy.reason
+    assert rt.get("fine").status == "loaded" and [t.plugin_id for t in rt.tools()] == ["fine"]
+
+
+def test_staging_directories_are_not_plugins(tmp_path):
+    # An installer copies into `.tmp-<id>-<ts>` before renaming; a crash in
+    # between must not leave a plugin that loads (or a duplicate id).
+    _plugin(tmp_path / "plugins", "real", TOOL_MANIFEST, {"tool.py": TOOL})
+    _plugin(tmp_path / "plugins", ".tmp-real-123", {**TOOL_MANIFEST, "id": "real"}, {"tool.py": TOOL})
+    rt = _runtime(tmp_path)
+    assert [p.id for p in rt.plugins] == ["real"] and rt.get("real").status == "loaded"
+    from mira_engine.plugins import catalog
+
+    assert [d.name for d in catalog.plugin_dirs(tmp_path / "plugins")] == ["real"]
+
+
+CHANNELS = '''
+from mira_engine.channels.base import BaseChannel
+
+class Good(BaseChannel):
+    name = "goodchat"
+    async def start(self): ...
+    async def stop(self): ...
+    async def send(self, msg): ...
+
+NotAChannel = object()
+'''
+
+
+def test_a_channel_that_cannot_be_imported_leaves_the_plugins_others_in_place(tmp_path):
+    manifest = {"provides": {"channels": [
+        {"name": "goodchat", "entry": "ch:Good"},
+        {"name": "missing", "entry": "ch:Nope"},
+        {"name": "wrongtype", "entry": "ch:NotAChannel"},
+    ]}}
+    _plugin(tmp_path / "plugins", "chans", manifest, {"ch.py": CHANNELS})
+    rt = _runtime(tmp_path)
+    plugin = rt.get("chans")
+    assert plugin.status == "loaded"  # entries are only imported on first use
+    channels = rt.channels()
+    assert set(channels) == {"goodchat"} and channels["goodchat"].__mira_plugin_id__ == "chans"
+    assert "channel wrongtype" in plugin.reason and "not a BaseChannel subclass" in plugin.reason

@@ -4,10 +4,6 @@
   "plugin_api": ">=1.0,<2.0",
   "owner": "github:MIRA-Intelligence",
   "description": "Email channel: IMAP polling for inbound mail, SMTP for replies.",
-  "requires": [
-    "imaplib",
-    "smtplib"
-  ],
   "provides": {
     "channels": [
       {

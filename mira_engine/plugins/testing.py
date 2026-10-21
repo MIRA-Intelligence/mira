@@ -205,7 +205,8 @@ def check_plugin(plugin_dir: str | Path, tier: Tier = "community") -> ContractRe
     with tempfile.TemporaryDirectory() as tmp:
         state = PluginState(Path(tmp) / "state.json")
         state.set_enabled(manifest.id, True)
-        runtime = PluginRuntime(sources=[], state=state)
+        # Its data dir is made here too, not in the real Mira home.
+        runtime = PluginRuntime(sources=[], state=state, data_root=Path(tmp) / "plugin-data")
         loaded = runtime._load_one(plugin_dir, tier, set())
         built: list[Tool] = []
         if loaded.status == "loaded":

@@ -17,8 +17,6 @@
   },
   "permissions": {
     "network": [
-      "api.dingtalk.com",
-      "oapi.dingtalk.com",
       "*.dingtalk.com"
     ],
     "filesystem": "none",

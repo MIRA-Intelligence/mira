@@ -38,6 +38,51 @@ def test_host_command_uses_the_frozen_executable(monkeypatch):
     assert paths.host_command() == [sys.executable, "--mira-plugin-host"]
 
 
+def test_host_env_puts_a_source_checkout_but_not_site_packages_on_the_path(monkeypatch):
+    import mira_engine
+    from mira_engine.plugins import isolation
+
+    monkeypatch.setenv("PYTHONPATH", "/elsewhere")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-leak")
+    env = isolation.host_env()
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(REPO), "/elsewhere"]
+    assert "OPENAI_API_KEY" not in env and env["PYTHONDONTWRITEBYTECODE"] == "1"
+    # An installed engine: its site dir must not outrank the standard library.
+    monkeypatch.setattr(mira_engine, "__file__", "/venv/lib/python3.12/site-packages/mira_engine/__init__.py")
+    assert isolation.host_env()["PYTHONPATH"] == "/elsewhere"
+
+
+def test_plugin_env_carries_only_what_the_manifest_grants(tmp_path, monkeypatch):
+    from mira_engine.config.paths import get_data_dir
+    from mira_engine.plugins import isolation
+    from mira_engine.plugins.manifest import parse_manifest
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-leak")
+    tools = {"tools": [{"name": "t", "entry": "t:T"}]}
+    manifest = parse_manifest({
+        "id": "p", "version": "1.0.0", "provides": tools,
+        "permissions": {"filesystem": "workspace:read", "secrets": ["channels.demo.token"]},
+    }, tmp_path)
+    env = isolation.plugin_env(manifest, workspace=tmp_path / "ws", config={"channels.demo.token": "tok"}, tier="community")
+    scratch = get_data_dir() / "plugin-data" / "p"
+    assert env["MIRA_PLUGIN_DATA_DIR"] == env["TMPDIR"] == str(scratch) and scratch.is_dir()
+    assert env["MIRA_PLUGIN_MIRA_HOME"] == str(get_data_dir()) and env["MIRA_PLUGIN_TIER"] == "community"
+    assert env["MIRA_PLUGIN_WORKSPACE"] == str(tmp_path / "ws")
+    assert json.loads(env["MIRA_PLUGIN_CONFIG"]) == {"channels.demo.token": "tok"}
+    assert "OPENAI_API_KEY" not in env
+    closed = parse_manifest({"id": "q", "version": "1.0.0", "provides": tools}, tmp_path)
+    env = isolation.plugin_env(closed, workspace=tmp_path / "ws", config={}, tier=None)
+    assert "MIRA_PLUGIN_WORKSPACE" not in env and "MIRA_PLUGIN_CONFIG" not in env
+    assert env["MIRA_PLUGIN_TIER"] == "experimental"
+
+
+def test_first_party_plugins_are_audited_only_when_asked(monkeypatch):
+    monkeypatch.delenv("MIRA_PLUGIN_AUDIT", raising=False)
+    assert PluginRuntime(sources=[]).audit_bundled is False
+    monkeypatch.setenv("MIRA_PLUGIN_AUDIT", "1")
+    assert PluginRuntime(sources=[]).audit_bundled is True
+
+
 def test_frozen_entry_dispatches_the_plugin_host(tmp_path):
     plugin = tmp_path / "probe"
     plugin.mkdir()

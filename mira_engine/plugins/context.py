@@ -27,6 +27,17 @@ _EMPTY: Mapping[str, Any] = MappingProxyType({})
 _CAMEL = re.compile(r"(?<!^)(?=[A-Z])")
 
 
+def plugin_data_dir(plugin_id: str, path: Path | None = None) -> Path:
+    """The plugin's private directory — ``<mira home>/plugin-data/<id>`` unless
+    ``path`` names it (an out-of-process host is told it) — made if missing."""
+    if path is None:
+        from mira_engine.config.paths import get_data_dir
+
+        path = get_data_dir() / "plugin-data" / plugin_id
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
+
+
 def _norm(segment: str) -> str:
     return _CAMEL.sub("_", segment).replace("-", "_").lower()
 
@@ -108,13 +119,7 @@ class PluginContext:
     @property
     def data_dir(self) -> Path:
         """The plugin's private directory (``<data>/plugin-data/<id>``)."""
-        root = self.data_root
-        if root is None:
-            from mira_engine.config.paths import get_data_dir
-
-            root = get_data_dir() / "plugin-data" / self.plugin_id
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        return root
+        return plugin_data_dir(self.plugin_id, self.data_root)
 
 
 def accepts_ctx(cls: type) -> bool:

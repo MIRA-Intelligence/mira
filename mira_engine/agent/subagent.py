@@ -53,6 +53,11 @@ ROLE_CONFIGS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Plugin tools a subagent gets when its role has no allowlist: the web tools
+# (bundled `web` plugin) it has always had. Other plugin tools — `hub_install`,
+# community plugins — stay with the main loop unless a role names them.
+SUBAGENT_PLUGIN_TOOLS: frozenset[str] = frozenset({"web_search", "web_fetch"})
+
 
 @dataclass(frozen=True)
 class DelegationPolicy:
@@ -253,7 +258,8 @@ class SubagentManager:
                 python_runtime=self.exec_config.python,
             ))
         # web_search / web_fetch come from the bundled `web` plugin.
-        self._register_plugin_tools(tools, run_workspace, _permitted)
+        plugin_allowed = SUBAGENT_PLUGIN_TOOLS if allowed is None else allowed
+        self._register_plugin_tools(tools, run_workspace, lambda name: name in plugin_allowed and _permitted(name))
         return tools
 
     def _register_plugin_tools(self, tools: ToolRegistry, run_workspace: Path, permitted) -> None:

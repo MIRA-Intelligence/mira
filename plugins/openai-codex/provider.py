@@ -485,7 +485,7 @@ def _redact_proxy_url(proxy: str) -> str:
 
 
 def create(*, spec, model, api_key, api_base, extra_headers, proxy):
-    return OpenAICodexProvider(default_model=model or "openai-codex/gpt-5.1-codex", proxy=proxy)
+    return OpenAICodexProvider(default_model=model, proxy=proxy)
 
 
 def login(print_fn, prompt_fn) -> None:

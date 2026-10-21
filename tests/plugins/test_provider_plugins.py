@@ -149,6 +149,88 @@ def test_plugin_provider_hooks_for_status_models_and_cli_metadata(user_plugins):
     assert [m.id for m in cache.models] == ["echo-1"]
 
 
+def test_a_section_that_is_not_a_provider_config_does_not_break_the_config():
+    cfg = Config.model_validate({"providers": {"foo": {"apiKey": 123}, "openai": {"apiKey": "sk-ok"}}})
+    assert cfg.providers.openai.api_key == "sk-ok" and cfg.providers.entry("foo") is None
+    # Kept as written, so saving the config doesn't lose it.
+    assert cfg.model_dump(by_alias=True)["providers"]["foo"] == {"apiKey": 123}
+
+
+def test_oauth_provider_sections_written_before_the_plugins_still_load():
+    # providers.openaiCodex / githubCopilot were fields once; a config.json
+    # from then reads the same way (and dumps the same way).
+    cfg = Config.model_validate({"providers": {"openaiCodex": {"apiKey": "k1"}, "githubCopilot": {"apiBase": "https://cp.example"}}})
+    assert cfg.providers.entry("openai_codex").api_key == "k1"
+    assert cfg.providers.entry("github-copilot").api_base == "https://cp.example"
+    dumped = cfg.model_dump(by_alias=True)["providers"]
+    assert dumped["openaiCodex"]["apiKey"] == "k1" and dumped["githubCopilot"]["apiBase"] == "https://cp.example"
+    names = Config().providers.provider_names()
+    assert names.index("openai") < names.index("openai_codex")  # the fields, then plugin providers
+    assert not {"proxy", "model_params", "custom_providers"} & set(names)
+
+
+def test_a_provider_spec_with_bad_types_is_left_out(user_plugins):
+    _plugin(user_plugins, "echo-plugin", ECHO)
+    _plugin(user_plugins, "broken-plugin", {**ECHO, "name": "broken_llm", "env_extras": [1]})
+    PluginState().set_registry_tiers({"echo-plugin": "verified", "broken-plugin": "verified"})
+    _fresh()
+    assert registry.find_by_name("echo_llm") is not None
+    assert registry.find_by_name("broken_llm") is None
+
+
+async def test_a_provider_without_a_models_hook_cannot_list_models(user_plugins):
+    from mira_engine.providers.model_fetch import ModelFetchError, fetch_provider_models
+
+    _plugin(user_plugins, "echo-plugin", ECHO)
+    manifest_path = user_plugins / "echo-plugin" / "plugin.json"
+    data = json.loads(manifest_path.read_text())
+    del data["provides"]["providers"][0]["models"]
+    manifest_path.write_text(json.dumps(data))
+    PluginState().set_registry_tiers({"echo-plugin": "verified"})
+    _fresh()
+    with pytest.raises(ModelFetchError, match="can't list its models"):
+        await fetch_provider_models(Config(), "echo_llm")
+
+
+def test_a_provider_whose_plugin_is_not_loaded_says_so_everywhere(user_plugins, monkeypatch):
+    import typer
+
+    from mira_engine.cli import commands
+    from mira_engine.providers.factory import make_provider, plugin_provider_unavailable
+
+    _plugin(user_plugins, "echo-plugin", {**ECHO, "is_oauth": True}, requires=["no_such_module_for_mira_tests"])
+    PluginState().set_registry_tiers({"echo-plugin": "verified"})
+    _fresh()
+    spec = registry.find_by_name("echo_llm")
+    assert spec is not None  # known from its manifest...
+    why = plugin_provider_unavailable(spec)
+    assert "isn't loaded (unavailable: needs no_such_module_for_mira_tests (not installed))" in why
+    cfg = Config.model_validate({"agents": {"defaults": {"provider": "echo_llm", "model": "echo-llm/echo-1"}}})
+    with pytest.raises(ValueError, match="isn't loaded"):
+        make_provider(cfg)  # ...but nothing can serve it
+    assert commands._oauth_login_status("echo_llm") == (False, None)
+    printed: list[str] = []
+    monkeypatch.setattr(commands.console, "print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    with pytest.raises(typer.Exit):
+        commands._run_oauth_login("echo_llm")
+    assert any("isn't loaded" in line for line in printed), printed
+
+
+def test_login_needs_the_plugins_login_hook(user_plugins, monkeypatch):
+    import typer
+
+    from mira_engine.cli import commands
+
+    _plugin(user_plugins, "echo-plugin", {**ECHO, "is_oauth": True})  # loaded, but declares no `login`
+    PluginState().set_registry_tiers({"echo-plugin": "verified"})
+    _fresh()
+    printed: list[str] = []
+    monkeypatch.setattr(commands.console, "print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    with pytest.raises(typer.Exit):
+        commands._run_oauth_login("echo_llm")
+    assert any("OAuth login not implemented for Echo LLM" in line for line in printed), printed
+
+
 def test_ui_lists_and_saves_plugin_providers(user_plugins, tmp_path):
     from mira_engine.config.ui_runtime import apply_ui_runtime_update, build_ui_runtime_payload
 
