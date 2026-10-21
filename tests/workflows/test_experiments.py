@@ -209,3 +209,19 @@ def test_unexecuted_skips_are_final_and_free_budget(tmp_path):
     record(service, run_id, command_id="child", id="Exp001.a", parent="Exp001", status="pending")
     with pytest.raises(WorkflowError, match="maxExperiments"):
         record(service, run_id, command_id="extra", id="Exp003", status="pending")
+
+
+def test_tool_schema_has_no_dangling_refs():
+    # Strict providers reject `#/$defs/...` pointers whose `$defs` is not at the
+    # root of the tool parameters ("Pointer '/$defs/ReplanDecision' does not exist").
+    tool = WorkflowExperimentTool()
+    text = json.dumps(tool.to_schema())
+    assert "$ref" not in text and "$defs" not in text
+    replan = tool.parameters["properties"]["experiment"]["properties"]["replan"]
+    decision = next(option for option in replan["anyOf"] if option.get("type") == "object")
+    assert decision["additionalProperties"] is False
+    assert decision["properties"]["action"]["enum"] == ["branch", "revise", "skip", "continue", "finish"]
+    assert not tool.validate_params({"experiment": {
+        "id": "Exp001", "title": "Baseline", "status": "completed",
+        "replan": {"action": "finish", "rationale": "Done"},
+    }})
