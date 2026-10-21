@@ -115,6 +115,8 @@ include = [
     "mira_engine/skills/**/*.md",
     "mira_engine/skills/**/*.sh",
 ]
+# The skills submodule also carries the MIRA Hub catalogue; only builtin_skills/ ships.
+exclude = ["mira_engine/skills/skills/**"]
 
 [tool.hatch.build.targets.sdist]
 include = [
