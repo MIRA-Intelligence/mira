@@ -45,6 +45,7 @@ from mira_engine.agent.tools.base import Tool
 from mira_engine.plugins.api import PLUGIN_API_VERSION, satisfies
 from mira_engine.plugins.guard import CircuitBreaker, GuardedHook, GuardedTool
 from mira_engine.plugins.manifest import MANIFEST_FILENAME, ManifestError, PluginManifest, Tier, load_manifest
+from mira_engine.plugins.paths import bundled_plugins_dir, user_plugins_dir
 from mira_engine.plugins.state import PluginState
 
 Status = Literal[
@@ -79,27 +80,6 @@ class PluginSource:
     path: Path
     tier: Tier
     from_config: bool = False
-
-
-def bundled_plugins_dir() -> Path | None:
-    """First-party plugins: shipped as ``mira_engine/_bundled_plugins`` in the
-    wheel, or the repo's ``plugins/`` in a source checkout."""
-    import mira_engine
-
-    pkg = Path(mira_engine.__file__).resolve().parent
-    shipped = pkg / "_bundled_plugins"
-    if shipped.is_dir():
-        return shipped
-    repo = pkg.parent
-    if (repo / "pyproject.toml").is_file() and (repo / "plugins").is_dir():
-        return repo / "plugins"
-    return None
-
-
-def user_plugins_dir() -> Path:
-    from mira_engine.config.paths import get_data_dir
-
-    return get_data_dir() / "plugins"
 
 
 _UNSET = object()
@@ -143,6 +123,12 @@ def _package_for(manifest: PluginManifest) -> str:
     """Import the plugin directory as its own package (relative imports work)."""
     _ensure_namespace()
     name = f"{_PACKAGE_ROOT}.{manifest.id.replace('-', '_')}"
+    cached = sys.modules.get(name)
+    if cached is not None and str(manifest.root) not in list(getattr(cached, "__path__", None) or []):
+        # Same id from another directory (another source, a reinstall, a test
+        # fixture): drop the stale package and its submodules.
+        for mod in [m for m in sys.modules if m == name or m.startswith(name + ".")]:
+            del sys.modules[mod]
     if name not in sys.modules:
         init = manifest.root / "__init__.py"
         spec = (
