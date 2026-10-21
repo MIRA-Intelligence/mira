@@ -3616,6 +3616,85 @@ def community_notifications(
         console.print("Notifications: none [dim](the agent runs on its own; approvals still need you)[/dim]")
 
 
+@community_app.command("approvals")
+def community_approvals_cmd(
+    action: str = typer.Argument(None, help="approve or reject (omit to list what is pending)"),
+    approval_id: str = typer.Argument(None, help="The approval id (from the list)"),
+    config: str | None = typer.Option(None, "--config", help="Path to config.json"),
+):
+    """List or decide community actions held for your approval (#72).
+
+    Decisions go through the running gateway when there is one, so the agent
+    follows up in the chat the action came from; without a gateway the action
+    runs here directly.
+    """
+    import asyncio
+
+    import httpx
+
+    from mira_engine.community import approvals
+
+    cfg = _load_community_config(config)
+    if action is None:
+        pending = approvals.list_approvals(status="pending")
+        if not pending:
+            console.print("No community actions are waiting for your approval.")
+            return
+        console.print(f"{__logo__} {len(pending)} community action(s) waiting for your approval\n")
+        for rec in pending:
+            console.print(f"  [cyan]{rec['id']}[/cyan]  {approvals.summarize(rec)}  [dim]{rec.get('created_at', '')}[/dim]")
+        console.print("\nDecide with: mira community approvals approve|reject <id>")
+        return
+    if action not in ("approve", "reject") or not approval_id:
+        console.print("[red]Usage: mira community approvals [approve|reject <id>][/red]")
+        raise typer.Exit(2)
+    record = approvals.get_approval(approval_id)
+    if record is None:
+        console.print(f"[red]No community approval {approval_id}.[/red]")
+        raise typer.Exit(1)
+    if record.get("status") != "pending":
+        console.print(f"Approval {approval_id} is already {record.get('status')}.")
+        raise typer.Exit(1)
+
+    # Prefer the gateway: it executes, records and follows up in the chat.
+    from mira_engine.config.loader import get_config_path
+    from mira_engine.security.gateway_auth import local_gateway_tokens
+
+    host = cfg.gateway.host
+    if host in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    url = f"http://{host}:{cfg.gateway.port}/api/community/approvals/{approval_id}/decide"
+    for token in local_gateway_tokens(get_config_path()) or [""]:
+        try:
+            with httpx.Client(timeout=120.0, trust_env=False) as client:
+                resp = client.post(url, json={"decision": action}, headers={"Authorization": f"Bearer {token}"} if token else {})
+        except httpx.HTTPError:
+            break  # no gateway: decide locally below
+        if resp.status_code == 401:
+            continue
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001
+            data = {}
+        if resp.status_code < 400 and data.get("ok"):
+            console.print(f"[green]✓[/green] {action}d: {data.get('result') or approvals.summarize(record)}")
+            return
+        console.print(f"[red]{action} failed: {data.get('error') or resp.text[:200]}[/red]")
+        raise typer.Exit(1)
+
+    if action == "reject":
+        approvals.set_status(approval_id, "rejected")
+        console.print(f"[green]✓[/green] rejected: {approvals.summarize(record)}")
+        return
+    result = asyncio.run(approvals.execute_approval(record, cfg.community))
+    approvals.set_status(approval_id, "approved" if result.get("ok") else "failed", detail=str(result.get("detail") or ""))
+    if result.get("ok"):
+        console.print(f"[green]✓[/green] approved and done: {result.get('detail')}")
+    else:
+        console.print(f"[red]approved, but it failed: {result.get('detail')}[/red]")
+        raise typer.Exit(1)
+
+
 @community_app.command("status")
 def community_status(
     config: str | None = typer.Option(None, "--config", help="Path to config.json"),

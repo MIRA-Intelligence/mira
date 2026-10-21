@@ -3366,7 +3366,7 @@ async def test_renewing_a_claim_from_the_inbox(
     assert calls == ["p1", "gone"]
 
 
-async def test_handle_community_decide_keeps_pending_on_execution_failure(
+async def test_handle_community_decide_marks_failed_on_execution_failure(
     ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rec = {"id": "3", "action": "comment", "status": "pending", "payload": {}}
@@ -3375,7 +3375,7 @@ async def test_handle_community_decide_keeps_pending_on_execution_failure(
     monkeypatch.setattr(
         ui_channel_mod.community_approvals,
         "set_status",
-        lambda i, s: set_calls.append(s) or rec,
+        lambda i, s, detail=None: set_calls.append(s) or {**rec, "status": s},
     )
 
     async def fake_exec(r, c):
@@ -3390,8 +3390,8 @@ async def test_handle_community_decide_keeps_pending_on_execution_failure(
     req.match_info = {"approval_id": "3"}
     resp = await ui_channel._handle_community_decide(req)
     assert resp.status == 502
-    # Execution failed, so the item must remain pending (never marked approved).
-    assert set_calls == []
+    # Execution failed: recorded as failed (#72), never as approved.
+    assert set_calls == ["failed"]
 
 
 async def test_handle_community_decide_not_found(
@@ -3744,3 +3744,40 @@ async def test_send_stream_reset_withdraws_partial_reply(ui_channel: UiChannel) 
     ))
     history = SessionManager(ui_channel.workspace).get_ui_history("ui:sid-reset")
     assert [entry["content"] for entry in history] == ["whole reply"]
+
+
+async def test_a_failed_approval_is_recorded_and_handed_back(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #72: an execution failure (privacy filter, git) no longer leaves the item
+    # pending behind a 502 — it is marked failed and the agent is told, so it
+    # can fix the cause and ask again.
+    rec = {
+        "id": "9", "action": "open_pr", "status": "pending",
+        "payload": {"title": "Add retry", "working_dir": "/ws"},
+        "origin": {"channel": "ui", "chat_id": "chat-9"},
+    }
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    statuses: list[tuple] = []
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "set_status",
+        lambda i, s, detail=None: statuses.append((i, s, detail)) or {**rec, "status": s},
+    )
+
+    async def fake_exec(r, c):
+        return {"ok": False, "detail": "privacy-filter: 'Acme' must not reach the community"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: Config())
+    ui_channel.bus.publish_inbound = AsyncMock()
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "9"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 502
+    assert statuses == [("9", "failed", "privacy-filter: 'Acme' must not reach the community")]
+    follow = ui_channel.bus.publish_inbound.await_args.args[0]
+    assert follow.chat_id == "ui:chat-9" and "could not be carried out" in follow.content

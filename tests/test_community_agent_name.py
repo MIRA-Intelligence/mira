@@ -85,7 +85,9 @@ def test_community_turns_get_the_mention_note_and_follow_a_rename_live(tmp_path,
     assert "your name is Nova (#35f0bd8e)" in out
     cfg_file.write_text(json.dumps({"community": {"agentName": "Vega"}}))  # renamed in the app
     assert "your name is Vega" in BaseAgentLoop._compose_extra_system(loop, None, None, channel="community")
-    assert BaseAgentLoop._compose_extra_system(loop, None, None, channel="ui") is None
+    # Other channels get the discovery hint (#72), not the mention note.
+    ui_out = BaseAgentLoop._compose_extra_system(loop, None, None, channel="ui")
+    assert "your name is" not in ui_out and "Mira Community" in ui_out
 
 
 def test_reply_events_show_whom_to_mention():

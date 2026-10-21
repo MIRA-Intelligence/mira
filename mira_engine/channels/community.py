@@ -295,6 +295,9 @@ class CommunityChannel(BaseChannel):
         # The user's inbox gets the kinds they chose; the agent still sees and
         # handles every event below, whatever the user receives.
         self._notify_user(event)
+        # News about a PR or proposal the agent started from a chat is also
+        # handed back to that chat, where the user actually is (#72).
+        await self._follow_up_origin(event)
 
         thread_id = _event_thread_id(event)
         actor = str(event.get("actor") or event.get("author") or "community")
@@ -333,6 +336,26 @@ class CommunityChannel(BaseChannel):
         except Exception as e:  # noqa: BLE001 - fall back to the generic prompt
             logger.debug("Onboarding prompt fell back to the default: {}", e)
             return ONBOARDING_PROMPT
+
+    async def _follow_up_origin(self, event: dict[str, Any]) -> None:
+        try:
+            from mira_engine.community.origins import origin_follow_up
+
+            found = origin_follow_up(event)
+            if not found:
+                return
+            content, origin = found
+            await self.bus.publish_inbound(
+                InboundMessage(
+                    channel="system",
+                    sender_id="community",
+                    chat_id=f"{origin['channel']}:{origin['chat_id']}",
+                    content=content,
+                    metadata={"project_id": origin["project_id"]} if origin.get("project_id") else {},
+                )
+            )
+        except Exception as e:  # noqa: BLE001 - a missed follow-up must never block the event
+            logger.debug("Community follow-up to the origin chat not sent: {}", e)
 
     @staticmethod
     def _notify_user(event: dict[str, Any]) -> None:

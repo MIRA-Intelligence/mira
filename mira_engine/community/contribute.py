@@ -69,6 +69,10 @@ class OpenPrResult:
     number: int
     branch: str
     login: str
+    # True when the branch already had an open PR: the push updated it.
+    updated: bool = False
+    # Every path the branch changes against the landing branch.
+    changed_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -234,6 +238,17 @@ async def start_contribution(
     owner, name = repo.split("/", 1)
     branch = f"{_slugify_branch(title)}-{uuid.uuid4().hex[:6]}"
     target = contributions_root(workspace) / f"{owner}__{name}" / branch.removeprefix(BRANCH_PREFIX)
+
+    # The PR is pushed with the user's own GitHub credentials: find out now,
+    # not after the change is written, that `gh` isn't logged in.
+    code, _, err = await run(["gh", "auth", "status"], None)
+    if code != 0:
+        raise ContributeError(
+            "GitHub CLI is not logged in (`gh auth status` failed"
+            + (f": {err.strip()[:200]}" if err.strip() else "")
+            + "). Your user needs to run `gh auth login` first; the PR is opened from their fork "
+            "with their credentials."
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
 
     await _stepper(run, None)(
@@ -342,7 +357,12 @@ async def open_pr_github(
     fork_url = f"https://github.com/{login}/{name}.git"
     await step(["git", "push", fork_url, f"{scope.branch}:{scope.branch}"])
 
-    # 6. Open the PR into the landing branch.
+    # 6. Open the PR into the landing branch — unless this branch already has
+    #    an open PR (follow-up commits after a review): the push updated it.
+    existing = await _existing_pr(step, scope, login)
+    if existing is not None:
+        url, number = existing
+        return OpenPrResult(url=url, number=number, branch=scope.branch, login=login, updated=True, changed_paths=changed)
     _, pr_out, _ = await step(
         [
             "gh",
@@ -366,4 +386,103 @@ async def open_pr_github(
     number = _parse_pr_number(url)
     if number is None:
         raise ContributeError(f"could not parse PR number from URL: {url}")
-    return OpenPrResult(url=url, number=number, branch=scope.branch, login=login)
+    return OpenPrResult(url=url, number=number, branch=scope.branch, login=login, changed_paths=changed)
+
+
+async def _existing_pr(step: Any, scope: ContributionScope, login: str) -> tuple[str, int] | None:
+    """The open PR for this workspace's branch on the user's fork, if any."""
+    code, out, _ = await step(
+        ["gh", "pr", "list", "--repo", scope.repo, "--head", f"{login}:{scope.branch}", "--state", "open", "--json", "number,url"],
+        allow_fail=True,
+    )
+    if code != 0:
+        return None
+    try:
+        prs = json.loads(out or "[]")
+    except ValueError:
+        return None
+    for pr in prs if isinstance(prs, list) else []:
+        if isinstance(pr, dict) and pr.get("url") and pr.get("number") is not None:
+            return str(pr["url"]), int(pr["number"])
+    return None
+
+
+def plugin_ids_from_paths(paths: list[str]) -> list[str]:
+    """The plugins a change adds or edits (``plugins/<id>/...``)."""
+    ids = {p.split("/", 2)[1] for p in paths if p.startswith("plugins/") and p.count("/") >= 2}
+    return sorted(i for i in ids if i)
+
+
+async def open_and_register_pr(
+    client: Any,
+    *,
+    working_dir: str,
+    title: str,
+    body: str = "",
+    proposal_id: str | None = None,
+    guard: PrivacyGuard | None = None,
+    runner: CommandRunner | None = None,
+) -> dict[str, Any]:
+    """Open (or update) the PR for a contribution workspace and register it with
+    the community — the one code path behind the ``community_open_pr`` tool and
+    an approved held action (#72). Raises :class:`ContributeError` when the PR
+    can't be opened; a registration failure is reported in the result instead,
+    since the PR is open by then."""
+    result = await open_pr_github(working_dir=working_dir, title=title, body=body, guard=guard, runner=runner)
+    scope = load_scope(working_dir)
+    out: dict[str, Any] = {
+        "url": result.url,
+        "number": result.number,
+        "login": result.login,
+        "updated": result.updated,
+        "repo": scope.repo,
+        "proposal_id": proposal_id or scope.proposal_id,
+        "work_order_id": scope.work_order_id,
+        "plugin_ids": plugin_ids_from_paths(result.changed_paths),
+        "pr_id": None,
+        "registered": False,
+        "error": "",
+    }
+    if result.updated:
+        # Registered when it was opened; the platform re-reads the new head.
+        out["registered"] = True
+        return out
+    try:
+        reg = await client.register_pr(
+            out["proposal_id"],
+            scope.repo,
+            result.number,
+            result.url,
+            result.login,
+            host="github",
+            title=title,
+            body=body,
+            work_order_id=scope.work_order_id,
+        )
+    except Exception as e:  # noqa: BLE001 - the PR is open even if registering fails
+        out["error"] = str(e)
+        return out
+    pr = (reg or {}).get("pr") or {}
+    out["registered"] = True
+    out["pr_id"] = str(pr.get("id") or "") or None
+    out["state"] = pr.get("state") or "open"
+    return out
+
+
+def pr_summary(out: dict[str, Any]) -> str:
+    """One paragraph for the agent (or the approvals log) about an opened PR."""
+    if out.get("updated"):
+        return (
+            f"Pushed the follow-up commits to the open PR {out['url']}; the community re-reads its new head "
+            "(reviews and approvals of the old head no longer count)."
+        )
+    if not out.get("registered"):
+        return (
+            f"Opened PR {out['url']}, but registering it with the community failed: {out.get('error')}. "
+            "You can retry registration later."
+        )
+    return (
+        f"Opened and registered PR {out['url']} (id {out.get('pr_id') or '?'}, state {out.get('state', 'open')}). "
+        "It merges once required checks pass and the gate for its lane is met "
+        "(plugin lane: reviews of the current head; core lane: a maintainer)."
+    )

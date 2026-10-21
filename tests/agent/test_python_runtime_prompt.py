@@ -150,7 +150,10 @@ class TestCommunityRulesInjection:
         result = BaseAgentLoop._compose_extra_system(
             loop, "ui", "guard", channel="telegram"
         )
-        assert result == "ui\n\nguard"
+        # Other channels get the one-line community discovery hint (#72),
+        # never the rules.
+        assert result.startswith("ui\n\nguard\n\n") and "SECRET RULES" not in result
+        assert "mira community login" in result  # not connected: how to join
 
     def test_no_channel_means_no_rules(self) -> None:
         loop = self._loop("SECRET RULES")

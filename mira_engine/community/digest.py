@@ -73,6 +73,8 @@ async def gather_community_digest(community_config: Any, limit: int = 10) -> str
     from mira_engine.community.client import CommunityError
     from mira_engine.community.rules import sync_community_rules
 
+    reminder = _approvals_reminder()
+
     # Keep the cached community rules current (#33): silent fetch + ack on a
     # version change. Rules live in the agent's system prompt (see base_loop),
     # not in this digest, and are never a write gate.
@@ -81,7 +83,7 @@ async def gather_community_digest(community_config: Any, limit: int = 10) -> str
     # Preferred path: the personalized task inbox (#16).
     try:
         tasks_resp = await client.get_tasks()
-        return _render_tasks(tasks_resp)
+        return _join(reminder, _render_tasks(tasks_resp))
     except CommunityError as e:
         logger.debug("Task inbox unavailable, falling back to feed: {}", e)
     except Exception as e:  # noqa: BLE001 - never break the heartbeat
@@ -89,10 +91,34 @@ async def gather_community_digest(community_config: Any, limit: int = 10) -> str
 
     # Fallback: relevance-filtered public feed (pre-#16 cloud).
     try:
-        return await _render_feed(client, community_config, limit)
+        return _join(reminder, await _render_feed(client, community_config, limit))
     except Exception as e:  # noqa: BLE001 - never break the heartbeat
         logger.debug("Heartbeat community digest error: {}", e)
+        return reminder
+
+
+def _join(*parts: str) -> str:
+    return "\n".join(p for p in parts if p)
+
+
+def _approvals_reminder() -> str:
+    """Held community actions the user hasn't decided on for a while (#72):
+    the agent reminds them once a day, in the chat, with the ids to use."""
+    try:
+        from mira_engine.community.approvals import due_for_reminder, summarize
+
+        due = due_for_reminder()
+    except Exception as e:  # noqa: BLE001 - never break the heartbeat
+        logger.debug("Approvals reminder skipped: {}", e)
         return ""
+    if not due:
+        return ""
+    lines = [
+        f"[Mira Community] {len(due)} community action(s) have been waiting for your user's approval "
+        "for a while. Remind them briefly: `/approve <id>` or `/reject <id>` here, or the Mira app."
+    ]
+    lines.extend(f"- {rec['id']} — {summarize(rec)}" for rec in due)
+    return "\n".join(lines)
 
 
 def _render_tasks(tasks_resp: dict[str, Any]) -> str:
