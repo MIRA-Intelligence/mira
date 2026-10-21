@@ -642,16 +642,11 @@ remove_account() {
 	id "$SERVER_USER" >/dev/null 2>&1 || return 0
 	# The service is stopped, but its systemd user manager or a sudo child can
 	# outlive it for a moment; userdel refuses while any process runs as it.
-	# sudo can retain the server's real UID with effective UID root. Check
-	# both separately: combining -u and -U would require both UIDs to match.
 	local i
 	for i in 1 2 3 4 5 6 7 8 9 10; do
-		pgrep -u "$SERVER_USER" >/dev/null || pgrep -U "$SERVER_USER" >/dev/null || break
+		pgrep -u "$SERVER_USER" >/dev/null || break
 		((i == 1)) && { loginctl terminate-user "$SERVER_USER" >/dev/null 2>&1 || true; }
-		if ((i == 5)); then
-			pkill -KILL -u "$SERVER_USER" || true
-			pkill -KILL -U "$SERVER_USER" || true
-		fi
+		((i == 5)) && { pkill -KILL -u "$SERVER_USER" || true; }
 		sleep 1
 	done
 	run userdel "$SERVER_USER"
