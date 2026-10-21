@@ -125,6 +125,27 @@ the next start), else `plugins.default_user_tier`. Promotion is
 `experimental → community → verified` by a maintainer
 (`PUT /plugins/:id` on the platform).
 
+### Permissions inside the engine
+
+A plugin that runs in process (`community`, `verified`) is checked against its
+`permissions` while its code runs — tool calls, hooks, its channel (start,
+send, stop and the tasks it starts), its import and construction:
+
+| Declared | Without it, the plugin gets a `PermissionError` when it… |
+|---|---|
+| `network` (any host) | connects to an internet address (loopback included) or resolves a host name |
+| `filesystem: workspace:write` | writes to the workspace (its own data dir, the media dir and the temp dir are always writable) |
+| `filesystem: workspace:read` | reads the workspace if it lives in the Mira home |
+| — | reads anything else in the Mira home (config, keys, the gateway token) |
+| `shell: true` | starts a process |
+
+The tool call fails with that error, and a plugin that keeps overstepping
+trips its breaker. This is a **tripwire, not a sandbox**: Python code in the
+engine's process can get around it, which is why plugins the platform hasn't
+vouched for run out of process. Declared host names are only logged, not
+enforced, in process. First-party plugins aren't checked; set
+`MIRA_PLUGIN_AUDIT=1` to log what they do beyond their manifests.
+
 ### Out-of-process plugins
 
 An experimental plugin's tools are served by `python -m mira_engine.plugins.host`

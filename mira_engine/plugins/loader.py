@@ -53,6 +53,7 @@ from mira_engine.plugins.manifest import (
     load_manifest,
 )
 from mira_engine.plugins.paths import bundled_plugins_dir, user_plugins_dir
+from mira_engine.plugins.permissions import Grant, grant_for, granted
 from mira_engine.plugins.state import PluginState
 
 Status = Literal[
@@ -80,6 +81,8 @@ class LoadedPlugin:
     # built again for every agent loop by PluginRuntime.build_tools.
     tool_entries: list[tuple[object, str | None, str]] = field(default_factory=list)
     isolated: bool = False
+    # What its in-process code runs under (plugins.permissions); None = unchecked.
+    grant: Grant | None = None
 
     @property
     def id(self) -> str:
@@ -202,8 +205,10 @@ class PluginRuntime:
         *,
         workspace: Path | None = None,
         allow_unsandboxed: bool | None = None,
+        audit_bundled: bool | None = None,
     ):
         self.sources = sources if sources is not None else default_sources()
+        self._audit_bundled = audit_bundled
         self.state = state or PluginState()
         # Config is read lazily — only when a user plugin is actually found —
         # so an engine without user plugins never touches it here.
@@ -229,6 +234,19 @@ class PluginRuntime:
         if self._allow_unsandboxed is None:
             self._allow_unsandboxed = bool(getattr(getattr(self._cfg(), "plugins", None), "unsandboxed_experimental", False))
         return self._allow_unsandboxed
+
+    @property
+    def audit_bundled(self) -> bool:
+        """Check first-party plugins too, logging only (``MIRA_PLUGIN_AUDIT=1``);
+        an environment switch so loading bundled plugins never reads the config."""
+        if self._audit_bundled is None:
+            self._audit_bundled = os.environ.get("MIRA_PLUGIN_AUDIT", "").lower() in ("1", "true", "yes")
+        return self._audit_bundled
+
+    def grant(self, manifest: PluginManifest, tier: Tier | None, workspace: Path | None = None) -> Grant | None:
+        if tier == "core-bundled" and not self.audit_bundled:
+            return None
+        return grant_for(manifest, tier, workspace=workspace or self._workspace, audit_bundled=self.audit_bundled)
 
     def _source_tier(self, source: PluginSource) -> Tier:
         if not source.from_config:
@@ -355,17 +373,10 @@ class PluginRuntime:
         # Built once here to validate the entries (and for status and the
         # contract kit); every agent loop builds its own via build_tools().
         probe = self.context(manifest, tier, workspace=self._workspace)
+        grant = result.grant = self.grant(manifest, tier)
         try:
-            for ep in manifest.channels:
-                result.channel_entries[ep.name or ep.entry.split(":", 1)[1]] = ep.entry
-            for ep in manifest.tools:
-                obj = _resolve(manifest, ep.entry)
-                tool = _build_tool(obj, ep.name, ep.entry, probe)
-                result.tools.append(GuardedTool(tool, breaker))  # type: ignore[arg-type]
-                result.tool_entries.append((obj, ep.name, ep.entry))
-            for ep in manifest.hooks:
-                hook = _instantiate(_resolve(manifest, ep.entry), AgentHook, ep.entry, probe)
-                result.hooks.append(GuardedHook(hook, breaker, mode=ep.mode))  # type: ignore[arg-type]
+            with granted(grant):  # the plugin's import and construction run as it
+                self._build_entries(result, manifest, breaker, probe, grant)
         except Exception as e:  # noqa: BLE001 - any plugin error stays with the plugin
             result.channels, result.channel_entries, result.tools, result.hooks, result.tool_entries = {}, {}, [], [], []
             result.reason = f"{type(e).__name__}: {e}"
@@ -373,6 +384,25 @@ class PluginRuntime:
 
         result.status = "loaded"
         return result
+
+    def _build_entries(
+        self,
+        result: LoadedPlugin,
+        manifest: PluginManifest,
+        breaker: CircuitBreaker,
+        probe: PluginContext,
+        grant: Grant | None,
+    ) -> None:
+        for ep in manifest.channels:
+            result.channel_entries[ep.name or ep.entry.split(":", 1)[1]] = ep.entry
+        for ep in manifest.tools:
+            obj = _resolve(manifest, ep.entry)
+            tool = _build_tool(obj, ep.name, ep.entry, probe)
+            result.tools.append(GuardedTool(tool, breaker, grant=grant))  # type: ignore[arg-type]
+            result.tool_entries.append((obj, ep.name, ep.entry))
+        for ep in manifest.hooks:
+            hook = _instantiate(_resolve(manifest, ep.entry), AgentHook, ep.entry, probe)
+            result.hooks.append(GuardedHook(hook, breaker, mode=ep.mode, grant=grant))  # type: ignore[arg-type]
 
     def _load_isolated(self, result: LoadedPlugin, manifest: PluginManifest) -> LoadedPlugin:
         """Serve the plugin's tools from a separate (sandboxed) process (mira#211)."""
@@ -430,7 +460,8 @@ class PluginRuntime:
             if name in plugin.channels:
                 continue
             try:
-                cls = _resolve(plugin.manifest, entry)
+                with granted(plugin.grant):
+                    cls = _resolve(plugin.manifest, entry)
                 if not (inspect.isclass(cls) and issubclass(cls, BaseChannel)):
                     raise TypeError(f"{entry} is not a BaseChannel subclass")
             except Exception as e:  # noqa: BLE001 - the plugin's problem, not the engine's
@@ -440,6 +471,11 @@ class PluginRuntime:
             cls.__mira_plugin_id__ = plugin.id  # type: ignore[attr-defined]
             plugin.channels[name] = cls
         return plugin.channels
+
+    def channel_grant(self, cls: type) -> Grant | None:
+        """What a plugin channel's code runs under (None for the engine's own)."""
+        plugin = self.get(getattr(cls, "__mira_plugin_id__", "") or "")
+        return plugin.grant if plugin is not None else None
 
     def channels(self, *, core: bool | None = None) -> dict[str, type]:
         """Channel classes from loaded plugins, imported on first use.
@@ -475,9 +511,12 @@ class PluginRuntime:
             assert p.manifest is not None
             ctx = self.context(p.manifest, p.tier, workspace=workspace, proxy=proxy, host=host)
             breaker = self.breaker(p.manifest.id, p.manifest.version, tier=p.tier)
+            grant = self.grant(p.manifest, p.tier, workspace)
             for obj, name, entry in p.tool_entries:
                 try:
-                    out.append(GuardedTool(_build_tool(obj, name, entry, ctx), breaker))  # type: ignore[arg-type]
+                    with granted(grant):
+                        tool = _build_tool(obj, name, entry, ctx)
+                    out.append(GuardedTool(tool, breaker, grant=grant))  # type: ignore[arg-type]
                 except Exception as e:  # noqa: BLE001 - the plugin's problem, not the loop's
                     logger.warning("plugin {} tool {} not available here: {}", p.id, name or entry, e)
         return out

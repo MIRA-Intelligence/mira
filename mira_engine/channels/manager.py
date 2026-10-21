@@ -13,6 +13,7 @@ from loguru import logger
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.channels.base import BaseChannel
+from mira_engine.plugins.permissions import granted
 from mira_engine.config.schema import Config
 from mira_engine.utils.restart import (
     consume_restart_notice_from_env,
@@ -123,7 +124,8 @@ class ChannelManager:
                     kwargs["restrict_to_workspace"] = self.config.tools.restrict_to_workspace
                     kwargs["on_runtime_config_updated"] = self.on_ui_runtime_config_updated
                     kwargs["auth_token"] = self.config.gateway.auth_token
-                self.channels[name] = cls(self._to_ns(section), self.bus, **kwargs)
+                with granted(self._grant(cls)):
+                    self.channels[name] = cls(self._to_ns(section), self.bus, **kwargs)
                 logger.info("{} channel enabled", name)
             except ImportError as e:
                 logger.warning("{} channel not available: {}", name, e)
@@ -140,9 +142,22 @@ class ChannelManager:
                     f'Set ["*"] to allow everyone, or add specific user IDs.'
                 )
 
+    @staticmethod
+    def _grant(channel: BaseChannel | type) -> Any:
+        """What a plugin channel's code runs under (plugins.permissions);
+        None for the engine's own channels."""
+        cls = channel if isinstance(channel, type) else type(channel)
+        if not getattr(cls, "__mira_plugin_id__", None):
+            return None
+        from mira_engine.plugins import get_runtime
+
+        return get_runtime().channel_grant(cls)
+
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         try:
-            await channel.start()
+            # Tasks the channel starts inherit the grant.
+            with granted(self._grant(channel)):
+                await channel.start()
         except Exception as e:
             logger.error("Failed to start channel {}: {}", name, e)
 
@@ -167,7 +182,8 @@ class ChannelManager:
 
         for name, channel in self.channels.items():
             try:
-                await channel.stop()
+                with granted(self._grant(channel)):
+                    await channel.stop()
                 logger.info("Stopped {} channel", name)
             except Exception as e:
                 logger.error("Error stopping {}: {}", name, e)
@@ -224,10 +240,11 @@ class ChannelManager:
         attempts = max(1, int(retries_cfg))
         for i in range(attempts):
             try:
-                if msg.metadata.get("_stream_delta"):
-                    await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
-                else:
-                    await channel.send(msg)
+                with granted(self._grant(channel)):
+                    if msg.metadata.get("_stream_delta"):
+                        await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
+                    else:
+                        await channel.send(msg)
                 return
             except asyncio.CancelledError:
                 raise
