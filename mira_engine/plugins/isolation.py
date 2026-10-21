@@ -31,6 +31,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,14 @@ def host_env() -> dict[str, str]:
     env = {k: os.environ[k] for k in _ENV_KEEP if k in os.environ}
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if not getattr(sys, "frozen", False):
+        # The host must run this engine's code, wherever it was imported from
+        # (a source checkout, another install): it doesn't start in the
+        # engine's working directory.
+        import mira_engine
+
+        root = str(Path(mira_engine.__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = os.pathsep.join([root, *[p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]])
     return env
 
 
@@ -155,7 +164,8 @@ def describe(
     argv = host_argv(manifest, workspace=workspace, sandbox=sandbox, describe=True)
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=DESCRIBE_TIMEOUT_S, env=env or host_env(), check=False
+            argv, capture_output=True, text=True, timeout=DESCRIBE_TIMEOUT_S, env=env or host_env(),
+            cwd=_scratch_dir(manifest.id), check=False,
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"plugin host did not describe its tools within {DESCRIBE_TIMEOUT_S}s") from e
@@ -172,10 +182,13 @@ def describe(
 class PluginHostClient:
     """A long-lived host process, started lazily and restarted after a crash."""
 
-    def __init__(self, plugin_id: str, argv: list[str], env: dict[str, str] | None = None):
+    def __init__(self, plugin_id: str, argv: list[str], env: dict[str, str] | None = None, cwd: Path | None = None):
         self.plugin_id = plugin_id
         self.argv = argv
         self.env = env
+        # The host works in its scratch dir: the engine's working directory
+        # may be one the sandbox hides (anything in the home on macOS).
+        self.cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task | None = None
         self._pending: dict[int, asyncio.Future] = {}
@@ -191,6 +204,7 @@ class PluginHostClient:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                     env=self.env or host_env(),
+                    cwd=self.cwd,
                     limit=16 * 1024 * 1024,
                 )
                 self._reader = asyncio.create_task(self._read(self._proc), name=f"plugin-host-{self.plugin_id}")

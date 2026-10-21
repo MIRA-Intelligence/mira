@@ -136,7 +136,11 @@ def grant_for(
     plugin_data = data_dir or data_root / "plugin-data" / manifest.id
     # Made here, by the engine: the plugin may write inside it, not create
     # its parents in the Mira home.
-    plugin_data.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not plugin_data.is_dir():
+        try:
+            plugin_data.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError:
+            pass  # e.g. inside a sandbox that already made it, or hides its parent
     writes = [str(plugin_data), str(media), str(Path(manifest.root) / "__pycache__")]
     reads = [str(manifest.root), str(plugin_data), str(media)]
     if workspace is not None and perms.filesystem in ("workspace:read", "workspace:write"):

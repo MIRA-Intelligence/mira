@@ -453,7 +453,10 @@ class PluginRuntime:
             result.reason = f"manifest declares tools {sorted(declared)} but the plugin serves {sorted(served)}"
             return result
         client = isolation.PluginHostClient(
-            manifest.id, isolation.host_argv(manifest, workspace=self.workspace, sandbox=sandbox), env=env
+            manifest.id,
+            isolation.host_argv(manifest, workspace=self.workspace, sandbox=sandbox),
+            env=env,
+            cwd=isolation._scratch_dir(manifest.id),
         )
         breaker = self.breaker(manifest.id, manifest.version, tier=result.tier)
         result.tools = [GuardedTool(isolation.SubprocessTool(client, d), breaker) for d in definitions]

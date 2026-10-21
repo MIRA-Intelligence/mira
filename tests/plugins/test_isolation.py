@@ -215,6 +215,9 @@ async def test_seatbelt_enforces_network_files_and_shell(tmp_path, monkeypatch):
     home_dir.mkdir()
     (home_dir / "private.txt").write_text("private")
     monkeypatch.setenv("HOME", str(home_dir))
+    # The engine's working directory is one the sandbox hides: the host must
+    # not depend on it (it runs in its scratch dir).
+    monkeypatch.chdir(home_dir)
     mira_home = Path(os.environ["MIRA_HOME"])
     mira_home.mkdir(parents=True, exist_ok=True)
     (mira_home / "config.json").write_text('{"providers": {"key": "sk-secret"}}')
