@@ -23,7 +23,6 @@ from mira_engine.agent.tools.filesystem import (
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.agent.tools.search import GlobTool, GrepTool
 from mira_engine.agent.tools.shell import ExecTool
-from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.config.schema import ExecToolConfig
@@ -253,10 +252,7 @@ class SubagentManager:
                 sandbox_extra_dirs=sandbox_dirs,
                 python_runtime=self.exec_config.python,
             ))
-        if _permitted("web_search"):
-            tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
-        if _permitted("web_fetch"):
-            tools.register(WebFetchTool(proxy=self.web_proxy))
+        # web_search / web_fetch come from the bundled `web` plugin.
         self._register_plugin_tools(tools, run_workspace, _permitted)
         return tools
 

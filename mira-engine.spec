@@ -56,6 +56,9 @@ a = Analysis(
         'tiktoken_ext.openai_public',
         # Out-of-process plugin host (`mira-engine --mira-plugin-host`).
         'mira_engine.plugins.host',
+        # Engine modules only the bundled plugins (plugins/web, plugins/mira-hub) import.
+        'mira_engine.agent.tools.web',
+        'mira_engine.agent.tools.hub',
     ],
     hookspath=[],
     hooksconfig={},
