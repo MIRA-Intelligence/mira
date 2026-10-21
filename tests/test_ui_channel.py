@@ -3573,3 +3573,60 @@ async def test_fs_file_serves_files_inside_and_refuses_escapes(ui_channel: UiCha
     link.symlink_to(outside)
     req.query = {"path": str(link)}
     assert (await ui_channel._handle_fs_file(req)).status == 403
+
+
+def _upload_request(query: dict[str, str], *parts: _FakePart, session_id: str = "PRJ-0001") -> MagicMock:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": session_id}
+    req.query = query
+    req.multipart = AsyncMock(return_value=_FakeMultipart(list(parts)))
+    return req
+
+
+async def test_upload_into_a_chosen_project_folder(ui_channel: UiChannel) -> None:
+    project = ui_channel.project_registry.default_project_parent / "PRJ-0001"
+    (project / "results").mkdir(parents=True)
+    (project / "results" / "a.csv").write_text("old", encoding="utf-8")
+
+    req = _upload_request(
+        {"dir": "results"},
+        _FakePart(name="files", filename="a.csv", chunks=[b"new"]),
+        _FakePart(name="files", filename="batch/b.txt", chunks=[b"b"]),
+    )
+    body = json.loads((await ui_channel._handle_upload_project_files(req)).text)
+
+    assert body["dir"] == "results"
+    assert [item["path"] for item in body["uploaded"]] == ["results/a_1.csv", "results/batch/b.txt"]
+    assert (project / "results" / "a.csv").read_text(encoding="utf-8") == "old"
+    assert (project / "results" / "batch" / "b.txt").read_bytes() == b"b"
+
+
+async def test_upload_with_empty_dir_goes_to_the_project_root(ui_channel: UiChannel) -> None:
+    req = _upload_request({"dir": ""}, _FakePart(name="files", filename="notes.md", chunks=[b"n"]))
+    body = json.loads((await ui_channel._handle_upload_project_files(req)).text)
+
+    assert body["dir"] == ""
+    assert body["uploaded"][0]["path"] == "notes.md"
+    assert (ui_channel.project_registry.default_project_parent / "PRJ-0001" / "notes.md").is_file()
+
+
+async def test_upload_refuses_a_folder_outside_the_project(ui_channel: UiChannel) -> None:
+    req = _upload_request({"dir": "../escape"}, _FakePart(name="files", filename="x.txt", chunks=[b"x"]))
+    assert (await ui_channel._handle_upload_project_files(req)).status == 400
+    assert not (ui_channel.project_registry.default_project_parent / "escape").exists()
+
+
+async def test_fs_upload_creates_a_new_chat_folder(ui_channel: UiChannel, browse_home: Path) -> None:
+    chat_dir = ui_channel.projects_root / "chats" / "chat-new"
+    req = _upload_request({"dir": str(chat_dir)}, _FakePart(name="files", filename="scan.nii", chunks=[b"nii"]))
+    body = json.loads((await ui_channel._handle_fs_upload(req)).text)
+
+    assert body["uploaded"] == [{"name": "scan.nii", "path": str(chat_dir.resolve() / "scan.nii"), "size": 3}]
+    assert (chat_dir / "scan.nii").read_bytes() == b"nii"
+
+
+async def test_fs_upload_refuses_folders_outside_home_and_workspace(ui_channel: UiChannel, browse_home: Path) -> None:
+    req = _upload_request({"dir": "/"}, _FakePart(name="files", filename="x.txt", chunks=[b"x"]))
+    assert (await ui_channel._handle_fs_upload(req)).status == 403
+    req = _upload_request({"dir": str(browse_home)}, _FakePart(name="files", filename="../x.txt", chunks=[b"x"]))
+    assert (await ui_channel._handle_fs_upload(req)).status == 400

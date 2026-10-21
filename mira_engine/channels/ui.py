@@ -1430,6 +1430,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/chats/{chat_id}/workdir", self._handle_chat_workdir)
         self._app.router.add_get("/api/fs/list", self._handle_fs_list)
         self._app.router.add_get("/api/fs/file", self._handle_fs_file)
+        self._app.router.add_post("/api/fs/upload", self._handle_fs_upload)
         self._app.router.add_get("/api/projects/{session_id}/skill-plugins", self._handle_skill_plugins_list)
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/install", self._handle_skill_plugins_install)
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
@@ -4038,11 +4039,125 @@ class UiChannel(BaseChannel):
             "truncated": truncated,
         })
 
+    async def _save_uploads(
+        self,
+        request: web.Request,
+        upload_dir: Path,
+        *,
+        relative_to: Path | None = None,
+    ) -> tuple[list[dict[str, Any]], web.Response | None]:
+        """Write the request's ``files`` parts into *upload_dir*, never overwriting.
+
+        Browser folder uploads keep their relative paths. Returned paths are
+        relative to *relative_to*, or absolute without it.
+        """
+        try:
+            multipart = await request.multipart()
+        except Exception:
+            return [], web.json_response({"error": "expected multipart/form-data"}, status=400)
+        uploaded: list[dict[str, Any]] = []
+        while True:
+            part = await multipart.next()
+            if part is None:
+                break
+            if part.name != "files" or not part.filename:
+                await part.release()
+                continue
+            destination = _resolve_upload_destination(upload_dir, part.filename, preserve_relative_path=True)
+            if destination is None:
+                await part.release()
+                return [], web.json_response({"error": f"unsafe upload path: {part.filename}"}, status=400)
+            size = 0
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with destination.open("wb") as f:
+                    while chunk := await part.read_chunk():
+                        f.write(chunk)
+                        size += len(chunk)
+            except OSError as exc:
+                logger.warning("Failed to write uploaded file {}: {}", destination, exc)
+                return [], web.json_response({"error": str(exc)}, status=500)
+            uploaded.append({
+                "name": destination.name,
+                "path": destination.relative_to(relative_to).as_posix() if relative_to else str(destination),
+                "size": size,
+            })
+        if not uploaded:
+            return [], web.json_response({"error": "no files uploaded"}, status=400)
+        return uploaded, None
+
+    async def _upload_into_project_folder(
+        self, request: web.Request, session_id: str, folder: str
+    ) -> web.Response:
+        """Upload into a folder of the project chosen in the explorer ('' is the project root)."""
+        project_dir = self._resolve_project_dir(session_id, create=True)
+        if project_dir is None:
+            return web.json_response({"error": "project not found"}, status=404)
+        root = project_dir.resolve()
+        upload_dir = (root / folder.strip().strip("/\\")).resolve()
+        if upload_dir != root and root not in upload_dir.parents:
+            return web.json_response({"error": "dir is outside the project"}, status=400)
+        if upload_dir.exists() and not upload_dir.is_dir():
+            return web.json_response({"error": "dir is not a folder"}, status=400)
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        uploaded, error = await self._save_uploads(request, upload_dir, relative_to=root)
+        if error is not None:
+            return error
+        relative_dir = upload_dir.relative_to(root).as_posix()
+        self._audit(
+            source="ui",
+            action="api_project_files_uploaded",
+            session_id=session_id,
+            project_dir=project_dir,
+            details={
+                "dir": relative_dir,
+                "count": len(uploaded),
+                "files": [item["path"] for item in uploaded],
+            },
+        )
+        return web.json_response({
+            "session_id": session_id,
+            "dir": "" if relative_dir == "." else relative_dir,
+            "uploaded": uploaded,
+            "extracted": [],
+        })
+
+    async def _handle_fs_upload(self, request: web.Request) -> web.Response:
+        """Upload into a folder the explorer is browsing (Quick Chat), under the user's home or workspace."""
+        directory, error = self._resolve_browse_path(request.query.get("dir", ""))
+        if error is not None:
+            return error
+        if directory.exists() and not directory.is_dir():
+            return web.json_response({"error": "dir is not a folder"}, status=400)
+        try:
+            # A new chat's folder may not exist before its first turn.
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        uploaded, error = await self._save_uploads(request, directory)
+        if error is not None:
+            return error
+        self._audit(
+            source="ui",
+            action="api_fs_files_uploaded",
+            details={"dir": str(directory), "count": len(uploaded), "files": [item["path"] for item in uploaded]},
+        )
+        return web.json_response({"dir": str(directory), "uploaded": uploaded})
+
     async def _handle_upload_project_files(self, request: web.Request) -> web.Response:
-        """Upload files into projects_root/<session_id>/data for web clients."""
+        """Upload files into projects_root/<session_id>/data for web clients.
+
+        With ``dir`` (a folder relative to the project, '' for its root) files
+        go there instead, and ``target`` is ignored.
+        """
         session_id = request.match_info.get("session_id", "").strip()
         if not session_id:
             return web.json_response({"error": "session_id required"}, status=400)
+        if "dir" in request.query:
+            return await self._upload_into_project_folder(request, session_id, request.query["dir"])
         target = (request.query.get("target") or "data").strip().lower()
         if target not in {"data", "references"}:
             return web.json_response(
