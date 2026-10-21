@@ -52,6 +52,12 @@ starts its channels, so loading plugins never imports channel SDKs. A
 first-party channel ranks like a built-in one: neither an entry point nor
 another plugin can take its name.
 
+The optional agent tools are first-party plugins too: `web` (`web_search`,
+`web_fetch`) and `mira-hub` (`hub_search`, `hub_install`).
+`mira plugin disable web` takes web access away from the agent and its
+subagents. Tools that are part of the agent loop itself (files, exec, message,
+spawn, workflow, cron, knowledge, pubmed, community) stay in the engine.
+
 `entry` is `module:attr` inside the plugin directory; the directory is imported
 as its own package, so relative imports work.
 

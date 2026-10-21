@@ -48,7 +48,6 @@ from mira_engine.agent.tools.community import (
 )
 from mira_engine.agent.tools.consult import ConsultRoleTool
 from mira_engine.agent.tools.cron import CronTool
-from mira_engine.agent.tools.hub import HubInstallTool, HubSearchTool
 from mira_engine.agent.tools.knowledge import KnowledgeReadTool, KnowledgeScope, KnowledgeSearchTool
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
@@ -62,7 +61,6 @@ from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.agent.tools.search import GlobTool, GrepTool
 from mira_engine.agent.tools.shell import ExecTool
 from mira_engine.agent.tools.spawn import SpawnTool
-from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.command.router import CommandContext, CommandRouter
@@ -536,10 +534,6 @@ class BaseAgentLoop:
                 python_runtime=self.exec_config.python,
             ))
             self.tools.register(BgTool(registry=self._bg_registry))
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
-        self.tools.register(WebFetchTool(proxy=self.web_proxy))
-        self.tools.register(HubSearchTool(proxy=self.web_proxy))
-        self.tools.register(HubInstallTool(workspace=self.workspace, proxy=self.web_proxy))
         self.tools.register(PubMedSearchTool(proxy=self.web_proxy))
         self._knowledge_scope = KnowledgeScope() if self.knowledge_config.enabled else None
         if self._knowledge_scope is not None:

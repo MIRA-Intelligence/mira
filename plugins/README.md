@@ -10,7 +10,8 @@ dependency a plugin needs there must be listed in its `hiddenimports`.
 
 What's here: the messaging channels (`discord`, `dingtalk`, `email`, `feishu`,
 `matrix`, `mochat`, `qq`, `slack`, `telegram`, `wecom`, `weixin`,
-`whatsapp`). Tests for a plugin's code live in the engine's `tests/`, which
+`whatsapp`) and the optional agent tools (`web`: web_search/web_fetch;
+`mira-hub`: hub_search/hub_install). Tests for a plugin's code live in the engine's `tests/`, which
 imports plugins as `mira_plugins.<id>.<module>` (see `tests/conftest.py`).
 
 This directory is the community **plugin lane**: changes here are reviewed by
