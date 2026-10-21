@@ -469,6 +469,19 @@ class ProjectRegistry:
         existing = self._project_dirs.get(normalized_id)
         if existing is not None and existing.resolve(strict=False) != normalized_dir:
             raise ValueError(f"project_id {normalized_id!r} is already bound to {existing}")
+        if (
+            existing is not None
+            and display_name is None
+            and normalized_id not in self._hidden_project_ids
+            and normalized_id not in self._removed_project_ids
+            and normalized_id not in self._dirty_project_ids
+        ):
+            # Already registered exactly like this: nothing to persist. This is
+            # the common case (every outbound message re-registers), and the
+            # full save() sweeps every project's meta file under a cross-process
+            # lock.
+            meta = self.ensure_project_meta(normalized_id, normalized_dir)
+            return ProjectRef(normalized_id, normalized_dir, meta)
         self._project_dirs[normalized_id] = normalized_dir
         self._dirty_project_ids.add(normalized_id)
         self._hidden_project_ids.discard(normalized_id)

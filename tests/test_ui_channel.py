@@ -3402,3 +3402,54 @@ async def test_handle_project_knowledge_attaches_existing_bases(ui_channel: UiCh
 
     resp = await ui_channel._handle_project_knowledge(request("GET"))
     assert json.loads(resp.text)["knowledge_bases"] == [kb.id]
+
+
+async def test_send_strips_prompt_material_from_wire_and_history(ui_channel: UiChannel) -> None:
+    ws = MagicMock()
+    ws.closed = False
+    ws.send_json = AsyncMock()
+    ui_channel._clients["sid-strip"] = ws
+    blob = "x" * 20_000
+    await ui_channel.send(OutboundMessage(
+        channel="ui",
+        chat_id="sid-strip",
+        content="tok",
+        metadata={"_stream_delta": True, "turn_id": "t1", "_ui_system_instructions": blob},
+    ))
+    frame = ws.send_json.await_args.args[0]
+    assert frame["type"] == "stream_delta"
+    assert frame["metadata"] == {"_stream_delta": True, "turn_id": "t1"}
+
+    await ui_channel.send(OutboundMessage(
+        channel="ui",
+        chat_id="sid-strip",
+        content="",
+        metadata={"_stream_end": True, "turn_id": "t1", "_ui_system_instructions": blob},
+    ))
+    history = SessionManager(ui_channel.workspace).get_ui_history("ui:sid-strip")
+    assert history[-1]["content"] == "tok"
+    assert "_ui_system_instructions" not in history[-1]["metadata"]
+
+
+async def test_send_stream_reset_withdraws_partial_reply(ui_channel: UiChannel) -> None:
+    ws = MagicMock()
+    ws.closed = False
+    ws.send_json = AsyncMock()
+    ui_channel._clients["sid-reset"] = ws
+    await ui_channel.send(OutboundMessage(
+        channel="ui", chat_id="sid-reset", content="half-", metadata={"_stream_delta": True},
+    ))
+    await ui_channel.send(OutboundMessage(
+        channel="ui", chat_id="sid-reset", content="", metadata={"_stream_reset": True},
+    ))
+    assert ws.send_json.await_args.args[0]["type"] == "stream_reset"
+    assert "sid-reset" not in ui_channel._stream_buffers
+
+    await ui_channel.send(OutboundMessage(
+        channel="ui", chat_id="sid-reset", content="whole reply", metadata={"_stream_delta": True},
+    ))
+    await ui_channel.send(OutboundMessage(
+        channel="ui", chat_id="sid-reset", content="", metadata={"_stream_end": True},
+    ))
+    history = SessionManager(ui_channel.workspace).get_ui_history("ui:sid-reset")
+    assert [entry["content"] for entry in history] == ["whole reply"]

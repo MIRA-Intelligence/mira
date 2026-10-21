@@ -1,4 +1,5 @@
 import json
+from unittest.mock import patch
 from pathlib import Path
 
 import pytest
@@ -235,3 +236,22 @@ def test_reusing_directory_rejects_a_regular_file(tmp_path: Path) -> None:
         registry.create_project(project_id="study", display_name="Study", project_dir=target,
                                 allow_existing_dir=True)
     assert target.read_bytes() == b"keep this file"
+
+
+def test_register_project_dir_is_a_no_op_when_already_registered(tmp_path: Path) -> None:
+    workspace_file = tmp_path / ".mira" / "workspace.json"
+    legacy_index = tmp_path / ".mira" / "ui" / "project-dirs.json"
+    registry = ProjectRegistry(
+        tmp_path / "projects",
+        workspace_path=workspace_file,
+        legacy_index_path=legacy_index,
+    )
+    ref = registry.create_project(project_id="again", display_name="Again")
+    before = workspace_file.stat().st_mtime_ns
+
+    with patch.object(ProjectRegistry, "save", side_effect=AssertionError("must not persist")):
+        with patch.object(ProjectRegistry, "save_legacy_index", side_effect=AssertionError("must not persist")):
+            same = registry.register_project_dir("again", ref.project_dir)
+
+    assert same.project_dir == ref.project_dir
+    assert workspace_file.stat().st_mtime_ns == before
