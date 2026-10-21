@@ -47,6 +47,7 @@ class ContractReport:
     plugin_id: str
     passed: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -89,8 +90,9 @@ def check_tool(tool: Tool) -> list[str]:
     return problems
 
 
-def _channel_config(name: str) -> Any:
-    """The channel's real config defaults when mira has a section for it."""
+def _channel_config(name: str, cls: type | None = None) -> Any:
+    """The channel's real config defaults: mira's config section for it, else
+    the channel's own ``default_config()``."""
     try:
         from mira_engine.config.schema import ChannelsConfig
 
@@ -102,8 +104,14 @@ def _channel_config(name: str) -> Any:
             ns.enabled = True
             ns.allow_from = ["*"]
             return ns
-    except Exception:  # noqa: BLE001 - fall back to a minimal namespace
+    except Exception:  # noqa: BLE001 - fall back to the channel's defaults
         pass
+    try:
+        defaults = cls.default_config() if cls is not None else None
+    except Exception:  # noqa: BLE001
+        defaults = None
+    if isinstance(defaults, dict) and defaults:
+        return {**defaults, "enabled": True, "allowFrom": ["*"]}
     return SimpleNamespace(enabled=True, allow_from=["*"])
 
 
@@ -122,7 +130,7 @@ def check_channel(cls: type, name: str) -> list[str]:
     if problems:
         return problems
     try:
-        channel = cls(_channel_config(name), MessageBus())
+        channel = cls(_channel_config(name, cls), MessageBus())
     except Exception as e:  # noqa: BLE001
         return [f"constructing with default config raised {type(e).__name__}: {e}"]
     try:
@@ -204,6 +212,10 @@ def check_plugin(plugin_dir: str | Path, tier: Tier = "community") -> ContractRe
             # What an agent loop does: build the tools for its own workspace.
             runtime.plugins = [loaded]
             built = runtime.build_tools(workspace=Path(tmp))
+    if loaded.status == "unavailable":
+        # Its SDK isn't installed here: nothing to load, nothing to check.
+        report.skipped.append(f"load: {loaded.reason}")
+        return report
     if loaded.status != "loaded":
         report.check("load", [f"{loaded.status}: {loaded.reason}"])
         return report
@@ -213,7 +225,11 @@ def check_plugin(plugin_dir: str | Path, tier: Tier = "community") -> ContractRe
     if loaded.tools:
         missing = sorted({t.name for t in loaded.tools} - {t.name for t in built})
         report.check("tools build for an agent loop", [f"could not build {name}" for name in missing])
-    for name, cls in loaded.channels.items():
+    resolved = runtime.resolve_channels(loaded) if loaded.channel_entries else {}
+    for name in loaded.channel_entries:
+        if name not in resolved:
+            report.check(f"channel {name}", [f"could not be imported: {loaded.reason}"])
+    for name, cls in resolved.items():
         report.check(f"channel {name}", check_channel(cls, name))
     for tool in loaded.tools:
         report.check(f"tool {tool.name}", check_tool(tool))

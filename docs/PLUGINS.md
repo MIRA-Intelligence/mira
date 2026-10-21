@@ -35,9 +35,22 @@ mira plugin list                         # status, tier and reason for every plu
   },
   "permissions": { "network": ["api.example.com"], "filesystem": "none", "shell": false, "secrets": [] },
   "isolation": "in-process",
-  "default_enabled": false
+  "default_enabled": false,
+  "requires": ["some_sdk"]
 }
 ```
+
+`requires` lists importable modules the plugin needs (its SDKs). When one is
+missing the plugin is **unavailable** (`mira plugin list` says which) instead
+of failing — e.g. the matrix channel without the `matrix` extra, or any
+messaging channel in the desktop build, which doesn't ship their SDKs.
+
+The messaging channels (discord, dingtalk, email, feishu, matrix, mochat, qq,
+slack, telegram, wecom, weixin, whatsapp) are first-party plugins in
+[`plugins/`](../plugins). Their classes are imported only when the gateway
+starts its channels, so loading plugins never imports channel SDKs. A
+first-party channel ranks like a built-in one: neither an entry point nor
+another plugin can take its name.
 
 `entry` is `module:attr` inside the plugin directory; the directory is imported
 as its own package, so relative imports work.

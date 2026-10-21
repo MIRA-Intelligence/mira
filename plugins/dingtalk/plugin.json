@@ -1,0 +1,29 @@
+{
+  "id": "dingtalk",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "DingTalk channel: Stream Mode for inbound messages, OpenAPI for replies and media.",
+  "requires": [
+    "dingtalk_stream"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "dingtalk",
+        "entry": "dingtalk_channel:DingTalkChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "api.dingtalk.com",
+      "oapi.dingtalk.com",
+      "*.dingtalk.com"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.dingtalk"
+    ]
+  }
+}

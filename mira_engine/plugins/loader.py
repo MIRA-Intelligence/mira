@@ -56,7 +56,8 @@ from mira_engine.plugins.paths import bundled_plugins_dir, user_plugins_dir
 from mira_engine.plugins.state import PluginState
 
 Status = Literal[
-    "loaded", "disabled", "incompatible", "invalid", "failed", "tripped", "remote-disabled", "unsupported"
+    "loaded", "disabled", "incompatible", "invalid", "failed", "tripped", "remote-disabled", "unsupported",
+    "unavailable",
 ]
 _TRUSTED: tuple[Tier, ...] = ("core-bundled", "verified")
 _PACKAGE_ROOT = "mira_plugins"
@@ -70,6 +71,9 @@ class LoadedPlugin:
     manifest: PluginManifest | None = None
     tier: Tier | None = None
     channels: dict[str, type] = field(default_factory=dict)
+    # Channel entries (name -> "module:Class"), imported on first use by
+    # PluginRuntime.channels() so loading never imports channel SDKs.
+    channel_entries: dict[str, str] = field(default_factory=dict)
     tools: list[Tool] = field(default_factory=list)
     hooks: list[AgentHook] = field(default_factory=list)
     # In-process tool entries (resolved object, declared name, entry string),
@@ -153,6 +157,9 @@ def _package_for(manifest: PluginManifest) -> str:
             spec.submodule_search_locations.append(str(manifest.root))
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
+        # As the import system does for a subpackage: reachable as an
+        # attribute of its parent (``mira_plugins.telegram``).
+        setattr(sys.modules[_PACKAGE_ROOT], name.rsplit(".", 1)[1], module)
         if spec.loader:
             spec.loader.exec_module(module)
     return name
@@ -169,6 +176,13 @@ def _resolve(manifest: PluginManifest, entry: str) -> object:
 
 def _instantiate(obj: object, base: type, entry: str, ctx: PluginContext | None = None) -> object:
     return instantiate(obj, base, entry, ctx)
+
+
+def _importable(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _build_tool(obj: object, name: str | None, entry: str, ctx: PluginContext) -> Tool:
@@ -287,7 +301,11 @@ class PluginRuntime:
             loaded = self._load_one(plugin_dir, source_tier, seen)
             self.plugins.append(loaded)
             if loaded.status == "loaded":
-                logger.info("plugin {} {} loaded ({})", loaded.id, loaded.manifest.version, loaded.tier)
+                # First-party plugins load on every start; only user plugins are news.
+                log = logger.debug if loaded.tier == "core-bundled" else logger.info
+                log("plugin {} {} loaded ({})", loaded.id, loaded.manifest.version, loaded.tier)
+            elif loaded.status == "unavailable":
+                logger.debug("plugin {} unavailable: {}", loaded.id, loaded.reason)
             elif loaded.status not in ("disabled",):
                 logger.warning("plugin {} not loaded [{}]: {}", loaded.id, loaded.status, loaded.reason)
         return self.plugins
@@ -323,6 +341,10 @@ class PluginRuntime:
         if not enabled:
             result.status, result.reason = "disabled", "not enabled (mira plugin enable <id>)"
             return result
+        missing = [m for m in manifest.requires if not _importable(m)]
+        if missing:
+            result.status, result.reason = "unavailable", f"needs {', '.join(missing)} (not installed)"
+            return result
         if manifest.has_code and (tier == "experimental" or manifest.isolation == "subprocess"):
             return self._load_isolated(result, manifest)
         if tier not in _TRUSTED and any(h.mode == "mutate" for h in manifest.hooks):
@@ -335,12 +357,7 @@ class PluginRuntime:
         probe = self.context(manifest, tier, workspace=self._workspace)
         try:
             for ep in manifest.channels:
-                from mira_engine.channels.base import BaseChannel
-
-                cls = _resolve(manifest, ep.entry)
-                if not (inspect.isclass(cls) and issubclass(cls, BaseChannel)):
-                    raise TypeError(f"{ep.entry} is not a BaseChannel subclass")
-                result.channels[ep.name or cls.name] = cls
+                result.channel_entries[ep.name or ep.entry.split(":", 1)[1]] = ep.entry
             for ep in manifest.tools:
                 obj = _resolve(manifest, ep.entry)
                 tool = _build_tool(obj, ep.name, ep.entry, probe)
@@ -350,7 +367,7 @@ class PluginRuntime:
                 hook = _instantiate(_resolve(manifest, ep.entry), AgentHook, ep.entry, probe)
                 result.hooks.append(GuardedHook(hook, breaker, mode=ep.mode))  # type: ignore[arg-type]
         except Exception as e:  # noqa: BLE001 - any plugin error stays with the plugin
-            result.channels, result.tools, result.hooks, result.tool_entries = {}, [], [], []
+            result.channels, result.channel_entries, result.tools, result.hooks, result.tool_entries = {}, {}, [], [], []
             result.reason = f"{type(e).__name__}: {e}"
             return result
 
@@ -403,10 +420,35 @@ class PluginRuntime:
     def loaded(self) -> list[LoadedPlugin]:
         return [p for p in self.plugins if p.status == "loaded"]
 
-    def channels(self) -> dict[str, type]:
+    def resolve_channels(self, plugin: LoadedPlugin) -> dict[str, type]:
+        """Import the plugin's channel classes (once). A channel whose class
+        can't be imported is left out and logged; the plugin's others stay."""
+        from mira_engine.channels.base import BaseChannel
+
+        assert plugin.manifest is not None
+        for name, entry in plugin.channel_entries.items():
+            if name in plugin.channels:
+                continue
+            try:
+                cls = _resolve(plugin.manifest, entry)
+                if not (inspect.isclass(cls) and issubclass(cls, BaseChannel)):
+                    raise TypeError(f"{entry} is not a BaseChannel subclass")
+            except Exception as e:  # noqa: BLE001 - the plugin's problem, not the engine's
+                logger.warning("plugin {} channel {} not available: {}: {}", plugin.id, name, type(e).__name__, e)
+                plugin.reason = f"channel {name}: {type(e).__name__}: {e}"
+                continue
+            cls.__mira_plugin_id__ = plugin.id  # type: ignore[attr-defined]
+            plugin.channels[name] = cls
+        return plugin.channels
+
+    def channels(self, *, core: bool | None = None) -> dict[str, type]:
+        """Channel classes from loaded plugins, imported on first use.
+        ``core``: only core-bundled (True) or only other tiers (False)."""
         out: dict[str, type] = {}
         for p in self.loaded():
-            for name, cls in p.channels.items():
+            if core is not None and (p.tier == "core-bundled") != core:
+                continue
+            for name, cls in self.resolve_channels(p).items():
                 out.setdefault(name, cls)
         return out
 

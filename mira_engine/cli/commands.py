@@ -3197,7 +3197,7 @@ def channels_status(
 
     names: set[str] = set(discover_all().keys())
     names.update(getattr(cfg.channels, "model_extra", {}).keys())
-    names.update(("telegram", "whatsapp", "discord", "feishu", "mochat", "dingtalk", "email", "slack", "qq", "matrix", "ui"))
+    names.update(type(cfg.channels).builtin_channel_names())
 
     for name in sorted(names):
         section = getattr(cfg.channels, name, None)

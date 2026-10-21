@@ -10,8 +10,8 @@ except ImportError:
 
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
-from mira_engine.channels.slack import SlackChannel
-from mira_engine.channels.slack import SlackConfig
+from mira_plugins.slack.slack_channel import SlackChannel
+from mira_plugins.slack.slack_channel import SlackConfig
 
 
 class _FakeAsyncWebClient:

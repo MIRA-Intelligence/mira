@@ -6,7 +6,7 @@ import pytest
 
 # Check optional QQ dependencies before running tests
 try:
-    from mira_engine.channels import qq
+    from mira_plugins.qq import qq_channel as qq
     QQ_AVAILABLE = getattr(qq, "QQ_AVAILABLE", False)
 except ImportError:
     QQ_AVAILABLE = False
@@ -16,7 +16,7 @@ if not QQ_AVAILABLE:
 
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
-from mira_engine.channels.qq import QQChannel, QQConfig
+from mira_plugins.qq.qq_channel import QQChannel, QQConfig
 
 
 class _FakeApi:

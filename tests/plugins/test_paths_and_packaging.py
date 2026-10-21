@@ -98,3 +98,17 @@ def test_desktop_build_ships_bundled_plugins_and_only_builtin_skills():
     assert "_bundled_plugin_datas()" in spec and "mira_engine/_bundled_plugins" in spec
     assert "'mira_engine.plugins.host'" in spec
     assert "'skills/builtin_skills/**/*'" in spec and "'skills/**/*'" not in spec
+
+
+def test_loading_plugins_does_not_import_channel_sdks(tmp_path):
+    # Every agent loop (CLI, SDK) loads the plugin runtime; channel SDKs are
+    # only imported when the gateway asks for the channel classes.
+    code = (
+        "import sys; from mira_engine.plugins import get_runtime; rt = get_runtime(); "
+        "assert rt.get('telegram').status == 'loaded', rt.get('telegram').reason; "
+        "print(','.join(m for m in ('lark_oapi', 'telegram', 'slack_sdk', 'nio') if m in sys.modules))"
+    )
+    env = {**_env(), "MIRA_HOME": str(tmp_path / "home")}
+    out = subprocess.run([sys.executable, "-c", code], cwd=REPO, env=env, capture_output=True, text=True, check=False)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == ""

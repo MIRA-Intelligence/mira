@@ -1,0 +1,25 @@
+{
+  "id": "weixin",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Personal WeChat channel: QR-code login and HTTP long polling.",
+  "provides": {
+    "channels": [
+      {
+        "name": "weixin",
+        "entry": "weixin_channel:WeixinChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "*.weixin.qq.com",
+      "*.qq.com"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.weixin"
+    ]
+  }
+}

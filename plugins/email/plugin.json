@@ -1,0 +1,28 @@
+{
+  "id": "email",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Email channel: IMAP polling for inbound mail, SMTP for replies.",
+  "requires": [
+    "imaplib",
+    "smtplib"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "email",
+        "entry": "email_channel:EmailChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "*"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.email"
+    ]
+  }
+}

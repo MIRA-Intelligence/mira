@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mira_engine.channels.feishu import FeishuChannel
+from mira_plugins.feishu.feishu_channel import FeishuChannel
 
 
 def _make_channel(bot_open_id: str | None = None) -> FeishuChannel:

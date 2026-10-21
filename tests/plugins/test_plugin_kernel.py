@@ -237,7 +237,7 @@ def test_channels_from_plugins_cannot_shadow_builtins(tmp_path, monkeypatch):
 from mira_engine.channels.base import BaseChannel
 
 class Fake(BaseChannel):
-    name = "slack"
+    name = "ui"
     async def start(self): ...
     async def stop(self): ...
     async def send(self, msg): ...
@@ -245,12 +245,48 @@ class Fake(BaseChannel):
 class Other(Fake):
     name = "plugin-chat"
 '''
-    manifest = {"provides": {"channels": [{"name": "slack", "entry": "ch:Fake"}, {"name": "plugin-chat", "entry": "ch:Other"}]}}
+    manifest = {"provides": {"channels": [{"name": "ui", "entry": "ch:Fake"}, {"name": "plugin-chat", "entry": "ch:Other"}]}}
     _plugin(tmp_path / "plugins", "chans", manifest, {"ch.py": channel})
     set_runtime_for_tests(_runtime(tmp_path))
     found = registry.discover_all()
     assert found["plugin-chat"].__name__ == "Other"
-    assert found["slack"].__module__ == "mira_engine.channels.slack"
+    assert found["ui"].__module__ == "mira_engine.channels.ui"
+
+
+def test_first_party_plugin_channels_cannot_be_shadowed(tmp_path, monkeypatch):
+    from mira_engine.channels import registry
+    from mira_engine.plugins import set_runtime_for_tests
+
+    channel = '''
+from mira_engine.channels.base import BaseChannel
+
+class Fake(BaseChannel):
+    name = "telegram"
+    async def start(self): ...
+    async def stop(self): ...
+    async def send(self, msg): ...
+'''
+    _plugin(tmp_path / "community", "fake-telegram", {"provides": {"channels": [{"name": "telegram", "entry": "ch:Fake"}]}}, {"ch.py": channel})
+    rt = PluginRuntime(
+        sources=[
+            PluginSource(Path(__file__).resolve().parents[2] / "plugins", "core-bundled"),
+            PluginSource(tmp_path / "community", "community"),
+        ],
+        state=PluginState(tmp_path / "state.json"),
+    )
+    rt.load()
+    set_runtime_for_tests(rt)
+
+    class _EntryPoint:
+        name = "telegram"
+
+        @staticmethod
+        def load():
+            return object
+
+    monkeypatch.setattr("importlib.metadata.entry_points", lambda group=None: [_EntryPoint()])
+    found = registry.discover_all()
+    assert found["telegram"].__module__ == "mira_plugins.telegram.telegram_channel"
 
 
 def test_agent_loop_registers_plugin_tools_and_hooks_without_replacing_builtins(tmp_path):
