@@ -71,12 +71,14 @@ class PluginManifest:
     root: Path
     plugin_api: str = ">=1.0,<2.0"
     owner: str | None = None
+    name: str = ""
     description: str = ""
     declared_tier: Tier | None = None
     channels: tuple[EntryPoint, ...] = ()
     tools: tuple[EntryPoint, ...] = ()
     hooks: tuple[EntryPoint, ...] = ()
     skills: tuple[dict[str, Any], ...] = ()
+    groups: tuple[dict[str, Any], ...] = ()  # skill groups (skill-pack format)
     permissions: Permissions = field(default_factory=Permissions)
     isolation: Isolation = "in-process"
     default_enabled: bool = False
@@ -122,6 +124,9 @@ def parse_manifest(data: dict[str, Any], root: Path) -> PluginManifest:
     skills = provides.get("skills", data.get("skills")) or []
     if not isinstance(skills, list):
         raise ManifestError("skills must be a list")
+    groups = provides.get("groups", data.get("groups")) or []
+    if not isinstance(groups, list):
+        raise ManifestError("groups must be a list")
 
     perms = data.get("permissions") or {}
     if not isinstance(perms, dict):
@@ -143,12 +148,14 @@ def parse_manifest(data: dict[str, Any], root: Path) -> PluginManifest:
         root=root,
         plugin_api=str(data.get("plugin_api") or ">=1.0,<2.0"),
         owner=data.get("owner"),
+        name=str(data.get("name") or ""),
         description=str(data.get("description") or ""),
         declared_tier=tier,
         channels=_entries(provides.get("channels"), "channels", named=True),
         tools=_entries(provides.get("tools"), "tools", named=True),
         hooks=_entries(provides.get("hooks"), "hooks", named=False),
         skills=tuple(s for s in skills if isinstance(s, dict)),
+        groups=tuple(g for g in groups if isinstance(g, dict)),
         permissions=Permissions(
             network=tuple(str(h) for h in perms.get("network") or ()),
             filesystem=fs,

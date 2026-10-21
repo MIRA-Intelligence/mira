@@ -60,6 +60,23 @@ carries that loop's values (`mira_engine.plugins.context.PluginContext`):
 A tool that can't be built for a loop (its factory raises) is left out of that
 loop and logged; the plugin's other tools still load.
 
+## Skills and skill packs
+
+A plugin's `provides.skills` (`[{"id": "howto", "path": "skills/howto"}]`, each
+path a directory with a `SKILL.md`) reach the agent exactly like a skill pack's:
+they're listed in the desktop app's *Skills & Plugins* settings (source
+`kernel`), can be switched on and off per skill, group and project, and load
+while the plugin itself is enabled. `mira_engine.plugins.catalog` is the one
+list of installed plugins, read from manifests alone (no plugin code), so the
+skill manager and config-time code can use it.
+
+Installing a package from the desktop app sorts it by what it contains:
+skills only → a skill pack; a `plugin.json` that provides channels, tools or
+hooks → `~/.mira/plugins/<id>`, **switched off** until `mira plugin enable <id>`
+(its manifest can't switch itself on). The agent's `hub_install` installs
+skills only and refuses packages with code. `mira plugin list` shows skill
+packs next to plugins.
+
 ## What the kernel guarantees
 
 | Failure | Effect |

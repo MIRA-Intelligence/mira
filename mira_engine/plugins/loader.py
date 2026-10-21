@@ -45,7 +45,13 @@ from mira_engine.agent.tools.base import Tool
 from mira_engine.plugins.api import PLUGIN_API_VERSION, satisfies
 from mira_engine.plugins.context import ConfigView, PluginContext, instantiate
 from mira_engine.plugins.guard import CircuitBreaker, GuardedHook, GuardedTool
-from mira_engine.plugins.manifest import MANIFEST_FILENAME, ManifestError, PluginManifest, Tier, load_manifest
+from mira_engine.plugins.manifest import (
+    MANIFEST_FILENAME,
+    ManifestError,
+    PluginManifest,
+    Tier,
+    load_manifest,
+)
 from mira_engine.plugins.paths import bundled_plugins_dir, user_plugins_dir
 from mira_engine.plugins.state import PluginState
 

@@ -59,6 +59,11 @@ class PluginState:
             e.pop("tripped", None)
         self._write()
 
+    def forget(self, plugin_id: str) -> None:
+        """Drop the user's state for an uninstalled plugin."""
+        if self._data.pop(plugin_id, None) is not None:
+            self._write()
+
     def tripped(self, plugin_id: str) -> dict[str, Any] | None:
         value = self.entry(plugin_id).get("tripped")
         return value if isinstance(value, dict) else None
