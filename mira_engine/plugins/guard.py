@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Awaitable, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar
 
 from loguru import logger
 
@@ -31,6 +31,15 @@ DEFAULT_TOOL_TIMEOUT_S = 60.0
 DEFAULT_HOOK_TIMEOUT_S = 2.0
 DEFAULT_TRIP_THRESHOLD = 3
 DEFAULT_PAUSE_S = 300.0
+
+
+async def _as_plugin(grant: Grant | None, make: Callable[[], Awaitable[T]]) -> T:
+    """The plugin's own call, run under its grant. Only the plugin's code (and
+    any task it starts) runs as the plugin: the breaker around it is the
+    engine's, so what it does on a failure — persisting a trip — is not
+    subject to the plugin's permissions."""
+    with granted(grant):
+        return await make()
 
 
 class PluginTripped(Exception):
@@ -154,10 +163,8 @@ class GuardedTool(Tool):
 
     async def execute(self, **kwargs: Any) -> Any:
         try:
-            # The grant is set before the call's task starts, so it (and any
-            # task the tool spawns) runs as this plugin (plugins.permissions).
-            with granted(self._grant):
-                return await self._breaker.call(f"tool {self.name}", self._inner.execute(**kwargs), self._timeout_s)
+            call = _as_plugin(self._grant, lambda: self._inner.execute(**kwargs))
+            return await self._breaker.call(f"tool {self.name}", call, self._timeout_s)
         except PluginTripped:
             if self._breaker.paused:
                 return f"Error: tool '{self.name}' is paused after repeated failures; try again in a few minutes."
@@ -198,8 +205,8 @@ class GuardedHook(AgentHook):
 
     async def _call(self, method: str, *args: Any, **kwargs: Any) -> None:
         try:
-            with granted(self._grant):
-                await self._breaker.call(f"hook {method}", getattr(self._inner, method)(*args, **kwargs), self._timeout)
+            call = _as_plugin(self._grant, lambda: getattr(self._inner, method)(*args, **kwargs))
+            await self._breaker.call(f"hook {method}", call, self._timeout)
         except (PluginTripped, asyncio.TimeoutError):
             pass
         except Exception:  # noqa: BLE001 - counted by the breaker, never raised

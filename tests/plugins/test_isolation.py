@@ -87,13 +87,10 @@ def _rt(tmp_path: Path, *, unsandboxed: bool, workspace: Path | None = None) -> 
 
 
 def test_without_a_sandbox_experimental_plugins_need_an_explicit_opt_in(tmp_path, monkeypatch):
-    from mira_engine.plugins import isolation
-
     monkeypatch.setattr("mira_engine.agent.tools.sandbox.plugin_sandbox", lambda network=True: (None, "no bwrap"))
     _plugin(tmp_path / "plugins", "exp")
     p = _rt(tmp_path, unsandboxed=False).get("exp")
     assert p.status == "unsupported" and "unsandboxed_experimental" in p.reason
-    assert isolation  # imported for the monkeypatch target
 
 
 def test_out_of_process_plugins_cannot_provide_channels_or_hooks(tmp_path):
@@ -148,6 +145,44 @@ async def test_a_slow_host_start_does_not_count_against_the_call(tmp_path, monke
     tool = rt.tools()[0]
     tool._inner._call_timeout_s = 0.5
     assert (await tool.execute(what="pid")).isdigit()
+
+
+async def test_killing_a_hung_host_fails_the_other_calls_waiting_on_it(unsandboxed):
+    import asyncio
+
+    client = unsandboxed._inner._client
+    hung = asyncio.create_task(client.call("probe", {"what": "hang"}, 0.5))
+    other = asyncio.create_task(client.call("probe", {"what": "hang"}, 30))
+    with pytest.raises(asyncio.TimeoutError):
+        await hung
+    # The host is gone; the other call must not wait out its own 30 s.
+    with pytest.raises(RuntimeError, match="exited"):
+        await asyncio.wait_for(other, 5)
+
+
+async def test_the_tripwire_backs_up_a_missing_sandbox(tmp_path, monkeypatch):
+    # Windows, or Linux without bwrap: the host runs unsandboxed and only the
+    # in-host tripwire checks the manifest's permissions.
+    monkeypatch.setattr("mira_engine.agent.tools.sandbox.plugin_sandbox", lambda network=True: (None, "test"))
+    mira_home = Path(os.environ["MIRA_HOME"])
+    mira_home.mkdir(parents=True, exist_ok=True)
+    (mira_home / "config.json").write_text('{"providers": {"key": "sk-secret"}}')
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "data.txt").write_text("workspace data")
+    _plugin(tmp_path / "plugins", "noperm")
+    _plugin(tmp_path / "plugins", "writer", {"permissions": {"filesystem": "workspace:write", "shell": True}})
+    rt = _rt(tmp_path, unsandboxed=True, workspace=ws)
+    noperm = next(t for t in rt.tools() if t.plugin_id == "noperm")
+    writer = next(t for t in rt.tools() if t.plugin_id == "writer")
+    assert await noperm.execute(what="net") == "blocked: PermissionError"
+    assert await noperm.execute(what="read", path=str(mira_home / "config.json")) == "blocked: PermissionError"
+    assert await noperm.execute(what="write", path=str(mira_home / "leak.txt")) == "blocked: PermissionError"
+    assert await noperm.execute(what="run") == "blocked: PermissionError"
+    assert not (mira_home / "leak.txt").exists()
+    assert await writer.execute(what="read", path=str(ws / "data.txt")) == "workspace data"
+    assert await writer.execute(what="write", path=str(ws / "new.txt")) == "written"
+    assert await writer.execute(what="run") == "ran"
 
 
 def test_registry_tier_promotes_a_plugin_in_process(tmp_path):
@@ -243,7 +278,7 @@ async def test_seatbelt_enforces_network_files_and_shell(tmp_path, monkeypatch):
     assert (await noperm.execute(what="read", path=str(mira_home / "config.json"))).startswith("blocked")
     assert (await noperm.execute(what="read", path=str(home_dir / "private.txt"))).startswith("blocked")
     assert (await noperm.execute(what="write", path=str(tmp_path / "out.txt"))).startswith("blocked")
-    assert (await noperm.execute(what="run")).startswith(("blocked", "Error"))
+    assert (await noperm.execute(what="run")).startswith("blocked")
     assert not (tmp_path / "out.txt").exists()
 
     assert await writer.execute(what="read", path=str(ws / "data.txt")) == "workspace data"

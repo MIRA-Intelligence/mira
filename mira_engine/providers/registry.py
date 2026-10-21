@@ -803,9 +803,15 @@ def find_gateway(
     return None
 
 
+def provider_key(name: str) -> str:
+    """A provider's registry name from any way a config may write it
+    (``githubCopilot``, ``github-copilot`` -> ``github_copilot``)."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
+
+
 def find_by_name(name: str) -> ProviderSpec | None:
     """Find a provider spec by config field name, e.g. "dashscope"."""
-    key = re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
+    key = provider_key(name)
     for spec in all_providers():
         if spec.name == key:
             return spec

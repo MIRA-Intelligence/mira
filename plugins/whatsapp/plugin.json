@@ -4,9 +4,6 @@
   "plugin_api": ">=1.0,<2.0",
   "owner": "github:MIRA-Intelligence",
   "description": "WhatsApp channel: a local Node.js bridge (built with npm on first use) over a localhost WebSocket.",
-  "requires": [
-    "websockets"
-  ],
   "provides": {
     "channels": [
       {

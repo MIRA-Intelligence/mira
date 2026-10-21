@@ -48,20 +48,26 @@ class CatalogEntry:
         return self.manifest.root
 
 
-def _plugin_dirs(root: Path | None) -> list[Path]:
+def plugin_dirs(root: Path | None) -> list[Path]:
+    """The plugin directories under ``root`` (those with a manifest), sorted.
+    Dot-prefixed directories are an installer's staging area, not plugins."""
     if root is None:
         return []
     try:
-        return sorted(p for p in root.iterdir() if p.is_dir() and (p / MANIFEST_FILENAME).is_file())
+        return sorted(
+            p for p in root.iterdir()
+            if p.is_dir() and not p.name.startswith(".") and (p / MANIFEST_FILENAME).is_file()
+        )
     except OSError:
         return []
 
 
-def _mtime(path: Path) -> int | None:
+def _stamp(path: Path) -> tuple[int, int] | None:
     try:
-        return path.stat().st_mtime_ns
+        st = path.stat()
     except OSError:
         return None
+    return st.st_mtime_ns, st.st_size
 
 
 def sources() -> list[tuple[Path | None, Source]]:
@@ -72,10 +78,10 @@ def fingerprint(srcs: list[tuple[Path | None, Source]] | None = None, state_path
     """Changes whenever a manifest, the set of plugins or the plugin state does."""
     srcs = srcs if srcs is not None else sources()
     state_path = state_path or default_state_path()
-    parts: list[object] = [str(state_path), _mtime(state_path)]
+    parts: list[object] = [str(state_path), _stamp(state_path)]
     for root, _ in srcs:
-        for d in _plugin_dirs(root):
-            parts.append((str(d), _mtime(d / MANIFEST_FILENAME)))
+        for d in plugin_dirs(root):
+            parts.append((str(d), _stamp(d / MANIFEST_FILENAME)))
     return tuple(parts)
 
 
@@ -119,7 +125,7 @@ def entries(
     out: list[CatalogEntry] = []
     seen: set[str] = set()
     for root, source in srcs:
-        for d in _plugin_dirs(root):
+        for d in plugin_dirs(root):
             try:
                 manifest = load_manifest(d)
             except ManifestError:

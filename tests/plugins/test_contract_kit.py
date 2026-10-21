@@ -3,25 +3,59 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from mira_engine.cli.commands import app
+from mira_engine.plugins.catalog import plugin_dirs
 from mira_engine.plugins.loader import bundled_plugins_dir
 from mira_engine.plugins.testing import assert_plugin_contract, check_plugin
 
 runner = CliRunner()
-BUNDLED = bundled_plugins_dir()
-BUNDLED_PLUGINS = sorted(p for p in BUNDLED.iterdir() if (p / "plugin.json").is_file()) if BUNDLED else []
+BUNDLED_PLUGINS = plugin_dirs(bundled_plugins_dir())
 
 
 @pytest.mark.parametrize("plugin_dir", BUNDLED_PLUGINS, ids=lambda p: p.name)
 def test_every_bundled_plugin_passes_the_contract(plugin_dir):
     # Runs in mira/verify on the landing branch: a plugin-lane PR that breaks
     # the contract cannot turn green.
-    assert_plugin_contract(plugin_dir, tier="core-bundled")
+    report = assert_plugin_contract(plugin_dir, tier="core-bundled")
+    if report.skipped:
+        # Its SDK isn't installed here, so nothing was checked. CI installs
+        # every bundled plugin's SDK (the dev extra): there, a skip means a
+        # typo in `requires` or a missing dev dependency, not an optional SDK.
+        message = f"{report.plugin_id} was not checked: {'; '.join(report.skipped)}"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
+
+
+def test_a_plugin_whose_requirement_is_missing_is_skipped_not_failed(tmp_path):
+    manifest = {"provides": {"tools": [{"name": "t", "entry": "t:T"}]}, "requires": ["no_such_module_for_mira_tests"]}
+    d = _write(tmp_path / "needy", manifest, {"t.py": "raise RuntimeError('never imported')\n"})
+    report = check_plugin(d)
+    assert report.ok and "load" not in report.passed
+    assert report.skipped == ["load: needs no_such_module_for_mira_tests (not installed)"]
+
+
+def test_the_contract_leaves_nothing_in_the_mira_home(tmp_path):
+    tool = (
+        "from mira_engine.agent.tools.base import Tool\n"
+        "class T(Tool):\n"
+        "    name = 't'\n"
+        "    description = 'writes in its data dir when built'\n"
+        "    parameters = {'type': 'object', 'properties': {}}\n"
+        "    def __init__(self, ctx):\n"
+        "        (ctx.data_dir / 'built').write_text('x')\n"
+        "    async def execute(self, **kw):\n"
+        "        return 'ok'\n"
+    )
+    d = _write(tmp_path / "tidy", {"provides": {"tools": [{"name": "t", "entry": "t:T"}]}}, {"t.py": tool})
+    assert check_plugin(d).ok
+    assert not (Path(os.environ["MIRA_HOME"]) / "plugin-data").exists()
 
 
 def test_discord_is_a_bundled_plugin_channel():

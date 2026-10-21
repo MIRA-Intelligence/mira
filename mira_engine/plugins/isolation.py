@@ -38,9 +38,11 @@ from typing import Any
 from loguru import logger
 
 from mira_engine.agent.tools.base import Tool
+from mira_engine.plugins.context import plugin_data_dir
 from mira_engine.plugins.manifest import PluginManifest
 
 _ENV_KEEP = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "PYTHONPATH", "VIRTUAL_ENV", "SYSTEMROOT", "TMPDIR")
+_SITE_DIRS = ("site-packages", "dist-packages")
 DESCRIBE_TIMEOUT_S = 30.0
 
 
@@ -55,11 +57,14 @@ def host_env() -> dict[str, str]:
     if not getattr(sys, "frozen", False):
         # The host must run this engine's code, wherever it was imported from
         # (a source checkout, another install): it doesn't start in the
-        # engine's working directory.
+        # engine's working directory. An installed engine is found through
+        # the interpreter's own site dirs; putting those on PYTHONPATH would
+        # rank them above the standard library.
         import mira_engine
 
-        root = str(Path(mira_engine.__file__).resolve().parent.parent)
-        env["PYTHONPATH"] = os.pathsep.join([root, *[p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]])
+        root = Path(mira_engine.__file__).resolve().parent.parent
+        if root.name not in _SITE_DIRS:
+            env["PYTHONPATH"] = os.pathsep.join([str(root), *[p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]])
     return env
 
 
@@ -77,7 +82,7 @@ def plugin_env(
     from mira_engine.config.paths import get_data_dir
 
     env = host_env()
-    scratch = str(_scratch_dir(manifest.id))
+    scratch = str(plugin_data_dir(manifest.id))
     env["MIRA_PLUGIN_DATA_DIR"] = scratch
     env["TMPDIR"] = scratch  # its temp files stay in its own (writable) dir
     env["MIRA_PLUGIN_MIRA_HOME"] = str(get_data_dir())
@@ -87,14 +92,6 @@ def plugin_env(
     if config:
         env["MIRA_PLUGIN_CONFIG"] = json.dumps(config, default=str)
     return env
-
-
-def _scratch_dir(plugin_id: str) -> Path:
-    from mira_engine.config.paths import get_data_dir
-
-    path = get_data_dir() / "plugin-data" / plugin_id
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    return path
 
 
 def host_argv(
@@ -120,7 +117,7 @@ def host_argv(
     if workspace is not None and fs == "workspace:write":
         read_write.append(str(workspace))
     spec = SandboxSpec.build(
-        _scratch_dir(manifest.id),
+        plugin_data_dir(manifest.id),
         network="full" if manifest.permissions.network else "none",
         read_only_paths=read_only,
         read_write_paths=read_write,
@@ -165,7 +162,7 @@ def describe(
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, timeout=DESCRIBE_TIMEOUT_S, env=env or host_env(),
-            cwd=_scratch_dir(manifest.id), check=False,
+            cwd=plugin_data_dir(manifest.id), check=False,
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"plugin host did not describe its tools within {DESCRIBE_TIMEOUT_S}s") from e
@@ -265,15 +262,20 @@ class PluginHostClient:
 
     async def close(self) -> None:
         proc, self._proc = self._proc, None
+        if self._reader is not None:
+            self._reader.cancel()
+            self._reader = None
+        # Any other call still waiting on this host fails now, not at its own timeout.
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(RuntimeError(f"plugin host for {self.plugin_id} exited"))
+        self._pending.clear()
         if proc is not None and proc.returncode is None:
             proc.kill()
             try:
                 await asyncio.wait_for(proc.wait(), 5)
             except asyncio.TimeoutError:
                 pass
-        if self._reader is not None:
-            self._reader.cancel()
-            self._reader = None
 
 
 class SubprocessTool(Tool):

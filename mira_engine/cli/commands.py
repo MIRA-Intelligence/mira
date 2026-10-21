@@ -3882,6 +3882,7 @@ def status():
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
     if config_path.exists():
+        from mira_engine.providers.factory import plugin_provider_unavailable
         from mira_engine.providers.model_fetch import is_cache_stale, read_model_cache
         from mira_engine.providers.registry import all_providers
 
@@ -3901,7 +3902,10 @@ def status():
                 continue
             if spec.is_oauth:
                 authenticated, account_id = _oauth_login_status(spec.name)
-                if authenticated:
+                unavailable = plugin_provider_unavailable(spec) if spec.plugin_id else None
+                if unavailable:
+                    console.print(f"{spec.label}: [yellow]{unavailable}[/yellow]")
+                elif authenticated:
                     account_part = f" [dim]{account_id}[/dim]" if account_id else ""
                     console.print(f"{spec.label}: [green]✓ OAuth[/green]{account_part}")
                 else:
@@ -3947,7 +3951,9 @@ def _run_oauth_login(provider_name: str) -> None:
         raise typer.Exit(1)
     handler = get_runtime().provider_hook(spec.name, "login")
     if not handler:
-        console.print(f"[red]OAuth login not implemented for {spec.label}[/red]")
+        from mira_engine.providers.factory import plugin_provider_unavailable
+
+        console.print(f"[red]{plugin_provider_unavailable(spec) or f'OAuth login not implemented for {spec.label}'}[/red]")
         raise typer.Exit(1)
     console.print(f"\n{__logo__} OAuth Login - {spec.label}\n")
     try:

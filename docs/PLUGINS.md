@@ -55,8 +55,11 @@ another plugin can take its name.
 The optional agent tools are first-party plugins too: `web` (`web_search`,
 `web_fetch`) and `mira-hub` (`hub_search`, `hub_install`).
 `mira plugin disable web` takes web access away from the agent and its
-subagents. Tools that are part of the agent loop itself (files, exec, message,
-spawn, workflow, cron, knowledge, pubmed, community) stay in the engine.
+subagents. Subagents get only the web tools from plugins unless their role's
+allowlist names others; `hub_install` and community plugin tools stay with
+the main loop. Tools that are part of the agent loop itself (files, exec,
+message, spawn, workflow, cron, knowledge, pubmed, community) stay in the
+engine.
 
 `entry` is `module:attr` inside the plugin directory; the directory is imported
 as its own package, so relative imports work.
@@ -179,7 +182,9 @@ send, stop and the tasks it starts), its import and construction:
 | `shell: true` | starts a process |
 
 The tool call fails with that error, and a plugin that keeps overstepping
-trips its breaker. This is a **tripwire, not a sandbox**: Python code in the
+trips its breaker (the trip is the engine's own write to its state file, so
+it is persisted whatever the plugin may write). This is a **tripwire, not a
+sandbox**: Python code in the
 engine's process can get around it, which is why plugins the platform hasn't
 vouched for run out of process. Declared host names are only logged, not
 enforced, in process. First-party plugins aren't checked; set

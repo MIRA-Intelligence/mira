@@ -43,10 +43,10 @@ from loguru import logger
 from mira_engine.agent.hook import AgentHook
 from mira_engine.agent.tools.base import Tool
 from mira_engine.plugins.api import PLUGIN_API_VERSION, satisfies
-from mira_engine.plugins.context import ConfigView, PluginContext, instantiate
+from mira_engine.plugins.catalog import plugin_dirs
+from mira_engine.plugins.context import ConfigView, PluginContext, instantiate, plugin_data_dir
 from mira_engine.plugins.guard import CircuitBreaker, GuardedHook, GuardedTool
 from mira_engine.plugins.manifest import (
-    MANIFEST_FILENAME,
     ManifestError,
     PluginManifest,
     Tier,
@@ -222,6 +222,7 @@ class PluginRuntime:
         workspace: Path | None = None,
         allow_unsandboxed: bool | None = None,
         audit_bundled: bool | None = None,
+        data_root: Path | None = None,
     ):
         self.sources = sources if sources is not None else default_sources()
         self._audit_bundled = audit_bundled
@@ -230,6 +231,9 @@ class PluginRuntime:
         # so an engine without user plugins never touches it here.
         self._workspace = workspace
         self._allow_unsandboxed = allow_unsandboxed
+        # Where plugins' data dirs live; None = <mira home>/plugin-data (the
+        # contract kit points this at a temporary directory).
+        self._data_root = data_root
         self._config: Any = _UNSET
         self.plugins: list[LoadedPlugin] = []
         self._breakers: dict[str, CircuitBreaker] = {}
@@ -242,8 +246,11 @@ class PluginRuntime:
     @property
     def workspace(self) -> Path | None:
         if self._workspace is None and self._cfg() is not None:
-            self._workspace = self._cfg().workspace_path
+            self._workspace = getattr(self._cfg(), "workspace_path", None)
         return self._workspace
+
+    def _data_dir(self, plugin_id: str) -> Path | None:
+        return self._data_root / plugin_id if self._data_root is not None else None
 
     @property
     def allow_unsandboxed(self) -> bool:
@@ -262,7 +269,12 @@ class PluginRuntime:
     def grant(self, manifest: PluginManifest, tier: Tier | None, workspace: Path | None = None) -> Grant | None:
         if tier == "core-bundled" and not self.audit_bundled:
             return None
-        return grant_for(manifest, tier, workspace=workspace or self._workspace, audit_bundled=self.audit_bundled)
+        # The configured workspace when the caller has none: a load-time grant
+        # (hooks, channels) must cover it as a per-loop one does.
+        return grant_for(
+            manifest, tier, workspace=workspace or self.workspace, audit_bundled=self.audit_bundled,
+            data_dir=self._data_dir(manifest.id),
+        )
 
     def _source_tier(self, source: PluginSource) -> Tier:
         if not source.from_config:
@@ -309,6 +321,7 @@ class PluginRuntime:
             proxy=proxy,
             config=self.config_view(manifest, tier),
             host=dict(host or {}) if trusted else {},
+            data_root=self._data_dir(manifest.id),
         )
 
     # -- discovery ------------------------------------------------------------
@@ -316,14 +329,10 @@ class PluginRuntime:
     def discover(self) -> list[tuple[Path, Tier]]:
         found: list[tuple[Path, Tier]] = []
         for source in self.sources:
-            try:
-                children = sorted(p for p in source.path.iterdir() if p.is_dir())
-            except OSError:
-                continue
-            plugin_dirs = [d for d in children if (d / MANIFEST_FILENAME).is_file()]
-            if plugin_dirs:
+            dirs = plugin_dirs(source.path)
+            if dirs:
                 tier = self._source_tier(source)
-                found.extend((d, tier) for d in plugin_dirs)
+                found.extend((d, tier) for d in dirs)
         return found
 
     # -- loading --------------------------------------------------------------
@@ -392,7 +401,9 @@ class PluginRuntime:
         breaker = self.breaker(manifest.id, manifest.version, tier=tier)
         # Built once here to validate the entries (and for status and the
         # contract kit); every agent loop builds its own via build_tools().
-        probe = self.context(manifest, tier, workspace=self._workspace)
+        # Hooks keep this context, so a user plugin's hooks see the configured
+        # workspace (its config is read anyway; bundled plugins load without).
+        probe = self.context(manifest, tier, workspace=self._workspace if tier == "core-bundled" else self.workspace)
         grant = result.grant = self.grant(manifest, tier)
         try:
             with granted(grant):  # the plugin's import and construction run as it
@@ -456,7 +467,7 @@ class PluginRuntime:
             manifest.id,
             isolation.host_argv(manifest, workspace=self.workspace, sandbox=sandbox),
             env=env,
-            cwd=isolation._scratch_dir(manifest.id),
+            cwd=plugin_data_dir(manifest.id),
         )
         breaker = self.breaker(manifest.id, manifest.version, tier=result.tier)
         result.tools = [GuardedTool(isolation.SubprocessTool(client, d), breaker) for d in definitions]

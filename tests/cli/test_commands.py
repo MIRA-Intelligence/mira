@@ -239,13 +239,17 @@ def test_config_matches_openai_codex_with_hyphen_prefix():
     assert config.get_provider_name() == "openai_codex"
 
 
-def test_config_dump_excludes_oauth_provider_blocks():
+def test_config_dump_has_plugin_provider_blocks_only_once_stored():
     config = Config()
 
     providers = config.model_dump(by_alias=True)["providers"]
-
     assert "openaiCodex" not in providers
     assert "githubCopilot" not in providers
+    # Reading a plugin provider's config adds no block; storing one does.
+    assert not config.providers.entry("openai_codex").api_key
+    assert "openaiCodex" not in config.model_dump(by_alias=True)["providers"]
+    config.providers.entry("openai_codex", create=True).api_key = "k"
+    assert config.model_dump(by_alias=True)["providers"]["openaiCodex"]["apiKey"] == "k"
 
 
 def test_status_reports_oauth_not_logged_in_without_token(tmp_path, monkeypatch):
