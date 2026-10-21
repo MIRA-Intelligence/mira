@@ -26,7 +26,6 @@ import asyncio
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +64,9 @@ def host_argv(
     sandbox: bool,
     describe: bool = False,
 ) -> list[str]:
-    cmd = [sys.executable, "-m", "mira_engine.plugins.host", *(["--describe"] if describe else []), str(manifest.root)]
+    from mira_engine.plugins.paths import host_command
+
+    cmd = [*host_command(), *(["--describe"] if describe else []), str(manifest.root)]
     if not sandbox:
         return cmd
     import mira_engine

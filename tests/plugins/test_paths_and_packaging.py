@@ -1,0 +1,101 @@
+"""Plugin paths, lazy kernel imports and packaging hooks."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+from mira_engine.plugins import PluginRuntime, PluginSource
+from mira_engine.plugins import paths
+from mira_engine.plugins.state import PluginState
+
+REPO = Path(__file__).resolve().parents[2]
+
+
+def _env() -> dict[str, str]:
+    return {**os.environ, "PYTHONPATH": str(REPO)}
+
+
+def test_paths_module_does_not_import_the_loader():
+    # Code that runs while the config loads (provider lookups, the skill pack
+    # manager) uses mira_engine.plugins.paths; it must not import the loader,
+    # whose agent imports would cycle back into a half-loaded config module.
+    code = (
+        "import sys, mira_engine.plugins.paths as p; p.bundled_plugins_dir(); "
+        "print(','.join(m for m in ('mira_engine.plugins.loader', 'mira_engine.plugins.guard') if m in sys.modules))"
+    )
+    out = subprocess.run([sys.executable, "-c", code], cwd=REPO, env=_env(), capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == ""
+
+
+def test_host_command_uses_the_frozen_executable(monkeypatch):
+    assert paths.host_command() == [sys.executable, "-m", "mira_engine.plugins.host"]
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert paths.host_command() == [sys.executable, "--mira-plugin-host"]
+
+
+def test_frozen_entry_dispatches_the_plugin_host(tmp_path):
+    plugin = tmp_path / "probe"
+    plugin.mkdir()
+    (plugin / "plugin.json").write_text(json.dumps({
+        "id": "probe", "version": "1.0.0", "provides": {"tools": [{"name": "probe", "entry": "tool:Probe"}]},
+    }))
+    (plugin / "tool.py").write_text(textwrap.dedent("""
+        from mira_engine.agent.tools.base import Tool
+
+        class Probe(Tool):
+            name = "probe"
+            description = "probe"
+            parameters = {"type": "object", "properties": {}}
+
+            async def execute(self, **kw):
+                return "ok"
+    """))
+    out = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "mira_engine_entry.py"), "--mira-plugin-host", "--describe", str(plugin)],
+        cwd=REPO, env=_env(), capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout.strip().splitlines()[-1])["tools"][0]["name"] == "probe"
+
+
+def _echo_plugin(root: Path, reply: str) -> None:
+    root.mkdir(parents=True)
+    (root / "plugin.json").write_text(json.dumps({
+        "id": "samename", "version": "1.0.0", "default_enabled": True,
+        "provides": {"tools": [{"name": "same_tool", "entry": "tool:Same"}]},
+    }))
+    (root / "tool.py").write_text(textwrap.dedent(f"""
+        from mira_engine.agent.tools.base import Tool
+
+        class Same(Tool):
+            name = "same_tool"
+            description = "same"
+            parameters = {{"type": "object", "properties": {{}}}}
+
+            async def execute(self, **kw):
+                return "{reply}"
+    """))
+
+
+def test_same_plugin_id_from_another_directory_is_not_served_stale(tmp_path):
+    _echo_plugin(tmp_path / "a" / "samename", "from a")
+    _echo_plugin(tmp_path / "b" / "samename", "from b")
+    results = []
+    for src in ("a", "b"):
+        rt = PluginRuntime(sources=[PluginSource(tmp_path / src, "community")], state=PluginState(tmp_path / f"{src}.json"))
+        rt.load()
+        results.append(asyncio.run(rt.tools()[0].execute()))
+    assert results == ["from a", "from b"]
+
+
+def test_desktop_build_ships_bundled_plugins_and_only_builtin_skills():
+    spec = (REPO / "mira-engine.spec").read_text()
+    assert "_bundled_plugin_datas()" in spec and "mira_engine/_bundled_plugins" in spec
+    assert "'mira_engine.plugins.host'" in spec
+    assert "'skills/builtin_skills/**/*'" in spec and "'skills/**/*'" not in spec

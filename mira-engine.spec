@@ -15,6 +15,22 @@ _BUNDLED_UV = Path(SPECPATH) / "bundled" / _UV_BINARY_NAME  # noqa: F821 - SPECP
 _extra_binaries = [(str(_BUNDLED_UV), ".")] if _BUNDLED_UV.exists() else []
 
 
+def _bundled_plugin_datas():
+    """First-party plugins (repo ``plugins/``) ship as source next to the
+    package, where ``mira_engine.plugins.paths.bundled_plugins_dir`` finds them.
+    Their third-party imports are invisible to the analysis, so anything a
+    plugin needs on the desktop must also be in ``hiddenimports`` below; a
+    plugin whose ``requires`` are missing shows up as unavailable."""
+    root = Path(SPECPATH) / "plugins"  # noqa: F821 - SPECPATH is injected by PyInstaller
+    out = []
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if not path.is_file() or "__pycache__" in rel.parts or "tests" in rel.parts:
+            continue
+        out.append((str(path), str(Path("mira_engine/_bundled_plugins") / rel.parent)))
+    return out
+
+
 a = Analysis(
     ['scripts/mira_engine_entry.py'],
     pathex=[],
@@ -27,12 +43,20 @@ a = Analysis(
             includes=[
                 'templates/**/*',
                 'channels/ui_assets/**/*',
-                'skills/**/*',
+                # The skills submodule's skills/ is the MIRA Hub catalogue,
+                # installed on demand; only builtin_skills/ ships.
+                'skills/builtin_skills/**/*',
             ],
         )
         + copy_metadata('mira-engine')
+        + _bundled_plugin_datas()
     ),
-    hiddenimports=['mira_engine.channels.ui', 'tiktoken_ext.openai_public'],
+    hiddenimports=[
+        'mira_engine.channels.ui',
+        'tiktoken_ext.openai_public',
+        # Out-of-process plugin host (`mira-engine --mira-plugin-host`).
+        'mira_engine.plugins.host',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

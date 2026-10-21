@@ -3,8 +3,10 @@
 First-party plugins shipped with mira. Each directory is one plugin: a
 `plugin.json` manifest plus its code, loaded by the plugin kernel
 (`mira_engine/plugins`) exactly like a plugin a user installs into
-`~/.mira/plugins` — the same contract, the same guards. In a wheel this
-directory ships as `mira_engine/_bundled_plugins`.
+`~/.mira/plugins` — the same contract, the same guards. In a wheel and in the
+desktop build this directory ships as `mira_engine/_bundled_plugins`. The
+desktop build (`mira-engine.spec`) can't see a plugin's imports, so a
+dependency a plugin needs there must be listed in its `hiddenimports`.
 
 This directory is the community **plugin lane**: changes here are reviewed by
 the community, changes to the engine are not. See `mira plugin --help` and
