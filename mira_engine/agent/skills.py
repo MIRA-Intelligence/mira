@@ -8,10 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
-
-# Default builtin skills directory (relative to this file)
-BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+from mira_engine.agent.skill_plugins import BUILTIN_SKILLS_DIR, SkillPluginError, SkillPluginManager
 
 # ── scan caches ────────────────────────────────────────────────────────
 # Building the system prompt, routing skills and resolving always-on skills
