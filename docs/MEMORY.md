@@ -23,31 +23,45 @@ This keeps the system light in the moment, but reflective over time.
 
 ## Personal memory across projects
 
-Personal memory lives in `$MIRA_HOME/workspace/memory/MEMORY.md` (by default,
-`~/.mira/workspace/memory/MEMORY.md`). Every project loads this shared memory
-alongside its own `.mira/memory/MEMORY.md`. New sessions and restarted instances
-read the same files, so preferences persist across conversations and projects.
+Shared knowledge lives in `$MIRA_HOME/workspace/memory/MEMORY.md` (by default,
+`~/.mira/workspace/memory/MEMORY.md`). Each project loads this alongside its own
+`.mira/memory/MEMORY.md`. Stable user identity, preferences and interests stay in
+`$MIRA_HOME/workspace/USER.md`, which is also shared across projects. Project
+`USER.md` overlays and `USER.local.md` Settings take precedence. Dream reads those
+overrides without editing them or duplicating their configured values.
 
-Dream classifies confirmed user facts, preferences and reusable workflows as
-`PERSONAL`, and project architecture, paths and decisions as `MEMORY`. Its
-`edit_memory` tool applies surgical edits to either scope, creates missing memory,
-and uses file locks and concurrency checks to avoid overwriting another instance's
-changes. Project edits also update the legacy file and backup. Failed Dream runs
-keep their history cursor unchanged so the next run can retry.
+Dream classifies reusable workflows and cross-project knowledge as `PERSONAL`,
+stable identity/preferences as `USER`, and project architecture, paths and decisions
+as `MEMORY`. Its `edit_memory` tool supports `personal`, `user` and `project` scopes,
+with exact replacements, file locks and concurrency checks. Project edits also
+update the legacy file and backup. Errors include current contents so the model can
+repair a bad or stale edit within the same run.
+
+USER.md retains the communication-style, interests and preferred-language format
+used by community persona drafts. Sharing still requires PrivacyGuard filtering
+and user approval; shared knowledge is not automatically published as a persona.
+
+Dream advances its history cursor only after a completed batch with no unresolved
+tool errors. If a batch exhausts the iteration budget, Dream halves it and retries
+with fresh memory snapshots. Only the completed prefix is acknowledged; remaining
+entries are processed on later runs. If even one entry cannot complete, Dream raises
+an error and retains it. An idle run alone returns `False`, so scheduled failures
+are logged as failures rather than “nothing new”. Earlier successful edits remain
+saved and are included in the next attempt's context.
 
 In the UI, `/dream` processes the current project's archived history and keeps its
 completion response attached to that project. Archive the conversation first
-(for example with `/new`), then run `/dream`. A model or tool failure preserves
-unprocessed history and reports that the update could not complete.
+(for example with `/new`), then run `/dream`. Model/tool failures retain history
+and report a failure.
 
-For example, “I prefer Chinese replies” is personal memory; “this project uses
-PostgreSQL” stays in project memory. Existing global knowledge remains available;
-existing project facts are not automatically promoted into shared memory.
-Credentials and secrets should never be stored as personal memory.
+For example, “I prefer Chinese replies” belongs in USER.md; a reusable debugging
+workflow belongs in PERSONAL; “this project uses PostgreSQL” stays in project memory.
+Existing global knowledge remains available without automatically migrating facts
+between files. Credentials and secrets should never be stored in shared memory.
 
-You can inspect or edit the shared Markdown file directly to correct or remove a
-personal fact. `/dream-log` and `/dream-restore` cover project memory snapshots;
-they do not version or restore the shared personal memory file.
+You can inspect or edit the shared Markdown files directly to correct or remove a
+fact. `/dream-log` and `/dream-restore` cover project snapshots; they do not version
+or restore shared knowledge or shared USER.md from another project.
 
 ## The Flow
 

@@ -117,13 +117,6 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
             elapsed = time.monotonic() - t0
             if did_work:
                 content = f"Dream completed in {elapsed:.1f}s."
-            elif dream.store.read_unprocessed_history(
-                since_cursor=dream.store.get_last_dream_cursor()
-            ):
-                content = (
-                    "Dream could not complete. Unprocessed history was kept. "
-                    "Check model credentials or gateway logs and retry /dream."
-                )
             else:
                 content = "Dream: nothing to process."
         except Exception as e:

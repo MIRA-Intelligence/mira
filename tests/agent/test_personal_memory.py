@@ -8,7 +8,7 @@ import pytest
 
 from mira_engine.agent.base_loop import BaseAgentLoop
 from mira_engine.agent.context import ContextBuilder
-from mira_engine.agent.memory import Dream, MemoryStore
+from mira_engine.agent.memory import Dream, DreamRunError, MemoryStore
 from mira_engine.agent.tools.memory import EditMemoryTool
 from mira_engine.bus.events import InboundMessage
 from mira_engine.command.builtin import cmd_dream
@@ -28,7 +28,7 @@ async def test_dream_remembers_personal_facts_across_projects(memory_home):
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(
         side_effect=[
-            LLMResponse(content="[PERSONAL] Prefers Chinese replies\n[MEMORY] Uses PostgreSQL"),
+            LLMResponse(content="[USER] Prefers Chinese replies\n[MEMORY] Uses PostgreSQL"),
             LLMResponse(
                 content=None,
                 tool_calls=[
@@ -36,9 +36,9 @@ async def test_dream_remembers_personal_facts_across_projects(memory_home):
                         id="personal",
                         name="edit_memory",
                         arguments={
-                            "scope": "personal",
+                            "scope": "user",
                             "old_text": "",
-                            "new_text": "- Prefers Chinese replies",
+                            "new_text": "## Communication Style\n- Prefers Chinese replies",
                         },
                     ),
                     ToolCallRequest(
@@ -66,6 +66,8 @@ async def test_dream_remembers_personal_facts_across_projects(memory_home):
     assert store._legacy_project_memory_file.read_text(encoding="utf-8") == "- Uses PostgreSQL"
     assert store.memory_backup_file.read_text(encoding="utf-8") == "- Uses PostgreSQL"
     assert store.get_last_dream_cursor() == 1
+    assert store.read_global_term() == ""
+    assert "## Communication Style" in (store.global_workspace / "USER.md").read_text()
 
 
 async def test_dream_includes_existing_personal_memory_in_both_phases(memory_home):
@@ -128,6 +130,7 @@ async def test_concurrent_change_is_not_overwritten(memory_home, monkeypatch):
     result = await EditMemoryTool(store).execute("personal", "Original", "Stale update")
     assert result.startswith("Error")
     assert store.read_global_term() == "Concurrent update"
+    assert "Concurrent update" in result
 
 
 async def test_failed_personal_edit_keeps_history_for_retry(memory_home):
@@ -154,7 +157,8 @@ async def test_failed_personal_edit_keeps_history_for_retry(memory_home):
             ),
         ]
     )
-    assert not await Dream(store, provider, "test-model").run()
+    with pytest.raises(DreamRunError):
+        await Dream(store, provider, "test-model").run()
     assert store.get_last_dream_cursor() == 0
     assert len(store.read_unprocessed_history(since_cursor=0)) == 1
     assert store.read_global_term() == "Existing fact"
@@ -255,7 +259,7 @@ async def test_dream_command_processes_the_requesting_workspace(
     assert initial.metadata == metadata
     assert responses[0].metadata == metadata
     if provider_error:
-        assert "could not complete" in responses[0].content
+        assert "Dream failed" in responses[0].content
         assert "history was kept" in responses[0].content
         assert project_store.get_last_dream_cursor() == 0
         assert global_store.get_last_dream_cursor() == 0
@@ -267,3 +271,127 @@ async def test_dream_command_processes_the_requesting_workspace(
     assert (
         "Prefers Chinese replies" in ContextBuilder(memory_home / "project_b").build_system_prompt()
     )
+
+
+async def test_bad_edit_is_repaired_in_the_same_run(memory_home):
+    store = MemoryStore(memory_home / "project")
+    store.write_global_term("- Prefers Chinese replies")
+    for _ in range(3):
+        store.append_history("Use English replies now")
+
+    def edit(old_text):
+        return LLMResponse(content=None, tool_calls=[ToolCallRequest(
+            id=old_text, name="edit_memory",
+            arguments={"scope": "personal", "old_text": old_text,
+                       "new_text": "Prefers English replies"},
+        )])
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="Correct the existing fact"),
+        edit("Prefers chinese replies"), edit("Prefers Chinese replies"),
+        LLMResponse(content="Updated"),
+    ])
+    assert await Dream(store, provider, "test-model").run()
+    assert provider.chat_with_retry.await_count == 4
+    assert store.get_last_dream_cursor() == 3
+    assert store.read_global_term() == "- Prefers English replies"
+    messages = provider.chat_with_retry.call_args_list[2].kwargs["messages"]
+    assert any(m["role"] == "tool" and "- Prefers Chinese replies" in m["content"]
+               for m in messages)
+
+
+async def test_completed_with_unresolved_edit_keeps_history(memory_home):
+    store = MemoryStore(memory_home / "project")
+    store.write_global_term("Original")
+    store.append_history("New knowledge")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="Change knowledge"),
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(
+            id="bad", name="edit_memory", arguments={
+                "scope": "personal", "old_text": "Missing", "new_text": "New",
+            },
+        )]),
+        LLMResponse(content="Done"),
+    ])
+    with pytest.raises(DreamRunError, match="Unresolved"):
+        await Dream(store, provider, "test-model").run()
+    assert store.get_last_dream_cursor() == 0
+    assert store.read_global_term() == "Original"
+
+
+async def test_iteration_limit_shrinks_batch_and_advances_only_completed_prefix(memory_home):
+    from mira_engine.agent.runner import AgentRunResult
+
+    store = MemoryStore(memory_home / "project")
+    for i in range(4):
+        store.append_history(f"Event {i}")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Analysis"))
+    dream = Dream(store, provider, "test-model")
+
+    async def run_batch(spec):
+        # Simulate a partial write before exceeding the budget. The next analysis
+        # must see it, so retrying cannot blindly recreate or overwrite that fact.
+        if dream._runner.run.await_count == 1:
+            store.write_global_term("Partially saved knowledge")
+            reason = "max_iterations"
+        else:
+            reason = "completed"
+        return AgentRunResult(final_content="", stop_reason=reason, messages=[],
+                              tools_used=[], usage={}, tool_events=[])
+
+    dream._runner.run = AsyncMock(side_effect=run_batch)
+    assert await dream.run()
+    assert store.get_last_dream_cursor() == 2
+    assert [e["cursor"] for e in store.read_unprocessed_history(2)] == [3, 4]
+    retry_prompt = provider.chat_with_retry.call_args_list[1].kwargs["messages"][1]["content"]
+    assert "Partially saved knowledge" in retry_prompt
+    assert "Event 2" not in retry_prompt
+
+
+async def test_single_entry_iteration_failure_raises_instead_of_reporting_idle(memory_home):
+    from mira_engine.agent.runner import AgentRunResult
+
+    store = MemoryStore(memory_home / "project")
+    store.append_history("One difficult entry")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Analysis"))
+    dream = Dream(store, provider, "test-model")
+    dream._runner.run = AsyncMock(return_value=AgentRunResult(
+        final_content="", stop_reason="max_iterations", messages=[], tools_used=[],
+        usage={}, tool_events=[],
+    ))
+    with pytest.raises(DreamRunError, match="max_iterations"):
+        await dream.run()
+    dream._runner.run.assert_awaited_once()
+    assert store.get_last_dream_cursor() == 0
+
+
+async def test_authoritative_user_settings_are_visible_but_not_editable(memory_home):
+    store = MemoryStore(memory_home / "project")
+    settings = store.global_workspace / "USER.local.md"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("Name: Alice\nTimezone: Asia/Tokyo\nLanguage: Japanese")
+    project_settings = store.workspace / "USER.local.md"
+    project_settings.write_text("Language: English")
+    store.append_history("Review preferences")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="[SKIP] Settings already cover these facts"),
+        LLMResponse(content="Nothing to update"),
+    ])
+    dream = Dream(store, provider, "test-model")
+    assert await dream.run()
+    for call in provider.chat_with_retry.call_args_list:
+        prompt = call.kwargs["messages"][1]["content"]
+        assert "Timezone: Asia/Tokyo" in prompt
+        assert "Language: English" in prompt
+    result = await dream._tools.execute("edit_file", {
+        "path": "USER.local.md", "old_text": "English", "new_text": "French",
+    })
+    assert result.startswith("Error")
+    assert project_settings.read_text() == "Language: English"
+    assert store.read_global_term() == ""
+    assert not (store.global_workspace / "USER.md").exists()

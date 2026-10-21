@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
-from mira_engine.agent.runner import AgentRunner, AgentRunSpec
+from mira_engine.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from mira_engine.agent.token_usage import record_token_usage
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.utils.gitstore import GitStore
@@ -891,6 +891,35 @@ class Consolidator:
                     return
 
 
+class DreamRunError(RuntimeError):
+    """Dream failed; pending history is retained for a later retry."""
+
+
+class _DreamTools(ToolRegistry):
+    """Allow repairs in the same run, but never acknowledge unresolved edits."""
+
+    def __init__(self, store: MemoryStore):
+        super().__init__()
+        self.store = store
+        self.failed_edits: set[tuple[str, str]] = set()
+
+    async def execute(self, name: str, params: dict[str, Any]) -> str:
+        key = (name, str(params.get("scope", params.get("path", ""))))
+        if name == "edit_file":
+            path = Path(params.get("path", ""))
+            if not path.is_absolute():
+                path = self.store.project_workspace / path
+            if path.resolve() != self.store.soul_file.resolve():
+                self.failed_edits.add(key)
+                return "Error: edit_file may only update SOUL.md. Use edit_memory for USER and memory; USER.local.md is read-only."
+        result = await super().execute(name, params)
+        if result.startswith(("Error", "Warning")):
+            self.failed_edits.add(key)
+        else:
+            self.failed_edits.discard(key)
+        return result
+
+
 class Dream:
     """Two-phase memory processor for unprocessed history entries."""
 
@@ -912,11 +941,11 @@ class Dream:
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
-    def _build_tools(self) -> ToolRegistry:
+    def _build_tools(self) -> _DreamTools:
         from mira_engine.agent.tools.filesystem import EditFileTool, ReadFileTool
         from mira_engine.agent.tools.memory import EditMemoryTool
 
-        tools = ToolRegistry()
+        tools = _DreamTools(self.store)
         workspace = self.store.project_workspace
         tools.register(ReadFileTool(workspace=workspace, allowed_dir=workspace))
         tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace))
@@ -924,34 +953,54 @@ class Dream:
         return tools
 
     async def run(self) -> bool:
-        last_cursor = self.store.get_last_dream_cursor()
-        entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
+        """Return False only for idle runs; failures raise for accurate cron logging."""
+        entries = self.store.read_unprocessed_history(self.store.get_last_dream_cursor())
         if not entries:
             return False
+        batch_size = max(1, self.max_batch_size)
+        while True:
+            batch = entries[:batch_size]
+            tools = self._build_tools()
+            result = await self._run_batch(batch, tools)
+            if result.stop_reason == "completed":
+                if tools.failed_edits:
+                    raise DreamRunError("Unresolved memory edits; unprocessed history was kept.")
+                self.store.set_last_dream_cursor(batch[-1]["cursor"])
+                self.store.compact_history()
+                return True
+            if result.stop_reason == "max_iterations" and len(batch) > 1:
+                batch_size = max(1, len(batch) // 2)
+                logger.warning("Dream exhausted its iteration budget; retrying {} history entries", batch_size)
+                continue
+            raise DreamRunError(f"Dream stopped: {result.stop_reason}; unprocessed history was kept.")
 
-        batch = entries[: self.max_batch_size]
+    async def _run_batch(
+        self, batch: list[dict[str, Any]], tools: _DreamTools
+    ) -> AgentRunResult:
         history_text = "\n".join(f"[{e['timestamp']}] {e['content']}" for e in batch)
         current_date = datetime.now().strftime("%Y-%m-%d")
         current_personal = self.store.read_global_term() or "(empty)"
         current_memory = self.store.read_memory() or "(empty)"
         current_soul = self.store.read_soul() or "(empty)"
-        current_user = self.store.read_user() or "(empty)"
+        current_user = self.store.read_file(self.store.global_workspace / "USER.md") or "(empty)"
+        settings = []
+        for workspace in dict.fromkeys([self.store.global_workspace, self.store.project_workspace]):
+            if workspace != self.store.global_workspace:
+                settings.append(f"Project USER.md (read-only overlay):\n{self.store.read_file(workspace / 'USER.md')}")
+            settings.append(f"{workspace / 'USER.local.md'} (read-only settings):\n{self.store.read_file(workspace / 'USER.local.md')}")
         file_context = (
             f"## Current Date\n{current_date}\n\n"
             f"## Current PERSONAL memory ({len(current_personal)} chars)\n{current_personal}\n\n"
             f"## Current MEMORY.md ({len(current_memory)} chars)\n{current_memory}\n\n"
             f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
-            f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
+            f"## Current shared USER.md ({len(current_user)} chars)\n{current_user}\n\n"
+            "## Authoritative user settings and project overrides\n" + "\n\n".join(settings)
         )
-
         try:
             phase1_response = await self.provider.chat_with_retry(
                 model=self.model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": render_template("agent/dream_phase1.md", strip=True),
-                    },
+                    {"role": "system", "content": render_template("agent/dream_phase1.md", strip=True)},
                     {"role": "user", "content": f"## Conversation History\n{history_text}\n\n{file_context}"},
                 ],
                 tools=None,
@@ -959,37 +1008,22 @@ class Dream:
             )
             await record_token_usage(phase1_response.usage, self.model)
             if phase1_response.finish_reason == "error":
-                logger.warning("Dream Phase 1 returned a provider error; keeping history for retry")
-                return False
+                raise DreamRunError("Dream provider error; unprocessed history was kept.")
             analysis = phase1_response.content or ""
-        except Exception:
-            logger.exception("Dream Phase 1 failed")
-            return False
-
-        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}"
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": render_template("agent/dream_phase2.md", strip=True)},
-            {"role": "user", "content": phase2_prompt},
-        ]
-        try:
-            result = await self._runner.run(
+            return await self._runner.run(
                 AgentRunSpec(
-                    initial_messages=messages,
-                    tools=self._tools,
+                    initial_messages=[
+                        {"role": "system", "content": render_template("agent/dream_phase2.md", strip=True)},
+                        {"role": "user", "content": f"## Analysis Result\n{analysis}\n\n{file_context}"},
+                    ],
+                    tools=tools,
                     model=self.model,
                     max_iterations=self.max_iterations,
                     max_tool_result_chars=self.max_tool_result_chars,
-                    fail_on_tool_error=True,
+                    fail_on_tool_error=False,
                 )
             )
-        except Exception:
-            logger.exception("Dream Phase 2 failed")
-            result = None
-
-        if not result or result.stop_reason != "completed":
-            return False
-
-        new_cursor = batch[-1]["cursor"]
-        self.store.set_last_dream_cursor(new_cursor)
-        self.store.compact_history()
-        return bool(result and result.stop_reason == "completed")
+        except DreamRunError:
+            raise
+        except Exception as exc:
+            raise DreamRunError("Dream failed; unprocessed history was kept.") from exc
