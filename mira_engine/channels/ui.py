@@ -3738,14 +3738,37 @@ class UiChannel(BaseChannel):
         return web.json_response(chat)
 
     async def _handle_delete_chat(self, request: web.Request) -> web.Response:
+        """Remove a chat from the list; with ``delete_files=1`` also delete its folder."""
         chat_id = request.match_info.get("chat_id", "")
+        files_deleted = False
+        if request.query.get("delete_files") == "1":
+            # Files go first: if that fails the chat stays listed and the user can retry.
+            try:
+                folder = chat_workdir(self.projects_root, chat_id)
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
+            if self.project_registry.project_id_for_dir(folder) is not None:
+                return web.json_response({"error": "folder belongs to a project"}, status=409)
+            if folder.is_dir():
+                try:
+                    await asyncio.to_thread(shutil.rmtree, folder)
+                except OSError as exc:
+                    logger.warning("Failed to delete chat folder {}: {}", folder, exc)
+                    return web.json_response({"error": f"could not delete {folder}: {exc}"}, status=500)
+                files_deleted = True
+                self._audit(
+                    source="ui",
+                    action="api_chat_files_deleted",
+                    session_id=chat_id,
+                    details={"chat_dir": str(folder)},
+                )
         try:
             self.organization_store.delete_chat(chat_id)
         except KeyError:
             return web.json_response({"error": "chat not found"}, status=404)
         except (OSError, ValueError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
-        return web.json_response({"deleted": True, "chat_id": chat_id})
+        return web.json_response({"deleted": True, "chat_id": chat_id, "files_deleted": files_deleted})
 
     async def _handle_create_project(self, request: web.Request) -> web.Response:
         """Create/register a project in the workspace file."""

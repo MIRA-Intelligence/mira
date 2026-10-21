@@ -3630,3 +3630,65 @@ async def test_fs_upload_refuses_folders_outside_home_and_workspace(ui_channel: 
     assert (await ui_channel._handle_fs_upload(req)).status == 403
     req = _upload_request({"dir": str(browse_home)}, _FakePart(name="files", filename="../x.txt", chunks=[b"x"]))
     assert (await ui_channel._handle_fs_upload(req)).status == 400
+
+
+async def _import_chat(ui_channel: UiChannel, chat_id: str) -> None:
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"chats": [{"id": chat_id, "title": "Question"}]})
+    assert (await ui_channel._handle_import_chats(req)).status == 200
+
+
+def _delete_chat_request(chat_id: str, query: dict[str, str]) -> MagicMock:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"chat_id": chat_id}
+    req.query = query
+    return req
+
+
+async def test_delete_chat_keeps_its_folder_unless_asked(ui_channel: UiChannel) -> None:
+    await _import_chat(ui_channel, "chat-1")
+    folder = ui_channel.projects_root / "chats" / "chat-1"
+    folder.mkdir(parents=True)
+    (folder / "result.png").write_bytes(b"png")
+
+    body = json.loads((await ui_channel._handle_delete_chat(_delete_chat_request("chat-1", {}))).text)
+
+    assert body == {"deleted": True, "chat_id": "chat-1", "files_deleted": False}
+    assert (folder / "result.png").is_file()
+
+
+async def test_delete_chat_with_files_removes_its_folder(ui_channel: UiChannel) -> None:
+    await _import_chat(ui_channel, "chat-1")
+    folder = ui_channel.projects_root / "chats" / "chat-1"
+    (folder / "plots").mkdir(parents=True)
+    (folder / "plots" / "roc.png").write_bytes(b"png")
+    other = ui_channel.projects_root / "chats" / "chat-2"
+    other.mkdir(parents=True)
+
+    resp = await ui_channel._handle_delete_chat(_delete_chat_request("chat-1", {"delete_files": "1"}))
+    body = json.loads(resp.text)
+
+    assert body["files_deleted"] is True
+    assert not folder.exists()
+    assert other.is_dir()
+    assert "chat-1" not in [chat["id"] for chat in ui_channel.organization_store.snapshot()["chats"]]
+
+
+async def test_delete_chat_with_files_and_no_folder_still_removes_the_chat(ui_channel: UiChannel) -> None:
+    await _import_chat(ui_channel, "chat-1")
+    body = json.loads((await ui_channel._handle_delete_chat(_delete_chat_request("chat-1", {"delete_files": "1"}))).text)
+    assert body == {"deleted": True, "chat_id": "chat-1", "files_deleted": False}
+
+
+async def test_delete_chat_files_failure_keeps_the_chat(ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _import_chat(ui_channel, "chat-1")
+    (ui_channel.projects_root / "chats" / "chat-1").mkdir(parents=True)
+
+    def _fail(_path: Path) -> None:
+        raise PermissionError("busy")
+
+    monkeypatch.setattr(ui_channel_mod.shutil, "rmtree", _fail)
+    resp = await ui_channel._handle_delete_chat(_delete_chat_request("chat-1", {"delete_files": "1"}))
+
+    assert resp.status == 500
+    assert "chat-1" in [chat["id"] for chat in ui_channel.organization_store.snapshot()["chats"]]
