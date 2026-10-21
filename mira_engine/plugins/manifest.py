@@ -40,6 +40,7 @@ Isolation = Literal["in-process", "subprocess"]
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _ENTRY = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*$")
+_MODULE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)*$")
 _SEMVER = re.compile(r"^\d+\.\d+\.\d+([-+].*)?$")
 
 
@@ -82,6 +83,9 @@ class PluginManifest:
     permissions: Permissions = field(default_factory=Permissions)
     isolation: Isolation = "in-process"
     default_enabled: bool = False
+    # Importable modules the plugin needs (its SDKs); when one is missing the
+    # plugin is reported "unavailable" instead of failing.
+    requires: tuple[str, ...] = ()
 
     @property
     def has_code(self) -> bool:
@@ -141,6 +145,9 @@ def parse_manifest(data: dict[str, Any], root: Path) -> PluginManifest:
     isolation = data.get("isolation", "in-process")
     if isolation not in ("in-process", "subprocess"):
         raise ManifestError("isolation must be in-process or subprocess")
+    requires = data.get("requires") or []
+    if not isinstance(requires, list) or not all(isinstance(r, str) and _MODULE.match(r) for r in requires):
+        raise ManifestError("requires must be a list of importable module names")
 
     return PluginManifest(
         id=pid,
@@ -164,6 +171,7 @@ def parse_manifest(data: dict[str, Any], root: Path) -> PluginManifest:
         ),
         isolation=isolation,
         default_enabled=bool(data.get("default_enabled", False)),
+        requires=tuple(requires),
     )
 
 

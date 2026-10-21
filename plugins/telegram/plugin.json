@@ -1,0 +1,28 @@
+{
+  "id": "telegram",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Telegram channel: python-telegram-bot long polling, replies, media and voice transcription.",
+  "requires": [
+    "telegram"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "telegram",
+        "entry": "telegram_channel:TelegramChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "api.telegram.org",
+      "*"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.telegram"
+    ]
+  }
+}

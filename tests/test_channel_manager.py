@@ -63,16 +63,16 @@ def _enable_all_channels(cfg: Config) -> None:
 
 def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
     for module_name, cls_name in (
-        ("mira_engine.channels.telegram", "TelegramChannel"),
-        ("mira_engine.channels.whatsapp", "WhatsAppChannel"),
+        ("mira_plugins.telegram.telegram_channel", "TelegramChannel"),
+        ("mira_plugins.whatsapp.whatsapp_channel", "WhatsAppChannel"),
         ("mira_engine.channels.discord", "DiscordChannel"),
-        ("mira_engine.channels.feishu", "FeishuChannel"),
-        ("mira_engine.channels.mochat", "MochatChannel"),
-        ("mira_engine.channels.dingtalk", "DingTalkChannel"),
-        ("mira_engine.channels.email", "EmailChannel"),
-        ("mira_engine.channels.slack", "SlackChannel"),
-        ("mira_engine.channels.qq", "QQChannel"),
-        ("mira_engine.channels.matrix", "MatrixChannel"),
+        ("mira_plugins.feishu.feishu_channel", "FeishuChannel"),
+        ("mira_plugins.mochat.mochat_channel", "MochatChannel"),
+        ("mira_plugins.dingtalk.dingtalk_channel", "DingTalkChannel"),
+        ("mira_plugins.email.email_channel", "EmailChannel"),
+        ("mira_plugins.slack.slack_channel", "SlackChannel"),
+        ("mira_plugins.qq.qq_channel", "QQChannel"),
+        ("mira_plugins.matrix.matrix_channel", "MatrixChannel"),
         ("mira_engine.channels.ui", "UiChannel"),
         ("mira_engine.channels.community", "CommunityChannel"),
     ):
@@ -143,7 +143,7 @@ def test_ui_channel_receives_restrict_to_workspace_from_config(monkeypatch) -> N
 
 
 async def test_start_all_and_stop_all_with_channels(monkeypatch) -> None:
-    _install_channel_module(monkeypatch, "mira_engine.channels.telegram", "TelegramChannel")
+    _install_channel_module(monkeypatch, "mira_plugins.telegram.telegram_channel", "TelegramChannel")
     # The community channel is enabled by default and its real start() waits
     # for credentials forever, so start_all() would never return without a stub.
     _install_channel_module(monkeypatch, "mira_engine.channels.community", "CommunityChannel")

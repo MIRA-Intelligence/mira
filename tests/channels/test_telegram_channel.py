@@ -13,8 +13,8 @@ except ImportError:
 
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
-from mira_engine.channels.telegram import TELEGRAM_REPLY_CONTEXT_MAX_LEN, TelegramChannel, _StreamBuf
-from mira_engine.channels.telegram import TelegramConfig
+from mira_plugins.telegram.telegram_channel import TELEGRAM_REPLY_CONTEXT_MAX_LEN, TelegramChannel, _StreamBuf
+from mira_plugins.telegram.telegram_channel import TelegramConfig
 
 
 class _FakeHTTPXRequest:
@@ -172,9 +172,9 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     app = _FakeApp(lambda: setattr(channel, "_running", False))
     builder = _FakeBuilder(app)
 
-    monkeypatch.setattr("mira_engine.channels.telegram.HTTPXRequest", _FakeHTTPXRequest)
+    monkeypatch.setattr("mira_plugins.telegram.telegram_channel.HTTPXRequest", _FakeHTTPXRequest)
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.Application",
+        "mira_plugins.telegram.telegram_channel.Application",
         SimpleNamespace(builder=lambda: builder),
     )
 
@@ -210,9 +210,9 @@ async def test_start_respects_custom_pool_config(monkeypatch) -> None:
     app = _FakeApp(lambda: setattr(channel, "_running", False))
     builder = _FakeBuilder(app)
 
-    monkeypatch.setattr("mira_engine.channels.telegram.HTTPXRequest", _FakeHTTPXRequest)
+    monkeypatch.setattr("mira_plugins.telegram.telegram_channel.HTTPXRequest", _FakeHTTPXRequest)
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.Application",
+        "mira_plugins.telegram.telegram_channel.Application",
         SimpleNamespace(builder=lambda: builder),
     )
 
@@ -248,7 +248,7 @@ async def test_send_text_retries_on_timeout() -> None:
 
     channel._app.bot.send_message = flaky_send
 
-    import mira_engine.channels.telegram as tg_mod
+    import mira_plugins.telegram.telegram_channel as tg_mod
     orig_delay = tg_mod._SEND_RETRY_BASE_DELAY
     tg_mod._SEND_RETRY_BASE_DELAY = 0.01
     try:
@@ -276,7 +276,7 @@ async def test_send_text_gives_up_after_max_retries() -> None:
 
     channel._app.bot.send_message = always_timeout
 
-    import mira_engine.channels.telegram as tg_mod
+    import mira_plugins.telegram.telegram_channel as tg_mod
     orig_delay = tg_mod._SEND_RETRY_BASE_DELAY
     tg_mod._SEND_RETRY_BASE_DELAY = 0.01
     try:
@@ -299,11 +299,11 @@ async def test_on_error_logs_network_issues_as_warning(monkeypatch) -> None:
     recorded: list[tuple[str, str]] = []
 
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.logger.warning",
+        "mira_plugins.telegram.telegram_channel.logger.warning",
         lambda message, error: recorded.append(("warning", message.format(error))),
     )
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.logger.error",
+        "mira_plugins.telegram.telegram_channel.logger.error",
         lambda message, error: recorded.append(("error", message.format(error))),
     )
 
@@ -323,7 +323,7 @@ async def test_on_error_summarizes_empty_network_error(monkeypatch) -> None:
     recorded: list[tuple[str, str]] = []
 
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.logger.warning",
+        "mira_plugins.telegram.telegram_channel.logger.warning",
         lambda message, error: recorded.append(("warning", message.format(error))),
     )
 
@@ -341,11 +341,11 @@ async def test_on_error_keeps_non_network_exceptions_as_error(monkeypatch) -> No
     recorded: list[tuple[str, str]] = []
 
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.logger.warning",
+        "mira_plugins.telegram.telegram_channel.logger.warning",
         lambda message, error: recorded.append(("warning", message.format(error))),
     )
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.logger.error",
+        "mira_plugins.telegram.telegram_channel.logger.error",
         lambda message, error: recorded.append(("error", message.format(error))),
     )
 
@@ -390,7 +390,7 @@ async def test_send_delta_stream_end_treats_not_modified_as_success() -> None:
 @pytest.mark.asyncio
 async def test_send_delta_stream_end_splits_oversized_reply() -> None:
     """Final streamed reply exceeding Telegram limit is split into chunks."""
-    from mira_engine.channels.telegram import TELEGRAM_MAX_MESSAGE_LEN
+    from mira_plugins.telegram.telegram_channel import TELEGRAM_MAX_MESSAGE_LEN
 
     channel = TelegramChannel(
         TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
@@ -571,7 +571,7 @@ async def test_send_remote_media_url_after_security_validation(monkeypatch) -> N
         MessageBus(),
     )
     channel._app = _FakeApp(lambda: None)
-    monkeypatch.setattr("mira_engine.channels.telegram.validate_url_target", lambda url: (True, ""))
+    monkeypatch.setattr("mira_plugins.telegram.telegram_channel.validate_url_target", lambda url: (True, ""))
 
     await channel.send(
         OutboundMessage(
@@ -600,7 +600,7 @@ async def test_send_blocks_unsafe_remote_media_url(monkeypatch) -> None:
     )
     channel._app = _FakeApp(lambda: None)
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.validate_url_target",
+        "mira_plugins.telegram.telegram_channel.validate_url_target",
         lambda url: (False, "Blocked: example.com resolves to private/internal address 127.0.0.1"),
     )
 
@@ -822,7 +822,7 @@ async def test_download_message_media_returns_path_when_download_succeeds(
     media_dir = tmp_path / "media" / "telegram"
     media_dir.mkdir(parents=True)
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.get_media_dir",
+        "mira_plugins.telegram.telegram_channel.get_media_dir",
         lambda channel=None: media_dir if channel else tmp_path / "media",
     )
 
@@ -858,7 +858,7 @@ async def test_download_message_media_uses_file_unique_id_when_available(
     media_dir = tmp_path / "media" / "telegram"
     media_dir.mkdir(parents=True)
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.get_media_dir",
+        "mira_plugins.telegram.telegram_channel.get_media_dir",
         lambda channel=None: media_dir if channel else tmp_path / "media",
     )
 
@@ -907,7 +907,7 @@ async def test_on_message_attaches_reply_to_media_when_available(monkeypatch, tm
     media_dir = tmp_path / "media" / "telegram"
     media_dir.mkdir(parents=True)
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.get_media_dir",
+        "mira_plugins.telegram.telegram_channel.get_media_dir",
         lambda channel=None: media_dir if channel else tmp_path / "media",
     )
 
@@ -990,7 +990,7 @@ async def test_on_message_reply_to_caption_and_media(monkeypatch, tmp_path) -> N
     media_dir = tmp_path / "media" / "telegram"
     media_dir.mkdir(parents=True)
     monkeypatch.setattr(
-        "mira_engine.channels.telegram.get_media_dir",
+        "mira_plugins.telegram.telegram_channel.get_media_dir",
         lambda channel=None: media_dir if channel else tmp_path / "media",
     )
 

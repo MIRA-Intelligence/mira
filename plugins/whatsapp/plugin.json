@@ -1,0 +1,29 @@
+{
+  "id": "whatsapp",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "WhatsApp channel: a local Node.js bridge (built with npm on first use) over a localhost WebSocket.",
+  "requires": [
+    "websockets"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "whatsapp",
+        "entry": "whatsapp_channel:WhatsAppChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "localhost",
+      "127.0.0.1"
+    ],
+    "filesystem": "none",
+    "shell": true,
+    "secrets": [
+      "channels.whatsapp"
+    ]
+  }
+}

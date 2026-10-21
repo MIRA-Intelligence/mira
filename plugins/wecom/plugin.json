@@ -1,0 +1,28 @@
+{
+  "id": "wecom",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "WeCom (Enterprise WeChat) channel: AI bot over WebSocket (wecom_aibot_sdk).",
+  "requires": [
+    "wecom_aibot_sdk"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "wecom",
+        "entry": "wecom_channel:WecomChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "*.work.weixin.qq.com",
+      "*.weixin.qq.com"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.wecom"
+    ]
+  }
+}

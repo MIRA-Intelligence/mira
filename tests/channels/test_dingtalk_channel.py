@@ -7,7 +7,7 @@ import pytest
 
 # Check optional dingtalk dependencies before running tests
 try:
-    from mira_engine.channels import dingtalk
+    from mira_plugins.dingtalk import dingtalk_channel as dingtalk
     DINGTALK_AVAILABLE = getattr(dingtalk, "DINGTALK_AVAILABLE", False)
 except ImportError:
     DINGTALK_AVAILABLE = False
@@ -16,9 +16,9 @@ if not DINGTALK_AVAILABLE:
     pytest.skip("DingTalk dependencies not installed (dingtalk-stream)", allow_module_level=True)
 
 from mira_engine.bus.queue import MessageBus
-import mira_engine.channels.dingtalk as dingtalk_module
-from mira_engine.channels.dingtalk import DingTalkChannel, MiraDingTalkHandler
-from mira_engine.channels.dingtalk import DingTalkConfig
+import mira_plugins.dingtalk.dingtalk_channel as dingtalk_module
+from mira_plugins.dingtalk.dingtalk_channel import DingTalkChannel, MiraDingTalkHandler
+from mira_plugins.dingtalk.dingtalk_channel import DingTalkConfig
 
 
 class _FakeResponse:
