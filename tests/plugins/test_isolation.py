@@ -117,8 +117,23 @@ async def test_a_hung_plugin_call_is_killed_and_the_host_replaced(unsandboxed):
     tool = unsandboxed
     tool._inner._call_timeout_s = 0.5
     first = await tool.execute(what="pid")
+    assert first.isdigit(), first
     assert "Error" in await tool.execute(what="hang")
-    assert await tool.execute(what="pid") != first
+    second = await tool.execute(what="pid")
+    assert second.isdigit() and second != first
+
+
+async def test_a_slow_host_start_does_not_count_against_the_call(tmp_path, monkeypatch):
+    # Importing the engine and the plugin takes a while on a cold start; the
+    # tool's own timeout only covers the call.
+    monkeypatch.setattr("mira_engine.agent.tools.sandbox.sandbox_available", lambda network=True: (False, "test"))
+    d = _plugin(tmp_path / "plugins", "slowstart")
+    (d / "probe.py").write_text("import time\ntime.sleep(1.0)\n" + (d / "probe.py").read_text())
+    rt = _rt(tmp_path, unsandboxed=True)
+    assert rt.get("slowstart").status == "loaded", rt.get("slowstart").reason
+    tool = rt.tools()[0]
+    tool._inner._call_timeout_s = 0.5
+    assert (await tool.execute(what="pid")).isdigit()
 
 
 def test_registry_tier_promotes_a_plugin_in_process(tmp_path):

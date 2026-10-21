@@ -176,7 +176,32 @@ class PluginHostClient:
                     limit=16 * 1024 * 1024,
                 )
                 self._reader = asyncio.create_task(self._read(self._proc), name=f"plugin-host-{self.plugin_id}")
+                # Wait until the host has imported the engine and the plugin,
+                # so a cold start doesn't eat into the first call's timeout.
+                try:
+                    await self._request(self._proc, "describe", None, DESCRIBE_TIMEOUT_S)
+                except BaseException:
+                    await self.close()
+                    raise
             return self._proc
+
+    async def _request(
+        self, proc: asyncio.subprocess.Process, method: str, params: dict[str, Any] | None, timeout: float
+    ) -> Any:
+        self._next_id += 1
+        rid = self._next_id
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[rid] = fut
+        msg: dict[str, Any] = {"id": rid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        assert proc.stdin is not None
+        proc.stdin.write((json.dumps(msg) + "\n").encode())
+        await proc.stdin.drain()
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self._pending.pop(rid, None)
 
     async def _read(self, proc: asyncio.subprocess.Process) -> None:
         assert proc.stdout is not None
@@ -199,18 +224,10 @@ class PluginHostClient:
 
     async def call(self, tool: str, args: dict[str, Any], timeout: float) -> Any:
         proc = await self._ensure()
-        self._next_id += 1
-        rid = self._next_id
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[rid] = fut
-        assert proc.stdin is not None
-        proc.stdin.write((json.dumps({"id": rid, "method": "call", "params": {"tool": tool, "args": args}}) + "\n").encode())
-        await proc.stdin.drain()
         try:
-            return await asyncio.wait_for(fut, timeout)
+            return await self._request(proc, "call", {"tool": tool, "args": args}, timeout)
         except asyncio.TimeoutError:
             # A hung plugin call: kill the host; the next call starts a fresh one.
-            self._pending.pop(rid, None)
             await self.close()
             raise
 
