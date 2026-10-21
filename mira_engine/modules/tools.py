@@ -15,6 +15,30 @@ from mira_engine.workflows import JsonWorkflowRepository, WorkflowService
 from mira_engine.workflows.models import new_id
 
 
+def _inline_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Inline a pydantic schema's `$defs` so it can be nested in a tool's parameters.
+
+    Pydantic puts nested models in a root-level `$defs` and points at them with
+    `#/$defs/...`. Nested under another object that root is gone, the pointers
+    dangle and strict providers reject the whole request. Models must not be
+    recursive.
+    """
+    defs = schema.get("$defs", {})
+
+    def resolve(node: Any) -> Any:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                rest = {k: v for k, v in node.items() if k != "$ref"}
+                return resolve({**defs[ref.removeprefix("#/$defs/")], **rest})
+            return {k: resolve(v) for k, v in node.items() if k != "$defs"}
+        if isinstance(node, list):
+            return [resolve(v) for v in node]
+        return node
+
+    return resolve(schema)
+
+
 class PubMedSearchTool(Tool):
     """Search PubMed directly and persist a non-hallucinable search audit."""
 
@@ -624,7 +648,7 @@ class WorkflowExperimentTool(InitiationResearchResultTool):
 
         return {
             "type": "object",
-            "properties": {"experiment": ExperimentRecord.model_json_schema()},
+            "properties": {"experiment": _inline_refs(ExperimentRecord.model_json_schema())},
             "required": ["experiment"], "additionalProperties": False,
         }
 
