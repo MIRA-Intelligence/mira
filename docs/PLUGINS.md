@@ -42,6 +42,24 @@ mira plugin list                         # status, tier and reason for every plu
 `entry` is `module:attr` inside the plugin directory; the directory is imported
 as its own package, so relative imports work.
 
+### Tool entries and the plugin context
+
+A tool `entry` can name a `Tool` subclass with a no-argument constructor, a
+`Tool` subclass whose `__init__` takes `ctx`, or a factory `def make(ctx) ->
+Tool`. Every agent loop (and subagent) builds its own instances, so `ctx`
+carries that loop's values (`mira_engine.plugins.context.PluginContext`):
+
+| Field | |
+|---|---|
+| `workspace` | the loop's workspace (for an out-of-process plugin: the engine's, only if `permissions.filesystem` grants it) |
+| `proxy` | the configured web proxy |
+| `config` | a `ConfigView`: `ctx.config.get("channels.discord.token")`. Plugins that aren't core-bundled only see the paths listed in `permissions.secrets` (and their subtrees) |
+| `data_dir` | the plugin's private directory, `<mira home>/plugin-data/<id>` |
+| `host` | engine values for core-bundled plugins (e.g. `brave_api_key`); empty otherwise |
+
+A tool that can't be built for a loop (its factory raises) is left out of that
+loop and logged; the plugin's other tools still load.
+
 ## What the kernel guarantees
 
 | Failure | Effect |
@@ -49,7 +67,7 @@ as its own package, so relative imports work.
 | invalid manifest, API mismatch, import error, wrong entry type | that plugin is not loaded (`mira plugin list` shows why); everything else runs |
 | a tool raises or exceeds its timeout (60 s) | the model gets a tool error |
 | a hook raises or exceeds its timeout (2 s) | the call is skipped |
-| 3 consecutive failures | the plugin is **tripped** and stays off until `mira plugin enable` |
+| 3 consecutive failures | the plugin is **tripped** and stays off until `mira plugin enable`; a core-bundled plugin is only **paused** for 5 minutes (nothing persisted) |
 | a plugin tool/channel reuses a built-in name | the built-in wins |
 
 ## Remote disable

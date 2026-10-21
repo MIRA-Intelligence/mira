@@ -285,3 +285,27 @@ def test_agent_loop_registers_plugin_tools_and_hooks_without_replacing_builtins(
     assert loop.tools.has("echo_plugin")
     assert type(loop.tools.get("read_file")).__module__ == "mira_engine.agent.tools.filesystem"
     assert loop._hook is not None and any(getattr(h, "mode", None) == "observe" for h in loop._hook._hooks)
+
+
+def test_subagents_get_the_plugin_tools_their_role_allows(tmp_path):
+    from mira_engine.agent.subagent import ROLE_CONFIGS, SubagentManager
+    from mira_engine.config.schema import ExecToolConfig
+    from mira_engine.plugins import set_runtime_for_tests
+    from mira_engine.providers.base import LLMProvider, LLMResponse
+
+    class _Provider(LLMProvider):
+        async def chat(self, *a, **kw):
+            return LLMResponse(content="ok")
+
+        def get_default_model(self):
+            return "dummy/default"
+
+    _plugin(tmp_path / "plugins", "echo", TOOL_MANIFEST, {"tool.py": TOOL})
+    set_runtime_for_tests(_runtime(tmp_path))
+    manager = SubagentManager(
+        provider=_Provider(), workspace=tmp_path / "ws", bus=None, model="dummy/default",
+        exec_config=ExecToolConfig(timeout=5),
+    )
+    assert manager._build_tools(tmp_path / "ws").has("echo_plugin")
+    limited = next(role for role, cfg in ROLE_CONFIGS.items() if cfg.get("allowed_tools"))
+    assert not manager._build_tools(tmp_path / "ws", limited).has("echo_plugin")

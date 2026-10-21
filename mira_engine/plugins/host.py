@@ -37,15 +37,37 @@ def _limit_resources() -> None:
         pass
 
 
+def _context(manifest: Any) -> Any:
+    """The plugin's context, from what the engine passed in the environment:
+    its scratch dir, the workspace (only when the manifest asks for it) and
+    the config values it declared in ``permissions.secrets``."""
+    from mira_engine.plugins.context import ConfigView, PluginContext
+
+    try:
+        values = json.loads(os.environ.get("MIRA_PLUGIN_CONFIG") or "{}")
+    except ValueError:
+        values = {}
+    workspace = os.environ.get("MIRA_PLUGIN_WORKSPACE")
+    data_dir = os.environ.get("MIRA_PLUGIN_DATA_DIR")
+    return PluginContext(
+        plugin_id=manifest.id,
+        tier=os.environ.get("MIRA_PLUGIN_TIER") or "experimental",
+        workspace=Path(workspace) if workspace else None,
+        config=ConfigView.from_values(values if isinstance(values, dict) else {}),
+        data_root=Path(data_dir) if data_dir else None,
+    )
+
+
 def _load_tools(plugin_dir: Path) -> dict[str, Any]:
     from mira_engine.agent.tools.base import Tool
     from mira_engine.plugins.loader import _instantiate, _resolve
     from mira_engine.plugins.manifest import load_manifest
 
     manifest = load_manifest(plugin_dir)
+    ctx = _context(manifest)
     tools: dict[str, Any] = {}
     for ep in manifest.tools:
-        tool = _instantiate(_resolve(manifest, ep.entry), Tool, ep.entry)
+        tool = _instantiate(_resolve(manifest, ep.entry), Tool, ep.entry, ctx)
         tools[tool.name] = tool  # type: ignore[attr-defined]
     return tools
 

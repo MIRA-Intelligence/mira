@@ -43,6 +43,7 @@ from loguru import logger
 from mira_engine.agent.hook import AgentHook
 from mira_engine.agent.tools.base import Tool
 from mira_engine.plugins.api import PLUGIN_API_VERSION, satisfies
+from mira_engine.plugins.context import ConfigView, PluginContext, instantiate
 from mira_engine.plugins.guard import CircuitBreaker, GuardedHook, GuardedTool
 from mira_engine.plugins.manifest import MANIFEST_FILENAME, ManifestError, PluginManifest, Tier, load_manifest
 from mira_engine.plugins.paths import bundled_plugins_dir, user_plugins_dir
@@ -65,6 +66,10 @@ class LoadedPlugin:
     channels: dict[str, type] = field(default_factory=dict)
     tools: list[Tool] = field(default_factory=list)
     hooks: list[AgentHook] = field(default_factory=list)
+    # In-process tool entries (resolved object, declared name, entry string),
+    # built again for every agent loop by PluginRuntime.build_tools.
+    tool_entries: list[tuple[object, str | None, str]] = field(default_factory=list)
+    isolated: bool = False
 
     @property
     def id(self) -> str:
@@ -156,14 +161,15 @@ def _resolve(manifest: PluginManifest, entry: str) -> object:
         raise ImportError(f"{entry}: no attribute {attr!r}") from e
 
 
-def _instantiate(obj: object, base: type, entry: str) -> object:
-    if inspect.isclass(obj):
-        if not issubclass(obj, base):
-            raise TypeError(f"{entry} is not a {base.__name__}")
-        return obj()
-    if isinstance(obj, base):
-        return obj
-    raise TypeError(f"{entry} is not a {base.__name__}")
+def _instantiate(obj: object, base: type, entry: str, ctx: PluginContext | None = None) -> object:
+    return instantiate(obj, base, entry, ctx)
+
+
+def _build_tool(obj: object, name: str | None, entry: str, ctx: PluginContext) -> Tool:
+    tool = _instantiate(obj, Tool, entry, ctx)
+    if name and tool.name != name:  # type: ignore[attr-defined]
+        raise ValueError(f"{entry} is named {tool.name!r}, manifest says {name!r}")  # type: ignore[attr-defined]
+    return tool  # type: ignore[return-value]
 
 
 class PluginRuntime:
@@ -210,10 +216,46 @@ class PluginRuntime:
         tier = getattr(getattr(self._cfg(), "plugins", None), "default_user_tier", source.tier)
         return tier if tier in ("community", "experimental") else source.tier
 
-    def breaker(self, plugin_id: str, version: str | None = None) -> CircuitBreaker:
+    def breaker(self, plugin_id: str, version: str | None = None, *, tier: Tier | None = None) -> CircuitBreaker:
         if plugin_id not in self._breakers:
-            self._breakers[plugin_id] = CircuitBreaker(plugin_id, self.state, version=version)
+            # A first-party plugin that trips (e.g. web search timing out) is
+            # paused for a while, not switched off for good.
+            self._breakers[plugin_id] = CircuitBreaker(
+                plugin_id, self.state, version=version, persist=tier != "core-bundled"
+            )
         return self._breakers[plugin_id]
+
+    # -- plugin context -------------------------------------------------------
+
+    def _config_data(self) -> Any:
+        cfg = self._cfg()
+        try:
+            return cfg.model_dump() if cfg is not None else None
+        except Exception:  # noqa: BLE001 - a plugin gets no config rather than breaking
+            return None
+
+    def config_view(self, manifest: PluginManifest, tier: Tier | None) -> ConfigView:
+        allowed = None if tier == "core-bundled" else manifest.permissions.secrets
+        return ConfigView(self._config_data, allowed)
+
+    def context(
+        self,
+        manifest: PluginManifest,
+        tier: Tier | None,
+        *,
+        workspace: Path | None = None,
+        proxy: str | None = None,
+        host: dict[str, Any] | None = None,
+    ) -> PluginContext:
+        trusted = tier == "core-bundled"
+        return PluginContext(
+            plugin_id=manifest.id,
+            tier=tier or "experimental",
+            workspace=workspace,
+            proxy=proxy,
+            config=self.config_view(manifest, tier),
+            host=dict(host or {}) if trusted else {},
+        )
 
     # -- discovery ------------------------------------------------------------
 
@@ -281,7 +323,10 @@ class PluginRuntime:
             result.reason = f"mutate hooks need a verified or core-bundled plugin (this one is {tier})"
             return result
 
-        breaker = self.breaker(manifest.id, manifest.version)
+        breaker = self.breaker(manifest.id, manifest.version, tier=tier)
+        # Built once here to validate the entries (and for status and the
+        # contract kit); every agent loop builds its own via build_tools().
+        probe = self.context(manifest, tier, workspace=self._workspace)
         try:
             for ep in manifest.channels:
                 from mira_engine.channels.base import BaseChannel
@@ -291,15 +336,15 @@ class PluginRuntime:
                     raise TypeError(f"{ep.entry} is not a BaseChannel subclass")
                 result.channels[ep.name or cls.name] = cls
             for ep in manifest.tools:
-                tool = _instantiate(_resolve(manifest, ep.entry), Tool, ep.entry)
-                if ep.name and tool.name != ep.name:  # type: ignore[attr-defined]
-                    raise ValueError(f"{ep.entry} is named {tool.name!r}, manifest says {ep.name!r}")  # type: ignore[attr-defined]
+                obj = _resolve(manifest, ep.entry)
+                tool = _build_tool(obj, ep.name, ep.entry, probe)
                 result.tools.append(GuardedTool(tool, breaker))  # type: ignore[arg-type]
+                result.tool_entries.append((obj, ep.name, ep.entry))
             for ep in manifest.hooks:
-                hook = _instantiate(_resolve(manifest, ep.entry), AgentHook, ep.entry)
+                hook = _instantiate(_resolve(manifest, ep.entry), AgentHook, ep.entry, probe)
                 result.hooks.append(GuardedHook(hook, breaker, mode=ep.mode))  # type: ignore[arg-type]
         except Exception as e:  # noqa: BLE001 - any plugin error stays with the plugin
-            result.channels, result.tools, result.hooks = {}, [], []
+            result.channels, result.tools, result.hooks, result.tool_entries = {}, [], [], []
             result.reason = f"{type(e).__name__}: {e}"
             return result
 
@@ -318,8 +363,14 @@ class PluginRuntime:
         except isolation.IsolationUnavailable as e:
             result.status, result.reason = "unsupported", str(e)
             return result
+        env = isolation.plugin_env(
+            manifest,
+            workspace=self.workspace,
+            config=self.config_view(manifest, result.tier).values(),
+            tier=result.tier,
+        )
         try:
-            definitions = isolation.describe(manifest, workspace=self.workspace, sandbox=sandbox)
+            definitions = isolation.describe(manifest, workspace=self.workspace, sandbox=sandbox, env=env)
         except Exception as e:  # noqa: BLE001 - the plugin's problem, not the engine's
             result.reason = f"{type(e).__name__}: {e}"
             return result
@@ -329,10 +380,11 @@ class PluginRuntime:
             result.reason = f"manifest declares tools {sorted(declared)} but the plugin serves {sorted(served)}"
             return result
         client = isolation.PluginHostClient(
-            manifest.id, isolation.host_argv(manifest, workspace=self.workspace, sandbox=sandbox)
+            manifest.id, isolation.host_argv(manifest, workspace=self.workspace, sandbox=sandbox), env=env
         )
-        breaker = self.breaker(manifest.id, manifest.version)
+        breaker = self.breaker(manifest.id, manifest.version, tier=result.tier)
         result.tools = [GuardedTool(isolation.SubprocessTool(client, d), breaker) for d in definitions]
+        result.isolated = True
         result.status = "loaded"
         result.reason = "out of process" + ("" if sandbox else " (unsandboxed)")
         return result
@@ -353,7 +405,34 @@ class PluginRuntime:
         return out
 
     def tools(self) -> list[Tool]:
+        """The tools built at load time (status, contract checks, tests)."""
         return [t for p in self.loaded() for t in p.tools]
+
+    def build_tools(
+        self,
+        *,
+        workspace: Path | None = None,
+        proxy: str | None = None,
+        host: dict[str, Any] | None = None,
+    ) -> list[Tool]:
+        """Fresh tool instances for one agent loop (its workspace and proxy),
+        behind the plugin's shared breaker. Out-of-process plugins keep their
+        single host, so their load-time tools are reused. A tool whose
+        construction fails is left out and logged; the rest still load."""
+        out: list[Tool] = []
+        for p in self.loaded():
+            if p.isolated or not p.tool_entries:
+                out.extend(p.tools)
+                continue
+            assert p.manifest is not None
+            ctx = self.context(p.manifest, p.tier, workspace=workspace, proxy=proxy, host=host)
+            breaker = self.breaker(p.manifest.id, p.manifest.version, tier=p.tier)
+            for obj, name, entry in p.tool_entries:
+                try:
+                    out.append(GuardedTool(_build_tool(obj, name, entry, ctx), breaker))  # type: ignore[arg-type]
+                except Exception as e:  # noqa: BLE001 - the plugin's problem, not the loop's
+                    logger.warning("plugin {} tool {} not available here: {}", p.id, name or entry, e)
+        return out
 
     def hooks(self) -> list[AgentHook]:
         return [h for p in self.loaded() for h in p.hooks]

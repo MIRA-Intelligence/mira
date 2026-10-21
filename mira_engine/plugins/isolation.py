@@ -49,6 +49,27 @@ def host_env() -> dict[str, str]:
     return env
 
 
+def plugin_env(
+    manifest: PluginManifest,
+    *,
+    workspace: Path | None,
+    config: dict[str, Any],
+    tier: str | None,
+) -> dict[str, str]:
+    """The host's environment: :func:`host_env` plus what the plugin's context
+    is built from (see ``mira_engine.plugins.host``). Only the config values
+    the manifest declared in ``permissions.secrets`` are passed, and the
+    workspace only when ``permissions.filesystem`` grants it."""
+    env = host_env()
+    env["MIRA_PLUGIN_DATA_DIR"] = str(_scratch_dir(manifest.id))
+    env["MIRA_PLUGIN_TIER"] = tier or "experimental"
+    if workspace is not None and manifest.permissions.filesystem != "none":
+        env["MIRA_PLUGIN_WORKSPACE"] = str(workspace)
+    if config:
+        env["MIRA_PLUGIN_CONFIG"] = json.dumps(config, default=str)
+    return env
+
+
 def _scratch_dir(plugin_id: str) -> Path:
     from mira_engine.config.paths import get_data_dir
 
@@ -105,11 +126,19 @@ def plan(manifest: PluginManifest, *, workspace: Path | None, allow_unsandboxed:
     )
 
 
-def describe(manifest: PluginManifest, *, workspace: Path | None, sandbox: bool) -> list[dict[str, Any]]:
+def describe(
+    manifest: PluginManifest,
+    *,
+    workspace: Path | None,
+    sandbox: bool,
+    env: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Ask a one-shot host for the plugin's tool definitions."""
     argv = host_argv(manifest, workspace=workspace, sandbox=sandbox, describe=True)
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=DESCRIBE_TIMEOUT_S, env=host_env(), check=False)
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=DESCRIBE_TIMEOUT_S, env=env or host_env(), check=False
+        )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"plugin host did not describe its tools within {DESCRIBE_TIMEOUT_S}s") from e
     line = (proc.stdout or "").strip().splitlines()[-1:] or [""]
@@ -125,9 +154,10 @@ def describe(manifest: PluginManifest, *, workspace: Path | None, sandbox: bool)
 class PluginHostClient:
     """A long-lived host process, started lazily and restarted after a crash."""
 
-    def __init__(self, plugin_id: str, argv: list[str]):
+    def __init__(self, plugin_id: str, argv: list[str], env: dict[str, str] | None = None):
         self.plugin_id = plugin_id
         self.argv = argv
+        self.env = env
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task | None = None
         self._pending: dict[int, asyncio.Future] = {}
@@ -142,7 +172,7 @@ class PluginHostClient:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
-                    env=host_env(),
+                    env=self.env or host_env(),
                     limit=16 * 1024 * 1024,
                 )
                 self._reader = asyncio.create_task(self._read(self._proc), name=f"plugin-host-{self.plugin_id}")

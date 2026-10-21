@@ -481,11 +481,17 @@ class BaseAgentLoop:
         return get_runtime().hooks()
 
     def _register_plugin_tools(self) -> None:
-        """Register tools from loaded plugins (mira#206). A plugin can never
-        replace a built-in tool: name clashes are skipped and logged."""
+        """Register tools from loaded plugins (mira#206), built for this loop's
+        workspace and proxy. A plugin can never replace a built-in tool: name
+        clashes are skipped and logged."""
         from mira_engine.plugins import get_runtime
 
-        for tool in get_runtime().tools():
+        tools = get_runtime().build_tools(
+            workspace=self.workspace,
+            proxy=self.web_proxy,
+            host={"brave_api_key": self.brave_api_key},
+        )
+        for tool in tools:
             if self.tools.has(tool.name):
                 logger.warning("plugin tool {} ignored: the name is already taken", tool.name)
                 continue
