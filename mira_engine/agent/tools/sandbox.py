@@ -137,6 +137,15 @@ def bwrap_argv(spec: SandboxSpec, cwd: str | Path | None = None) -> list[str]:
     media = _resolve(get_media_dir())
     read_only = [path for path in [*shared, *([media] if media else []), *spec.extra_read_only] if path.exists()]
 
+    # Granted paths strictly inside the Mira home (a plugin under
+    # <home>/plugins, the default workspace <home>/workspace) would be hidden
+    # by the mask below, so they are mounted again after it; the home itself
+    # and its ancestors never are.
+    granted_inside = [
+        *(("--ro-bind-try", path) for path in spec.read_only if path != mira_home and _inside(path, mira_home)),
+        *(("--bind-try", path) for path in spec.read_write if path != mira_home and _inside(path, mira_home)),
+    ]
+
     def mask_mira_home(only_inside: bool) -> list[str]:
         # Nothing before this may expose the Mira home (config.json, keys, the
         # gateway token); then the parts commands need are mounted again.
@@ -144,6 +153,8 @@ def bwrap_argv(spec: SandboxSpec, cwd: str | Path | None = None) -> list[str]:
         for path in read_only:
             if not only_inside or _inside(path, mira_home):
                 masked += ["--ro-bind", str(path), str(path)]
+        for flag, path in granted_inside:
+            masked += [flag, str(path), str(path)]
         return masked
 
     args += mask_mira_home(only_inside=False)

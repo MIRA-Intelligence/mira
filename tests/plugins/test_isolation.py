@@ -151,3 +151,25 @@ async def test_sandbox_enforces_network_and_filesystem_permissions(tmp_path, mon
     assert (await noperm.execute(what="read", path=str(ws / "data.txt"))).startswith("blocked")
     assert await reader.execute(what="read", path=str(ws / "data.txt")) == "workspace data"
     assert (await reader.execute(what="read", path=str(secret))).startswith("blocked")
+
+
+@pytest.mark.skipif(not BWRAP_OK, reason="needs bubblewrap (Linux)")
+async def test_sandbox_sees_plugins_and_workspace_under_the_mira_home(tmp_path):
+    # The real layout: ~/.mira/plugins/<id> and the default ~/.mira/workspace.
+    home = Path(os.environ["MIRA_HOME"])
+    ws = home / "workspace"
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "data.txt").write_text("workspace data")
+    (home / "config.json").write_text('{"providers": {"key": "sk-secret"}}')
+    _plugin(home / "plugins", "reader", {"permissions": {"filesystem": "workspace:read"}})
+    rt = PluginRuntime(
+        sources=[PluginSource(home / "plugins", "experimental")],
+        state=PluginState(tmp_path / "state.json"),
+        workspace=ws,
+        allow_unsandboxed=False,
+    )
+    rt.load()
+    assert rt.get("reader").status == "loaded", rt.get("reader").reason
+    reader = next(t for t in rt.tools() if t.plugin_id == "reader")
+    assert await reader.execute(what="read", path=str(ws / "data.txt")) == "workspace data"
+    assert (await reader.execute(what="read", path=str(home / "config.json"))).startswith("blocked")

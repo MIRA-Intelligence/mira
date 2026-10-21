@@ -66,6 +66,23 @@ class TestBwrapArgv:
         # The mask comes after every user/admin path.
         assert args.index(str(extra)) < mask
 
+    def test_granted_paths_inside_mira_home_survive_the_mask(self, workspace: Path) -> None:
+        mira_home = _mira_home()
+        plugin = mira_home / "plugins" / "probe"
+        user_ws = mira_home / "workspace"
+        plugin.mkdir(parents=True)
+        user_ws.mkdir(parents=True)
+        args = bwrap_argv(SandboxSpec.build(
+            workspace, read_only_paths=[str(plugin), str(mira_home)], read_write_paths=[str(user_ws)]))
+        mask = max(i for i, token in enumerate(args) if token == "--tmpfs" and args[i + 1] == str(mira_home))
+        ro_after = [i for i, t in enumerate(args) if t == "--ro-bind-try" and args[i + 1] == str(plugin)]
+        rw_after = [i for i, t in enumerate(args) if t == "--bind-try" and args[i + 1] == str(user_ws)]
+        assert ro_after and max(ro_after) > mask
+        assert rw_after and max(rw_after) > mask
+        # The home itself is never mounted again over its own mask.
+        assert all(args[i + 1] != str(mira_home) for i in range(mask + 1, len(args) - 1)
+                   if args[i] in ("--ro-bind-try", "--bind-try", "--ro-bind", "--bind"))
+
     def test_workspace_containing_mira_home_masks_again(self, tmp_path: Path, monkeypatch) -> None:
         home = tmp_path / "home"
         mira_home = home / ".mira"
@@ -147,6 +164,21 @@ class TestRealSandbox:
         assert result.returncode == 0, result.stderr
         assert result.stdout == "data"
         assert not (shared / "new").exists()
+
+    def test_grants_under_mira_home_are_visible_but_secrets_are_not(self, workspace: Path) -> None:
+        mira_home = _mira_home()
+        (mira_home / "config.json").write_text('{"secret": "sk-test"}')
+        plugin = mira_home / "plugins" / "probe"
+        plugin.mkdir(parents=True)
+        (plugin / "code.py").write_text("print('plugin')")
+        user_ws = mira_home / "workspace"
+        user_ws.mkdir(parents=True)
+        result = _run(SandboxSpec.build(workspace, read_only_paths=[str(plugin)], read_write_paths=[str(user_ws)]),
+                      f"cat {plugin}/code.py && echo ok > {user_ws}/out.txt && "
+                      f"! cat {mira_home}/config.json 2>/dev/null && echo done")
+        assert result.returncode == 0, result.stderr
+        assert "print('plugin')" in result.stdout and "sk-test" not in result.stdout
+        assert (user_ws / "out.txt").read_text() == "ok\n"
 
     def test_own_pid_namespace(self, workspace: Path) -> None:
         result = _run(SandboxSpec.build(workspace), "ls /proc | grep -c '^[0-9]'")
