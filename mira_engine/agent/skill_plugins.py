@@ -24,6 +24,9 @@ _GLOBAL_STATE_FILENAME = "plugin_state.json"
 _PROJECT_OVERRIDES_FILENAME = "plugin_overrides.json"
 _BUILTIN_PLUGIN_ID = "builtin-skills"
 _BUILTIN_PLUGIN_NAME = "Built-in Skills"
+# mira_engine/skills is the mira-skills submodule; only its builtin_skills/
+# ship with MIRA (its skills/ is the MIRA Hub catalogue, installed on demand).
+BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills" / "builtin_skills"
 _BUILTIN_MANIFEST_UNCACHED = object()
 _PLUGINS_CACHE_TTL_S = 5.0
 # Directories skipped when scanning built-in skills (keeps startup/interrupt responsive).
@@ -97,7 +100,7 @@ class SkillPluginManager:
         self.plugins_root = ensure_dir(self.global_skills_dir / "plugins")
         self.global_state_path = self.global_skills_dir / _GLOBAL_STATE_FILENAME
         self.project_overrides_path = self.project_skills_dir / _PROJECT_OVERRIDES_FILENAME
-        self.builtin_skills_dir = Path(__file__).parent.parent / "skills"
+        self.builtin_skills_dir = BUILTIN_SKILLS_DIR
         self._builtin_manifest_cache: dict[str, Any] | None | object = _BUILTIN_MANIFEST_UNCACHED
         # list_plugins() re-reads both state files and every installed plugin
         # manifest; it is called hundreds of times per agent turn. Memoise on
@@ -426,6 +429,7 @@ class SkillPluginManager:
         *,
         plugin_id_hint: str,
         plugin_name_hint: str,
+        manifest_defaults: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         manifest_file = source_dir / PLUGIN_MANIFEST_FILENAME
         if not manifest_file.is_file():
@@ -434,6 +438,10 @@ class SkillPluginManager:
                 plugin_id_hint=plugin_id_hint,
                 plugin_name_hint=plugin_name_hint,
             )
+            for key in ("name", "version", "description"):
+                value = (manifest_defaults or {}).get(key)
+                if isinstance(value, str) and value.strip():
+                    payload[key] = value.strip()
             self._write_json(manifest_file, payload)
         return self._load_manifest(source_dir)
 
@@ -658,11 +666,13 @@ class SkillPluginManager:
         source_path: str,
         plugin_id_hint: str,
         plugin_name_hint: str,
+        manifest_defaults: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         manifest = self._ensure_manifest_for_install(
             source_dir,
             plugin_id_hint=plugin_id_hint,
             plugin_name_hint=plugin_name_hint,
+            manifest_defaults=manifest_defaults,
         )
         plugin_id = manifest["id"]
         destination = self.plugins_root / plugin_id
@@ -693,7 +703,21 @@ class SkillPluginManager:
             plugin_name_hint=resolved.name.replace("-", " ").replace("_", " ").title(),
         )
 
-    def install_from_zip(self, archive_path: Path, archive_name_hint: str | None = None) -> dict[str, Any]:
+    def install_from_zip(
+        self,
+        archive_path: Path,
+        archive_name_hint: str | None = None,
+        *,
+        source_type: str = "zip",
+        source_path: str | None = None,
+        manifest_defaults: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Install a zipped skill package.
+
+        ``source_type``/``source_path`` record where it came from (default: the
+        zip itself); ``manifest_defaults`` (name/version/description) fill an
+        inferred manifest when the package has no plugin.json.
+        """
         resolved = archive_path.expanduser().resolve()
         if not resolved.is_file():
             raise SkillPluginError(f"Plugin zip file not found: {resolved}")
@@ -704,10 +728,11 @@ class SkillPluginManager:
             plugin_root = self._find_extracted_plugin_root(tmp_dir)
             return self._install_from_source_dir(
                 plugin_root,
-                source_type="zip",
-                source_path=str(resolved),
+                source_type=source_type,
+                source_path=source_path or str(resolved),
                 plugin_id_hint=hint_stem,
                 plugin_name_hint=hint_stem.replace("-", " ").replace("_", " ").title(),
+                manifest_defaults=manifest_defaults,
             )
 
     def uninstall(self, plugin_id: str) -> None:
