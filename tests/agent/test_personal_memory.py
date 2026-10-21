@@ -395,3 +395,54 @@ async def test_authoritative_user_settings_are_visible_but_not_editable(memory_h
     assert project_settings.read_text() == "Language: English"
     assert store.read_global_term() == ""
     assert not (store.global_workspace / "USER.md").exists()
+
+
+async def test_learned_user_preferences_feed_private_community_persona_drafts(memory_home):
+    persona = pytest.importorskip("mira_engine.community.persona")
+    from mira_engine.community import approvals
+    from mira_engine.community.privacy import PrivacyGuard
+
+    store = MemoryStore(memory_home / "project")
+    profile = "## Communication Style\n- Prefers concise answers\n- Alice's private codename\n\n## Topics of Interest\n- Astrophysics"
+    store.append_history("User likes concise answers and astrophysics")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="[USER] Preferences and interests"),
+        LLMResponse(content=None, tool_calls=[ToolCallRequest(
+            id="profile", name="edit_memory", arguments={
+                "scope": "user", "old_text": "", "new_text": profile,
+            },
+        )]),
+        LLMResponse(content="Updated"),
+    ])
+    assert await Dream(store, provider, "test-model").run()
+    workspace = store.global_workspace
+    approval_id = persona.propose_persona_update(workspace, None, PrivacyGuard(["Alice"]))
+    assert approval_id
+    draft = approvals.get_approval(approval_id)["payload"]["draft"]
+    assert "Astrophysics" in draft
+    assert "Prefers concise answers" in draft
+    assert "Alice" not in draft
+    assert not persona.persona_path(workspace).exists()  # Approval still required.
+
+
+async def test_community_cron_distinguishes_provider_failure_from_idle(memory_home, monkeypatch):
+    jobs = pytest.importorskip("mira_engine.cron.system_jobs")
+    logger = MagicMock()
+    monkeypatch.setattr(jobs, "logger", logger)
+    store = MemoryStore(memory_home / "project")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="Invalid token", finish_reason="error",
+    ))
+    dream = Dream(store, provider, "test-model")
+    job = SimpleNamespace(id=jobs.DREAM_JOB_ID)
+    assert await jobs.run_system_job(job, dream.run)
+    logger.info.assert_called_once_with("Dream run finished ({})", "nothing new")
+    logger.reset_mock()
+    store.append_history("Pending work")
+    with pytest.raises(DreamRunError):
+        await jobs.run_system_job(job, dream.run)
+    logger.exception.assert_called_once_with("Dream run failed")
+    logger.info.assert_not_called()
+    assert store.get_last_dream_cursor() == 0
