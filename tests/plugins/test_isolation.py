@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 
-from mira_engine.agent.tools.sandbox import sandbox_available
+from mira_engine.agent.tools.sandbox import sandbox_available, seatbelt_available
 from mira_engine.plugins import PluginRuntime, PluginSource
 from mira_engine.plugins.state import PluginState
 
@@ -45,6 +46,19 @@ class Probe(Tool):
                 return open(path).read()[:50]
             except OSError as e:
                 return "blocked: " + type(e).__name__
+        if what == "write":
+            try:
+                with open(path, "w") as f:
+                    f.write("x")
+                return "written"
+            except OSError as e:
+                return "blocked: " + type(e).__name__
+        if what == "run":
+            import subprocess
+            try:
+                return subprocess.run(["/bin/echo", "ran"], capture_output=True, text=True).stdout.strip()
+            except OSError as e:
+                return "blocked: " + type(e).__name__
         return "?"
 '''
 
@@ -75,7 +89,7 @@ def _rt(tmp_path: Path, *, unsandboxed: bool, workspace: Path | None = None) -> 
 def test_without_a_sandbox_experimental_plugins_need_an_explicit_opt_in(tmp_path, monkeypatch):
     from mira_engine.plugins import isolation
 
-    monkeypatch.setattr("mira_engine.agent.tools.sandbox.sandbox_available", lambda network=True: (False, "no bwrap"))
+    monkeypatch.setattr("mira_engine.agent.tools.sandbox.plugin_sandbox", lambda network=True: (None, "no bwrap"))
     _plugin(tmp_path / "plugins", "exp")
     p = _rt(tmp_path, unsandboxed=False).get("exp")
     assert p.status == "unsupported" and "unsandboxed_experimental" in p.reason
@@ -91,7 +105,7 @@ def test_out_of_process_plugins_cannot_provide_channels_or_hooks(tmp_path):
 
 @pytest.fixture
 def unsandboxed(tmp_path, monkeypatch):
-    monkeypatch.setattr("mira_engine.agent.tools.sandbox.sandbox_available", lambda network=True: (False, "test"))
+    monkeypatch.setattr("mira_engine.agent.tools.sandbox.plugin_sandbox", lambda network=True: (None, "test"))
     monkeypatch.setenv("MIRA_TEST_SECRET", "sk-should-not-leak")
     _plugin(tmp_path / "plugins", "exp")
     rt = _rt(tmp_path, unsandboxed=True)
@@ -126,7 +140,7 @@ async def test_a_hung_plugin_call_is_killed_and_the_host_replaced(unsandboxed):
 async def test_a_slow_host_start_does_not_count_against_the_call(tmp_path, monkeypatch):
     # Importing the engine and the plugin takes a while on a cold start; the
     # tool's own timeout only covers the call.
-    monkeypatch.setattr("mira_engine.agent.tools.sandbox.sandbox_available", lambda network=True: (False, "test"))
+    monkeypatch.setattr("mira_engine.agent.tools.sandbox.plugin_sandbox", lambda network=True: (None, "test"))
     d = _plugin(tmp_path / "plugins", "slowstart")
     (d / "probe.py").write_text("import time\ntime.sleep(1.0)\n" + (d / "probe.py").read_text())
     rt = _rt(tmp_path, unsandboxed=True)
@@ -188,3 +202,48 @@ async def test_sandbox_sees_plugins_and_workspace_under_the_mira_home(tmp_path):
     reader = next(t for t in rt.tools() if t.plugin_id == "reader")
     assert await reader.execute(what="read", path=str(ws / "data.txt")) == "workspace data"
     assert (await reader.execute(what="read", path=str(home / "config.json"))).startswith("blocked")
+
+
+SEATBELT_OK = sys.platform == "darwin" and seatbelt_available()[0]
+
+
+@pytest.mark.skipif(not SEATBELT_OK, reason="needs macOS sandbox-exec")
+async def test_seatbelt_enforces_network_files_and_shell(tmp_path, monkeypatch):
+    # The real layout: plugins in <mira home>/plugins; a home directory with a
+    # private file; a workspace outside the home.
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    (home_dir / "private.txt").write_text("private")
+    monkeypatch.setenv("HOME", str(home_dir))
+    mira_home = Path(os.environ["MIRA_HOME"])
+    mira_home.mkdir(parents=True, exist_ok=True)
+    (mira_home / "config.json").write_text('{"providers": {"key": "sk-secret"}}')
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "data.txt").write_text("workspace data")
+    _plugin(mira_home / "plugins", "noperm")
+    _plugin(mira_home / "plugins", "writer", {"permissions": {"filesystem": "workspace:write", "shell": True}})
+    rt = PluginRuntime(
+        sources=[PluginSource(mira_home / "plugins", "experimental")],
+        state=PluginState(tmp_path / "state.json"),
+        workspace=ws,
+        allow_unsandboxed=False,
+    )
+    rt.load()
+    for pid in ("noperm", "writer"):
+        assert rt.get(pid).status == "loaded" and rt.get(pid).reason == "out of process (seatbelt)", rt.get(pid).reason
+    noperm = next(t for t in rt.tools() if t.plugin_id == "noperm")
+    writer = next(t for t in rt.tools() if t.plugin_id == "writer")
+
+    assert (await noperm.execute(what="net")).startswith("blocked")
+    assert (await noperm.execute(what="read", path=str(ws / "data.txt"))).startswith("blocked")
+    assert (await noperm.execute(what="read", path=str(mira_home / "config.json"))).startswith("blocked")
+    assert (await noperm.execute(what="read", path=str(home_dir / "private.txt"))).startswith("blocked")
+    assert (await noperm.execute(what="write", path=str(tmp_path / "out.txt"))).startswith("blocked")
+    assert (await noperm.execute(what="run")).startswith(("blocked", "Error"))
+    assert not (tmp_path / "out.txt").exists()
+
+    assert await writer.execute(what="read", path=str(ws / "data.txt")) == "workspace data"
+    assert await writer.execute(what="write", path=str(ws / "new.txt")) == "written"
+    assert (await writer.execute(what="read", path=str(mira_home / "config.json"))).startswith("blocked")
+    assert await writer.execute(what="run") == "ran"

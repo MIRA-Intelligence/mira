@@ -119,6 +119,8 @@ def grant_for(
     *,
     workspace: Path | None = None,
     audit_bundled: bool = False,
+    data_dir: Path | None = None,
+    mira_home: Path | None = None,
 ) -> Grant | None:
     """The grant a plugin's in-process code runs under, or None when it isn't
     checked (core-bundled without ``MIRA_PLUGIN_AUDIT``)."""
@@ -127,13 +129,16 @@ def grant_for(
     from mira_engine.config.paths import get_data_dir, get_media_dir
 
     perms = manifest.permissions
-    data_root = get_data_dir()
-    plugin_data = data_root / "plugin-data" / manifest.id
+    # An out-of-process host is told these by the engine (its own environment
+    # doesn't know the engine's Mira home).
+    data_root = mira_home or get_data_dir()
+    media = (mira_home / "media") if mira_home else get_media_dir()
+    plugin_data = data_dir or data_root / "plugin-data" / manifest.id
     # Made here, by the engine: the plugin may write inside it, not create
     # its parents in the Mira home.
     plugin_data.mkdir(parents=True, exist_ok=True, mode=0o700)
-    writes = [str(plugin_data), str(get_media_dir()), str(Path(manifest.root) / "__pycache__")]
-    reads = [str(manifest.root), str(plugin_data), str(get_media_dir())]
+    writes = [str(plugin_data), str(media), str(Path(manifest.root) / "__pycache__")]
+    reads = [str(manifest.root), str(plugin_data), str(media)]
     if workspace is not None and perms.filesystem in ("workspace:read", "workspace:write"):
         reads.append(str(workspace))
         if perms.filesystem == "workspace:write":

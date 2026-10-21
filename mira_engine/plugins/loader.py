@@ -459,7 +459,7 @@ class PluginRuntime:
         result.tools = [GuardedTool(isolation.SubprocessTool(client, d), breaker) for d in definitions]
         result.isolated = True
         result.status = "loaded"
-        result.reason = "out of process" + ("" if sandbox else " (unsandboxed)")
+        result.reason = f"out of process ({sandbox or 'unsandboxed'})"
         return result
 
     # -- views ----------------------------------------------------------------

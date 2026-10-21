@@ -182,7 +182,7 @@ async def test_first_party_plugins_pause_instead_of_tripping_for_good(tmp_path, 
 
 @pytest.fixture
 def unsandboxed(monkeypatch):
-    monkeypatch.setattr("mira_engine.agent.tools.sandbox.sandbox_available", lambda network=True: (False, "test"))
+    monkeypatch.setattr("mira_engine.agent.tools.sandbox.plugin_sandbox", lambda network=True: (None, "test"))
 
 
 async def test_out_of_process_tools_get_their_context_from_the_engine(tmp_path, unsandboxed):
