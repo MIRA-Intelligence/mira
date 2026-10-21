@@ -257,7 +257,20 @@ class SubagentManager:
             tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         if _permitted("web_fetch"):
             tools.register(WebFetchTool(proxy=self.web_proxy))
+        self._register_plugin_tools(tools, run_workspace, _permitted)
         return tools
+
+    def _register_plugin_tools(self, tools: ToolRegistry, run_workspace: Path, permitted) -> None:
+        """Plugin tools the role and delegation policy allow; built-ins win name clashes."""
+        from mira_engine.plugins import get_runtime
+
+        for tool in get_runtime().build_tools(
+            workspace=run_workspace,
+            proxy=self.web_proxy,
+            host={"brave_api_key": self.brave_api_key},
+        ):
+            if permitted(tool.name) and not tools.has(tool.name):
+                tools.register(tool)
 
     async def spawn(
         self,

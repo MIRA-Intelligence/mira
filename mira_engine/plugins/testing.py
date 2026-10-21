@@ -178,10 +178,18 @@ def check_plugin(plugin_dir: str | Path, tier: Tier = "community") -> ContractRe
         state.set_enabled(manifest.id, True)
         runtime = PluginRuntime(sources=[], state=state)
         loaded = runtime._load_one(plugin_dir, tier, set())
+        built: list[Tool] = []
+        if loaded.status == "loaded":
+            # What an agent loop does: build the tools for its own workspace.
+            runtime.plugins = [loaded]
+            built = runtime.build_tools(workspace=Path(tmp))
     if loaded.status != "loaded":
         report.check("load", [f"{loaded.status}: {loaded.reason}"])
         return report
     report.check("load", [])
+    if loaded.tools:
+        missing = sorted({t.name for t in loaded.tools} - {t.name for t in built})
+        report.check("tools build for an agent loop", [f"could not build {name}" for name in missing])
     for name, cls in loaded.channels.items():
         report.check(f"channel {name}", check_channel(cls, name))
     for tool in loaded.tools:

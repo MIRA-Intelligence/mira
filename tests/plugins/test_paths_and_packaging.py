@@ -10,8 +10,7 @@ import sys
 import textwrap
 from pathlib import Path
 
-from mira_engine.plugins import PluginRuntime, PluginSource
-from mira_engine.plugins import paths
+from mira_engine.plugins import PluginRuntime, PluginSource, paths
 from mira_engine.plugins.state import PluginState
 
 REPO = Path(__file__).resolve().parents[2]

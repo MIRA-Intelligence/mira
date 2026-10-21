@@ -49,6 +49,27 @@ def host_env() -> dict[str, str]:
     return env
 
 
+def plugin_env(
+    manifest: PluginManifest,
+    *,
+    workspace: Path | None,
+    config: dict[str, Any],
+    tier: str | None,
+) -> dict[str, str]:
+    """The host's environment: :func:`host_env` plus what the plugin's context
+    is built from (see ``mira_engine.plugins.host``). Only the config values
+    the manifest declared in ``permissions.secrets`` are passed, and the
+    workspace only when ``permissions.filesystem`` grants it."""
+    env = host_env()
+    env["MIRA_PLUGIN_DATA_DIR"] = str(_scratch_dir(manifest.id))
+    env["MIRA_PLUGIN_TIER"] = tier or "experimental"
+    if workspace is not None and manifest.permissions.filesystem != "none":
+        env["MIRA_PLUGIN_WORKSPACE"] = str(workspace)
+    if config:
+        env["MIRA_PLUGIN_CONFIG"] = json.dumps(config, default=str)
+    return env
+
+
 def _scratch_dir(plugin_id: str) -> Path:
     from mira_engine.config.paths import get_data_dir
 
@@ -105,11 +126,19 @@ def plan(manifest: PluginManifest, *, workspace: Path | None, allow_unsandboxed:
     )
 
 
-def describe(manifest: PluginManifest, *, workspace: Path | None, sandbox: bool) -> list[dict[str, Any]]:
+def describe(
+    manifest: PluginManifest,
+    *,
+    workspace: Path | None,
+    sandbox: bool,
+    env: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Ask a one-shot host for the plugin's tool definitions."""
     argv = host_argv(manifest, workspace=workspace, sandbox=sandbox, describe=True)
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=DESCRIBE_TIMEOUT_S, env=host_env(), check=False)
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=DESCRIBE_TIMEOUT_S, env=env or host_env(), check=False
+        )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"plugin host did not describe its tools within {DESCRIBE_TIMEOUT_S}s") from e
     line = (proc.stdout or "").strip().splitlines()[-1:] or [""]
@@ -125,9 +154,10 @@ def describe(manifest: PluginManifest, *, workspace: Path | None, sandbox: bool)
 class PluginHostClient:
     """A long-lived host process, started lazily and restarted after a crash."""
 
-    def __init__(self, plugin_id: str, argv: list[str]):
+    def __init__(self, plugin_id: str, argv: list[str], env: dict[str, str] | None = None):
         self.plugin_id = plugin_id
         self.argv = argv
+        self.env = env
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task | None = None
         self._pending: dict[int, asyncio.Future] = {}
@@ -142,11 +172,36 @@ class PluginHostClient:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
-                    env=host_env(),
+                    env=self.env or host_env(),
                     limit=16 * 1024 * 1024,
                 )
                 self._reader = asyncio.create_task(self._read(self._proc), name=f"plugin-host-{self.plugin_id}")
+                # Wait until the host has imported the engine and the plugin,
+                # so a cold start doesn't eat into the first call's timeout.
+                try:
+                    await self._request(self._proc, "describe", None, DESCRIBE_TIMEOUT_S)
+                except BaseException:
+                    await self.close()
+                    raise
             return self._proc
+
+    async def _request(
+        self, proc: asyncio.subprocess.Process, method: str, params: dict[str, Any] | None, timeout: float
+    ) -> Any:
+        self._next_id += 1
+        rid = self._next_id
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[rid] = fut
+        msg: dict[str, Any] = {"id": rid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        assert proc.stdin is not None
+        proc.stdin.write((json.dumps(msg) + "\n").encode())
+        await proc.stdin.drain()
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self._pending.pop(rid, None)
 
     async def _read(self, proc: asyncio.subprocess.Process) -> None:
         assert proc.stdout is not None
@@ -169,18 +224,10 @@ class PluginHostClient:
 
     async def call(self, tool: str, args: dict[str, Any], timeout: float) -> Any:
         proc = await self._ensure()
-        self._next_id += 1
-        rid = self._next_id
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[rid] = fut
-        assert proc.stdin is not None
-        proc.stdin.write((json.dumps({"id": rid, "method": "call", "params": {"tool": tool, "args": args}}) + "\n").encode())
-        await proc.stdin.drain()
         try:
-            return await asyncio.wait_for(fut, timeout)
+            return await self._request(proc, "call", {"tool": tool, "args": args}, timeout)
         except asyncio.TimeoutError:
             # A hung plugin call: kill the host; the next call starts a fresh one.
-            self._pending.pop(rid, None)
             await self.close()
             raise
 

@@ -3,9 +3,11 @@
 Every plugin tool and hook runs behind a :class:`CircuitBreaker`: calls are
 bounded by a timeout, failures and timeouts are counted per plugin, and after
 ``threshold`` consecutive failures the plugin is *tripped* — persisted, so it
-stays off across restarts until the user re-enables it. A tripped plugin's
-tools answer with an error the model can read; its hooks become no-ops. The
-engine itself never sees a plugin exception.
+stays off across restarts until the user re-enables it. First-party
+(core-bundled) plugins are only *paused* in memory for ``cooldown_s``: a web
+search that keeps timing out shouldn't disable web search for good. A tripped
+plugin's tools answer with an error the model can read; its hooks become
+no-ops. The engine itself never sees a plugin exception.
 
 All log lines carry the plugin id, so a misbehaving plugin is attributable.
 """
@@ -13,6 +15,7 @@ All log lines carry the plugin id, so a misbehaving plugin is attributable.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Awaitable, TypeVar
 
 from loguru import logger
@@ -26,6 +29,7 @@ T = TypeVar("T")
 DEFAULT_TOOL_TIMEOUT_S = 60.0
 DEFAULT_HOOK_TIMEOUT_S = 2.0
 DEFAULT_TRIP_THRESHOLD = 3
+DEFAULT_PAUSE_S = 300.0
 
 
 class PluginTripped(Exception):
@@ -39,18 +43,29 @@ class CircuitBreaker:
         state: PluginState,
         threshold: int = DEFAULT_TRIP_THRESHOLD,
         version: str | None = None,
+        *,
+        persist: bool = True,
+        cooldown_s: float = DEFAULT_PAUSE_S,
     ):
         self.plugin_id = plugin_id
         self.version = version
         self.state = state
         self.threshold = threshold
         self.consecutive_failures = 0
+        self.persist = persist
+        self.cooldown_s = cooldown_s
+        self._paused_until = 0.0
+
+    @property
+    def paused(self) -> bool:
+        return self._paused_until > time.monotonic()
 
     @property
     def tripped(self) -> bool:
         """Off because it kept failing, or because the platform disabled it."""
         return (
-            self.state.tripped(self.plugin_id) is not None
+            self.paused
+            or self.state.tripped(self.plugin_id) is not None
             or self.state.remote_reason(self.plugin_id, self.version) is not None
         )
 
@@ -69,6 +84,11 @@ class CircuitBreaker:
         )
         if self.consecutive_failures >= self.threshold and not self.tripped:
             reason = f"{self.consecutive_failures} consecutive failures, last in {what}: {error}"
+            if not self.persist:
+                self._paused_until = time.monotonic() + self.cooldown_s
+                self.consecutive_failures = 0
+                logger.error("plugin {} paused for {:.0f}s (circuit tripped): {}", self.plugin_id, self.cooldown_s, reason)
+                return
             self.state.trip(self.plugin_id, reason)
             logger.error("plugin {} disabled (circuit tripped): {}", self.plugin_id, reason)
 
@@ -128,6 +148,8 @@ class GuardedTool(Tool):
         try:
             return await self._breaker.call(f"tool {self.name}", self._inner.execute(**kwargs), self._timeout_s)
         except PluginTripped:
+            if self._breaker.paused:
+                return f"Error: tool '{self.name}' is paused after repeated failures; try again in a few minutes."
             return f"Error: tool '{self.name}' is unavailable — plugin '{self.plugin_id}' was disabled after repeated failures."
         except asyncio.TimeoutError:
             return f"Error: tool '{self.name}' (plugin '{self.plugin_id}') timed out after {self._timeout_s}s."
