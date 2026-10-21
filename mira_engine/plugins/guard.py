@@ -22,6 +22,7 @@ from loguru import logger
 
 from mira_engine.agent.hook import AgentHook, AgentHookContext
 from mira_engine.agent.tools.base import Tool
+from mira_engine.plugins.permissions import Grant, granted
 from mira_engine.plugins.state import PluginState
 
 T = TypeVar("T")
@@ -115,10 +116,17 @@ class CircuitBreaker:
 class GuardedTool(Tool):
     """A plugin tool behind its plugin's breaker and a call timeout."""
 
-    def __init__(self, inner: Tool, breaker: CircuitBreaker, timeout_s: float = DEFAULT_TOOL_TIMEOUT_S):
+    def __init__(
+        self,
+        inner: Tool,
+        breaker: CircuitBreaker,
+        timeout_s: float = DEFAULT_TOOL_TIMEOUT_S,
+        grant: Grant | None = None,
+    ):
         self._inner = inner
         self._breaker = breaker
         self._timeout_s = timeout_s
+        self._grant = grant
 
     @property
     def plugin_id(self) -> str:
@@ -146,7 +154,10 @@ class GuardedTool(Tool):
 
     async def execute(self, **kwargs: Any) -> Any:
         try:
-            return await self._breaker.call(f"tool {self.name}", self._inner.execute(**kwargs), self._timeout_s)
+            # The grant is set before the call's task starts, so it (and any
+            # task the tool spawns) runs as this plugin (plugins.permissions).
+            with granted(self._grant):
+                return await self._breaker.call(f"tool {self.name}", self._inner.execute(**kwargs), self._timeout_s)
         except PluginTripped:
             if self._breaker.paused:
                 return f"Error: tool '{self.name}' is paused after repeated failures; try again in a few minutes."
@@ -168,10 +179,12 @@ class GuardedHook(AgentHook):
         breaker: CircuitBreaker,
         mode: str = "observe",
         timeout_s: float = DEFAULT_HOOK_TIMEOUT_S,
+        grant: Grant | None = None,
     ):
         super().__init__(reraise=False)
         self._inner = inner
         self._breaker = breaker
+        self._grant = grant
         self.mode = "mutate" if mode == "mutate" else "observe"
         # The breaker enforces the timeout; CompositeHook must not double-wrap.
         self.timeout_s = None
@@ -185,7 +198,8 @@ class GuardedHook(AgentHook):
 
     async def _call(self, method: str, *args: Any, **kwargs: Any) -> None:
         try:
-            await self._breaker.call(f"hook {method}", getattr(self._inner, method)(*args, **kwargs), self._timeout)
+            with granted(self._grant):
+                await self._breaker.call(f"hook {method}", getattr(self._inner, method)(*args, **kwargs), self._timeout)
         except (PluginTripped, asyncio.TimeoutError):
             pass
         except Exception:  # noqa: BLE001 - counted by the breaker, never raised
@@ -210,7 +224,8 @@ class GuardedHook(AgentHook):
         if self.mode != "mutate" or self._breaker.tripped:
             return content
         try:
-            result = self._inner.finalize_content(context, content)
+            with granted(self._grant):
+                result = self._inner.finalize_content(context, content)
         except Exception as e:  # noqa: BLE001
             self._breaker.failure("hook finalize_content", e)
             return content
