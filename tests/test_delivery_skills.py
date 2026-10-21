@@ -11,7 +11,7 @@ import pytest
 
 from mira_engine.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 
-DOCS = BUILTIN_SKILLS_DIR / "builtin_skills" / "documents"
+DOCS = BUILTIN_SKILLS_DIR / "documents"
 SLIDES = DOCS / "mira-slides"
 NOTEBOOK = DOCS / "jupyter-notebook-export"
 
