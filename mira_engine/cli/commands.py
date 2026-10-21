@@ -46,7 +46,6 @@ from mira_engine.cli.workflow import workflow_app
 from mira_engine.config.paths import get_workspace_path
 from mira_engine.config.schema import Config
 from mira_engine.providers.factory import make_provider, make_role_provider
-from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
 from mira_engine.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
@@ -118,9 +117,7 @@ def _probe_urls_parallel(urls: list[str | None]) -> dict[str, str]:
 
 
 _PROVIDER_DEFAULT_ENDPOINTS: dict[str, str] = {
-    # OAuth providers: probe public auth/start domains.
-    "github_copilot": "https://github.com",
-    "openai_codex": "https://chatgpt.com",
+    # (Providers from plugins declare theirs in plugin.json: `endpoint`.)
     # SDK/default endpoints for providers that don't expose default_api_base in registry.
     "openai": "https://api.openai.com/v1",
     "anthropic": "https://api.anthropic.com",
@@ -154,8 +151,7 @@ _PROVIDER_MODEL_EXAMPLES: dict[str, tuple[str, ...]] = {
     "ollama": ("llama3.2", "qwen2.5"),
     "vllm": ("meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-7B-Instruct"),
     "ovms": ("meta-llama/Llama-3.1-8B-Instruct",),
-    "github_copilot": ("gpt-4o", "gpt-5"),
-    "openai_codex": ("gpt-5-codex", "gpt-5.1-codex"),
+    # (Providers from plugins declare theirs in plugin.json: `model_examples`.)
 }
 
 
@@ -169,7 +165,12 @@ def _provider_probe_url(spec, provider_cfg: object | None) -> str | None:
         return None
     if spec.default_api_base:
         return spec.default_api_base
-    return _PROVIDER_DEFAULT_ENDPOINTS.get(spec.name)
+    if spec.name in _PROVIDER_DEFAULT_ENDPOINTS:
+        return _PROVIDER_DEFAULT_ENDPOINTS[spec.name]
+    from mira_engine.providers.registry import plugin_provider
+
+    plugin = plugin_provider(spec.name)
+    return plugin.endpoint if plugin else None
 
 
 def _validate_model_input(model: str) -> str | None:
@@ -183,7 +184,12 @@ def _validate_model_input(model: str) -> str | None:
 
 
 def _provider_model_examples(provider_name: str) -> tuple[str, ...]:
-    return _PROVIDER_MODEL_EXAMPLES.get(provider_name, ("<provider-model-name>",))
+    if provider_name in _PROVIDER_MODEL_EXAMPLES:
+        return _PROVIDER_MODEL_EXAMPLES[provider_name]
+    from mira_engine.providers.registry import plugin_provider
+
+    plugin = plugin_provider(provider_name)
+    return (plugin.model_examples if plugin else ()) or ("<provider-model-name>",)
 
 
 def _prepare_model_default_for_provider(model: str, spec) -> str:
@@ -846,7 +852,7 @@ def onboard(
     from mira_engine.cli.onboard import run_onboard
     from mira_engine.config.loader import get_config_path, load_config, save_config, set_config_path
     from mira_engine.config.schema import Config
-    from mira_engine.providers.registry import PROVIDERS, find_by_name
+    from mira_engine.providers.registry import all_providers, find_by_name
 
     config_path = Path(config).expanduser().resolve() if config else get_config_path()
     if config:
@@ -924,11 +930,11 @@ def onboard(
 
     # Quick provider setup for non-wizard onboarding in interactive terminals.
     if not wizard and sys.stdin.isatty() and sys.stdout.isatty():
-        specs = list(PROVIDERS)
+        specs = list(all_providers())
         if specs and typer.confirm("Configure a model provider now?", default=True):
             provider_rows: list[tuple[object, object | None, bool, str | None]] = []
             for spec in specs:
-                provider_cfg = getattr(cfg.providers, spec.name, None)
+                provider_cfg = cfg.providers.entry(spec.name)
                 configured = bool(
                     provider_cfg and (
                         provider_cfg.api_base if spec.is_local else (provider_cfg.api_key or spec.is_oauth)
@@ -970,7 +976,7 @@ def onboard(
                     save_config(cfg, config_path)
                     _run_oauth_login(selected.name)
                 else:
-                    selected_cfg = getattr(cfg.providers, selected.name, None)
+                    selected_cfg = cfg.providers.entry(selected.name, create=True)
                     if selected_cfg is not None:
                         # Custom provider requires explicit api_base configuration
                         if selected.name == "custom":
@@ -3847,26 +3853,18 @@ def community_logout(
 
 
 def _oauth_login_status(provider_name: str) -> tuple[bool, str | None]:
-    """Return local OAuth login state without doing any network calls."""
+    """Return local OAuth login state without doing any network calls
+    (the ``login_status`` hook of the plugin that provides the provider)."""
+    from mira_engine.plugins import get_runtime
+
     try:
-        if provider_name == "openai_codex":
-            ensure_oauth_state_dirs_for_runtime()
-            from oauth_cli_kit import get_token
-
-            token = get_token()
-        elif provider_name == "github_copilot":
-            from mira_engine.providers.github_copilot_provider import get_github_copilot_login_status
-
-            token = get_github_copilot_login_status()
-        else:
+        hook = get_runtime().provider_hook(provider_name, "login_status")
+        if hook is None:
             return False, None
+        logged_in, account_id = hook()
     except Exception:
         return False, None
-
-    if not (token and getattr(token, "access", None)):
-        return False, None
-    account_id = getattr(token, "account_id", None)
-    return True, str(account_id) if account_id else None
+    return (True, str(account_id) if account_id else None) if logged_in else (False, None)
 
 
 @app.command()
@@ -3884,8 +3882,8 @@ def status():
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
     if config_path.exists():
-        from mira_engine.providers.registry import PROVIDERS
         from mira_engine.providers.model_fetch import is_cache_stale, read_model_cache
+        from mira_engine.providers.registry import all_providers
 
         console.print(f"Model: {_format_model_selection(config.agents.defaults.model)}")
         active_provider = (
@@ -3897,8 +3895,8 @@ def status():
                 console.print(f"Team {_role}: {_format_model_selection(_role_model)}")
 
         # Check API keys from registry
-        for spec in PROVIDERS:
-            p = getattr(config.providers, spec.name, None)
+        for spec in all_providers():
+            p = config.providers.entry(spec.name)
             if p is None:
                 continue
             if spec.is_oauth:
@@ -3938,61 +3936,28 @@ def status():
 # ============================================================================
 
 
-def _login_openai_codex() -> None:
-    ensure_oauth_state_dirs_for_runtime()
-    try:
-        from oauth_cli_kit import get_token, login_oauth_interactive
-        token = None
-        try:
-            token = get_token()
-        except Exception:
-            pass
-        if not (token and token.access):
-            console.print("[cyan]Starting interactive OAuth login...[/cyan]\n")
-            token = login_oauth_interactive(
-                print_fn=lambda s: console.print(s),
-                prompt_fn=lambda s: typer.prompt(s),
-            )
-        if not (token and token.access):
-            console.print("[red]✗ Authentication failed[/red]")
-            raise typer.Exit(1)
-        console.print(f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]")
-    except ImportError:
-        console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
-        raise typer.Exit(1)
-
-
-def _login_github_copilot() -> None:
-    ensure_oauth_state_dirs_for_runtime()
-    console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
-    try:
-        from mira_engine.providers.github_copilot_provider import login_github_copilot
-
-        login_github_copilot(print_fn=lambda s: console.print(s))
-        console.print("[green]✓ Authenticated with GitHub Copilot[/green]")
-    except Exception as e:
-        console.print(f"[red]Authentication error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-_LOGIN_HANDLERS: dict[str, callable] = {
-    "openai_codex": _login_openai_codex,
-    "github_copilot": _login_github_copilot,
-}
-
-
 def _run_oauth_login(provider_name: str) -> None:
+    """Interactive login: the ``login`` hook of the plugin that provides the
+    provider (``login(print_fn, prompt_fn)``, raising on failure)."""
+    from mira_engine.plugins import get_runtime
     from mira_engine.providers.registry import find_by_name
 
     spec = find_by_name(provider_name)
     if not spec or not spec.is_oauth:
         raise typer.Exit(1)
-    handler = _LOGIN_HANDLERS.get(spec.name)
+    handler = get_runtime().provider_hook(spec.name, "login")
     if not handler:
         console.print(f"[red]OAuth login not implemented for {spec.label}[/red]")
         raise typer.Exit(1)
     console.print(f"\n{__logo__} OAuth Login - {spec.label}\n")
-    handler()
+    try:
+        handler(print_fn=lambda s: console.print(s), prompt_fn=lambda s: typer.prompt(s))
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red]Authentication error: {e}[/red]")
+        raise typer.Exit(1) from e
+    console.print(f"[green]✓ Authenticated with {spec.label}[/green]")
 
 
 if __name__ == "__main__":

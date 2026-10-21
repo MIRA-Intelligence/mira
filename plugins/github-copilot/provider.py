@@ -352,3 +352,61 @@ class GitHubCopilotProvider(OpenAICompatProvider):
             tool_choice=tool_choice,
             on_content_delta=on_content_delta,
         )
+
+
+# -- plugin hooks (plugin.json: provides.providers) ---------------------------
+
+
+def create(*, spec, model, api_key, api_base, extra_headers, proxy):
+    return GitHubCopilotProvider(default_model=model or "github-copilot/gpt-4.1", api_base=api_base, proxy=proxy)
+
+
+def login(print_fn, prompt_fn) -> None:
+    ensure_oauth_state_dirs_for_runtime()
+    print_fn("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
+    login_github_copilot(print_fn=print_fn)
+
+
+def login_status() -> tuple[bool, str | None]:
+    """Local OAuth state only — no network."""
+    token = get_github_copilot_login_status()
+    if not (token and getattr(token, "access", None)):
+        return False, None
+    return True, getattr(token, "account_id", None)
+
+
+def _is_supported_chat_model(payload: dict[str, Any]) -> bool:
+    capabilities = payload.get("capabilities")
+    if isinstance(capabilities, dict) and capabilities.get("type") != "chat":
+        return False
+    if payload.get("model_picker_enabled") is False:
+        return False
+    policy = payload.get("policy")
+    if isinstance(policy, dict) and policy.get("state") == "disabled":
+        return False
+    endpoints = payload.get("supported_endpoints")
+    if isinstance(endpoints, list):
+        return "/chat/completions" in endpoints
+    return True
+
+
+async def fetch_models(*, model, api_base, proxy):
+    """The chat models this Copilot account can use (``mira models refresh``)."""
+    from mira_engine.providers import model_fetch
+
+    provider = GitHubCopilotProvider(default_model=model or "github_copilot/gpt-4.1", api_base=api_base, proxy=proxy)
+    token = await provider._get_copilot_access_token()
+    base = provider.api_base.rstrip("/")
+    payload = await model_fetch._get_json(
+        f"{base}/models",
+        headers={**provider.extra_headers, "Authorization": f"Bearer {token}", "Accept": "application/json"},
+        proxy=provider.proxy,
+    )
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        payload = {**payload, "data": [m for m in payload["data"] if not isinstance(m, dict) or _is_supported_chat_model(m)]}
+    return model_fetch._new_cache(
+        provider="github_copilot",
+        models=model_fetch._parse_openai_compatible_models(payload, "github_copilot"),
+        api_base=provider.api_base,
+        account_id=getattr(get_github_copilot_login_status(), "account_id", None),
+    )

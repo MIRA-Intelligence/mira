@@ -79,6 +79,39 @@ carries that loop's values (`mira_engine.plugins.context.PluginContext`):
 A tool that can't be built for a loop (its factory raises) is left out of that
 loop and logged; the plugin's other tools still load.
 
+## LLM providers
+
+A plugin can add an LLM provider. `provides.providers` holds the provider's
+registry metadata as data (`spec`: the fields of
+`mira_engine.providers.registry.ProviderSpec`) and the plugin's hooks:
+
+```json
+"providers": [{
+  "spec": { "name": "my_llm", "keywords": ["my-llm"], "display_name": "My LLM" },
+  "entry": "llm:create",
+  "login": "llm:login",
+  "login_status": "llm:login_status",
+  "models": "llm:fetch_models",
+  "endpoint": "https://api.my-llm.example",
+  "model_examples": ["my-llm-large"]
+}]
+```
+
+| Hook | Signature | Used by |
+|---|---|---|
+| `entry` (required) | `create(*, spec, model, api_key, api_base, extra_headers, proxy) -> LLMProvider` | every agent turn |
+| `login` | `login(print_fn, prompt_fn)`, raising on failure | `mira onboard` (OAuth providers) |
+| `login_status` | `login_status() -> (logged_in, account_id)`, no network | `mira status` |
+| `models` | `async fetch_models(*, model, api_base, proxy) -> ModelCache` | the model list in the desktop app, `mira models refresh` |
+
+The provider is configured like any other, under `providers.<name>` in
+config.json (`providers.myLlm.apiKey`). It's listed in the desktop app and
+matched by model prefix or keyword after the core providers, whose names a
+plugin can't take. Because a provider sees every prompt and holds the user's
+keys, only first-party plugins and plugins the registry rated **verified**
+can contribute one. OpenAI Codex and GitHub Copilot are first-party provider
+plugins (`plugins/openai-codex`, `plugins/github-copilot`).
+
 ## Skills and skill packs
 
 A plugin's `provides.skills` (`[{"id": "howto", "path": "skills/howto"}]`, each

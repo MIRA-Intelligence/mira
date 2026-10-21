@@ -58,6 +58,34 @@ class EntryPoint:
 
 
 @dataclass(frozen=True)
+class ProviderEntry:
+    """An LLM provider a plugin contributes (design §3.2): its registry metadata
+    (``spec``, the fields of ``mira_engine.providers.registry.ProviderSpec``) and
+    the plugin's hooks, each ``module:attr``:
+
+    * ``entry`` — ``create(*, spec, model, api_key, api_base, extra_headers, proxy)``
+      returns the ``LLMProvider`` (required);
+    * ``login`` — ``login(print_fn, prompt_fn)``, interactive (OAuth) login;
+    * ``login_status`` — ``login_status() -> (logged_in, account_id)``, no network;
+    * ``models`` — ``async fetch_models(*, model, api_base, proxy) -> ModelCache``.
+
+    ``endpoint`` (probed by ``mira status``) and ``model_examples`` (shown by
+    onboarding) are plain data."""
+
+    spec: dict[str, Any]
+    entry: str
+    login: str | None = None
+    login_status: str | None = None
+    models: str | None = None
+    endpoint: str | None = None
+    model_examples: tuple[str, ...] = ()
+
+    @property
+    def name(self) -> str:
+        return str(self.spec["name"])
+
+
+@dataclass(frozen=True)
 class Permissions:
     network: tuple[str, ...] = ()
     filesystem: Literal["none", "workspace:read", "workspace:write"] = "none"
@@ -78,6 +106,7 @@ class PluginManifest:
     channels: tuple[EntryPoint, ...] = ()
     tools: tuple[EntryPoint, ...] = ()
     hooks: tuple[EntryPoint, ...] = ()
+    providers: tuple[ProviderEntry, ...] = ()
     skills: tuple[dict[str, Any], ...] = ()
     groups: tuple[dict[str, Any], ...] = ()  # skill groups (skill-pack format)
     permissions: Permissions = field(default_factory=Permissions)
@@ -89,7 +118,7 @@ class PluginManifest:
 
     @property
     def has_code(self) -> bool:
-        return bool(self.channels or self.tools or self.hooks)
+        return bool(self.channels or self.tools or self.hooks or self.providers)
 
 
 def _entries(raw: Any, kind: str, *, named: bool) -> tuple[EntryPoint, ...]:
@@ -108,6 +137,41 @@ def _entries(raw: Any, kind: str, *, named: bool) -> tuple[EntryPoint, ...]:
         if mode not in ("observe", "mutate"):
             raise ManifestError(f"provides.{kind}: mode must be observe or mutate")
         out.append(EntryPoint(entry=item["entry"], name=name, mode=mode))
+    return tuple(out)
+
+
+_PROVIDER_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_HOOKS = ("entry", "login", "login_status", "models")
+
+
+def _providers(raw: Any) -> tuple[ProviderEntry, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ManifestError("provides.providers must be a list")
+    out: list[ProviderEntry] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ManifestError("provides.providers: each item must be an object")
+        spec = item.get("spec")
+        if not isinstance(spec, dict) or not _PROVIDER_NAME.match(str(spec.get("name", ""))):
+            raise ManifestError("provides.providers: each needs a spec with a snake_case name")
+        for hook in _HOOKS:
+            value = item.get(hook)
+            if (hook == "entry" or value is not None) and not _ENTRY.match(str(value or "")):
+                raise ManifestError(f"provides.providers: {hook} must be of the form 'module:attr'")
+        examples = item.get("model_examples") or []
+        if not isinstance(examples, list):
+            raise ManifestError("provides.providers: model_examples must be a list")
+        out.append(ProviderEntry(
+            spec=dict(spec),
+            entry=item["entry"],
+            login=item.get("login"),
+            login_status=item.get("login_status"),
+            models=item.get("models"),
+            endpoint=item.get("endpoint"),
+            model_examples=tuple(str(m) for m in examples),
+        ))
     return tuple(out)
 
 
@@ -161,6 +225,7 @@ def parse_manifest(data: dict[str, Any], root: Path) -> PluginManifest:
         channels=_entries(provides.get("channels"), "channels", named=True),
         tools=_entries(provides.get("tools"), "tools", named=True),
         hooks=_entries(provides.get("hooks"), "hooks", named=False),
+        providers=_providers(provides.get("providers")),
         skills=tuple(s for s in skills if isinstance(s, dict)),
         groups=tuple(g for g in groups if isinstance(g, dict)),
         permissions=Permissions(

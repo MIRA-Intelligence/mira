@@ -479,3 +479,35 @@ def _redact_proxy_url(proxy: str) -> str:
     scheme, rest = proxy.split("://", 1) if "://" in proxy else ("", proxy)
     host = rest.rsplit("@", 1)[1]
     return f"{scheme}://***@{host}" if scheme else f"***@{host}"
+
+
+# -- plugin hooks (plugin.json: provides.providers) ---------------------------
+
+
+def create(*, spec, model, api_key, api_base, extra_headers, proxy):
+    return OpenAICodexProvider(default_model=model or "openai-codex/gpt-5.1-codex", proxy=proxy)
+
+
+def login(print_fn, prompt_fn) -> None:
+    ensure_oauth_state_dirs_for_runtime()
+    from oauth_cli_kit import login_oauth_interactive
+
+    token = None
+    try:
+        token = get_codex_token()
+    except Exception:
+        pass
+    if not (token and token.access):
+        print_fn("[cyan]Starting interactive OAuth login...[/cyan]\n")
+        token = login_oauth_interactive(print_fn=print_fn, prompt_fn=prompt_fn)
+    if not (token and token.access):
+        raise RuntimeError("authentication failed")
+
+
+def login_status() -> tuple[bool, str | None]:
+    """Local OAuth state only — no network."""
+    ensure_oauth_state_dirs_for_runtime()
+    token = get_codex_token()
+    if not (token and getattr(token, "access", None)):
+        return False, None
+    return True, getattr(token, "account_id", None)

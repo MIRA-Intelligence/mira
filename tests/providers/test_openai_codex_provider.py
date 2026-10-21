@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-import mira_engine.providers.openai_codex_provider as codex_provider
-from mira_engine.providers.openai_codex_provider import (
+import mira_plugins.openai_codex.provider as codex_provider
+from mira_plugins.openai_codex.provider import (
     OpenAICodexProvider,
     _consume_sse,
     _error_kind,

@@ -470,7 +470,17 @@ class ModelParamRule(Base):
 
 
 class ProvidersConfig(Base):
-    """Configuration for LLM providers."""
+    """Configuration for LLM providers.
+
+    Providers contributed by plugins (``provides.providers``) have no field
+    here: their sections are kept as extra fields (``providers.<name>``, as
+    ProviderConfig). Use :meth:`entry` to read any provider's config.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    # Empty configs handed out for plugin providers without a section, kept
+    # so the same object comes back (not saved until stored with create=True).
+    _plugin_defaults: dict[str, "ProviderConfig"] = PrivateAttr(default_factory=dict)
 
     proxy: str | None = None  # Global proxy for LLM provider HTTP calls.
     # User-editable per-model parameter rules (see ModelParamRule). Empty by
@@ -509,18 +519,53 @@ class ProvidersConfig(Base):
     volcengine_agent_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Agent Plan
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
-    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
-    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
 
-    def entry(self, name: str) -> ProviderConfig | None:
-        """Return the config for a provider id, including additional custom providers."""
+    @model_validator(mode="after")
+    def _plugin_provider_sections(self) -> "ProvidersConfig":
+        # Extra keys are plugin providers' sections: give them the same shape
+        # as a field (camelCase keys accepted, serialised with the rest).
+        for key, value in list((self.model_extra or {}).items()):
+            if isinstance(value, dict):
+                self.model_extra[key] = ProviderConfig.model_validate(value)
+        return self
+
+    def entry(self, name: str, *, create: bool = False) -> ProviderConfig | None:
+        """Return the config for a provider id: a field, an additional custom
+        provider, or a plugin provider's section. A plugin provider without a
+        section gets an empty one (like a field's default); ``create`` stores
+        it, so changes to it are saved."""
         if name in self.custom_providers:
             return self.custom_providers[name]
         if name in {"proxy", "model_params", "custom_providers"}:
             return None
-        value = getattr(self, name, None)
-        return value if isinstance(value, ProviderConfig) else None
+        key = re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
+        if key in type(self).model_fields:
+            value = getattr(self, key, None)
+            return value if isinstance(value, ProviderConfig) else None
+        extras = self.model_extra if self.model_extra is not None else {}
+        for extra_key, value in extras.items():
+            if re.sub(r"(?<!^)(?=[A-Z])", "_", extra_key).replace("-", "_").lower() == key:
+                return value if isinstance(value, ProviderConfig) else None
+        from mira_engine.providers.registry import find_by_name
+
+        spec = find_by_name(key)
+        if spec is None or not spec.plugin_id:
+            return None
+        config = self._plugin_defaults.setdefault(key, ProviderConfig())
+        if create and self.model_extra is not None:
+            # Saved like the fields: camelCase in config.json.
+            self.model_extra[to_camel(key)] = self._plugin_defaults.pop(key)
+        return config
+
+    def provider_names(self) -> list[str]:
+        """Every provider that can be configured: the fields, then the
+        providers plugins contribute (custom providers not included)."""
+        from mira_engine.providers.registry import all_providers
+
+        names = [n for n in type(self).model_fields if n not in {"proxy", "model_params", "custom_providers"}]
+        names.extend(s.name for s in all_providers() if s.plugin_id and s.name not in names)
+        return names
 
 
 class HeartbeatConfig(Base):
@@ -809,7 +854,7 @@ class Config(BaseSettings):
         setting. Pass ``"auto"`` to explicitly force auto-detection even when a
         global provider is configured; pass ``None`` to inherit the global.
         """
-        from mira_engine.providers.registry import PROVIDERS, find_by_name
+        from mira_engine.providers.registry import all_providers, find_by_name
 
         def _normalized_provider_name(value: str | None) -> str | None:
             if not value:
@@ -832,7 +877,7 @@ class Config(BaseSettings):
             forced_normalized = _normalized_provider_name(forced)
             spec = find_by_name(forced_normalized or forced)
             if spec:
-                p = getattr(self.providers, spec.name, None)
+                p = self.providers.entry(spec.name)
                 return (p, spec.name) if p else (None, None)
             return None, None
 
@@ -845,16 +890,18 @@ class Config(BaseSettings):
             kw = kw.lower()
             return kw in model_lower or kw.replace("-", "_") in model_normalized
 
+        providers = all_providers()
+
         # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
-        for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
+        for spec in providers:
+            p = self.providers.entry(spec.name)
             if p and model_prefix and normalized_prefix == spec.name:
                 if spec.is_oauth or spec.is_local or p.api_key:
                     return p, spec.name
 
-        # Match by keyword (order follows PROVIDERS registry)
-        for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
+        # Match by keyword (order follows the provider registry)
+        for spec in providers:
+            p = self.providers.entry(spec.name)
             if p and any(_kw_matches(kw) for kw in spec.keywords):
                 if spec.is_oauth or spec.is_local or p.api_key:
                     return p, spec.name
@@ -864,10 +911,10 @@ class Config(BaseSettings):
         # Prefer providers whose detect_by_base_keyword matches the configured api_base
         # (e.g. Ollama's "11434" in "http://localhost:11434") over plain registry order.
         local_fallback: tuple[ProviderConfig, str] | None = None
-        for spec in PROVIDERS:
+        for spec in providers:
             if not spec.is_local:
                 continue
-            p = getattr(self.providers, spec.name, None)
+            p = self.providers.entry(spec.name)
             if not (p and p.api_base):
                 continue
             if spec.detect_by_base_keyword and spec.detect_by_base_keyword in p.api_base:
@@ -879,10 +926,10 @@ class Config(BaseSettings):
 
         # Fallback: gateways first, then others (follows registry order)
         # OAuth providers are NOT valid fallbacks — they require explicit model selection
-        for spec in PROVIDERS:
+        for spec in providers:
             if spec.is_oauth:
                 continue
-            p = getattr(self.providers, spec.name, None)
+            p = self.providers.entry(spec.name)
             if p and p.api_key:
                 return p, spec.name
         return None, None
