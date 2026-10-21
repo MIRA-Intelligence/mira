@@ -40,15 +40,12 @@ def validate_pair(agent: dict, ui: dict, compatibility: dict, agent_tag: str, ui
     if f"mira_engine-{agent_version}.tar.gz" not in engine_assets:
         raise ValueError("missing matching engine sdist")
     desktop_version = re.sub(r"rc(\d+)$", r"-rc.\1", ui_version)
-    channel = "rc" if "rc" in ui_version else "latest"
+    # One installer per platform: the macOS .dmg and the zipped Windows setup.
     for kind in ("standalone", "bundle"):
         prefix = f"MIRA-{kind}-{desktop_version}-"
-        for platform, suffix in (("mac", ".dmg"), ("mac", ".zip"), ("win", "-setup.zip"), ("win", "-setup.exe")):
+        for platform, suffix in (("mac", ".dmg"), ("win", "-setup.zip")):
             if not any(n.startswith(prefix + platform + "-") and n.endswith(suffix) for n in desktop_assets):
                 raise ValueError(f"missing {kind} {platform} {suffix} installer")
-        for platform in ("mac", "win"):
-            if f"{channel}-{platform}-{kind}.yml" not in desktop_assets:
-                raise ValueError(f"missing {kind} {platform} update manifest")
     return {"ok": True, "agent_tag": agent_tag, "ui_tag": ui_tag,
             "compatibility": compatibility, "engine_assets": sorted(engine_assets),
             "ui_assets": sorted(desktop_assets)}

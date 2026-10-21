@@ -13,9 +13,7 @@ def pair():
         "mira-engine-windows-x86_64.zip", "mira_engine-0.3.5rc1-py3-none-any.whl", "mira_engine-0.3.5rc1.tar.gz"])
     names = []
     for kind in ("bundle", "standalone"):
-        names += [f"MIRA-{kind}-0.4.5-rc.1-mac-arm64.{ext}" for ext in ("dmg", "zip")]
-        names += [f"MIRA-{kind}-0.4.5-rc.1-win-x64-setup.{ext}" for ext in ("exe", "zip")]
-        names += [f"rc-{platform}-{kind}.yml" for platform in ("mac", "win")]
+        names += [f"MIRA-{kind}-0.4.5-rc.1-mac-arm64.dmg", f"MIRA-{kind}-0.4.5-rc.1-win-x64-setup.zip"]
     ui = release("v0.4.5rc1", names)
     compat = {"release_train": "2026.10", "ui": "0.4.5rc1", "agent": "0.3.5rc1",
               "min_agent_for_ui": "0.3.5rc1", "api_contract": "v1"}
@@ -38,6 +36,14 @@ def test_incomplete_or_mismatched_pair_fails(failure):
     else:
         compat["agent"] = "0.3.4"
     with pytest.raises(ValueError):
+        validate_pair(engine, ui, compat, "v0.3.5rc1", "v0.4.5rc1")
+
+
+@pytest.mark.parametrize("dropped", ["mac-arm64.dmg", "win-x64-setup.zip"])
+def test_each_platform_installer_is_required(dropped):
+    engine, ui, compat = pair()
+    ui["assets"] = [a for a in ui["assets"] if not a["name"].endswith(dropped)]
+    with pytest.raises(ValueError, match="installer"):
         validate_pair(engine, ui, compat, "v0.3.5rc1", "v0.4.5rc1")
 
 
