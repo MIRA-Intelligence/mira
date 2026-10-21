@@ -38,6 +38,7 @@ from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
 from mira_engine.agent.tools.sandbox import sandbox_status
 from mira_engine.bus.events import OutboundMessage
 from mira_engine.bus.queue import MessageBus
+from mira_engine.chats import chat_workdir, ensure_chat_workdir
 from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.config import loader as config_loader
@@ -832,6 +833,7 @@ def _resolve_upload_destination(
 
 _PROJECT_FILE_LIST_SKIP_DIRS = frozenset({".mira", "__pycache__", ".git", "node_modules"})
 _PROJECT_FILE_LIST_LIMIT = 5000
+_BROWSE_LIST_LIMIT = 2000
 
 
 def _collect_project_file_entries(
@@ -870,6 +872,34 @@ def _collect_project_file_entries(
                 "is_dir": False,
             })
     return entries, False
+
+
+def _list_directory(
+    directory: Path,
+    *,
+    show_hidden: bool = False,
+    limit: int = _BROWSE_LIST_LIMIT,
+) -> tuple[list[dict[str, Any]], bool]:
+    """One level of *directory* for the explorer: folders first, then files by name."""
+    rows: list[dict[str, Any]] = []
+    for child in directory.iterdir():
+        name = child.name
+        if name == ".DS_Store" or (name.startswith(".") and not show_hidden):
+            continue
+        try:
+            stat = child.stat()
+        except OSError:  # broken symlink or no permission
+            continue
+        is_dir = child.is_dir()
+        rows.append({
+            "name": name,
+            "path": str(child),
+            "is_dir": is_dir,
+            "size": 0 if is_dir else stat.st_size,
+            "mtime": int(stat.st_mtime),
+        })
+    rows.sort(key=lambda row: (not row["is_dir"], row["name"].lower()))
+    return rows[:limit], len(rows) > limit
 
 
 def _attachment_disposition(filename: str) -> str:
@@ -1174,6 +1204,36 @@ class UiChannel(BaseChannel):
         except (FileNotFoundError, ValueError):
             return None
 
+    def _ensure_chat_dir(self, chat_id: str) -> Path | None:
+        """Create the Quick Chat working directory; ``None`` if the id or disk refuses."""
+        try:
+            return ensure_chat_workdir(self.projects_root, chat_id)
+        except (OSError, ValueError) as exc:
+            logger.warning("No working directory for chat {}: {}", chat_id, exc)
+            return None
+
+    def _browse_roots(self) -> list[Path]:
+        """Folders the explorer may show: the user's home, plus the workspace if it is elsewhere."""
+        roots = [Path.home().resolve()]
+        workspace = self.projects_root.expanduser().resolve()
+        if not any(workspace == root or root in workspace.parents for root in roots):
+            roots.append(workspace)
+        return roots
+
+    def _resolve_browse_path(self, raw_path: str) -> tuple[Path | None, web.Response | None]:
+        if not raw_path.strip():
+            return None, web.json_response({"error": "path required"}, status=400)
+        candidate = Path(raw_path.strip()).expanduser()
+        if not candidate.is_absolute():
+            return None, web.json_response({"error": "path must be absolute"}, status=400)
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            return None, web.json_response({"error": "invalid path"}, status=400)
+        if any(resolved == root or root in resolved.parents for root in self._browse_roots()):
+            return resolved, None
+        return None, web.json_response({"error": "path is outside the browsable folders"}, status=403)
+
     def _project_dir_from_metadata(
         self,
         session_id: str | None,
@@ -1367,6 +1427,9 @@ class UiChannel(BaseChannel):
             self._handle_attach_chat_context,
         )
         self._app.router.add_get("/api/projects/{session_id}/artifacts", self._handle_project_artifact)
+        self._app.router.add_get("/api/chats/{chat_id}/workdir", self._handle_chat_workdir)
+        self._app.router.add_get("/api/fs/list", self._handle_fs_list)
+        self._app.router.add_get("/api/fs/file", self._handle_fs_file)
         self._app.router.add_get("/api/projects/{session_id}/skill-plugins", self._handle_skill_plugins_list)
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/install", self._handle_skill_plugins_install)
         self._app.router.add_post("/api/projects/{session_id}/skill-plugins/state", self._handle_skill_plugins_state)
@@ -2280,6 +2343,10 @@ class UiChannel(BaseChannel):
                     if project_dir is not None:
                         metadata["project_id"] = session_id
                         metadata["project_dir"] = project_dir
+                    elif loop_mode == "normal":
+                        chat_dir = self._ensure_chat_dir(session_id)
+                        if chat_dir is not None:
+                            metadata["chat_dir"] = str(chat_dir)
                     if workflow_run is not None:
                         metadata["workflow_run_id"] = workflow_run_id
                         metadata["workflow_module_type"] = workflow_run.module_type
@@ -3276,7 +3343,7 @@ class UiChannel(BaseChannel):
         return {
             "mode": self._project_storage_mode(),
             "custom_dir_allowed": self._custom_project_dirs_allowed(),
-            "default_parent_dir": str(self.projects_root),
+            "default_parent_dir": str(self.project_registry.default_project_parent),
             "workspace_file": str(self._project_workspace_path),
         }
 
@@ -4217,6 +4284,60 @@ class UiChannel(BaseChannel):
         if request.query.get("download") == "1":
             # The UI and engine are usually different origins, where the
             # browser ignores <a download>, so the header has to ask for it.
+            return web.FileResponse(
+                candidate,
+                headers={"Content-Disposition": _attachment_disposition(candidate.name)},
+            )
+        if is_deck_file(candidate):
+            return deck_response(candidate, edit=request.query.get("mode") == "edit")
+        return web.FileResponse(candidate)
+
+    async def _handle_chat_workdir(self, request: web.Request) -> web.Response:
+        """Where a Quick Chat keeps its files; the folder may not exist before the first turn."""
+        chat_id = request.match_info.get("chat_id", "")
+        try:
+            path = chat_workdir(self.projects_root, chat_id)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({
+            "chat_id": chat_id,
+            "path": str(path),
+            "exists": path.is_dir(),
+            "home": str(self._browse_roots()[0]),
+        })
+
+    async def _handle_fs_list(self, request: web.Request) -> web.Response:
+        """List one folder under the user's home (or the workspace) for the explorer."""
+        directory, error = self._resolve_browse_path(request.query.get("path", ""))
+        if error is not None:
+            return error
+        if not directory.is_dir():
+            return web.json_response({"error": "directory not found"}, status=404)
+        try:
+            entries, truncated = await asyncio.to_thread(
+                _list_directory, directory, show_hidden=request.query.get("hidden") == "1"
+            )
+        except PermissionError:
+            return web.json_response({"error": "permission denied"}, status=403)
+        except OSError as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        roots = self._browse_roots()
+        return web.json_response({
+            "path": str(directory),
+            "parent": None if directory in roots else str(directory.parent),
+            "home": str(roots[0]),
+            "entries": entries,
+            "truncated": truncated,
+        })
+
+    async def _handle_fs_file(self, request: web.Request) -> web.StreamResponse:
+        """Serve a file under the user's home (or the workspace) for preview or download."""
+        candidate, error = self._resolve_browse_path(request.query.get("path", ""))
+        if error is not None:
+            return error
+        if not candidate.is_file():
+            return web.json_response({"error": "file not found"}, status=404)
+        if request.query.get("download") == "1":
             return web.FileResponse(
                 candidate,
                 headers={"Content-Disposition": _attachment_disposition(candidate.name)},
