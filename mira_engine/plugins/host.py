@@ -118,6 +118,27 @@ async def _serve(tools: dict[str, Any], out: TextIO) -> None:
             reply({"id": rid, "error": f"{type(e).__name__}: {e}"})
 
 
+def _guard(plugin_dir: Path) -> None:
+    """Run the rest of this process as the plugin (``plugins.permissions``):
+    the tripwire backs up the sandbox, and is all there is without one — e.g.
+    starting programs without ``shell: true``."""
+    from mira_engine.plugins import permissions
+    from mira_engine.plugins.manifest import load_manifest
+
+    manifest = load_manifest(plugin_dir)
+    env = os.environ
+    grant = permissions.grant_for(
+        manifest,
+        env.get("MIRA_PLUGIN_TIER") or "experimental",
+        workspace=Path(env["MIRA_PLUGIN_WORKSPACE"]) if env.get("MIRA_PLUGIN_WORKSPACE") else None,
+        data_dir=Path(env["MIRA_PLUGIN_DATA_DIR"]) if env.get("MIRA_PLUGIN_DATA_DIR") else None,
+        mira_home=Path(env["MIRA_PLUGIN_MIRA_HOME"]) if env.get("MIRA_PLUGIN_MIRA_HOME") else None,
+    )
+    if grant is not None:
+        permissions.install()
+        permissions._current.set(grant)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     describe_only = "--describe" in args
@@ -129,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     protocol_out = sys.stdout
     sys.stdout = sys.stderr  # plugin prints must not corrupt the protocol
     try:
+        _guard(Path(args[0]))
         tools = _load_tools(Path(args[0]))
     except Exception as e:  # noqa: BLE001
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}), file=protocol_out, flush=True)

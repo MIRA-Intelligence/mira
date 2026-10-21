@@ -198,3 +198,58 @@ class TestRealSandbox:
         assert _run(spec, "mkdir -p ~/.cache/demo && echo kept > ~/.cache/demo/x").returncode == 0
         result = _run(spec, "cat ~/.cache/demo/x")
         assert result.stdout == "kept\n"
+
+
+class TestSeatbeltProfile:
+    def test_denies_then_allows_in_order(self, workspace: Path, tmp_path: Path, monkeypatch) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        plugin = tmp_path / "plugin"
+        plugin.mkdir()
+        profile = sandbox.seatbelt_profile(
+            SandboxSpec.build(workspace, network="none", read_only_paths=[str(plugin)]), shell=False
+        )
+        lines = profile.splitlines()
+        assert lines[:2] == ["(version 1)", "(allow default)"]
+        assert "(deny network-outbound (remote ip))" in lines
+        # Later rules win: each deny comes before what it must still allow.
+        deny_read = next(i for i, line in enumerate(lines) if line.startswith("(deny file-read-data"))
+        allow_read = next(i for i, line in enumerate(lines) if line.startswith("(allow file-read-data"))
+        assert deny_read < allow_read
+        assert f'(subpath "{home.resolve()}")' in lines[deny_read]
+        assert f'(subpath "{plugin.resolve()}")' in lines[allow_read]
+        assert lines.index('(deny file-write* (subpath "/"))') < next(
+            i for i, line in enumerate(lines) if line.startswith("(allow file-write*"))
+        assert "(deny process-exec*)" in lines
+
+    def test_never_allows_a_directory_that_contains_the_home(self, workspace: Path, monkeypatch) -> None:
+        # sys.path can hold the current directory, which may be the home itself.
+        home = workspace.parent
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(sys, "path", [str(home), str(home.parent), *sys.path])
+        profile = sandbox.seatbelt_profile(SandboxSpec.build(workspace))
+        allow_read = next(line for line in profile.splitlines() if line.startswith("(allow file-read-data"))
+        assert f'(subpath "{home.resolve()}")' not in allow_read
+        assert f'(subpath "{home.parent.resolve()}")' not in allow_read
+
+    def test_network_and_shell_when_granted(self, workspace: Path) -> None:
+        profile = sandbox.seatbelt_profile(SandboxSpec.build(workspace), shell=True)
+        assert "network-outbound" not in profile and "process-exec" not in profile
+
+    def test_hides_extra_paths(self, workspace: Path, tmp_path: Path) -> None:
+        other = tmp_path / "other-ws"
+        other.mkdir()
+        profile = sandbox.seatbelt_profile(SandboxSpec.build(workspace), hide=[other])
+        deny_read = next(line for line in profile.splitlines() if line.startswith("(deny file-read-data"))
+        assert f'(subpath "{other.resolve()}")' in deny_read
+
+    def test_plugin_sandbox_picks_the_platform_backend(self, monkeypatch) -> None:
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(sandbox, "seatbelt_available", lambda: (True, ""))
+        assert sandbox.plugin_sandbox() == ("seatbelt", "")
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(sandbox, "sandbox_available", lambda network=True: (False, "no bwrap"))
+        assert sandbox.plugin_sandbox() == (None, "no bwrap")
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert sandbox.plugin_sandbox()[0] is None

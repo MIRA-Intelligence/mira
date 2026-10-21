@@ -133,7 +133,7 @@ def test_trust_cannot_be_self_declared(tmp_path):
 
 def test_experimental_plugins_never_load_in_process(tmp_path, monkeypatch):
     # Without a sandbox (and without the user's opt-in) they don't run at all.
-    monkeypatch.setattr("mira_engine.agent.tools.sandbox.sandbox_available", lambda network=True: (False, "test"))
+    monkeypatch.setattr("mira_engine.agent.tools.sandbox.plugin_sandbox", lambda network=True: (None, "test"))
     _plugin(tmp_path / "plugins", "exp", {**TOOL_MANIFEST, "tier": "experimental"}, {"tool.py": TOOL})
     rt = _runtime(tmp_path)
     assert rt.get("exp").status == "unsupported" and rt.tools() == []

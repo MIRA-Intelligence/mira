@@ -187,18 +187,28 @@ enforced, in process. First-party plugins aren't checked; set
 
 ### Out-of-process plugins
 
-An experimental plugin's tools are served by `python -m mira_engine.plugins.host`
-in a child process. With bubblewrap (Linux) the host sees system directories
-and its own code read-only, a private scratch directory, the workspace only if
-`permissions.filesystem` asks (`workspace:read` / `workspace:write`), and **no
-network** unless `permissions.network` is non-empty; the Mira home (config,
-keys, gateway token) is masked. The host gets a minimal environment (no API
-keys), a memory limit, and is killed when a call hangs; a crash fails that call
-and the next call starts a fresh host.
+An experimental plugin's tools are served by a host process (`python -m
+mira_engine.plugins.host`, or the desktop build's own `--mira-plugin-host`
+mode), sandboxed:
 
-Without bubblewrap (e.g. macOS) experimental plugins don't load unless
-`plugins.unsandboxed_experimental` is set — they then still run out of process
-(crashes and hangs stay isolated), but their permissions are not enforced.
+| | Linux (bubblewrap) | macOS (Seatbelt, `sandbox-exec`) |
+|---|---|---|
+| reads | system dirs and its own code, read-only; nothing else is mounted | everything outside the home directory except the Mira home and an ungranted workspace; in the home, only its interpreter, its own code and its grants |
+| writes | its scratch dir (`<mira home>/plugin-data/<id>`, also its temp dir), a `workspace:write` workspace | the same |
+| workspace | only with `workspace:read` / `workspace:write` | the same |
+| Mira home (config, keys, gateway token) | masked | hidden |
+| network | none unless `permissions.network` is non-empty | the same |
+| other programs | — | refused unless `shell: true` |
+
+Either way the host gets a minimal environment (no API keys, only its
+declared secrets), a memory limit, and is killed when a call hangs; a crash
+fails that call and the next call starts a fresh host. Inside the host the
+permission tripwire runs as well (so `shell: false` holds on Linux too).
+
+Without a sandbox — Windows, or Linux without working bwrap — experimental
+plugins don't load unless `plugins.unsandboxed_experimental` is set; they then
+still run out of process (crashes and hangs stay isolated) with only the
+in-host tripwire checking their permissions.
 
 ## Contract
 

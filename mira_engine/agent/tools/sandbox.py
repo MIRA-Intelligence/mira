@@ -218,3 +218,117 @@ def sandbox_status(mode: str, *, network: str = "full") -> dict[str, object]:
         return {"mode": mode or None, "network": None, "available": None, "reason": None}
     ok, reason = sandbox_available(network != "none")
     return {"mode": mode, "network": network, "available": ok, "reason": reason or None}
+
+
+# ── macOS: Seatbelt (sandbox-exec) for out-of-process plugins ─────────
+
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+_seatbelt_cache: tuple[bool, str] | None = None
+
+
+def _sb(path: Path | str) -> str:
+    """A path as an SBPL string literal."""
+    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _seatbelt_read_roots(hidden: list[Path]) -> list[Path]:
+    """What a Python host needs to read: its interpreter and its import path
+    — never a directory that contains the home or the Mira home (``sys.path``
+    can hold the current directory, which may be the home itself)."""
+    roots = [Path(sys.prefix), Path(sys.base_prefix), Path(sys.exec_prefix), Path(sys.executable).parent]
+    roots += [Path(p) for p in sys.path if p]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    out: list[Path] = []
+    for root in roots:
+        resolved = _resolve(root)
+        if resolved is None or not resolved.exists() or resolved in out:
+            continue
+        if any(_inside(h, resolved) for h in hidden):
+            continue
+        out.append(resolved)
+    return out
+
+
+def seatbelt_profile(spec: SandboxSpec, *, shell: bool = True, hide: list[Path] | tuple[Path, ...] = ()) -> str:
+    """An SBPL profile for one plugin host (later rules win, so each deny is
+    followed by what it must still allow):
+
+    - no network unless the spec allows it (AF_UNIX stays, for asyncio);
+    - writes only to the scratch dir (``spec.workspace``), ``read_write``
+      grants and ``/dev``;
+    - no reading the contents of anything in the home directory, the Mira
+      home or ``hide`` (e.g. a workspace the plugin wasn't granted) except
+      the interpreter and its import path, ``read_only`` / ``extra_read_only``
+      grants and the scratch dir;
+    - without ``shell``, no executing anything but the interpreter itself.
+    """
+    home = _resolve(os.environ.get("HOME") or Path.home())
+    mira_home = _mira_home()
+    lines = ["(version 1)", "(allow default)"]
+    if not spec.network:
+        lines.append("(deny network-outbound (remote ip))")
+        lines.append("(deny network-bind (local ip))")
+    lines.append('(deny file-write* (subpath "/"))')
+    writable = [spec.workspace, *spec.read_write]
+    lines.append("(allow file-write* " + " ".join(f"(subpath {_sb(p)})" for p in writable) + ' (subpath "/dev"))')
+    hidden = [p for p in (home, mira_home, *(_resolve(h) for h in hide)) if p is not None]
+    lines.append("(deny file-read-data " + " ".join(f"(subpath {_sb(p)})" for p in hidden) + ")")
+    readable = [*_seatbelt_read_roots(hidden), *spec.read_only, *spec.extra_read_only, *writable]
+    lines.append("(allow file-read-data " + " ".join(f"(subpath {_sb(p)})" for p in readable) + ")")
+    if not shell:
+        lines.append("(deny process-exec*)")
+        lines.append("(allow process-exec* " + " ".join(f"(literal {_sb(p)})" for p in _interpreters()) + ")")
+    return "\n".join(lines)
+
+
+def _interpreters() -> list[Path]:
+    """The executables starting the host may run: the interpreter (or the
+    frozen app), and on a macOS framework build the ``Python.app`` binary it
+    re-executes itself as."""
+    candidates = [Path(sys.executable), Path(getattr(sys, "_base_executable", "") or sys.executable)]
+    candidates.append(Path(sys.base_prefix) / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python")
+    out: list[Path] = []
+    for candidate in candidates:
+        for path in (candidate, _resolve(candidate)):
+            if path is not None and path.exists() and path not in out:
+                out.append(path)
+    return out
+
+
+def seatbelt_argv(spec: SandboxSpec, *, shell: bool = True, hide: list[Path] | tuple[Path, ...] = ()) -> list[str]:
+    """``sandbox-exec`` arguments; append the command argv."""
+    return [SANDBOX_EXEC, "-p", seatbelt_profile(spec, shell=shell, hide=hide)]
+
+
+def seatbelt_available() -> tuple[bool, str]:
+    """Whether sandbox-exec works here (macOS)."""
+    global _seatbelt_cache
+    if _seatbelt_cache is not None:
+        return _seatbelt_cache
+    if sys.platform != "darwin":
+        _seatbelt_cache = (False, "the Seatbelt sandbox is only available on macOS")
+    elif not Path(SANDBOX_EXEC).exists():
+        _seatbelt_cache = (False, "sandbox-exec is not available")
+    else:
+        try:
+            result = subprocess.run(
+                [SANDBOX_EXEC, "-p", "(version 1)(allow default)", "/usr/bin/true"],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            ok = result.returncode == 0
+            _seatbelt_cache = (ok, "" if ok else f"sandbox-exec failed: {(result.stderr or '').strip()[-200:]}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            _seatbelt_cache = (False, f"sandbox-exec could not run: {exc}")
+    return _seatbelt_cache
+
+
+def plugin_sandbox(network: bool = True) -> tuple[str | None, str]:
+    """The sandbox for an out-of-process plugin here: ``"bwrap"`` (Linux),
+    ``"seatbelt"`` (macOS) or None with the reason (e.g. Windows)."""
+    if sys.platform == "darwin":
+        ok, reason = seatbelt_available()
+        return ("seatbelt" if ok else None), reason
+    ok, reason = sandbox_available(network=network)
+    return ("bwrap" if ok else None), reason

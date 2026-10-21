@@ -4,19 +4,24 @@ An ``experimental`` plugin (or any plugin declaring ``isolation: subprocess``)
 never runs inside the engine. Its tools are served by
 :mod:`mira_engine.plugins.host` in a child process:
 
-* **Sandboxed** (Linux + bwrap): the host sees system directories read-only,
-  its own code read-only, a private scratch directory, and the user's
-  workspace only if the manifest asks (``workspace:read`` / ``workspace:write``).
-  No declared network → a private network namespace (no network at all). The
-  Mira home — config, provider keys, the gateway token — is masked.
+* **Sandboxed** — bwrap on Linux, Seatbelt (``sandbox-exec``) on macOS: the
+  host can read its own code, its interpreter and a private scratch directory
+  (also its temp dir), and the user's workspace only if the manifest asks
+  (``workspace:read`` / ``workspace:write``); it writes only to the scratch dir
+  and a ``workspace:write`` workspace. No declared network → no network. The
+  Mira home — config, provider keys, the gateway token — stays hidden (on
+  macOS the whole home directory does, except those grants). Without
+  ``shell: true`` it can't start other programs (enforced by Seatbelt on macOS
+  and by the permission tripwire inside the host everywhere).
 * **Minimal environment** either way: only ``PATH``, locale and Python path
   variables are passed, never the engine's API keys.
 * **Crash/hang isolation**: a crashing host fails the call and is restarted on
   the next one; a hung call is killed at its timeout. The plugin's circuit
   breaker counts both.
 
-Without bwrap the host can still run out of process (crashes and hangs stay
-isolated) but permissions are not enforced, so that needs the user's explicit
+Without a sandbox (Windows, or Linux without working bwrap) the host can
+still run out of process (crashes and hangs stay isolated) but permissions
+are only checked by the in-host tripwire, so that needs the user's explicit
 ``plugins.unsandboxed_experimental``.
 """
 
@@ -26,6 +31,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +52,14 @@ def host_env() -> dict[str, str]:
     env = {k: os.environ[k] for k in _ENV_KEEP if k in os.environ}
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if not getattr(sys, "frozen", False):
+        # The host must run this engine's code, wherever it was imported from
+        # (a source checkout, another install): it doesn't start in the
+        # engine's working directory.
+        import mira_engine
+
+        root = str(Path(mira_engine.__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = os.pathsep.join([root, *[p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]])
     return env
 
 
@@ -60,8 +74,13 @@ def plugin_env(
     is built from (see ``mira_engine.plugins.host``). Only the config values
     the manifest declared in ``permissions.secrets`` are passed, and the
     workspace only when ``permissions.filesystem`` grants it."""
+    from mira_engine.config.paths import get_data_dir
+
     env = host_env()
-    env["MIRA_PLUGIN_DATA_DIR"] = str(_scratch_dir(manifest.id))
+    scratch = str(_scratch_dir(manifest.id))
+    env["MIRA_PLUGIN_DATA_DIR"] = scratch
+    env["TMPDIR"] = scratch  # its temp files stay in its own (writable) dir
+    env["MIRA_PLUGIN_MIRA_HOME"] = str(get_data_dir())
     env["MIRA_PLUGIN_TIER"] = tier or "experimental"
     if workspace is not None and manifest.permissions.filesystem != "none":
         env["MIRA_PLUGIN_WORKSPACE"] = str(workspace)
@@ -82,7 +101,7 @@ def host_argv(
     manifest: PluginManifest,
     *,
     workspace: Path | None,
-    sandbox: bool,
+    sandbox: str | bool | None,
     describe: bool = False,
 ) -> list[str]:
     from mira_engine.plugins.paths import host_command
@@ -91,7 +110,7 @@ def host_argv(
     if not sandbox:
         return cmd
     import mira_engine
-    from mira_engine.agent.tools.sandbox import SandboxSpec, bwrap_argv
+    from mira_engine.agent.tools.sandbox import SandboxSpec, bwrap_argv, seatbelt_argv
 
     fs = manifest.permissions.filesystem
     read_only = [str(manifest.root)]
@@ -107,22 +126,30 @@ def host_argv(
         read_write_paths=read_write,
         extra_read_only=[Path(mira_engine.__file__).resolve().parent],
     )
+    if sandbox == "seatbelt":
+        # bwrap shows only what it mounts; Seatbelt hides by listing, so an
+        # ungranted workspace outside the home is hidden explicitly.
+        hide = [workspace] if workspace is not None and fs == "none" else []
+        return seatbelt_argv(spec, shell=manifest.permissions.shell, hide=hide) + cmd
     return bwrap_argv(spec) + cmd
 
 
-def plan(manifest: PluginManifest, *, workspace: Path | None, allow_unsandboxed: bool) -> bool:
-    """Decide whether to sandbox. Returns True (sandboxed) / False (opted-in
+def plan(manifest: PluginManifest, *, workspace: Path | None, allow_unsandboxed: bool) -> str | None:
+    """Pick the sandbox: ``"bwrap"`` / ``"seatbelt"``, or None (opted-in
     unsandboxed); raises :class:`IsolationUnavailable` otherwise."""
-    from mira_engine.agent.tools.sandbox import sandbox_available
+    from mira_engine.agent.tools.sandbox import plugin_sandbox
 
-    ok, why = sandbox_available(network=bool(manifest.permissions.network))
-    if ok:
-        return True
+    backend, why = plugin_sandbox(network=bool(manifest.permissions.network))
+    if backend:
+        return backend
     if allow_unsandboxed:
-        logger.warning("plugin {} runs out of process WITHOUT a sandbox ({}); permissions are not enforced", manifest.id, why)
-        return False
+        logger.warning(
+            "plugin {} runs out of process WITHOUT a sandbox ({}); only the in-host tripwire checks its permissions",
+            manifest.id, why,
+        )
+        return None
     raise IsolationUnavailable(
-        f"needs the bwrap sandbox ({why}); set plugins.unsandboxed_experimental to run it unsandboxed"
+        f"needs a sandbox ({why}); set plugins.unsandboxed_experimental to run it unsandboxed"
     )
 
 
@@ -130,14 +157,15 @@ def describe(
     manifest: PluginManifest,
     *,
     workspace: Path | None,
-    sandbox: bool,
+    sandbox: str | bool | None,
     env: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Ask a one-shot host for the plugin's tool definitions."""
     argv = host_argv(manifest, workspace=workspace, sandbox=sandbox, describe=True)
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=DESCRIBE_TIMEOUT_S, env=env or host_env(), check=False
+            argv, capture_output=True, text=True, timeout=DESCRIBE_TIMEOUT_S, env=env or host_env(),
+            cwd=_scratch_dir(manifest.id), check=False,
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"plugin host did not describe its tools within {DESCRIBE_TIMEOUT_S}s") from e
@@ -154,10 +182,13 @@ def describe(
 class PluginHostClient:
     """A long-lived host process, started lazily and restarted after a crash."""
 
-    def __init__(self, plugin_id: str, argv: list[str], env: dict[str, str] | None = None):
+    def __init__(self, plugin_id: str, argv: list[str], env: dict[str, str] | None = None, cwd: Path | None = None):
         self.plugin_id = plugin_id
         self.argv = argv
         self.env = env
+        # The host works in its scratch dir: the engine's working directory
+        # may be one the sandbox hides (anything in the home on macOS).
+        self.cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task | None = None
         self._pending: dict[int, asyncio.Future] = {}
@@ -173,6 +204,7 @@ class PluginHostClient:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                     env=self.env or host_env(),
+                    cwd=self.cwd,
                     limit=16 * 1024 * 1024,
                 )
                 self._reader = asyncio.create_task(self._read(self._proc), name=f"plugin-host-{self.plugin_id}")
