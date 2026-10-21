@@ -215,6 +215,12 @@ class ExecTool(Tool):
         self._runtime_extra_dirs: ContextVar[list[Path] | None] = ContextVar(
             "exec_runtime_extra_dirs", default=None
         )
+        # Where commands start when the model gives no working_dir (a Quick
+        # Chat's folder). Unlike the working dir above, it is not the boundary
+        # for restrictions or the sandbox.
+        self._runtime_default_cwd: ContextVar[str | None] = ContextVar(
+            "exec_runtime_default_cwd", default=None
+        )
         self._runtime_session_id: ContextVar[str | None] = ContextVar(
             "exec_runtime_session_id", default=None
         )
@@ -272,6 +278,11 @@ class ExecTool(Tool):
 
         self._runtime_working_dir.set(None)
         self._runtime_extra_dirs.set(None)
+        self._runtime_default_cwd.set(None)
+
+    def set_default_cwd(self, path: Path | None) -> None:
+        """Start commands without a working_dir in *path* for this turn."""
+        self._runtime_default_cwd.set(str(path) if path is not None else None)
 
     def set_session_context(self, session_id: str, turn_id: str | None = None) -> None:
         """Associate spawned processes with the active UI/session turn."""
@@ -335,6 +346,9 @@ class ExecTool(Tool):
     def _workspace(self) -> str:
         return self._runtime_working_dir.get() or self.working_dir or os.getcwd()
 
+    def _default_cwd(self) -> str:
+        return self._runtime_default_cwd.get() or self._workspace()
+
     def _working_dir_error(self, working_dir: str | None) -> str | None:
         """A model-supplied working_dir must stay in the workspace when access is restricted."""
         if not working_dir or not (self.restrict_to_workspace or self.sandbox == "bwrap"):
@@ -342,7 +356,7 @@ class ExecTool(Tool):
         try:
             requested = Path(working_dir).expanduser()
             if not requested.is_absolute():
-                requested = Path(self._workspace()) / requested
+                requested = Path(self._default_cwd()) / requested
             requested = requested.resolve()
             workspace = Path(self._workspace()).resolve()
         except (OSError, RuntimeError):
@@ -377,8 +391,8 @@ class ExecTool(Tool):
         if error := self._working_dir_error(working_dir):
             return error
         if working_dir and not Path(working_dir).expanduser().is_absolute():
-            working_dir = str(Path(self._workspace()) / working_dir)
-        cwd = working_dir or self._workspace()
+            working_dir = str(Path(self._default_cwd()) / working_dir)
+        cwd = working_dir or self._default_cwd()
         background = bool(kwargs.get("background", False))
         timeout = kwargs.get("timeout", self.timeout)
         try:
@@ -409,7 +423,8 @@ class ExecTool(Tool):
         elif self.sandbox:
             return f"Error: unknown sandbox backend {self.sandbox!r} (tools.exec.sandbox)"
 
-        venv = await self._maybe_bootstrap_venv(command, cwd, sandbox_spec)
+        # A chat's default folder shares the workspace venv instead of getting its own.
+        venv = await self._maybe_bootstrap_venv(command, working_dir or self._workspace(), sandbox_spec)
         env = self._build_env()
         if venv is not None:
             self._apply_venv_to_env(env, venv)
