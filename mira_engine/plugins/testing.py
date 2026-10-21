@@ -34,7 +34,7 @@ from mira_engine.agent.tools.base import Tool
 from mira_engine.plugins.api import PLUGIN_API_VERSION, satisfies
 from mira_engine.plugins.guard import GuardedHook, GuardedTool
 from mira_engine.plugins.loader import PluginRuntime
-from mira_engine.plugins.manifest import ManifestError, Tier, load_manifest
+from mira_engine.plugins.manifest import ManifestError, PluginManifest, Tier, load_manifest
 from mira_engine.plugins.state import PluginState
 
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -155,6 +155,27 @@ def check_hook(hook: AgentHook) -> list[str]:
     return problems
 
 
+def check_skills(manifest: PluginManifest) -> list[str]:
+    """Each provided skill is a directory inside the plugin with a SKILL.md."""
+    problems: list[str] = []
+    root = manifest.root.resolve()
+    for i, skill in enumerate(manifest.skills):
+        sid = skill.get("id")
+        rel = skill.get("path", sid)
+        if not isinstance(sid, str) or not sid:
+            problems.append(f"skill #{i + 1} needs an id")
+            continue
+        if not isinstance(rel, str) or not rel.strip():
+            problems.append(f"skill {sid} needs a path")
+            continue
+        target = (root / rel).resolve()
+        if target != root and root not in target.parents:
+            problems.append(f"skill {sid}: {rel} is outside the plugin")
+        elif not ((target / "SKILL.md").is_file() or (target.name == "SKILL.md" and target.is_file())):
+            problems.append(f"skill {sid}: no SKILL.md at {rel}")
+    return problems
+
+
 def check_plugin(plugin_dir: str | Path, tier: Tier = "community") -> ContractReport:
     """Run the full contract for the plugin in ``plugin_dir``."""
     plugin_dir = Path(plugin_dir).resolve()
@@ -187,6 +208,8 @@ def check_plugin(plugin_dir: str | Path, tier: Tier = "community") -> ContractRe
         report.check("load", [f"{loaded.status}: {loaded.reason}"])
         return report
     report.check("load", [])
+    if manifest.skills:
+        report.check("skills", check_skills(manifest))
     if loaded.tools:
         missing = sorted({t.name for t in loaded.tools} - {t.name for t in built})
         report.check("tools build for an agent loop", [f"could not build {name}" for name in missing])

@@ -39,7 +39,26 @@ def list_plugins() -> None:
             ]
             provides = ", ".join(parts)
         table.add_row(p.id, m.version if m else "", p.tier or "", p.status, provides, p.reason)
-    console.print(table if runtime.plugins else "No plugins found.")
+    packs = _skill_packs()
+    for pack in packs:
+        source = pack.get("source") or {}
+        table.add_row(
+            pack["id"], pack.get("version", ""), "skill pack", "installed",
+            f"skills:{len(pack.get('skills') or [])}", source.get("path", ""),
+        )
+    console.print(table if runtime.plugins or packs else "No plugins found.")
+
+
+def _skill_packs() -> list[dict]:
+    """Skill packs installed from the desktop app or MIRA Hub (no code)."""
+    try:
+        from mira_engine.agent.skill_plugins import SkillPluginManager
+        from mira_engine.config.paths import get_workspace_path
+
+        plugins = SkillPluginManager(get_workspace_path(None)).list_plugins()
+    except Exception:  # noqa: BLE001 - the kernel listing above still stands
+        return []
+    return [p for p in plugins if (p.get("source") or {}).get("type") not in ("builtin", "kernel")]
 
 
 def _set_enabled(plugin_id: str, enabled: bool) -> None:
