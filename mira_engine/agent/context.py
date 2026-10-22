@@ -151,6 +151,7 @@ class ContextBuilder:
         chat_id: str | None,
         project_dir: str | None = None,
         run_mode: str | None = None,
+        working_dir: str | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
@@ -160,8 +161,8 @@ class ContextBuilder:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
             if project_dir:
                 lines.append(f"Project Directory: {project_dir}")
-            elif channel == "ui":
-                lines.append(f"Project Directory: projects/{chat_id}")
+            elif working_dir:
+                lines.append(f"Working Directory: {working_dir} (save files for this chat here)")
             if run_mode:
                 lines.append(f"Run Mode: {run_mode}")
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
@@ -299,9 +300,12 @@ class ContextBuilder:
         extra_system: str | None = None,
         current_role: str = "user",
         loaded_skills: list[str] | None = None,
+        working_dir: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, project_dir, run_mode)
+        runtime_ctx = self._build_runtime_context(
+            channel, chat_id, project_dir, run_mode, working_dir=working_dir
+        )
         user_content = self._build_user_content(current_message, media)
 
         if isinstance(user_content, str):

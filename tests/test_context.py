@@ -222,14 +222,26 @@ class TestBuildRuntimeContext:
             s = ContextBuilder._build_runtime_context("x", "y", "/abs/proj")
         assert "Project Directory: /abs/proj" in s
 
-    def test_ui_default_project_dir(self) -> None:
+    def test_ui_without_a_directory_does_not_invent_one(self) -> None:
         with (
             patch("mira_engine.agent.context.datetime") as m_dt,
             patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
         ):
             m_dt.now.return_value.strftime.return_value = "T"
             s = ContextBuilder._build_runtime_context("ui", "abc123", None)
-        assert "Project Directory: projects/abc123" in s
+        assert "Directory:" not in s
+
+    def test_quick_chat_working_directory_is_absolute(self) -> None:
+        with (
+            patch("mira_engine.agent.context.datetime") as m_dt,
+            patch("mira_engine.agent.context.time.strftime", return_value="UTC"),
+        ):
+            m_dt.now.return_value.strftime.return_value = "T"
+            s = ContextBuilder._build_runtime_context(
+                "ui", "chat-1", None, working_dir="/home/u/.mira/workspace/chats/chat-1"
+            )
+        assert "Working Directory: /home/u/.mira/workspace/chats/chat-1" in s
+        assert "Project Directory" not in s
 
     def test_no_channel_or_chat_id_time_only(self) -> None:
         with (

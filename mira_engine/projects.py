@@ -20,6 +20,8 @@ from mira_engine.config.paths import get_runtime_subdir
 from mira_engine.utils.locks import locked_update_text, locked_write_text
 
 PROJECT_DIR_PREFIX = "PRJ"
+# New projects live in <workspace>/projects/<id>; older ones sit directly in the workspace.
+PROJECTS_DIRNAME = "projects"
 PROJECT_META_DIRNAME = ".mira"
 PROJECT_META_FILENAME = "project.json"
 PROJECT_META_SCHEMA_VERSION = 1
@@ -155,14 +157,24 @@ class ProjectRegistry:
         self._dirty_project_ids: set[str] = set()
         self._removed_project_ids: set[str] = set()
         self._unhidden_project_ids: set[str] = set()
-        self._known_project_roots: set[Path] = {self.projects_root}
+        self._known_project_roots: set[Path] = {self.projects_root, self.default_project_parent}
         self._load_workspace_file()
         self._load_legacy_project_dir_index()
-        self.register_projects_under_root(self.projects_root, persist=False)
+        for root in self._project_parents():
+            self.register_projects_under_root(root, persist=False)
 
     @property
     def project_dirs(self) -> dict[str, Path]:
         return self._project_dirs
+
+    @property
+    def default_project_parent(self) -> Path:
+        """Where new projects are created: ``<projects_root>/projects``."""
+        return self.projects_root / PROJECTS_DIRNAME
+
+    def _project_parents(self) -> tuple[Path, Path]:
+        """Current layout first, then the legacy one (projects directly in the root)."""
+        return self.default_project_parent, self.projects_root
 
     @property
     def known_project_roots(self) -> set[Path]:
@@ -277,13 +289,14 @@ class ProjectRegistry:
                     continue
                 existing = merged_dirs.get(project_id)
                 project_dir_resolved = project_dir.resolve(strict=False)
-                current_root_candidate = (
-                    self.projects_root / project_id
-                ).resolve(strict=False)
+                current_root_candidates = {
+                    (parent / project_id).resolve(strict=False)
+                    for parent in self._project_parents()
+                }
                 if (
                     existing is not None
                     and existing.resolve(strict=False) != project_dir_resolved
-                    and current_root_candidate != project_dir_resolved
+                    and project_dir_resolved not in current_root_candidates
                 ):
                     raise ValueError(
                         f"project_id {project_id!r} is already bound to {existing}"
@@ -311,7 +324,7 @@ class ProjectRegistry:
                 })
             payload = {
                 "schema_version": 1,
-                "default_project_parent": str(self.projects_root),
+                "default_project_parent": str(self.default_project_parent),
                 "projects": projects,
                 "hidden_projects": sorted(merged_hidden),
             }
@@ -563,8 +576,10 @@ class ProjectRegistry:
                 display_name=display_name,
             )
 
-        current_candidate = (self.projects_root / normalized_id).expanduser().resolve()
-        if current_candidate.is_dir():
+        for parent in self._project_parents():
+            current_candidate = (parent / normalized_id).expanduser().resolve()
+            if not current_candidate.is_dir():
+                continue
             existing = self._project_dirs.get(normalized_id)
             if existing is not None and existing.resolve(strict=False) != current_candidate:
                 self._project_dirs.pop(normalized_id, None)
@@ -586,7 +601,7 @@ class ProjectRegistry:
             self.drop_project_dir_registration(normalized_id)
 
         for root in self._known_project_roots:
-            if root == self.projects_root:
+            if root in self._project_parents():
                 continue
             candidate = (root / normalized_id).expanduser().resolve()
             if candidate.is_dir():
@@ -597,10 +612,11 @@ class ProjectRegistry:
                 )
 
         if create:
-            current_candidate.mkdir(parents=True, exist_ok=True)
+            new_dir = (self.default_project_parent / normalized_id).expanduser().resolve()
+            new_dir.mkdir(parents=True, exist_ok=True)
             return self.register_project_dir(
                 normalized_id,
-                current_candidate,
+                new_dir,
                 display_name=display_name,
             )
 
@@ -620,7 +636,7 @@ class ProjectRegistry:
         if project_dir is not None:
             target_dir = Path(project_dir).expanduser().resolve()
         else:
-            parent = Path(project_parent_dir).expanduser() if project_parent_dir else self.projects_root
+            parent = Path(project_parent_dir).expanduser() if project_parent_dir else self.default_project_parent
             target_dir = (parent / normalized_id).expanduser().resolve()
 
         existing_dir = self._project_dirs.get(normalized_id)
@@ -652,7 +668,8 @@ class ProjectRegistry:
         )
 
     def list_projects(self) -> list[ProjectRef]:
-        self.register_projects_under_root(self.projects_root)
+        for root in self._project_parents():
+            self.register_projects_under_root(root)
         refs: list[ProjectRef] = []
         stale: list[str] = []
         for project_id, project_dir in sorted(self._project_dirs.items()):
