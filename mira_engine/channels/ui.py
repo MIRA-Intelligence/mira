@@ -3398,7 +3398,7 @@ class UiChannel(BaseChannel):
 
     async def _handle_community_approvals(self, request: web.Request) -> web.Response:
         status = request.query.get("status")
-        if status is not None and status not in ("pending", "approved", "rejected"):
+        if status is not None and status not in community_approvals.STATUSES:
             return web.json_response({"error": "invalid status filter"}, status=400)
         approvals = community_approvals.list_approvals(status=status)
         return web.json_response({"approvals": approvals})
@@ -3432,8 +3432,17 @@ class UiChannel(BaseChannel):
         cfg = config_loader.load_config(config_loader.get_config_path().expanduser().resolve())
         result = await community_approvals.execute_approval(record, cfg.community)
         if not result.get("ok"):
+            # Recorded as failed (not left pending) and handed back to the
+            # agent, which can fix the cause and ask again (#72).
+            updated = community_approvals.set_status(approval_id, "failed", detail=str(result.get("detail") or ""))
+            self._audit(
+                source="ui",
+                action="community_approval_failed",
+                details={"id": approval_id, "action": record.get("action"), "detail": result.get("detail")},
+            )
+            await self._follow_up_approval(record, result, cfg)
             return web.json_response(
-                {"ok": False, "error": result.get("detail"), "approval": record}, status=502
+                {"ok": False, "error": result.get("detail"), "approval": updated or record}, status=502
             )
         updated = community_approvals.set_status(approval_id, "approved")
         self._audit(
@@ -3447,30 +3456,14 @@ class UiChannel(BaseChannel):
     async def _follow_up_approval(
         self, record: dict[str, Any], result: dict[str, Any], cfg: Config
     ) -> None:
-        """Back in the conversation that asked for it, the agent picks up after an
-        approval: a posted proposal is offered for building, a claimed one is built."""
-        from mira_engine.community.client import CommunityClient
-        from mira_engine.community.proposals import (
-            approved_claim_prompt,
-            approved_proposal_prompt,
-            post_link,
-        )
-
+        """Back in the conversation that asked for it, the agent picks up after a
+        decision: a posted proposal is offered for building, a claimed one is
+        built, an opened PR is reported, a failed execution is fixed."""
         origin = record.get("origin") or {}
-        payload = record.get("payload") or {}
         if not origin.get("channel") or not origin.get("chat_id"):
             return
-        action = record.get("action")
-        title = str(payload.get("title") or "")
-        if action == "post_proposal" and payload.get("category", "development") == "development":
-            post_id = str(result.get("post_id") or "")
-            if not post_id:
-                return
-            client = CommunityClient(cfg.community.api_base, cfg.community.agent_token)
-            content = approved_proposal_prompt(title, post_id, await post_link(client, cfg.community, post_id))
-        elif action == "claim_proposal" and payload.get("proposal_id"):
-            content = approved_claim_prompt(title, str(payload["proposal_id"]))
-        else:
+        content = await community_approvals.follow_up_prompt(record, result, cfg.community)
+        if not content:
             return
         await self.bus.publish_inbound(
             InboundMessage(

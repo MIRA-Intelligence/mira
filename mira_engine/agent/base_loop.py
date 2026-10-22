@@ -748,7 +748,7 @@ class BaseAgentLoop:
                 if hasattr(tool, "clear_project_context"):
                     tool.clear_project_context()
 
-        for name in ("message", "spawn", "cron", "community_post_proposal", "community_claim_proposal"):
+        for name in ("message", "spawn", "cron", "community_post_proposal", "community_claim_proposal", "community_open_pr"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
@@ -888,6 +888,7 @@ class BaseAgentLoop:
         ) or ""
         rules = ""
         mentions = ""
+        community_hint = ""
         if channel == "community":
             from mira_engine.community.mentions import community_name, mention_note
             from mira_engine.community.rules import rules_for_prompt
@@ -897,7 +898,16 @@ class BaseAgentLoop:
                 community_name(self.community_config),
                 str(getattr(self.community_config, "agent_id", "") or ""),
             )
-        sections = [chunk for chunk in (python_hint, base, notice, rules, mentions) if chunk]
+        elif channel and getattr(self, "community_config", None) is not None:
+            # In an ordinary chat the agent only knows the community exists if
+            # it is told (#72): one sentence, whether or not it is connected.
+            from mira_engine.community.proposals import community_discovery_hint
+
+            tools = getattr(self, "tools", None)
+            community_hint = community_discovery_hint(
+                self.community_config, connected=bool(tools is not None and tools.has("community_post_proposal"))
+            )
+        sections = [chunk for chunk in (python_hint, base, notice, rules, mentions, community_hint) if chunk]
         return "\n\n".join(sections) if sections else None
 
     def _community_budget(self):

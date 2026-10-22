@@ -28,6 +28,24 @@ async def post_link(client: Any, community_config: Any, post_id: str) -> str:
     return f"{web.rstrip('/')}/proposals/{post_id}" if web and post_id else ""
 
 
+def community_discovery_hint(community_config: Any, *, connected: bool) -> str:
+    """One sentence for ordinary chats: feature ideas for Mira have a place to
+    go, and how to get there when the agent isn't connected yet."""
+    if not getattr(community_config, "enabled", True):
+        return ""
+    if connected:
+        return (
+            "Feature requests and improvement ideas for Mira itself can be proposed to the Mira "
+            "Community with community_post_proposal (ask your user first); a proposal can then be "
+            "built and submitted as a pull request with the other community_* tools."
+        )
+    return (
+        "Feature requests and improvement ideas for Mira itself can be proposed to the Mira "
+        "Community; this agent is not connected to it yet — your user can join with "
+        "`mira community login` (or the Community panel in the Mira app)."
+    )
+
+
 def proposal_next_step(post_id: str, link: str = "") -> str:
     """Tell the agent to offer building the proposal it just posted."""
     where = f" ({link})" if link else ""

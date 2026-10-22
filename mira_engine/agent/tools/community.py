@@ -47,8 +47,10 @@ class _CommunityTool(Tool):
             return (
                 f"Held for your user's approval (autonomy mode: {self._gate.mode}). "
                 f"Queued community action '{action}' as approval {approval_id}. "
-                "Your user reviews it in the Mira app (Community → Approvals) and it "
-                "runs once they approve it; community maintainers are not involved. "
+                f"Tell your user: they can approve it by replying `/approve {approval_id}` here "
+                f"(or `/reject {approval_id}`), in the Mira app (Community → Approvals), or with "
+                f"`mira community approvals approve {approval_id}`; `/approvals` lists what is waiting. "
+                "It runs once they approve it; community maintainers are not involved. "
                 "Do not submit it again." + (f" {held_note}" if held_note else "")
             )
         return await self._run_with_rules_autoack(run)
@@ -269,8 +271,12 @@ class CommunityPostProposalTool(_FollowedUp):
 
     async def execute(self, title: str, body: str, **_: Any) -> str:
         async def run() -> str:
+            from mira_engine.community.origins import remember
+
             res = await self._client.create_proposal(title, body, category="development")
             post_id = str(res.get("id") or "")
+            # News about this proposal (claims, PRs, merges) comes back here.
+            remember("proposal", post_id, self._origin(), title=title)
             link = await post_link(self._client, self._community_config, post_id)
             return proposal_next_step(post_id, link)
 
@@ -513,7 +519,7 @@ class CommunitySubmitPatchTool(_CommunityTool):
         )
 
 
-class CommunityOpenPrTool(_CommunityTool):
+class CommunityOpenPrTool(_FollowedUp):
     @property
     def name(self) -> str:
         return "community_open_pr"
@@ -525,7 +531,8 @@ class CommunityOpenPrTool(_CommunityTool):
             "community_start_contribution): commits the in-scope changes there, pushes the "
             "workspace branch to your user's GitHub fork with their local git credentials, "
             "opens the PR into the community landing branch and registers it so it can be "
-            "reviewed and bot-merged. Refuses changes outside the workspace's scope or "
+            "reviewed and bot-merged. Call it again after addressing a review: it pushes the "
+            "follow-up commits to the same PR. Refuses changes outside the workspace's scope or "
             "containing credentials. High-impact: may require human approval."
         )
 
@@ -560,47 +567,32 @@ class CommunityOpenPrTool(_CommunityTool):
         **_: Any,
     ) -> str:
         async def run() -> str:
-            from mira_engine.community.contribute import ContributeError, load_scope, open_pr_github
+            from mira_engine.community.contribute import ContributeError, open_and_register_pr, pr_summary
+            from mira_engine.community.origins import remember
             from mira_engine.community.privacy import default_guard
 
             try:
-                result = await open_pr_github(
+                out = await open_and_register_pr(
+                    self._client,
                     working_dir=working_dir,
                     title=title,
                     body=body,
+                    proposal_id=proposal_id,
                     guard=default_guard(),
                 )
             except ContributeError as e:
                 return f"Could not open the PR: {e}"
-            scope = load_scope(working_dir)
-            try:
-                reg = await self._client.register_pr(
-                    proposal_id or scope.proposal_id,
-                    scope.repo,
-                    result.number,
-                    result.url,
-                    result.login,
-                    host="github",
-                    title=title,
-                    body=body,
-                    work_order_id=scope.work_order_id,
-                )
-            except Exception as e:  # noqa: BLE001 - PR is open even if register fails
-                return (
-                    f"Opened PR {result.url}, but registering it with the community "
-                    f"failed: {e}. You can retry registration later."
-                )
-            pr = reg.get("pr") or {}
-            return (
-                f"Opened and registered PR {result.url} (id {pr.get('id', '?')}, state {pr.get('state', 'open')}). "
-                "It merges once required checks pass and the gate for its lane is met "
-                "(plugin lane: reviews of the current head; core lane: a maintainer)."
-            )
+            if out.get("pr_id"):
+                # Reviews, merges and reverts of this PR are reported back here.
+                remember("pr", out["pr_id"], self._origin(), url=out["url"], plugin_ids=out["plugin_ids"], working_dir=working_dir)
+            return pr_summary(out)
 
         return await self._gated(
             "open_pr",
             {"working_dir": working_dir, "title": title, "body": body, "proposal_id": proposal_id},
             run,
+            origin=self._origin(),
+            held_note="Once your user approves it, the PR is opened and you will be told here.",
         )
 
 
@@ -648,6 +640,12 @@ class CommunityReviewPrTool(_CommunityTool):
             problems = [*([policy["base_reason"]] if policy.get("base_reason") else []), *(policy.get("violations") or [])]
             if problems:
                 lines.append("platform findings: " + "; ".join(problems))
+            gate = detail.get("gate") or pr.get("gate") or {}
+            if isinstance(gate, dict) and gate.get("checked_sha"):
+                reasons = [str(r) for r in (gate.get("reasons") or [])]
+                lines.append(
+                    "merge gate: " + ("; ".join(reasons) if reasons else "passes — the bot merges it on the next run")
+                )
             current = [r for r in detail.get("reviews") or [] if r.get("current")]
             if current:
                 lines.append("reviews of this head: " + ", ".join(f"{r.get('reviewer_name')}={r.get('verdict')}" for r in current))
@@ -999,7 +997,13 @@ class CommunityStartContributionTool(_CommunityTool):
                     "type": "string",
                     "description": "A development proposal this contribution implements.",
                 },
-                "repo": {"type": "string", "description": "Upstream repo, 'owner/name' (not needed for a work order)."},
+                "repo": {
+                    "type": "string",
+                    "description": (
+                        "Upstream repo, 'owner/name'. Not needed for a work order; defaults to "
+                        "community.default_repo (the MIRA engine) otherwise."
+                    ),
+                },
                 "title": {
                     "type": "string",
                     "description": "Short name of the change (used for the branch); defaults to the proposal's title.",
@@ -1056,10 +1060,13 @@ class CommunityStartContributionTool(_CommunityTool):
                     "one else builds it at the same time."
                 )
             title = title or str(proposal.get("title") or "")
+        # The MIRA engine is where nearly every proposal lands; the agent
+        # shouldn't have to guess its name.
+        repo = repo or str(getattr(self._community_config, "default_repo", "") or "")
         if not repo or not title:
             return (
-                "Pass work_order_id; or proposal_id and repo to build a proposal; or repo "
-                "and title for a free contribution (a new plugin or docs/)."
+                "Pass work_order_id; or proposal_id (and repo, unless community.default_repo applies) "
+                "to build a proposal; or repo and title for a free contribution (a new plugin or docs/)."
             )
         try:
             path, scope = await start_contribution(

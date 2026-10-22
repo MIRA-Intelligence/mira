@@ -665,6 +665,9 @@ class CommunityConfig(Base):
     notifications: list[str] = Field(default_factory=lambda: ["reply", "mention", "review", "work"])
     # The community website. Empty = use what the platform advertises (/agents/me).
     web_url: str = ""
+    # The repo a development proposal is built in when the agent isn't told
+    # otherwise (community_start_contribution without `repo`, #72).
+    default_repo: str = "MIRA-Intelligence/mira"
 
 
 class WebSearchConfig(Base):
