@@ -26,6 +26,21 @@ def test_pyinstaller_spec_uses_windows_onedir_only() -> None:
     assert "a.datas" in non_windows_branch
 
 
+def test_frozen_entry_repairs_the_trust_store_before_anything_talks_tls() -> None:
+    # The released macOS executable had OpenSSL's CA path compiled in from the
+    # build runner (python.org framework): an empty trust store on users' Macs
+    # and CERTIFICATE_VERIFY_FAILED on every aiohttp call. The entry point must
+    # fix that before the CLI, the gateway or a plugin host import anything.
+    entry = _read("scripts/mira_engine_entry.py")
+
+    assert "from mira_engine.utils.tls import ensure_ca_bundle" in entry
+    fix = entry.index("ensure_ca_bundle()")
+    assert fix < entry.index("from mira_engine.plugins.host import main")
+    assert fix < entry.index("from mira_engine.cli.agent_service import app")
+
+    assert "'certifi'" in _read("mira-engine.spec")
+
+
 def test_agent_release_uses_windows_onedir_zip_artifact() -> None:
     workflow = _read(".github/workflows/agent-release.yml")
 

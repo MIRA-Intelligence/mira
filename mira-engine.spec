@@ -54,6 +54,10 @@ a = Analysis(
     hiddenimports=[
         'mira_engine.channels.ui',
         'tiktoken_ext.openai_public',
+        # The CA bundle the executable falls back to when OpenSSL's compiled-in
+        # path belongs to the build machine (scripts/mira_engine_entry.py →
+        # mira_engine.utils.tls). Collected via PyInstaller's certifi hook.
+        'certifi',
         # Out-of-process plugin host (`mira-engine --mira-plugin-host`).
         'mira_engine.plugins.host',
         # Engine modules only the bundled plugins (plugins/web, plugins/mira-hub) import.
