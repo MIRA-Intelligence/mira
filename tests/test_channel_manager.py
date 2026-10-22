@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from importlib.machinery import ModuleSpec
 from types import SimpleNamespace
 
 from mira_engine.bus.events import OutboundMessage
@@ -35,10 +36,16 @@ class _DummyChannel(BaseChannel):
         self.sent.append(msg)
 
 
-def _install_channel_module(monkeypatch, module_name: str, cls_name: str) -> None:
+def _install_module(monkeypatch, module_name: str) -> types.ModuleType:
     mod = types.ModuleType(module_name)
-    setattr(mod, cls_name, _DummyChannel)
+    # A spec, so importlib.util.find_spec (the loader's `requires` check) sees it.
+    mod.__spec__ = ModuleSpec(module_name, loader=None)
     monkeypatch.setitem(sys.modules, module_name, mod)
+    return mod
+
+
+def _install_channel_module(monkeypatch, module_name: str, cls_name: str) -> None:
+    setattr(_install_module(monkeypatch, module_name), cls_name, _DummyChannel)
 
 
 def _enable_all_channels(cfg: Config) -> None:
@@ -77,6 +84,11 @@ def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
         ("mira_engine.channels.community", "CommunityChannel"),
     ):
         _install_channel_module(monkeypatch, module_name, cls_name)
+    # The matrix plugin declares `requires: [nio, mistune, nh3]` and the loader
+    # reports it unavailable without them. A bare install (the release build)
+    # has no matrix SDK; stand them in — this test is about the manager.
+    for sdk in ("nio", "mistune", "nh3"):
+        _install_module(monkeypatch, sdk)
 
     cfg = Config()
     _enable_all_channels(cfg)
