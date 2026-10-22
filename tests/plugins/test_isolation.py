@@ -15,7 +15,7 @@ from mira_engine.plugins import PluginRuntime, PluginSource
 from mira_engine.plugins.state import PluginState
 
 PROBE = '''
-import asyncio, os, socket
+import asyncio, os, socket, sys
 from mira_engine.agent.tools.base import Tool
 
 class Probe(Tool):
@@ -56,7 +56,7 @@ class Probe(Tool):
         if what == "run":
             import subprocess
             try:
-                return subprocess.run(["/bin/echo", "ran"], capture_output=True, text=True).stdout.strip()
+                return subprocess.run([sys.executable, "-c", "print('ran')"], capture_output=True, text=True).stdout.strip()
             except OSError as e:
                 return "blocked: " + type(e).__name__
         return "?"

@@ -13,8 +13,10 @@ never runs inside the engine. Its tools are served by
   macOS the whole home directory does, except those grants). Without
   ``shell: true`` it can't start other programs (enforced by Seatbelt on macOS
   and by the permission tripwire inside the host everywhere).
-* **Minimal environment** either way: only ``PATH``, locale and Python path
-  variables are passed, never the engine's API keys.
+* **Minimal environment** either way: only ``PATH``, locale, Python path and
+  the OS's own variables are passed, never the engine's API keys. On Windows
+  the host's ``USERPROFILE`` is its scratch dir, so the real profile stays
+  hidden and ``Path.home()`` still works.
 * **Crash/hang isolation**: a crashing host fails the call and is restarted on
   the next one; a hung call is killed at its timeout. The plugin's circuit
   breaker counts both.
@@ -41,7 +43,11 @@ from mira_engine.agent.tools.base import Tool
 from mira_engine.plugins.context import plugin_data_dir
 from mira_engine.plugins.manifest import PluginManifest
 
-_ENV_KEEP = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "PYTHONPATH", "VIRTUAL_ENV", "SYSTEMROOT", "TMPDIR")
+_ENV_KEEP = (
+    "PATH", "LANG", "LC_ALL", "LC_CTYPE", "PYTHONPATH", "VIRTUAL_ENV", "TMPDIR",
+    # Windows: without these a Python child cannot start or find its DLLs.
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+)
 _SITE_DIRS = ("site-packages", "dist-packages")
 DESCRIBE_TIMEOUT_S = 30.0
 
@@ -85,6 +91,8 @@ def plugin_env(
     scratch = str(plugin_data_dir(manifest.id))
     env["MIRA_PLUGIN_DATA_DIR"] = scratch
     env["TMPDIR"] = scratch  # its temp files stay in its own (writable) dir
+    if sys.platform == "win32":
+        env["USERPROFILE"] = scratch  # pathlib's home; the real profile stays hidden
     env["MIRA_PLUGIN_MIRA_HOME"] = str(get_data_dir())
     env["MIRA_PLUGIN_TIER"] = tier or "experimental"
     if workspace is not None and manifest.permissions.filesystem != "none":
