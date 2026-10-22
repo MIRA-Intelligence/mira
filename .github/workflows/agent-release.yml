@@ -44,6 +44,8 @@ jobs:
           pip install pytest pytest-asyncio pytest-cov aiohttp ruff build pyinstaller
 
       - name: Run tests
+        env:
+          LITELLM_RUST: "0"  # see tests.yml (Windows hang in litellm's native log filter)
         run: python -m pytest tests -q
 
       - name: Fetch bundled uv binary

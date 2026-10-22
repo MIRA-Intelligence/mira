@@ -125,4 +125,8 @@ jobs:
       - name: Run tests
         # faulthandler_timeout dumps every thread's stack from C when a test
         # overruns — it works where pytest-timeout's thread cannot get the GIL.
+        env:
+          # litellm >= 1.106 filters error log records through a native (Rust)
+          # redactor; on Windows that call hung the run with every timer dead.
+          LITELLM_RUST: "0"
         run: python -m pytest tests -q -p no:cacheprovider --timeout=120 --timeout-method=thread -o faulthandler_timeout=150 -rfE --durations=25

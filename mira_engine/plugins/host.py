@@ -151,16 +151,36 @@ def main(argv: list[str] | None = None) -> int:
     _limit_resources()
     protocol_out = sys.stdout
     sys.stdout = sys.stderr  # plugin prints must not corrupt the protocol
-    try:
-        _guard(Path(args[0]))
-        tools = _load_tools(Path(args[0]))
-    except Exception as e:  # noqa: BLE001
-        print(json.dumps({"error": f"{type(e).__name__}: {e}"}), file=protocol_out, flush=True)
-        return 1
+    plugin_dir = Path(args[0])
     if describe_only:
+        tools = _start(plugin_dir, protocol_out)
+        if tools is None:
+            return 1
         print(json.dumps(_describe(tools)), file=protocol_out, flush=True)
         return 0
-    asyncio.run(_serve(tools, protocol_out))
+    return asyncio.run(_run(plugin_dir, protocol_out))
+
+
+def _start(plugin_dir: Path, out: TextIO) -> dict[str, Any] | None:
+    """Arm the plugin's grant and load its tools; on failure report on the
+    protocol stream and return None."""
+    try:
+        _guard(plugin_dir)
+        return _load_tools(plugin_dir)
+    except Exception as e:  # noqa: BLE001
+        print(json.dumps({"error": f"{type(e).__name__}: {e}"}), file=out, flush=True)
+        return None
+
+
+async def _run(plugin_dir: Path, out: TextIO) -> int:
+    # The event loop exists before the plugin's grant is armed: on Windows
+    # asyncio's Proactor loop connects a loopback socketpair for its own
+    # wake-ups, which a plugin without network permission may not do. The
+    # grant is set in this task's context, which every plugin task inherits.
+    tools = _start(plugin_dir, out)
+    if tools is None:
+        return 1
+    await _serve(tools, out)
     return 0
 
 
