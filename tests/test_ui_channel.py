@@ -3868,7 +3868,8 @@ async def test_fs_list_shows_one_folder_and_stops_at_home(ui_channel: UiChannel,
 
 async def test_fs_list_rejects_paths_outside_home_and_workspace(ui_channel: UiChannel, browse_home: Path) -> None:
     req = MagicMock(spec=web.Request)
-    for path, status in (("/", 403), ("relative/dir", 400), ("", 400), (str(browse_home / "missing"), 404)):
+    root = browse_home.anchor  # "/" (POSIX) or "C:\\" (Windows): absolute, outside home and workspace
+    for path, status in ((root, 403), ("relative/dir", 400), ("", 400), (str(browse_home / "missing"), 404)):
         req.query = {"path": path}
         assert (await ui_channel._handle_fs_list(req)).status == status, path
 
@@ -3954,7 +3955,7 @@ async def test_fs_upload_creates_a_new_chat_folder(ui_channel: UiChannel, browse
 
 
 async def test_fs_upload_refuses_folders_outside_home_and_workspace(ui_channel: UiChannel, browse_home: Path) -> None:
-    req = _upload_request({"dir": "/"}, _FakePart(name="files", filename="x.txt", chunks=[b"x"]))
+    req = _upload_request({"dir": browse_home.anchor}, _FakePart(name="files", filename="x.txt", chunks=[b"x"]))
     assert (await ui_channel._handle_fs_upload(req)).status == 403
     req = _upload_request({"dir": str(browse_home)}, _FakePart(name="files", filename="../x.txt", chunks=[b"x"]))
     assert (await ui_channel._handle_fs_upload(req)).status == 400

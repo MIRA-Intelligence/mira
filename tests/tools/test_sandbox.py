@@ -217,8 +217,8 @@ class TestSeatbeltProfile:
         deny_read = next(i for i, line in enumerate(lines) if line.startswith("(deny file-read-data"))
         allow_read = next(i for i, line in enumerate(lines) if line.startswith("(allow file-read-data"))
         assert deny_read < allow_read
-        assert f'(subpath "{home.resolve()}")' in lines[deny_read]
-        assert f'(subpath "{plugin.resolve()}")' in lines[allow_read]
+        assert f"(subpath {sandbox._sb(home.resolve())})" in lines[deny_read]
+        assert f"(subpath {sandbox._sb(plugin.resolve())})" in lines[allow_read]
         assert lines.index('(deny file-write* (subpath "/"))') < next(
             i for i, line in enumerate(lines) if line.startswith("(allow file-write*"))
         assert "(deny process-exec*)" in lines
@@ -230,8 +230,8 @@ class TestSeatbeltProfile:
         monkeypatch.setattr(sys, "path", [str(home), str(home.parent), *sys.path])
         profile = sandbox.seatbelt_profile(SandboxSpec.build(workspace))
         allow_read = next(line for line in profile.splitlines() if line.startswith("(allow file-read-data"))
-        assert f'(subpath "{home.resolve()}")' not in allow_read
-        assert f'(subpath "{home.parent.resolve()}")' not in allow_read
+        assert f"(subpath {sandbox._sb(home.resolve())})" not in allow_read
+        assert f"(subpath {sandbox._sb(home.parent.resolve())})" not in allow_read
 
     def test_network_and_shell_when_granted(self, workspace: Path) -> None:
         profile = sandbox.seatbelt_profile(SandboxSpec.build(workspace), shell=True)
@@ -242,7 +242,7 @@ class TestSeatbeltProfile:
         other.mkdir()
         profile = sandbox.seatbelt_profile(SandboxSpec.build(workspace), hide=[other])
         deny_read = next(line for line in profile.splitlines() if line.startswith("(deny file-read-data"))
-        assert f'(subpath "{other.resolve()}")' in deny_read
+        assert f"(subpath {sandbox._sb(other.resolve())})" in deny_read
 
     def test_plugin_sandbox_picks_the_platform_backend(self, monkeypatch) -> None:
         monkeypatch.setattr(sys, "platform", "darwin")

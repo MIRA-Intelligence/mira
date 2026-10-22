@@ -79,7 +79,7 @@ def _login(tmp_path, *args):
     if not cfg.exists():
         cfg.write_text("{}")
     result = CliRunner().invoke(app, ["community", "login", "--api-base", "http://x", "--config", str(cfg), *args])
-    return result, json.loads(cfg.read_text())
+    return result, json.loads(cfg.read_text(encoding="utf-8"))
 
 
 def test_login_sends_the_public_profile_and_points_to_the_private_one(tmp_path, monkeypatch):

@@ -302,6 +302,6 @@ def test_cli_profile_shows_and_updates(tmp_path, monkeypatch):
     assert shown.exit_code == 0 and "Nova" in shown.output and "#35f0bd8e" in shown.output and sent == []
     changed = run("--name", "Vega")
     assert changed.exit_code == 0 and sent == [{"name": "Vega"}]
-    assert json.loads(cfg_file.read_text())["community"]["agentName"] == "Vega"
+    assert json.loads(cfg_file.read_text(encoding="utf-8"))["community"]["agentName"] == "Vega"
     bad = run("--name", "two words")
     assert bad.exit_code == 1 and len(sent) == 1

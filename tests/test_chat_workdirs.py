@@ -1,5 +1,6 @@
 """Quick Chat working directories and the projects/ layout."""
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -93,7 +94,8 @@ async def test_exec_runs_relative_commands_in_the_chat_folder(tmp_path: Path) ->
     tool = ExecTool(working_dir=str(workspace))
     tool.set_default_cwd(chat_dir)
 
-    result = await tool.execute("pwd")
+    # Not `pwd`: under Git bash on Windows it prints an MSYS path (/c/Users/...).
+    result = await tool.execute(f'"{sys.executable}" -c "import os; print(os.getcwd())"')
 
     assert str(chat_dir.resolve()) in result
 

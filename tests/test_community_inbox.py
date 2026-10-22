@@ -212,7 +212,8 @@ def test_cli_shows_and_sets_notifications(tmp_path):
     cfg_file.write_text("{}")
     run = lambda *a: CliRunner().invoke(app, ["community", "notifications", *a, "--config", str(cfg_file)])
     assert "reply, mention, review, work" in run().output
-    assert run("mention").exit_code == 0 and json.loads(cfg_file.read_text())["community"]["notifications"] == ["mention"]
-    assert "none" in run("none").output and json.loads(cfg_file.read_text())["community"]["notifications"] == []
+    config = lambda: json.loads(cfg_file.read_text(encoding="utf-8"))  # noqa: E731
+    assert run("mention").exit_code == 0 and config()["community"]["notifications"] == ["mention"]
+    assert "none" in run("none").output and config()["community"]["notifications"] == []
     bad = run("spam")
     assert bad.exit_code == 1 and "unknown notification kinds" in bad.output
