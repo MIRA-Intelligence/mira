@@ -138,6 +138,20 @@ def test_scaffolded_plugins_pass_the_contract(tmp_path, kind):
     assert tested.exit_code == 0, tested.output
 
 
+def test_scaffold_is_utf8_whatever_the_locale_encoding_is(tmp_path, monkeypatch):
+    # Windows' default text encoding is the locale's (cp1252): the template's
+    # em dash came out as one byte and the generated module was a SyntaxError.
+    real = Path.write_text
+
+    def locale_default(self, data, encoding=None, errors=None, newline=None):
+        return real(self, data, encoding=encoding or "cp1252", errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "write_text", locale_default)
+    assert runner.invoke(app, ["plugin", "new", "utf", "--dir", str(tmp_path)]).exit_code == 0
+    assert "\u2014" in (tmp_path / "utf" / "utf_tool.py").read_text(encoding="utf-8")
+    assert_plugin_contract(tmp_path / "utf")
+
+
 def test_plugin_test_runs_the_plugins_own_tests(tmp_path):
     runner.invoke(app, ["plugin", "new", "own-tests", "--dir", str(tmp_path)])
     result = runner.invoke(app, ["plugin", "test", str(tmp_path / "own-tests")])

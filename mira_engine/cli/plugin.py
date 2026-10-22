@@ -184,11 +184,13 @@ def new(
     (target / "tests").mkdir(parents=True)
     if kind == "tool":
         module, entry_cls = f"{snake}_tool", f"{cls}Tool"
-        (target / f"{module}.py").write_text(_TOOL_TEMPLATE.format(title=title, cls=entry_cls, tool_name=snake))
+        (target / f"{module}.py").write_text(_TOOL_TEMPLATE.format(title=title, cls=entry_cls, tool_name=snake), encoding="utf-8")
         provides = {"tools": [{"name": snake, "entry": f"{module}:{entry_cls}"}]}
     else:
         module, entry_cls = f"{snake}_channel", f"{cls}Channel"
-        (target / f"{module}.py").write_text(_CHANNEL_TEMPLATE.format(title=title, cls=entry_cls, channel_name=plugin_id))
+        (target / f"{module}.py").write_text(
+            _CHANNEL_TEMPLATE.format(title=title, cls=entry_cls, channel_name=plugin_id), encoding="utf-8"
+        )
         provides = {"channels": [{"name": plugin_id, "entry": f"{module}:{entry_cls}"}]}
     manifest = {
         "id": plugin_id,
@@ -199,6 +201,6 @@ def new(
         "permissions": {"network": [], "filesystem": "none", "shell": False, "secrets": []},
         "default_enabled": False,
     }
-    (target / "plugin.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    (target / "tests" / "test_contract.py").write_text(_TEST_TEMPLATE)
+    (target / "plugin.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (target / "tests" / "test_contract.py").write_text(_TEST_TEMPLATE, encoding="utf-8")
     console.print(f"Created {target}. Next: mira plugin test {target}; mira plugin enable {plugin_id}")

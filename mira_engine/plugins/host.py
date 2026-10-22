@@ -88,14 +88,16 @@ def _describe(tools: dict[str, Any]) -> dict[str, Any]:
 
 async def _serve(tools: dict[str, Any], out: TextIO) -> None:
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+    # Requests are read in a worker thread: the event loop can't read stdin
+    # itself on Windows (connect_read_pipe is POSIX-only), and a thread has
+    # no line-length limit, so a call with large arguments gets through.
+    stdin = sys.stdin.buffer
 
     def reply(msg: dict[str, Any]) -> None:
         out.write(json.dumps(msg, default=str) + "\n")
         out.flush()
 
-    while line := await reader.readline():
+    while line := await loop.run_in_executor(None, stdin.readline):
         try:
             req = json.loads(line)
         except ValueError:
