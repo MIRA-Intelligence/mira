@@ -122,4 +122,4 @@ jobs:
           pip install pytest pytest-asyncio pytest-timeout aiohttp
 
       - name: Run tests
-        run: python -m pytest tests -q -p no:cacheprovider --timeout=300 --timeout-method=thread -rfE
+        run: python -m pytest tests -q -p no:cacheprovider --timeout=120 --timeout-method=thread -rfE --durations=25
