@@ -130,6 +130,7 @@ jobs:
         working-directory: pr
         env:
           MIRA_REQUIRE_BWRAP: "1"
+          MIRA_ALL_PLUGIN_SDKS: "1"
         run: python -m pytest -c ../base/pyproject.toml --rootdir . -p no:cacheprovider tests/
 
   report:

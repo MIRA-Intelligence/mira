@@ -56,6 +56,8 @@ jobs:
       - name: Run tests with coverage
         env:
           MIRA_REQUIRE_BWRAP: "1"
+          # Every bundled plugin's SDK is installed (dev extra): a skipped contract is a failure.
+          MIRA_ALL_PLUGIN_SDKS: "1"
         run: |
           python -m pytest tests/ \
             --cov=mira_engine \

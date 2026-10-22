@@ -24,11 +24,13 @@ def test_every_bundled_plugin_passes_the_contract(plugin_dir):
     # the contract cannot turn green.
     report = assert_plugin_contract(plugin_dir, tier="core-bundled")
     if report.skipped:
-        # Its SDK isn't installed here, so nothing was checked. CI installs
-        # every bundled plugin's SDK (the dev extra): there, a skip means a
-        # typo in `requires` or a missing dev dependency, not an optional SDK.
+        # Its SDK isn't installed here, so nothing was checked. Where every
+        # bundled plugin's SDK is installed (the dev extra; tests.yml and
+        # mira/verify set MIRA_ALL_PLUGIN_SDKS) a skip means a typo in
+        # `requires` or a missing dev dependency, not an optional SDK. The
+        # release build installs the bare package, so there a skip is a skip.
         message = f"{report.plugin_id} was not checked: {'; '.join(report.skipped)}"
-        if os.environ.get("CI"):
+        if os.environ.get("MIRA_ALL_PLUGIN_SDKS"):
             pytest.fail(message)
         pytest.skip(message)
 
