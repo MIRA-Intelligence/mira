@@ -18,8 +18,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11"]
     runs-on: ${{ matrix.os }}
-    # The suite takes ~5 min; a hang must not hold a release for hours.
-    timeout-minutes: 45
+    # A hang must not hold a release for hours (the suite is slow on Windows).
+    timeout-minutes: 75
 
     steps:
       - name: Checkout

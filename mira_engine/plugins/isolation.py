@@ -185,7 +185,9 @@ def describe(
 
 
 class PluginHostClient:
-    """A long-lived host process, started lazily and restarted after a crash."""
+    """A long-lived host process, started lazily and restarted after a crash.
+    Its stderr (plugin prints, tracebacks) goes to ``host-stderr.log`` in its
+    scratch dir, and the tail of that is quoted when the host dies."""
 
     def __init__(self, plugin_id: str, argv: list[str], env: dict[str, str] | None = None, cwd: Path | None = None):
         self.plugin_id = plugin_id
@@ -203,15 +205,21 @@ class PluginHostClient:
     async def _ensure(self) -> asyncio.subprocess.Process:
         async with self._start_lock:
             if self._proc is None or self._proc.returncode is not None:
-                self._proc = await asyncio.create_subprocess_exec(
-                    *self.argv,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    env=self.env or host_env(),
-                    cwd=self.cwd,
-                    limit=16 * 1024 * 1024,
-                )
+                stderr_path = self._stderr_path()
+                stderr_file = open(stderr_path, "wb") if stderr_path else None  # noqa: SIM115 - handed to the child
+                try:
+                    self._proc = await asyncio.create_subprocess_exec(
+                        *self.argv,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=stderr_file if stderr_file is not None else asyncio.subprocess.DEVNULL,
+                        env=self.env or host_env(),
+                        cwd=self.cwd,
+                        limit=16 * 1024 * 1024,
+                    )
+                finally:
+                    if stderr_file is not None:
+                        stderr_file.close()  # the child holds its own handle
                 self._reader = asyncio.create_task(self._read(self._proc), name=f"plugin-host-{self.plugin_id}")
                 # Wait until the host has imported the engine and the plugin,
                 # so a cold start doesn't eat into the first call's timeout.
@@ -221,6 +229,18 @@ class PluginHostClient:
                     await self.close()
                     raise
             return self._proc
+
+    def _stderr_path(self) -> Path | None:
+        return self.cwd / "host-stderr.log" if self.cwd is not None else None
+
+    def _exit_message(self) -> str:
+        message = f"plugin host for {self.plugin_id} exited"
+        path = self._stderr_path()
+        try:
+            tail = path.read_text(errors="replace").strip()[-400:] if path else ""
+        except OSError:
+            tail = ""
+        return f"{message}: {tail}" if tail else message
 
     async def _request(
         self, proc: asyncio.subprocess.Process, method: str, params: dict[str, Any] | None, timeout: float
@@ -256,7 +276,7 @@ class PluginHostClient:
         # The host exited: fail whatever was still waiting.
         for fut in self._pending.values():
             if not fut.done():
-                fut.set_exception(RuntimeError(f"plugin host for {self.plugin_id} exited"))
+                fut.set_exception(RuntimeError(self._exit_message()))
         self._pending.clear()
 
     async def call(self, tool: str, args: dict[str, Any], timeout: float) -> Any:
@@ -276,7 +296,7 @@ class PluginHostClient:
         # Any other call still waiting on this host fails now, not at its own timeout.
         for fut in self._pending.values():
             if not fut.done():
-                fut.set_exception(RuntimeError(f"plugin host for {self.plugin_id} exited"))
+                fut.set_exception(RuntimeError(self._exit_message()))
         self._pending.clear()
         if proc is not None and proc.returncode is None:
             proc.kill()
