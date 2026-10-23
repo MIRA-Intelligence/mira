@@ -25,6 +25,7 @@ from mira_engine.utils.helpers import (
     strip_think,
 )
 from mira_engine.utils.locks import (
+    LockAcquisitionError,
     atomic_write_text,
     interprocess_lock,
     locked_write_text,
@@ -910,7 +911,7 @@ class _DreamTools(ToolRegistry):
     def __init__(self, store: MemoryStore):
         super().__init__()
         self.store = store
-        self.failed_edits: set[Path] = set()
+        self.failed_edits: set[Path | None] = set()
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:
         target = None
@@ -932,14 +933,18 @@ class _DreamTools(ToolRegistry):
                 "user": self.store.global_workspace / "USER.md",
             }
             scope = params.get("scope")
-            if isinstance(scope, str) and scope in targets:
-                target = targets[scope].resolve()
+            if isinstance(scope, str):
+                target = targets.get(scope.strip().casefold())
+                if target is not None:
+                    target = target.resolve()
         result = await super().execute(name, params)
-        if target is not None:
+        if target is not None or name == "edit_memory":
             if result.startswith(("Error", "Warning")):
                 self.failed_edits.add(target)
             else:
                 self.failed_edits.discard(target)
+                if name == "edit_memory":
+                    self.failed_edits.discard(None)  # A valid write repairs an unknown scope.
         return result
 
 
@@ -989,12 +994,21 @@ class Dream:
         return 0, max(1, self.max_batch_size)
 
     async def run(self) -> bool:
+        """Allow one Dream per workspace, including across gateway processes."""
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(interprocess_lock(self.store.memory_dir / ".dream_run", timeout=0))
+            except LockAcquisitionError as exc:
+                raise DreamRunError("Dream is already running for this workspace; retry later.") from exc
+            return await self._run_once()
+
+    async def _run_once(self) -> bool:
         """One bounded attempt per tick; persist retries across Dream instances."""
         cursor = self.store.get_last_dream_cursor()
         entries = self.store.read_unprocessed_history(cursor)
         if not entries:
             return False
-        attempts, batch_size = self._read_retry_state(cursor)
+        _, batch_size = self._read_retry_state(cursor)
         batch = entries[:batch_size]
         tools = self._build_tools()
         result = await self._run_batch(batch, tools)
@@ -1007,17 +1021,19 @@ class Dream:
             result.stop_reason == "completed" and tools.failed_edits
         ):
             reason = ("Unresolved memory edits" if tools.failed_edits else result.stop_reason)
-            self._record_failed_attempt(cursor, batch, attempts + 1, reason)
+            self._record_failed_attempt(cursor, batch, reason)
         # Provider/transport failures must never consume the bad-entry allowance.
         raise DreamRunError(f"Dream stopped: {result.stop_reason}; unprocessed history was kept.")
 
     def _record_failed_attempt(
-        self, cursor: int, batch: list[dict[str, Any]], attempts: int, reason: str
+        self, cursor: int, batch: list[dict[str, Any]], reason: str
     ) -> None:
         state_file = self.store.memory_dir / ".dream_retry.json"
         with interprocess_lock(self.store._dream_cursor_file):
             if self.store.get_last_dream_cursor() != cursor:
                 raise DreamRunError("Dream cursor changed concurrently; retry with current history.")
+            previous_attempts, _ = self._read_retry_state(cursor)
+            attempts = previous_attempts + 1
             if attempts < self._MAX_CURSOR_ATTEMPTS:
                 # Isolate one entry for the final attempt, even with a large batch.
                 batch_size = 1 if attempts == self._MAX_CURSOR_ATTEMPTS - 1 else max(1, len(batch) // 2)

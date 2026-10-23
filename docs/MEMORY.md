@@ -46,6 +46,10 @@ SOUL.md, keyed by canonical target file. Reads, unsupported scopes, read-only fi
 and path-policy refusals do not block a completed run. The first shared USER.md
 edit uses the bundled template if no file exists, preserving its profile sections.
 
+Only one Dream can run per workspace at a time; overlapping calls report busy
+without making model calls or consuming retry attempts. Invalid-scope memory writes
+remain unresolved until repaired.
+
 Each invocation performs at most one analysis phase and one editing phase (up to
 `maxIterations` model turns, excluding the provider's own transport retries). On an
 iteration-budget failure or unresolved write, the next invocation retries a smaller

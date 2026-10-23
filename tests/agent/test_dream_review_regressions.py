@@ -1,5 +1,6 @@
 """Regressions for policy refusals, bootstrap profiles and bounded Dream retries."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -49,7 +50,6 @@ async def test_rejected_user_file_edit_can_be_repaired_with_scoped_edit(tmp_path
     ("edit_file", {"path": "USER.local.md", "old_text": "English", "new_text": "French"}),
     ("edit_file", {"path": "../SOUL.md", "old_text": "Helpful", "new_text": "Rude"}),
     ("read_file", {"path": "memory/MEMORY.md"}),
-    ("edit_memory", {"scope": "invalid", "old_text": "", "new_text": "Wrong scope"}),
 ])
 async def test_policy_refusals_and_read_errors_do_not_block_completed_runs(tmp_path, name, arguments):
     store = MemoryStore(tmp_path / "project")
@@ -181,3 +181,54 @@ async def test_effective_user_template_is_present_in_both_dream_phases(tmp_path)
         assert "### Communication Style" in prompt
         assert "### Response Length" in prompt
     assert not (store.global_workspace / "USER.md").exists()
+
+
+@pytest.mark.parametrize("scope", ["Personal", "invalid"])
+@pytest.mark.parametrize("repair", [False, True])
+async def test_invalid_memory_scope_requires_a_repaired_write(tmp_path, scope, repair):
+    store = MemoryStore(tmp_path / "project")
+    store.append_history("Remember reusable workflow A")
+    responses = [tool_response("edit_memory", scope=scope, old_text="", new_text="Workflow A")]
+    if repair:
+        responses.append(tool_response("edit_memory", scope="personal", old_text="", new_text="Workflow A"))
+    provider = provider_for(*responses, LLMResponse(content="Done"))
+    if repair:
+        assert await Dream(store, provider, "test").run()
+    else:
+        with pytest.raises(DreamRunError, match="Unresolved"):
+            await Dream(store, provider, "test").run()
+    assert store.get_last_dream_cursor() == int(repair)
+    assert store.read_global_term() == ("Workflow A" if repair else "")
+
+
+async def test_overlapping_dreams_do_not_duplicate_work_or_lose_retry_counts(tmp_path):
+    store = MemoryStore(tmp_path / "project")
+    store.append_history("Pending entry")
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Analysis"))
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def fail_after_release(spec):
+        started.set()
+        await release.wait()
+        return run_result("max_iterations")
+
+    first, second = (Dream(store, provider, "test") for _ in range(2))
+    for dream in (first, second):
+        dream._runner.run = AsyncMock(side_effect=fail_after_release)
+    task = asyncio.create_task(first.run())
+    await asyncio.wait_for(started.wait(), timeout=2)
+    try:
+        with pytest.raises(DreamRunError, match="already running"):
+            await asyncio.wait_for(second.run(), timeout=0.5)
+    finally:
+        release.set()
+        with pytest.raises(DreamRunError, match="max_iterations"):
+            await task
+    second._runner.run.assert_not_awaited()
+    state = store.memory_dir / ".dream_retry.json"
+    assert json.loads(state.read_text())["attempts"] == 1
+    with pytest.raises(DreamRunError, match="max_iterations"):
+        await second.run()
+    assert json.loads(state.read_text())["attempts"] == 2
+    assert provider.chat_with_retry.await_count == 2
