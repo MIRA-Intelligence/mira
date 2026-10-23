@@ -255,3 +255,15 @@ async def test_empty_final_responses_are_bounded_and_later_history_proceeds(tmp_
     store.append_history("Healthy next entry")
     assert await Dream(store, provider_for(LLMResponse(content="No changes")), "test").run()
     assert store.get_last_dream_cursor() == 2
+
+
+async def test_small_dream_batches_do_not_compact_away_pending_entries(tmp_path):
+    store = MemoryStore(tmp_path / "project", max_history_entries=3)
+    for cursor in range(1, 8):
+        store.append_history(f"Fact {cursor}")
+    for cursor in range(1, 8):
+        provider = provider_for(LLMResponse(content="No changes"))
+        assert await Dream(store, provider, "test", max_batch_size=1).run()
+        assert store.get_last_dream_cursor() == cursor
+        assert [e["cursor"] for e in store.read_unprocessed_history(cursor)] == list(range(cursor + 1, 8))
+    assert [e["cursor"] for e in store.read_unprocessed_history(0)] == [5, 6, 7]

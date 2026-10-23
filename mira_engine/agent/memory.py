@@ -274,13 +274,20 @@ class MemoryStore:
         return entries
 
     def compact_history(self) -> None:
-        entries = self.read_unprocessed_history(since_cursor=0)
-        if len(entries) <= self.max_history_entries:
-            return
-        keep = entries[-self.max_history_entries :]
-        with open(self.history_jsonl_file, "w", encoding="utf-8") as f:
-            for entry in keep:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        """Retain recent history and every entry Dream has not acknowledged."""
+        with interprocess_lock(self.history_jsonl_file):
+            entries = self.read_unprocessed_history(since_cursor=0)
+            if len(entries) <= self.max_history_entries:
+                return
+            cursor = self.get_last_dream_cursor()
+            recent_start = len(entries) - len(entries[-self.max_history_entries :])
+            keep = [entry for index, entry in enumerate(entries)
+                    if index >= recent_start or entry["cursor"] > cursor]
+            if len(keep) == len(entries):
+                return
+            content = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in keep)
+            atomic_write_text(self.history_jsonl_file, content,
+                              mode=self.history_jsonl_file.stat().st_mode & 0o777)
 
     @staticmethod
     def _parse_timestamped_line(line: str) -> tuple[str, str] | None:

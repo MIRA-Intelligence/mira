@@ -66,6 +66,9 @@ can process the remaining history. After correcting the cause, re-archive the sa
 `entry.content` as a new history entry to retry it; do not reset the cursor and
 reprocess unrelated history. The saved record survives ordinary history compaction.
 Earlier successful memory edits remain saved and appear in fresh retry snapshots.
+History compaction retains the latest configured number of entries plus all pending
+entries, even if that temporarily exceeds the limit. Compaction and appends share
+a lock so concurrent archiving cannot be overwritten.
 
 Provider/credential/transport failures retain history and do not consume the
 bad-entry allowance: an API outage never causes entries to be skipped. Only idle
