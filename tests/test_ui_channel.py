@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from aiohttp import web
 
@@ -1404,30 +1405,31 @@ async def test_submit_feedback_sends_single_text_message(
     assert "Show workspace files as a tree." in posted[0]["content"]["text"]
 
 
-async def test_post_feishu_webhook_retries_ssl_verification_failure(
+async def test_post_feishu_webhook_never_retries_without_certificate_verification(
     ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The retry with ssl=False that papered over the frozen build's empty
+    # trust store (fixed in mira_engine.utils.tls) is gone: a certificate
+    # failure is an error the user sees, not a reason to stop verifying.
     relay = ui_channel_mod._FeedbackRelayConfig(
         feishu_webhook_url="https://open.feishu.cn/webhook/test",
         feishu_secret="super-secret",
     )
-    calls: list[bool | None] = []
+    calls: list[dict[str, Any]] = []
 
     async def _fake_post_once(
         _relay: ui_channel_mod._FeedbackRelayConfig,
-        _body: dict[str, Any],
-        *,
-        ssl: bool | None = None,
+        body: dict[str, Any],
     ) -> None:
-        calls.append(ssl)
-        if ssl is None:
-            raise ui_channel_mod.ClientError("CERTIFICATE_VERIFY_FAILED")
+        calls.append(body)
+        raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
 
     monkeypatch.setattr(ui_channel, "_post_feishu_webhook_once", _fake_post_once)
 
-    await ui_channel._post_feishu_webhook(relay, {"msg_type": "text", "content": {"text": "hello"}})
+    with pytest.raises(RuntimeError, match="CERTIFICATE_VERIFY_FAILED"):
+        await ui_channel._post_feishu_webhook(relay, {"msg_type": "text", "content": {"text": "hello"}})
 
-    assert calls == [None, False]
+    assert len(calls) == 1 and calls[0]["sign"]  # signed once, sent once
 
 
 async def test_post_feishu_webhook_wraps_non_certificate_network_error(
@@ -1441,15 +1443,45 @@ async def test_post_feishu_webhook_wraps_non_certificate_network_error(
     async def _fake_post_once(
         _relay: ui_channel_mod._FeedbackRelayConfig,
         _body: dict[str, Any],
-        *,
-        ssl: bool | None = None,
     ) -> None:
-        raise ui_channel_mod.ClientError("connection refused")
+        raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(ui_channel, "_post_feishu_webhook_once", _fake_post_once)
 
     with pytest.raises(RuntimeError, match="feishu webhook request failed: connection refused"):
         await ui_channel._post_feishu_webhook(relay, {"msg_type": "text", "content": {"text": "hello"}})
+
+
+async def test_post_feishu_webhook_once_reports_what_feishu_answered(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay = ui_channel_mod._FeedbackRelayConfig(
+        feishu_webhook_url="https://open.feishu.cn/webhook/test", feishu_secret=""
+    )
+    answers: list[httpx.Response] = []
+    sent: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return answers.pop(0)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)
+    )
+    body = {"msg_type": "text", "content": {"text": "hello"}}
+
+    answers.append(httpx.Response(200, json={"code": 0, "msg": "success"}))
+    await ui_channel._post_feishu_webhook_once(relay, body)
+    assert sent == [body]
+
+    answers.append(httpx.Response(200, json={"code": 19021, "msg": "sign match fail"}))
+    with pytest.raises(RuntimeError, match="feishu webhook error 19021: sign match fail"):
+        await ui_channel._post_feishu_webhook_once(relay, body)
+
+    answers.append(httpx.Response(502, text="bad gateway"))
+    with pytest.raises(RuntimeError, match="feishu webhook returned 502"):
+        await ui_channel._post_feishu_webhook_once(relay, body)
 
 
 async def test_handle_config_updates_runtime_fields_and_provider_secrets(

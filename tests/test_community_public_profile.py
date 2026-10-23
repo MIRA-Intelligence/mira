@@ -52,6 +52,18 @@ def test_pairing_payload_keeps_domains_top_level_for_older_platforms():
 # --------------------------------------------------------------------------- #
 
 
+_REAL_ASYNC_CLIENT = httpx.AsyncClient  # captured before any test patches it
+
+
+def _serve(monkeypatch, handler):
+    """Every httpx.AsyncClient the engine opens talks to ``handler``."""
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *a, **k: _REAL_ASYNC_CLIENT(*a, transport=httpx.MockTransport(handler), **k),
+    )
+
+
 def _fake_platform(monkeypatch, *, start_status=200, start_body=None):
     seen: dict = {}
 
@@ -65,9 +77,7 @@ def _fake_platform(monkeypatch, *, start_status=200, start_body=None):
             return httpx.Response(200, json={"status": "authorized", "agent_token": "tok", "agent_id": "a1"})
         return httpx.Response(404)
 
-    real_client = httpx.Client
-    monkeypatch.setattr(httpx, "Client", lambda *a, **k: real_client(*a, transport=httpx.MockTransport(handler), **k))
-    monkeypatch.setattr("time.sleep", lambda _s: None)
+    _serve(monkeypatch, handler)
     monkeypatch.setattr("webbrowser.open", lambda _u: None)
     return seen
 
@@ -107,38 +117,31 @@ def test_login_reports_the_platforms_reason_for_a_rejected_profile(tmp_path, mon
     assert result.exit_code == 1 and "bio must be a string" in result.output and "Network error" not in result.output
 
 
+def test_login_reports_a_network_failure_in_plain_words(tmp_path, monkeypatch):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+
+    _serve(monkeypatch, handler)
+    monkeypatch.setattr("webbrowser.open", lambda _u: None)
+    result, saved = _login(tmp_path, "--bio", "fine here")
+    assert result.exit_code == 1 and "Network error contacting community" in result.output
+    assert "CERTIFICATE_VERIFY_FAILED" in result.output and "agentToken" not in saved.get("community", {})
+
+
 # --------------------------------------------------------------------------- #
 # Desktop UI pairing endpoint                                                  #
 # --------------------------------------------------------------------------- #
 
 
-class _FakeResp:
-    def __init__(self, status, body):
-        self.status, self._body = status, body
+def _fake_pairing_platform(monkeypatch, sent, status=200, body=None):
+    """The platform behind the UI handlers: records what was posted where."""
+    body = body or {"user_code": "C", "poll_token": "p", "verification_url": "u"}
 
-    async def json(self):
-        return self._body
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((str(request.url), json.loads(request.content)))
+        return httpx.Response(status, json=body)
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_):
-        return False
-
-
-class _FakeSession:
-    def __init__(self, sent, status=200, body=None):
-        self.sent, self.status, self.body = sent, status, body or {"user_code": "C", "poll_token": "p", "verification_url": "u"}
-
-    def post(self, url, json=None):
-        self.sent.append((url, json))
-        return _FakeResp(self.status, self.body)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_):
-        return False
+    _serve(monkeypatch, handler)
 
 
 @pytest.fixture
@@ -166,7 +169,7 @@ def _request(body):
 
 
 async def test_ui_pairing_forwards_the_public_profile(ui_env):
-    ui_env.monkeypatch.setattr(ui_env.mod, "ClientSession", lambda **_k: _FakeSession(ui_env.sent))
+    _fake_pairing_platform(ui_env.monkeypatch, ui_env.sent)
     channel = SimpleNamespace()
     resp = await ui_env.mod.UiChannel._handle_community_pair_start(
         channel, _request({"profile": {"domains": ["rag"], "tech_stack": "python, go", "bio": "hi"}})
@@ -179,15 +182,53 @@ async def test_ui_pairing_forwards_the_public_profile(ui_env):
 
 
 async def test_ui_pairing_rejects_a_bad_profile_and_relays_platform_errors(ui_env):
-    ui_env.monkeypatch.setattr(ui_env.mod, "ClientSession", lambda **_k: _FakeSession(ui_env.sent))
+    _fake_pairing_platform(ui_env.monkeypatch, ui_env.sent)
     resp = await ui_env.mod.UiChannel._handle_community_pair_start(SimpleNamespace(), _request({"profile": {"bio": "x" * 600}}))
     assert resp.status == 400 and "500" in json.loads(resp.text)["error"] and ui_env.sent == []
 
-    ui_env.monkeypatch.setattr(
-        ui_env.mod, "ClientSession", lambda **_k: _FakeSession(ui_env.sent, 400, {"error": "participation must be a subset"})
-    )
+    _fake_pairing_platform(ui_env.monkeypatch, ui_env.sent, 400, {"error": "participation must be a subset"})
     resp = await ui_env.mod.UiChannel._handle_community_pair_start(SimpleNamespace(), _request({"profile": {"bio": "ok"}}))
     assert resp.status == 400 and "participation must be a subset" in json.loads(resp.text)["error"]
+
+    def down(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+
+    _serve(ui_env.monkeypatch, down)
+    resp = await ui_env.mod.UiChannel._handle_community_pair_start(SimpleNamespace(), _request({"profile": {"bio": "ok"}}))
+    assert resp.status == 502 and json.loads(resp.text)["error"].startswith("network error: ")
+
+
+async def test_ui_polling_saves_the_token_and_takes_the_platforms_name(ui_env):
+    answers: dict[str, tuple[int, dict]] = {
+        "/agents/pair/poll": (202, {}),
+        "/agents/me": (200, {"id": "a1", "name": "Nova", "status": "active"}),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status, body = answers[request.url.path]
+        return httpx.Response(status, json=body)
+
+    _serve(ui_env.monkeypatch, handler)
+    channel = SimpleNamespace(
+        _fetch_agent_me=ui_env.mod.UiChannel._fetch_agent_me,
+        _community_status_payload=ui_env.mod.UiChannel._community_status_payload,
+        _audit=lambda **_k: None,
+    )
+    poll = lambda: ui_env.mod.UiChannel._handle_community_pair_poll(channel, _request({"poll_token": "p"}))  # noqa: E731
+
+    assert json.loads((await poll()).text) == {"status": "pending"}
+    answers["/agents/pair/poll"] = (410, {})
+    assert json.loads((await poll()).text) == {"status": "expired"}
+    answers["/agents/pair/poll"] = (500, {})
+    resp = await poll()
+    assert resp.status == 502 and json.loads(resp.text)["error"] == "poll failed: HTTP 500"
+    assert not ui_env.cfg.community.agent_token
+
+    answers["/agents/pair/poll"] = (200, {"agent_token": "tok", "agent_id": "a1"})
+    body = json.loads((await poll()).text)
+    assert body["status"] == "authorized"
+    assert (ui_env.cfg.community.enabled, ui_env.cfg.community.agent_token, ui_env.cfg.community.agent_id) == (True, "tok", "a1")
+    assert ui_env.cfg.community.agent_name == "Nova"
 
 
 def test_status_reports_whether_the_private_profile_is_set_up():

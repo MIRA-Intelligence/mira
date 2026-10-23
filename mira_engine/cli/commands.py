@@ -3359,8 +3359,7 @@ def community_login(
     import time
     import webbrowser
 
-    import httpx
-
+    from mira_engine.community.pairing import PairingError, fetch_me, poll_pairing, start_pairing
     from mira_engine.community.public_profile import (
         PublicProfileError,
         normalize_public_profile,
@@ -3406,61 +3405,39 @@ def community_login(
         {"code_host": cfg.community.code_host, "autonomy_mode": cfg.community.autonomy_mode, "domains": []},
         public_profile,
     )
+    # The same two requests the desktop app makes (mira_engine.community.pairing).
+    async def pair() -> tuple[str, str, dict | None]:
+        start = await start_pairing(base, start_payload)
+        console.print("To authorize this agent, open:")
+        console.print(f"  [link={start.verification_url}]{start.verification_url}[/link]")
+        if start.user_code:
+            console.print(f"and enter code: [bold cyan]{start.user_code}[/bold cyan]")
+        try:
+            webbrowser.open(start.verification_url)
+        except Exception:
+            pass
+        console.print("\n[dim]Waiting for authorization...[/dim]")
+
+        deadline = time.monotonic() + start.expires_in
+        while time.monotonic() < deadline:
+            await asyncio.sleep(start.interval)
+            poll = await poll_pairing(base, start.poll_token)
+            if poll.status == "expired":
+                break
+            if poll.status == "authorized":
+                # The platform has the final say on the name (it falls back to a default).
+                return poll.agent_token, poll.agent_id, await fetch_me(base, poll.agent_token)
+        return "", "", None
+
     try:
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.post(f"{base}/agents/pair/start", json=start_payload)
-            if resp.status_code == 404:
-                console.print(
-                    "[yellow]Pairing endpoint not available yet.[/yellow] "
-                    "The cloud agent gateway (#108/#109) is not deployed."
-                )
-                raise typer.Exit(1)
-            if resp.status_code == 400:
-                detail = (resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}).get("error")
-                console.print(f"[red]The community rejected the pairing request: {detail or resp.text}[/red]")
-                raise typer.Exit(1)
-            resp.raise_for_status()
-            data = resp.json()
-
-            verification_url = data.get("verification_url") or data.get("verification_uri")
-            user_code = data.get("user_code") or data.get("pairing_code")
-            poll_token = data.get("poll_token") or data.get("device_code")
-            interval = int(data.get("interval", 5))
-            expires_in = int(data.get("expires_in", 300))
-
-            if not (verification_url and poll_token):
-                console.print("[red]Unexpected pairing response from server[/red]")
-                raise typer.Exit(1)
-
-            console.print("To authorize this agent, open:")
-            console.print(f"  [link={verification_url}]{verification_url}[/link]")
-            if user_code:
-                console.print(f"and enter code: [bold cyan]{user_code}[/bold cyan]")
-            try:
-                webbrowser.open(verification_url)
-            except Exception:
-                pass
-            console.print("\n[dim]Waiting for authorization...[/dim]")
-
-            deadline = time.monotonic() + expires_in
-            agent_token = None
-            agent_id = ""
-            while time.monotonic() < deadline:
-                time.sleep(interval)
-                poll = client.post(f"{base}/agents/pair/poll", json={"poll_token": poll_token})
-                if poll.status_code in (202, 425):
-                    continue
-                if poll.status_code == 200:
-                    pdata = poll.json()
-                    agent_token = pdata.get("agent_token")
-                    agent_id = pdata.get("agent_id", "")
-                    if agent_token:
-                        break
-                else:
-                    console.print(f"[red]Pairing failed: HTTP {poll.status_code}[/red]")
-                    raise typer.Exit(1)
-    except httpx.HTTPError as e:
-        console.print(f"[red]Network error contacting community: {e}[/red]")
+        agent_token, agent_id, me = asyncio.run(pair())
+    except PairingError as e:
+        if e.network:
+            console.print(f"[red]Network error contacting community: {e}[/red]")
+        elif e.status == 400:
+            console.print(f"[red]The community rejected the pairing request: {e.detail or e}[/red]")
+        else:
+            console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
     if not agent_token:
@@ -3471,12 +3448,9 @@ def community_login(
     cfg.community.api_base = base
     cfg.community.agent_token = agent_token
     cfg.community.agent_id = agent_id
-    # The platform has the final say on the name (it falls back to a default).
-    try:
-        me = httpx.get(f"{base}/agents/me", headers={"Authorization": f"Bearer {agent_token}"}, timeout=10.0)
-        cfg.community.agent_name = str((me.json() or {}).get("name") or "") if me.status_code == 200 else ""
-    except Exception:  # noqa: BLE001 - the status endpoints refresh it later
-        cfg.community.agent_name = public_profile.get("name", "")
+    cfg.community.agent_name = (
+        str(me.get("name") or "") if me is not None else public_profile.get("name", "")
+    )
     save_config(cfg)
     console.print(
         "\n[green]✓[/green] Joined the Mira Community"

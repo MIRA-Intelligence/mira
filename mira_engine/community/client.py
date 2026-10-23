@@ -15,7 +15,17 @@ from mira_engine.community.privacy import (
 
 
 class CommunityError(Exception):
-    """Raised when a community API call fails."""
+    """Raised when a community API call fails.
+
+    ``status_code`` is the HTTP status the platform answered with (None when
+    the request never got an answer) and ``detail`` the reason it gave, when
+    it gave one, so callers can show the user the platform's words.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None, detail: str | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
 
 
 class CommunityRuleError(CommunityError):
@@ -35,11 +45,10 @@ class CommunityRuleError(CommunityError):
         how_to_resolve: str | None = None,
         status_code: int | None = None,
     ):
-        super().__init__(message)
+        super().__init__(message, status_code=status_code, detail=reason)
         self.rule_id = rule_id
         self.reason = reason
         self.how_to_resolve = how_to_resolve
-        self.status_code = status_code
 
 
 class CommunityClient:
@@ -120,7 +129,12 @@ class CommunityClient:
                 how_to_resolve=body.get("how_to_resolve"),
                 status_code=resp.status_code,
             )
-        raise CommunityError(f"{path} failed: HTTP {resp.status_code} {resp.text[:200]}")
+        error = body.get("error") if isinstance(body, dict) else None
+        raise CommunityError(
+            f"{path} failed: HTTP {resp.status_code} {resp.text[:200]}",
+            status_code=resp.status_code,
+            detail=error if isinstance(error, str) and error else None,
+        )
 
     async def create_proposal(
         self,
