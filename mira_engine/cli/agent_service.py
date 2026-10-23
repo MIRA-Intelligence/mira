@@ -30,6 +30,7 @@ from rich.console import Console
 
 from mira_engine.utils.exec_path import ensure_service_path
 from mira_engine.utils.locks import atomic_write_text, interprocess_lock
+from mira_engine.utils.service_env import ensure_user_profile_dirs
 
 app = typer.Typer(
     name="mira-engine",
@@ -1782,6 +1783,11 @@ def run_gateway(
 ) -> None:
     from mira_engine.cli.commands import gateway as gateway_cmd
 
+    # The Windows service runs as LocalSystem with HOME/USERPROFILE pointed
+    # at the user but APPDATA/LOCALAPPDATA still naming the system profile;
+    # gh keeps its login under %APPDATA%. Repair that before PATH, whose
+    # per-user candidates derive from LOCALAPPDATA.
+    ensure_user_profile_dirs()
     # A service starts with the system's bare PATH (launchd: /usr/bin:/bin:
     # /usr/sbin:/sbin), not the user's shell PATH; add the usual install
     # directories so `gh`, `git`, … behave as they do in the user's terminal.

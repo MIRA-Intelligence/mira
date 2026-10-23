@@ -46,6 +46,7 @@ from mira_engine.utils.exec_path import (
     missing_executable_message,
     resolve_executable,
 )
+from mira_engine.utils.service_env import gh_login_hint
 
 # (returncode, stdout, stderr)
 CommandRunner = Callable[[list[str], str | None], Awaitable[tuple[int, str, str]]]
@@ -261,11 +262,13 @@ async def start_contribution(
     # not after the change is written, that `gh` isn't logged in.
     code, _, err = await run(["gh", "auth", "status"], None)
     if code != 0:
+        hint = gh_login_hint()
         raise ContributeError(
             "GitHub CLI is not logged in (`gh auth status` failed"
             + (f": {err.strip()[:200]}" if err.strip() else "")
             + "). Your user needs to run `gh auth login` first; the PR is opened from their fork "
             "with their credentials."
+            + (f" {hint}" if hint else "")
         )
     target.parent.mkdir(parents=True, exist_ok=True)
 
