@@ -47,11 +47,17 @@ def well_known_bin_dirs(
             root = environ.get(name)
             return [Path(root, *parts)] if root else []
 
+        # The Windows service (WinSW) runs as LocalSystem with HOME and
+        # USERPROFILE pointed at the user's profile, but LOCALAPPDATA still
+        # names the system profile; derive the user-scope directories from
+        # the home as well, so per-user installs (winget --scope user,
+        # scoop, portable packages) are found too.
+        local_appdata = [*env_path("LOCALAPPDATA"), home / "AppData" / "Local"]
         return [
             *env_path("ProgramFiles", "GitHub CLI"),
             *env_path("ProgramFiles(x86)", "GitHub CLI"),
-            *env_path("LOCALAPPDATA", "Programs", "GitHub CLI"),
-            *env_path("LOCALAPPDATA", "Microsoft", "WinGet", "Links"),
+            *(d / "Programs" / "GitHub CLI" for d in local_appdata),
+            *(d / "Microsoft" / "WinGet" / "Links" for d in local_appdata),
             home / "scoop" / "shims",
             *env_path("ProgramData", "chocolatey", "bin"),
             *env_path("ProgramFiles", "Git", "cmd"),

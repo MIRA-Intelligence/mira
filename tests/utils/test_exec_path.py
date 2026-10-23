@@ -48,6 +48,10 @@ def test_well_known_dirs_cover_the_package_managers_per_platform(tmp_path):
     win = [str(p) for p in well_known_bin_dirs(platform="win32", home=tmp_path, environ=roots)]
     assert os.path.join(r"C:\Program Files", "GitHub CLI") in win
     assert os.path.join(r"C:\Users\u\AppData\Local", "Microsoft", "WinGet", "Links") in win
+    # The service runs as LocalSystem, whose LOCALAPPDATA is the system
+    # profile: user-scope installs are also looked up under the user's home.
+    assert str(tmp_path / "AppData" / "Local" / "Programs" / "GitHub CLI") in win
+    assert str(tmp_path / "scoop" / "shims") in win
     # An unset Windows root (ProgramData here) contributes nothing.
     assert not any("chocolatey" in p for p in win)
 
