@@ -30,7 +30,8 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 from uuid import uuid4
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, WSCloseCode, web
+import httpx
+from aiohttp import WSCloseCode, web
 from loguru import logger
 
 from mira_engine import __version__
@@ -43,6 +44,8 @@ from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.community import approvals as community_approvals
 from mira_engine.community import inbox as community_inbox
+from mira_engine.community.client import CommunityClient, CommunityError, CommunityRuleError
+from mira_engine.community.pairing import PairingError, fetch_me, poll_pairing, start_pairing
 from mira_engine.community.public_profile import (
     PublicProfileError,
     normalize_profile_patch,
@@ -3234,23 +3237,7 @@ class UiChannel(BaseChannel):
         """Best-effort ``GET /agents/me``: lifecycle status (pending/active/
         suspended, for the Onboard action) and the advertised website. None
         when not logged in or the service is unreachable."""
-        c = cfg.community
-        base = (c.api_base or "").rstrip("/")
-        if not (base and c.agent_token):
-            return None
-        try:
-            async with ClientSession(timeout=ClientTimeout(total=8)) as session:
-                async with session.get(
-                    f"{base}/agents/me",
-                    headers={"Authorization": f"Bearer {c.agent_token}"},
-                ) as resp:
-                    if resp.status >= 400:
-                        return None
-                    data = await resp.json()
-        except (ClientError, asyncio.TimeoutError, json.JSONDecodeError):
-            return None
-        agent = data.get("agent", data) if isinstance(data, dict) else {}
-        return agent if isinstance(agent, dict) else None
+        return await fetch_me(cfg.community.api_base or "", cfg.community.agent_token or "")
 
     async def _handle_community_inbox(self, request: web.Request) -> web.Response:
         """The user's notifications, newest first (``?kind=``, ``?unread=1``)."""
@@ -3317,8 +3304,6 @@ class UiChannel(BaseChannel):
     async def _handle_community_renew_claim(self, request: web.Request) -> web.Response:
         """The user renews their agent's claim on a development proposal (the
         renew button on an expiry reminder). Their click is the approval."""
-        from mira_engine.community.client import CommunityClient, CommunityError, CommunityRuleError
-
         cfg = config_loader.load_config(config_loader.get_config_path().expanduser().resolve())
         if not cfg.community.agent_token:
             return web.json_response({"error": "not logged in to the community"}, status=409)
@@ -3364,23 +3349,13 @@ class UiChannel(BaseChannel):
         if not c.agent_token:
             return web.json_response({"error": "not logged in to the community"}, status=409)
         try:
-            async with ClientSession(timeout=ClientTimeout(total=15)) as session:
-                async with session.patch(
-                    f"{(c.api_base or '').rstrip('/')}/agents/me/profile",
-                    json=fields,
-                    headers={"Authorization": f"Bearer {c.agent_token}"},
-                ) as resp:
-                    try:
-                        data = await resp.json(content_type=None)
-                    except (json.JSONDecodeError, ValueError):
-                        data = None
-                    if resp.status >= 400:
-                        detail = data.get("error") if isinstance(data, dict) else None
-                        return web.json_response(
-                            {"error": f"the community rejected the change: {detail or f'HTTP {resp.status}'}"},
-                            status=400 if resp.status == 400 else 502,
-                        )
-        except (ClientError, asyncio.TimeoutError) as exc:
+            data = await CommunityClient(c.api_base or "", c.agent_token, timeout=15).update_profile(fields)
+        except CommunityError as exc:
+            return web.json_response(
+                {"error": f"the community rejected the change: {exc.detail or f'HTTP {exc.status_code}'}"},
+                status=400 if exc.status_code == 400 else 502,
+            )
+        except httpx.HTTPError as exc:
             return web.json_response({"error": f"network error: {exc}"}, status=502)
         data = data if isinstance(data, dict) else {}
         profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
@@ -3592,29 +3567,11 @@ class UiChannel(BaseChannel):
             public_profile,
         )
         try:
-            async with ClientSession(timeout=ClientTimeout(total=30)) as session:
-                async with session.post(
-                    f"{api_base}/agents/pair/start", json=start_payload
-                ) as resp:
-                    if resp.status == 404:
-                        return web.json_response(
-                            {"error": "pairing endpoint unavailable on the community service"},
-                            status=502,
-                        )
-                    if resp.status >= 400:
-                        # Surface the platform's reason (e.g. an invalid profile field).
-                        try:
-                            detail = (await resp.json()).get("error")
-                        except (ClientError, json.JSONDecodeError, AttributeError, ValueError):
-                            detail = None
-                        return web.json_response(
-                            {"error": f"pairing failed: {detail or f'HTTP {resp.status}'}"},
-                            status=400 if resp.status == 400 else 502,
-                        )
-                    data = await resp.json()
-        except (ClientError, asyncio.TimeoutError) as exc:
-            return web.json_response({"error": f"network error: {exc}"}, status=502)
-        return web.json_response(data)
+            start = await start_pairing(api_base, start_payload)
+        except PairingError as exc:
+            # The platform's reason (e.g. an invalid profile field) reaches the user.
+            return web.json_response({"error": str(exc)}, status=400 if exc.status == 400 else 502)
+        return web.json_response(start.raw)
 
     async def _handle_community_pair_poll(self, request: web.Request) -> web.Response:
         try:
@@ -3629,30 +3586,16 @@ class UiChannel(BaseChannel):
         cfg = config_loader.load_config(config_path)
         api_base = (body.get("api_base") or cfg.community.api_base or "").rstrip("/")
         try:
-            async with ClientSession(timeout=ClientTimeout(total=30)) as session:
-                async with session.post(
-                    f"{api_base}/agents/pair/poll", json={"poll_token": poll_token}
-                ) as resp:
-                    if resp.status in (202, 425):
-                        return web.json_response({"status": "pending"})
-                    if resp.status == 410:
-                        return web.json_response({"status": "expired"})
-                    if resp.status >= 400:
-                        return web.json_response(
-                            {"error": f"poll failed: HTTP {resp.status}"}, status=502
-                        )
-                    data = await resp.json()
-        except (ClientError, asyncio.TimeoutError) as exc:
-            return web.json_response({"error": f"network error: {exc}"}, status=502)
-
-        agent_token = data.get("agent_token")
-        if not agent_token:
-            return web.json_response({"status": "pending"})
+            poll = await poll_pairing(api_base, poll_token)
+        except PairingError as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        if poll.status != "authorized":
+            return web.json_response({"status": poll.status})
 
         cfg.community.enabled = True
         cfg.community.api_base = api_base
-        cfg.community.agent_token = agent_token
-        cfg.community.agent_id = data.get("agent_id", "")
+        cfg.community.agent_token = poll.agent_token
+        cfg.community.agent_id = poll.agent_id
         # The platform has the final say on the name (it falls back to a default).
         me = await self._fetch_agent_me(cfg)
         cfg.community.agent_name = str((me or {}).get("name") or "")
@@ -3821,50 +3764,39 @@ class UiChannel(BaseChannel):
             body["timestamp"] = timestamp_sec
             body["sign"] = _feishu_sign(timestamp_sec, relay.feishu_secret)
 
+        # A certificate failure is reported, never retried without
+        # verification: the frozen build's empty trust store that used to
+        # cause it is repaired at the entry point (mira_engine.utils.tls),
+        # and a corporate CA belongs in SSL_CERT_FILE.
         try:
             await self._post_feishu_webhook_once(relay, body)
-        except ClientError as exc:
-            if "CERTIFICATE_VERIFY_FAILED" not in str(exc) and "certificate verify failed" not in str(exc):
-                raise RuntimeError(f"feishu webhook request failed: {exc}") from exc
-            logger.warning("SSL certificate verification failed for Feishu feedback webhook; retrying with ssl=False")
-            try:
-                await self._post_feishu_webhook_once(relay, body, ssl=False)
-            except (ClientError, asyncio.TimeoutError) as retry_exc:
-                raise RuntimeError(f"feishu webhook request failed: {retry_exc}") from retry_exc
-        except asyncio.TimeoutError as exc:
+        except httpx.HTTPError as exc:
             raise RuntimeError(f"feishu webhook request failed: {exc}") from exc
 
     async def _post_feishu_webhook_once(
         self,
         relay: _FeedbackRelayConfig,
         body: dict[str, Any],
-        *,
-        ssl: bool | None = None,
     ) -> None:
-        timeout = ClientTimeout(total=_FEEDBACK_TIMEOUT_SECONDS)
-        request_kwargs: dict[str, Any] = {
-            "json": body,
-            "headers": {"Content-Type": "application/json"},
-        }
-        if ssl is not None:
-            request_kwargs["ssl"] = ssl
-        async with ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.post(
+        # httpx honours HTTP(S)_PROXY, as the aiohttp session (trust_env) did.
+        async with httpx.AsyncClient(timeout=_FEEDBACK_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
                 relay.feishu_webhook_url,
-                **request_kwargs,
-            ) as resp:
-                text = await resp.text()
-                if not 200 <= resp.status < 300:
-                    raise RuntimeError(f"feishu webhook returned {resp.status}")
-                if text:
-                    try:
-                        parsed = json.loads(text)
-                    except json.JSONDecodeError:
-                        parsed = None
-                    if isinstance(parsed, dict) and parsed.get("code") not in {None, 0}:
-                        raise RuntimeError(
-                            f"feishu webhook error {parsed.get('code')}: {parsed.get('msg') or 'unknown'}"
-                        )
+                json=body,
+                headers={"Content-Type": "application/json"},
+            )
+        if not 200 <= resp.status_code < 300:
+            raise RuntimeError(f"feishu webhook returned {resp.status_code}")
+        text = resp.text
+        if text:
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("code") not in {None, 0}:
+                raise RuntimeError(
+                    f"feishu webhook error {parsed.get('code')}: {parsed.get('msg') or 'unknown'}"
+                )
 
     async def _handle_feedback(self, request: web.Request) -> web.Response:
         relay = _resolve_feedback_config(self.config)

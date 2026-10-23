@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from aiohttp import web
 from typer.testing import CliRunner
@@ -20,6 +21,8 @@ from mira_engine.community.public_profile import (
 )
 from mira_engine.config.schema import Config
 from mira_engine.profile.onboarding import render_soul_local
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient  # captured before any test patches it
 
 # ------------------------------------------------------------------ validation
 
@@ -147,37 +150,14 @@ def _req(body=None):
     return req
 
 
-class _FakeResponse:
-    def __init__(self, status, data):
-        self.status = status
-        self._data = data
-
-    async def json(self, content_type=None):
-        return self._data
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
 def _fake_session(calls, status, data):
-    class Session:
-        def __init__(self, *a, **k):
-            pass
+    """The platform behind every httpx.AsyncClient: records what was sent."""
 
-        async def __aenter__(self):
-            return self
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((str(request.url), json.loads(request.content), request.headers))
+        return httpx.Response(status, json=data)
 
-        async def __aexit__(self, *exc):
-            return False
-
-        def patch(self, url, json=None, headers=None):
-            calls.append((url, json, headers))
-            return _FakeResponse(status, data)
-
-    return Session
+    return lambda *a, **k: _REAL_ASYNC_CLIENT(*a, transport=httpx.MockTransport(handler), **k)
 
 
 async def test_get_profile_returns_the_platform_view(ui, monkeypatch):
@@ -206,7 +186,7 @@ async def test_get_profile_when_logged_out_or_offline(ui, monkeypatch):
 async def test_saving_the_profile_patches_the_platform_and_caches_the_name(ui, monkeypatch):
     calls: list = []
     platform = {"name": "Vega", "profile": {"domains": ["plugins"], "bio": "new"}}
-    monkeypatch.setattr(ui.mod, "ClientSession", _fake_session(calls, 200, platform))
+    monkeypatch.setattr(httpx, "AsyncClient",_fake_session(calls, 200, platform))
     resp = await ui.mod.UiChannel._handle_community_profile_update(
         ui.channel, _req({"name": " Vega ", "bio": "new", "domains": ["plugins"]})
     )
@@ -221,7 +201,7 @@ async def test_saving_the_profile_patches_the_platform_and_caches_the_name(ui, m
 async def test_the_app_sends_every_field_and_cleared_ones_reach_the_platform_as_clears(ui, monkeypatch):
     # mira-ui sends the whole form; an emptied bio or list must clear it, not be dropped.
     calls: list = []
-    monkeypatch.setattr(ui.mod, "ClientSession", _fake_session(calls, 200, {"name": "Nova", "profile": {}}))
+    monkeypatch.setattr(httpx, "AsyncClient",_fake_session(calls, 200, {"name": "Nova", "profile": {}}))
     form = {"name": "Nova", "domains": ["agents"], "tech_stack": [], "languages": ["en"], "participation": ["answer"], "bio": ""}
     resp = await ui.mod.UiChannel._handle_community_profile_update(ui.channel, _req(form))
     assert resp.status == 200
@@ -230,7 +210,7 @@ async def test_the_app_sends_every_field_and_cleared_ones_reach_the_platform_as_
 
 async def test_saving_rejects_bad_input_before_reaching_the_platform(ui, monkeypatch):
     calls: list = []
-    monkeypatch.setattr(ui.mod, "ClientSession", _fake_session(calls, 200, {}))
+    monkeypatch.setattr(httpx, "AsyncClient",_fake_session(calls, 200, {}))
     for bad in ({"name": "two words"}, {}, {"token": "x"}, "Nova"):
         resp = await ui.mod.UiChannel._handle_community_profile_update(ui.channel, _req(bad))
         assert resp.status == 400 and json.loads(resp.text)["error"]
@@ -239,7 +219,7 @@ async def test_saving_rejects_bad_input_before_reaching_the_platform(ui, monkeyp
 
 async def test_saving_surfaces_the_platform_refusal_and_keeps_the_cache(ui, monkeypatch):
     ui.cfg.community.agent_name = "Nova"
-    monkeypatch.setattr(ui.mod, "ClientSession", _fake_session([], 400, {"error": "name taken"}))
+    monkeypatch.setattr(httpx, "AsyncClient",_fake_session([], 400, {"error": "name taken"}))
     resp = await ui.mod.UiChannel._handle_community_profile_update(ui.channel, _req({"name": "Vega"}))
     assert resp.status == 400 and "name taken" in json.loads(resp.text)["error"]
     assert ui.cfg.community.agent_name == "Nova" and ui.saved == []
@@ -247,7 +227,7 @@ async def test_saving_surfaces_the_platform_refusal_and_keeps_the_cache(ui, monk
 
 async def test_an_older_platform_that_ignores_the_name_keeps_the_cached_one(ui, monkeypatch):
     ui.cfg.community.agent_name = "Nova"
-    monkeypatch.setattr(ui.mod, "ClientSession", _fake_session([], 200, {"profile": {"bio": "x"}}))
+    monkeypatch.setattr(httpx, "AsyncClient",_fake_session([], 200, {"profile": {"bio": "x"}}))
     resp = await ui.mod.UiChannel._handle_community_profile_update(ui.channel, _req({"name": "Vega", "bio": "x"}))
     assert json.loads(resp.text)["name"] == "Nova"
 
@@ -269,8 +249,6 @@ async def test_status_reports_the_name_and_the_suggested_one(ui, monkeypatch, tm
 
 
 def test_cli_profile_shows_and_updates(tmp_path, monkeypatch):
-    import httpx
-
     from mira_engine.cli.commands import app
 
     cfg_file = tmp_path / "config.json"
