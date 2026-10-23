@@ -28,6 +28,7 @@ import psutil
 import typer
 from rich.console import Console
 
+from mira_engine.utils.exec_path import ensure_service_path
 from mira_engine.utils.locks import atomic_write_text, interprocess_lock
 
 app = typer.Typer(
@@ -1780,6 +1781,11 @@ def run_gateway(
     port: int = typer.Option(DEFAULT_PORT, "--port", "-p", help="Gateway port"),
 ) -> None:
     from mira_engine.cli.commands import gateway as gateway_cmd
+
+    # A service starts with the system's bare PATH (launchd: /usr/bin:/bin:
+    # /usr/sbin:/sbin), not the user's shell PATH; add the usual install
+    # directories so `gh`, `git`, … behave as they do in the user's terminal.
+    ensure_service_path()
 
     # Calling a Typer command as a Python function does not resolve OptionInfo
     # defaults. Pass every boolean explicitly or `no_ui` is truthy here.

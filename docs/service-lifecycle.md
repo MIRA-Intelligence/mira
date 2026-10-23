@@ -20,6 +20,16 @@ mira-engine restart
 
 macOS 的 stop 不会删除 plist，也不改变下次登录的自动启动设置。如需永久移除自启动，请使用 `uninstall-service`。
 
+### 服务进程的 PATH
+
+系统服务不经过登录 shell，拿到的是系统默认 PATH（macOS launchd 只有 `/usr/bin:/bin:/usr/sbin:/sbin`），所以终端里能用的命令，服务里不一定找得到——典型症状是桌面版的社区贡献工具报 `gh` 找不到，而终端里 `gh auth status` 正常。gateway 以服务方式启动时（`run-gateway`）会把本机存在的常见安装目录追加到 PATH 末尾：
+
+- macOS：`/opt/homebrew/bin`、`/opt/homebrew/sbin`、`/usr/local/bin`、`/usr/local/sbin`、`/opt/local/bin`、`~/.local/bin`、`~/bin`、Nix profile
+- Linux：`/usr/local/bin`、`~/.local/bin`、`~/bin`、Linuxbrew、`/snap/bin`、Nix profile
+- Windows：GitHub CLI、WinGet Links、scoop shims、Chocolatey、Git for Windows 的安装目录
+
+只追加不前置，原有 PATH 的优先级不变。装在别处的工具，把它软链到上面任一目录（如 `/usr/local/bin`）即可；社区贡献流程找不到 `gh`/`git` 时会在工具结果里列出搜索过的目录。
+
 ## 独立启动的 gateway
 
 用 `mira gateway` 启动的进程不一定属于系统服务。控制时必须使用与该进程相同的 `MIRA_HOME`：

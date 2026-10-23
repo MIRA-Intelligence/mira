@@ -41,6 +41,11 @@ from pathlib import Path
 from typing import Any
 
 from mira_engine.community.privacy import PrivacyGuard
+from mira_engine.utils.exec_path import (
+    extended_environ,
+    missing_executable_message,
+    resolve_executable,
+)
 
 # (returncode, stdout, stderr)
 CommandRunner = Callable[[list[str], str | None], Awaitable[tuple[int, str, str]]]
@@ -92,12 +97,25 @@ class ContributionScope:
 
 
 async def _default_runner(cmd: list[str], cwd: str | None) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    # The gateway may run as a service with the system's bare PATH, where
+    # `gh` installed by Homebrew/winget is invisible although the user's
+    # terminal finds it. Search the usual install directories too, and turn
+    # "not installed" into a ContributeError the agent can relay instead of
+    # a FileNotFoundError traceback.
+    program = resolve_executable(cmd[0])
+    if program is None:
+        raise ContributeError(missing_executable_message(cmd[0]))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            program,
+            *cmd[1:],
+            cwd=cwd,
+            env=extended_environ(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as e:
+        raise ContributeError(f"could not run `{shlex.join(cmd)}`: {e}") from e
     out, err = await proc.communicate()
     return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
 
