@@ -30,6 +30,12 @@ macOS 的 stop 不会删除 plist，也不改变下次登录的自动启动设�
 
 只追加不前置，原有 PATH 的优先级不变。装在别处的工具，把它软链到上面任一目录（如 `/usr/local/bin`）即可；社区贡献流程找不到 `gh`/`git` 时会在工具结果里列出搜索过的目录。
 
+### Windows 服务与 `gh` 的登录态
+
+Windows 上 WinSW 服务以 LocalSystem 运行。`install-service` 已把 HOME 和 USERPROFILE 指到用户目录，但 APPDATA、LOCALAPPDATA 仍指向系统 profile，而 GitHub CLI 的配置在 `%APPDATA%\GitHub CLI`，所以服务里的 `gh auth status` 看到的是一个从未登录过的 profile。gateway 以 Windows 服务启动时会把这两个变量也指到用户 profile 下（已在用户目录内的不动）。
+
+token 本身还有一道坎：`gh auth login` 默认把 token 存进登录账户的 Windows 凭据管理器，LocalSystem 打不开它。请改用 `gh auth login --insecure-storage`（token 落在 `%APPDATA%\GitHub CLI\hosts.yml`），再执行 `gh auth setup-git` 让 git 推送时也用这个 token；社区贡献流程在服务里检测到未登录时会给出同样的提示。代价是 token 明文存盘。
+
 ## 独立启动的 gateway
 
 用 `mira gateway` 启动的进程不一定属于系统服务。控制时必须使用与该进程相同的 `MIRA_HOME`：

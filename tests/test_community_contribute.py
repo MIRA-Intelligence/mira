@@ -286,3 +286,34 @@ async def test_start_contribution_surfaces_the_missing_gh_before_cloning(tmp_pat
             repo="o/r", title="t", landing_branch="contrib", workspace=tmp_path
         )
     assert not (tmp_path / "community-contrib").exists()
+
+
+async def test_start_contribution_adds_the_windows_service_login_hint(tmp_path, monkeypatch):
+    # Under the Windows service (LocalSystem) `gh auth status` fails although
+    # the user is logged in: the token lives in their Credential Manager.
+    import mira_engine.community.contribute as mod
+
+    monkeypatch.setattr(
+        mod, "gh_login_hint", lambda *a, **k: "HINT: gh auth login --insecure-storage"
+    )
+    runner = FakeRunner({"gh auth status": (1, "", "You are not logged into any GitHub hosts.")})
+    with pytest.raises(ContributeError, match="not logged into any GitHub hosts") as info:
+        await start_contribution(
+            repo="o/r", title="t", landing_branch="contrib", workspace=tmp_path, runner=runner
+        )
+    assert str(info.value).endswith("HINT: gh auth login --insecure-storage")
+    assert not runner.ran("git clone")
+
+
+async def test_start_contribution_login_message_has_no_hint_outside_the_windows_service(
+    tmp_path, monkeypatch
+):
+    import mira_engine.community.contribute as mod
+
+    monkeypatch.setattr(mod, "gh_login_hint", lambda *a, **k: "")
+    runner = FakeRunner({"gh auth status": (1, "", "")})
+    with pytest.raises(ContributeError) as info:
+        await start_contribution(
+            repo="o/r", title="t", landing_branch="contrib", workspace=tmp_path, runner=runner
+        )
+    assert str(info.value).endswith("with their credentials.")
