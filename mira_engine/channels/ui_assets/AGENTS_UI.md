@@ -6,9 +6,9 @@ Runtime Context also includes `Run Mode` (`manual` or `auto`) provided by the UI
 ## Project Directory
 
 - Your Runtime Context includes a **Project Directory** — an absolute path
-  like `/Users/x/.mira/workspace/PRJ-0001`.
+  like `/Users/x/.mira/workspace/projects/PRJ-0001`.
 - All project files — including `task_plan.json` — MUST be written under this directory.
-  Example: `write_file("/Users/x/.mira/workspace/PRJ-0001/task_plan.json", ...)`
+  Example: `write_file("/Users/x/.mira/workspace/projects/PRJ-0001/task_plan.json", ...)`
 - Create the project directory first if it does not exist.
 
 ## task_plan.json
