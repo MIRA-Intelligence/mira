@@ -83,14 +83,15 @@ async def test_soul_write_failure_and_repair_use_the_same_canonical_target(tmp_p
 async def test_first_user_write_preserves_the_runtime_profile_template(tmp_path):
     store = MemoryStore(tmp_path / "project")
     template = ContextBuilder._load_builtin_template("USER.md")
-    assert "Basic Information" in template and "Response Length" in template
+    assert "Response Length" in template
+    sections = [line for line in template.splitlines() if line.startswith("#")]
     result = await EditMemoryTool(store).execute(
         "user", "- General research assistance", "- Robotics",
     )
     assert result.startswith("Successfully")
     prompt = ContextBuilder(store.workspace).build_system_prompt()
     assert "Robotics" in prompt
-    assert "Basic Information" in prompt
+    assert all(section in prompt for section in sections)
     assert "Response Length" in prompt
     assert prompt.count("### Communication Style") == 1
 
@@ -173,9 +174,10 @@ async def test_effective_user_template_is_present_in_both_dream_phases(tmp_path)
     store.append_history("Interests are already configured")
     provider = provider_for(LLMResponse(content="No changes"))
     assert await Dream(store, provider, "test").run()
+    template = ContextBuilder._load_builtin_template("USER.md")
     for call in provider.chat_with_retry.call_args_list:
         prompt = call.kwargs["messages"][1]["content"]
-        assert "Basic Information" in prompt
+        assert template.strip() in prompt
         assert "### Communication Style" in prompt
         assert "### Response Length" in prompt
     assert not (store.global_workspace / "USER.md").exists()
