@@ -42,7 +42,7 @@ used by community persona drafts. Sharing still requires PrivacyGuard filtering
 and user approval; shared knowledge is not automatically published as a persona.
 
 Dream tracks only failed writes to PERSONAL, project memory, shared USER.md or
-SOUL.md, keyed by canonical target file. Reads, unsupported scopes, read-only files
+SOUL.md, keyed by canonical target file. Reads, read-only files
 and path-policy refusals do not block a completed run. The first shared USER.md
 edit uses the bundled template if no file exists, preserving its profile sections.
 
@@ -52,7 +52,7 @@ remain unresolved until repaired.
 
 Each invocation performs at most one analysis phase and one editing phase (up to
 `maxIterations` model turns, excluding the provider's own transport retries). On an
-iteration-budget failure or unresolved write, the next invocation retries a smaller
+iteration-budget failure, empty final reply, or unresolved write, the next invocation retries a smaller
 batch using fresh memory snapshots. Retry state is persisted in
 `.mira/memory/.dream_retry.json`, including across process restarts. There are at
 most three failed attempts at the same cursor position; the final attempt always

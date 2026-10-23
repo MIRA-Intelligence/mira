@@ -1017,7 +1017,7 @@ class Dream:
             (self.store.memory_dir / ".dream_retry.json").unlink(missing_ok=True)
             self.store.compact_history()
             return True
-        if result.stop_reason == "max_iterations" or (
+        if result.stop_reason in {"max_iterations", "empty_final_response"} or (
             result.stop_reason == "completed" and tools.failed_edits
         ):
             reason = ("Unresolved memory edits" if tools.failed_edits else result.stop_reason)

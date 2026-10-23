@@ -232,3 +232,26 @@ async def test_overlapping_dreams_do_not_duplicate_work_or_lose_retry_counts(tmp
         await second.run()
     assert json.loads(state.read_text())["attempts"] == 2
     assert provider.chat_with_retry.await_count == 2
+
+
+async def test_empty_final_responses_are_bounded_and_later_history_proceeds(tmp_path):
+    store = MemoryStore(tmp_path / "project")
+    store.append_history("Entry with repeated empty model output")
+    for attempt in range(1, 4):
+        # Two empty turns plus the runner's finalization attempt must stay empty.
+        provider = provider_for(*(LLMResponse(content="") for _ in range(3)))
+        with pytest.raises(DreamRunError, match="empty_final_response|Skipped"):
+            await Dream(store, provider, "test").run()
+        if attempt < 3:
+            assert store.get_last_dream_cursor() == 0
+            state = store.memory_dir / ".dream_retry.json"
+            assert json.loads(state.read_text())["attempts"] == attempt
+    assert store.get_last_dream_cursor() == 1
+    skipped = store.memory_dir / "dream_skipped.jsonl"
+    record = json.loads(skipped.read_text())
+    assert record["attempts"] == 3
+    assert record["reason"] == "empty_final_response"
+    assert record["entry"]["content"] == "Entry with repeated empty model output"
+    store.append_history("Healthy next entry")
+    assert await Dream(store, provider_for(LLMResponse(content="No changes")), "test").run()
+    assert store.get_last_dream_cursor() == 2
