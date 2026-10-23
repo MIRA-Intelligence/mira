@@ -37,8 +37,8 @@ async def test_dream_remembers_personal_facts_across_projects(memory_home):
                         name="edit_memory",
                         arguments={
                             "scope": "user",
-                            "old_text": "",
-                            "new_text": "## Communication Style\n- Prefers Chinese replies",
+                            "old_text": "- Clear, practical, and respectful",
+                            "new_text": "- Prefers Chinese replies",
                         },
                     ),
                     ToolCallRequest(
@@ -67,7 +67,7 @@ async def test_dream_remembers_personal_facts_across_projects(memory_home):
     assert store.memory_backup_file.read_text(encoding="utf-8") == "- Uses PostgreSQL"
     assert store.get_last_dream_cursor() == 1
     assert store.read_global_term() == ""
-    assert "## Communication Style" in (store.global_workspace / "USER.md").read_text()
+    assert "### Communication Style" in (store.global_workspace / "USER.md").read_text()
 
 
 async def test_dream_includes_existing_personal_memory_in_both_phases(memory_home):
@@ -181,7 +181,7 @@ async def test_memory_tool_rejects_ambiguous_matches_and_invalid_scopes(memory_h
         {"scope": "personal", "old_text": "Fact", "new_text": "Changed"},
         {"scope": "../outside", "old_text": "Fact", "new_text": "Changed"},
     ]:
-        result = await dream._tools.execute("edit_memory", arguments)
+        result = await dream._build_tools().execute("edit_memory", arguments)
         assert result.startswith("Error")
     assert store.read_global_term() == "Fact\nFact"
 
@@ -343,6 +343,9 @@ async def test_iteration_limit_shrinks_batch_and_advances_only_completed_prefix(
                               tools_used=[], usage={}, tool_events=[])
 
     dream._runner.run = AsyncMock(side_effect=run_batch)
+    with pytest.raises(DreamRunError, match="max_iterations"):
+        await dream.run()
+    assert store.get_last_dream_cursor() == 0
     assert await dream.run()
     assert store.get_last_dream_cursor() == 2
     assert [e["cursor"] for e in store.read_unprocessed_history(2)] == [3, 4]
@@ -388,7 +391,7 @@ async def test_authoritative_user_settings_are_visible_but_not_editable(memory_h
         prompt = call.kwargs["messages"][1]["content"]
         assert "Timezone: Asia/Tokyo" in prompt
         assert "Language: English" in prompt
-    result = await dream._tools.execute("edit_file", {
+    result = await dream._build_tools().execute("edit_file", {
         "path": "USER.local.md", "old_text": "English", "new_text": "French",
     })
     assert result.startswith("Error")
@@ -403,14 +406,19 @@ async def test_learned_user_preferences_feed_private_community_persona_drafts(me
     from mira_engine.community.privacy import PrivacyGuard
 
     store = MemoryStore(memory_home / "project")
-    profile = "## Communication Style\n- Prefers concise answers\n- Alice's private codename\n\n## Topics of Interest\n- Astrophysics"
     store.append_history("User likes concise answers and astrophysics")
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(side_effect=[
         LLMResponse(content="[USER] Preferences and interests"),
         LLMResponse(content=None, tool_calls=[ToolCallRequest(
             id="profile", name="edit_memory", arguments={
-                "scope": "user", "old_text": "", "new_text": profile,
+                "scope": "user", "old_text": "- Clear, practical, and respectful",
+                "new_text": "- Prefers concise answers\n- Alice's private codename",
+            },
+        ), ToolCallRequest(
+            id="interest", name="edit_memory", arguments={
+                "scope": "user", "old_text": "- General research assistance",
+                "new_text": "- Astrophysics",
             },
         )]),
         LLMResponse(content="Updated"),

@@ -52,7 +52,7 @@ class EditMemoryTool(Tool):
         local = self.store.read_long_term()
         shared = self.store.read_global_term()
         user_file = self.store.global_workspace / "USER.md"
-        current = (self.store.read_file(user_file) if scope == "user"
+        current = (self.store.read_global_user() if scope == "user"
                    else shared if scope == "personal" else local)
         if not old_text:
             if current:
@@ -67,7 +67,7 @@ class EditMemoryTool(Tool):
             updated = current.replace(old_text, new_text, 1)
         if scope == "user":
             with interprocess_lock(user_file):
-                latest = self.store.read_file(user_file)
+                latest = self.store.read_global_user()
                 if latest != current:
                     return f"Error: USER.md changed concurrently. Current contents:\n{latest}"
                 atomic_write_text(user_file, updated)

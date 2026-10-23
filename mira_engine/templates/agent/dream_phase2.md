@@ -10,7 +10,7 @@ Update memory files based on the analysis below.
 - To create empty memory, use old_text=""; never use "(empty)" as actual content
 - Do not use edit_file for USER, PERSONAL or MEMORY
 - USER.local.md is read-only; Settings and project user overlays take precedence. Never duplicate their values.
-- Preserve USER headings: ## Communication Style, ## Topics of Interest, - **Preferred language(s)**: ...
+- Preserve USER headings: ### Communication Style, ## Topics of Interest, - **Preferred language(s)**: ...
 
 ## File paths (relative to workspace root)
 - SOUL.md
@@ -32,3 +32,5 @@ Do NOT guess paths.
 - If uncertain whether to delete, keep but add "(verify currency)"
 
 If an edit fails, use the current contents in the error to repair old_text and retry before finishing.
+
+Preserve existing template headings and edit their bullets; do not create duplicate sections.

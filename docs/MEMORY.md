@@ -41,18 +41,39 @@ USER.md retains the communication-style, interests and preferred-language format
 used by community persona drafts. Sharing still requires PrivacyGuard filtering
 and user approval; shared knowledge is not automatically published as a persona.
 
-Dream advances its history cursor only after a completed batch with no unresolved
-tool errors. If a batch exhausts the iteration budget, Dream halves it and retries
-with fresh memory snapshots. Only the completed prefix is acknowledged; remaining
-entries are processed on later runs. If even one entry cannot complete, Dream raises
-an error and retains it. An idle run alone returns `False`, so scheduled failures
-are logged as failures rather than “nothing new”. Earlier successful edits remain
-saved and are included in the next attempt's context.
+Dream tracks only failed writes to PERSONAL, project memory, shared USER.md or
+SOUL.md, keyed by canonical target file. Reads, unsupported scopes, read-only files
+and path-policy refusals do not block a completed run. The first shared USER.md
+edit uses the bundled template if no file exists, preserving its profile sections.
+
+Each invocation performs at most one analysis phase and one editing phase (up to
+`maxIterations` model turns, excluding the provider's own transport retries). On an
+iteration-budget failure or unresolved write, the next invocation retries a smaller
+batch using fresh memory snapshots. Retry state is persisted in
+`.mira/memory/.dream_retry.json`, including across process restarts. There are at
+most three failed attempts at the same cursor position; the final attempt always
+isolates one entry. A successful batch acknowledges only its completed prefix.
+
+If the isolated entry still fails, Dream saves its full content, original cursor,
+timestamp, attempt count and failure reason to `.mira/memory/dream_skipped.jsonl`,
+then advances past **only that entry**. It logs a warning and reports the skip as an
+error, so it is visible in cron logs and `/dream` responses. Subsequent invocations
+can process the remaining history. After correcting the cause, re-archive the saved
+`entry.content` as a new history entry to retry it; do not reset the cursor and
+reprocess unrelated history. The saved record survives ordinary history compaction.
+Earlier successful memory edits remain saved and appear in fresh retry snapshots.
+
+Provider/credential/transport failures retain history and do not consume the
+bad-entry allowance: an API outage never causes entries to be skipped. Only idle
+runs return `False`; failures and skips raise `DreamRunError` for accurate logging.
 
 In the UI, `/dream` processes the current project's archived history and keeps its
 completion response attached to that project. Archive the conversation first
-(for example with `/new`), then run `/dream`. Model/tool failures retain history
-and report a failure.
+(for example with `/new`), then run `/dream`. When the community scheduler is used,
+automatic Dream currently covers **only the default workspace**. Project histories
+need `/dream` inside each project before their learned preferences reach shared
+USER.md or PERSONAL. Automatic scheduling across registered projects is a follow-up,
+not part of this PR.
 
 For example, “I prefer Chinese replies” belongs in USER.md; a reusable debugging
 workflow belongs in PERSONAL; “this project uses PostgreSQL” stays in project memory.

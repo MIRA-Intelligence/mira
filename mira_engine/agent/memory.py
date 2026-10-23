@@ -194,6 +194,15 @@ class MemoryStore:
     def read_user(self) -> str:
         return self.read_file(self.user_file)
 
+    def read_global_user(self) -> str:
+        """Match the runtime bootstrap: absent USER.md means the bundled template."""
+        from importlib.resources import files as pkg_files
+
+        path = self.global_workspace / "USER.md"
+        if path.exists():
+            return self.read_file(path)
+        return (pkg_files("mira_engine") / "templates" / "USER.md").read_text(encoding="utf-8")
+
     def write_user(self, content: str) -> None:
         locked_write_text(self.user_file, content)
 
@@ -892,31 +901,45 @@ class Consolidator:
 
 
 class DreamRunError(RuntimeError):
-    """Dream failed; pending history is retained for a later retry."""
+    """Dream failed or quarantined a repeatedly failing entry; see the message."""
 
 
 class _DreamTools(ToolRegistry):
-    """Allow repairs in the same run, but never acknowledge unresolved edits."""
+    """Track failed writes by canonical target; reads and policy refusals are harmless."""
 
     def __init__(self, store: MemoryStore):
         super().__init__()
         self.store = store
-        self.failed_edits: set[tuple[str, str]] = set()
+        self.failed_edits: set[Path] = set()
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:
-        key = (name, str(params.get("scope", params.get("path", ""))))
+        target = None
         if name == "edit_file":
-            path = Path(params.get("path", ""))
-            if not path.is_absolute():
-                path = self.store.project_workspace / path
-            if path.resolve() != self.store.soul_file.resolve():
-                self.failed_edits.add(key)
+            path = params.get("path")
+            if not isinstance(path, str):
+                return "Error: edit_file requires a file path."
+            target = Path(path)
+            if not target.is_absolute():
+                target = self.store.project_workspace / target
+            target = target.resolve()
+            if (target != self.store.soul_file.resolve()
+                    or not target.is_relative_to(self.store.project_workspace.resolve())):
                 return "Error: edit_file may only update SOUL.md. Use edit_memory for USER and memory; USER.local.md is read-only."
+        elif name == "edit_memory":
+            targets = {
+                "personal": self.store.global_memory_file,
+                "project": self.store.memory_file,
+                "user": self.store.global_workspace / "USER.md",
+            }
+            scope = params.get("scope")
+            if isinstance(scope, str) and scope in targets:
+                target = targets[scope].resolve()
         result = await super().execute(name, params)
-        if result.startswith(("Error", "Warning")):
-            self.failed_edits.add(key)
-        else:
-            self.failed_edits.discard(key)
+        if target is not None:
+            if result.startswith(("Error", "Warning")):
+                self.failed_edits.add(target)
+            else:
+                self.failed_edits.discard(target)
         return result
 
 
@@ -939,7 +962,6 @@ class Dream:
         self.max_iterations = max_iterations
         self.max_tool_result_chars = max_tool_result_chars
         self._runner = AgentRunner(provider)
-        self._tools = self._build_tools()
 
     def _build_tools(self) -> _DreamTools:
         from mira_engine.agent.tools.filesystem import EditFileTool, ReadFileTool
@@ -952,27 +974,77 @@ class Dream:
         tools.register(EditMemoryTool(self.store))
         return tools
 
+    _MAX_CURSOR_ATTEMPTS = 3
+
+    def _read_retry_state(self, cursor: int) -> tuple[int, int]:
+        path = self.store.memory_dir / ".dream_retry.json"
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if state["cursor"] == cursor:
+                attempts, batch_size = int(state["attempts"]), int(state["batch_size"])
+                if 0 <= attempts < self._MAX_CURSOR_ATTEMPTS and batch_size >= 1:
+                    return attempts, min(batch_size, max(1, self.max_batch_size))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return 0, max(1, self.max_batch_size)
+
     async def run(self) -> bool:
-        """Return False only for idle runs; failures raise for accurate cron logging."""
-        entries = self.store.read_unprocessed_history(self.store.get_last_dream_cursor())
+        """One bounded attempt per tick; persist retries across Dream instances."""
+        cursor = self.store.get_last_dream_cursor()
+        entries = self.store.read_unprocessed_history(cursor)
         if not entries:
             return False
-        batch_size = max(1, self.max_batch_size)
-        while True:
-            batch = entries[:batch_size]
-            tools = self._build_tools()
-            result = await self._run_batch(batch, tools)
-            if result.stop_reason == "completed":
-                if tools.failed_edits:
-                    raise DreamRunError("Unresolved memory edits; unprocessed history was kept.")
-                self.store.set_last_dream_cursor(batch[-1]["cursor"])
-                self.store.compact_history()
-                return True
-            if result.stop_reason == "max_iterations" and len(batch) > 1:
-                batch_size = max(1, len(batch) // 2)
-                logger.warning("Dream exhausted its iteration budget; retrying {} history entries", batch_size)
-                continue
-            raise DreamRunError(f"Dream stopped: {result.stop_reason}; unprocessed history was kept.")
+        attempts, batch_size = self._read_retry_state(cursor)
+        batch = entries[:batch_size]
+        tools = self._build_tools()
+        result = await self._run_batch(batch, tools)
+        if result.stop_reason == "completed" and not tools.failed_edits:
+            self.store.set_last_dream_cursor(batch[-1]["cursor"])
+            (self.store.memory_dir / ".dream_retry.json").unlink(missing_ok=True)
+            self.store.compact_history()
+            return True
+        if result.stop_reason == "max_iterations" or (
+            result.stop_reason == "completed" and tools.failed_edits
+        ):
+            reason = ("Unresolved memory edits" if tools.failed_edits else result.stop_reason)
+            self._record_failed_attempt(cursor, batch, attempts + 1, reason)
+        # Provider/transport failures must never consume the bad-entry allowance.
+        raise DreamRunError(f"Dream stopped: {result.stop_reason}; unprocessed history was kept.")
+
+    def _record_failed_attempt(
+        self, cursor: int, batch: list[dict[str, Any]], attempts: int, reason: str
+    ) -> None:
+        state_file = self.store.memory_dir / ".dream_retry.json"
+        with interprocess_lock(self.store._dream_cursor_file):
+            if self.store.get_last_dream_cursor() != cursor:
+                raise DreamRunError("Dream cursor changed concurrently; retry with current history.")
+            if attempts < self._MAX_CURSOR_ATTEMPTS:
+                # Isolate one entry for the final attempt, even with a large batch.
+                batch_size = 1 if attempts == self._MAX_CURSOR_ATTEMPTS - 1 else max(1, len(batch) // 2)
+                atomic_write_text(state_file, json.dumps({
+                    "cursor": cursor, "attempts": attempts, "batch_size": batch_size,
+                }))
+                raise DreamRunError(
+                    f"{reason}; unprocessed history was kept. Attempt {attempts}/"
+                    f"{self._MAX_CURSOR_ATTEMPTS}; next run will process {batch_size} entries."
+                )
+            # Preserve the complete entry separately before acknowledging it, so
+            # compaction cannot erase the evidence or prevent a manual replay.
+            skipped_file = self.store.memory_dir / "dream_skipped.jsonl"
+            record = {"entry": batch[0], "attempts": attempts, "reason": reason,
+                      "timestamp": datetime.now().isoformat()}
+            with interprocess_lock(skipped_file):
+                with skipped_file.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    stream.flush()
+            self.store.set_last_dream_cursor(batch[0]["cursor"])
+            state_file.unlink(missing_ok=True)
+        logger.warning("Dream skipped history entry {} after {} failed attempts; saved to {}",
+                       batch[0]["cursor"], attempts, skipped_file)
+        raise DreamRunError(
+            f"Skipped history entry {batch[0]['cursor']} after {attempts} failed attempts; "
+            f"saved to {skipped_file}. Later history can proceed on the next run."
+        )
 
     async def _run_batch(
         self, batch: list[dict[str, Any]], tools: _DreamTools
@@ -982,7 +1054,7 @@ class Dream:
         current_personal = self.store.read_global_term() or "(empty)"
         current_memory = self.store.read_memory() or "(empty)"
         current_soul = self.store.read_soul() or "(empty)"
-        current_user = self.store.read_file(self.store.global_workspace / "USER.md") or "(empty)"
+        current_user = self.store.read_global_user() or "(empty)"
         settings = []
         for workspace in dict.fromkeys([self.store.global_workspace, self.store.project_workspace]):
             if workspace != self.store.global_workspace:

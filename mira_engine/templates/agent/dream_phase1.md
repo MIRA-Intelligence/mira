@@ -28,6 +28,8 @@ Do not add: current weather, transient status, temporary errors, conversational 
 
 USER.local.md settings and project USER.md overlays take precedence over learned shared USER.md.
 Never duplicate name, timezone or language already set by Settings into USER.md or PERSONAL.
-Never change USER.local.md. Keep USER.md preferences under ## Communication Style,
+Never change USER.local.md. Keep USER.md preferences under ### Communication Style,
 ## Topics of Interest, and - **Preferred language(s)**: ... for community persona compatibility.
 Community sharing must continue through PrivacyGuard and user approval.
+
+Preserve existing template headings and edit their bullets; do not create duplicate sections.
