@@ -103,14 +103,17 @@ def test_resolve_executable_finds_a_program_the_bare_path_cannot_see(candidates,
     gh = present / "gh"
     gh.write_text("#!/bin/sh\nexit 0\n")
     gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
-    environ = {"PATH": "/usr/bin:/bin"}
+    # A bare PATH without a real `gh` (CI runners ship one in /usr/bin, and
+    # the user's own PATH entries deliberately win over the appended ones).
+    bare = str(tmp_path / "bare-bin")
+    environ = {"PATH": bare}
 
     assert resolve_executable("gh", environ, platform="linux", home=tmp_path) == str(gh)
     assert resolve_executable("gh-missing", environ, platform="linux", home=tmp_path) is None
 
     # Children of that program (gh runs git) see the same directories.
     env = extended_environ(environ, platform="linux", home=tmp_path)
-    assert env["PATH"] == f"/usr/bin:/bin:{present}"
+    assert env["PATH"] == f"{bare}:{present}"
 
 
 @POSIX
