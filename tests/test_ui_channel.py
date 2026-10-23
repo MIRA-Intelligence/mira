@@ -1815,7 +1815,7 @@ async def test_handle_create_project_managed_mode_ignores_client_path(
     body = json.loads(resp.text)
 
     assert resp.status == 201
-    assert body["project_dir"] == str((tmp_path / "managed" / "cloud-project").resolve())
+    assert body["project_dir"] == str((tmp_path / "managed" / "projects" / "cloud-project").resolve())
     assert ch._project_location_payload()["custom_dir_allowed"] is False
 
 
@@ -2070,7 +2070,7 @@ async def test_handle_upload_project_files_writes_data_files(ui_channel: UiChann
     ]
     assert body["extracted"] == []
 
-    data_dir = ui_channel.projects_root / "PRJ-0001" / "data"
+    data_dir = ui_channel.project_registry.default_project_parent / "PRJ-0001" / "data"
     assert (data_dir / "sample.csv").read_bytes() == b"a,b\n"
     assert (data_dir / "sample_1.csv").read_bytes() == b"c,d\n"
 
@@ -2094,7 +2094,7 @@ async def test_handle_upload_project_files_preserves_data_directory_paths(ui_cha
         {"name": "readme.txt", "path": "data/dataset/notes/readme.txt", "size": 2},
     ]
 
-    data_dir = ui_channel.projects_root / "PRJ-0002" / "data"
+    data_dir = ui_channel.project_registry.default_project_parent / "PRJ-0002" / "data"
     assert (data_dir / "dataset" / "tables" / "a.csv").read_bytes() == b"a,b\n"
     assert (data_dir / "dataset" / "tables" / "a_1.csv").read_bytes() == b"c,d\n"
     assert (data_dir / "dataset" / "notes" / "readme.txt").read_bytes() == b"ok"
@@ -2125,7 +2125,7 @@ async def test_handle_upload_project_files_rejects_absolute_data_paths(ui_channe
     resp = await ui_channel._handle_upload_project_files(req)
     assert resp.status == 400
     assert json.loads(resp.text) == {"error": "unsafe upload path: /tmp/escape.csv"}
-    assert not (ui_channel.projects_root / "PRJ-0004" / "data" / "tmp").exists()
+    assert not (ui_channel.project_registry.default_project_parent / "PRJ-0004" / "data" / "tmp").exists()
 
 
 async def test_handle_upload_project_files_references_extracts_zip(
@@ -2159,7 +2159,7 @@ async def test_handle_upload_project_files_references_extracts_zip(
         "references/bundle/notes/summary.txt",
     }
 
-    refs_dir = ui_channel.projects_root / "PRJ-0002" / "references"
+    refs_dir = ui_channel.project_registry.default_project_parent / "PRJ-0002" / "references"
     assert (refs_dir / "seed.pdf").read_bytes() == b"%PDF-1.7"
     assert (refs_dir / "bundle" / "papers" / "paper_a.pdf").read_bytes() == b"%PDF-1.4"
     assert (refs_dir / "bundle" / "notes" / "summary.txt").read_bytes() == b"ok"
@@ -2862,7 +2862,7 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert "_ui_system_instructions" in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"
 
-    meta_file = ui_channel.projects_root / "PRJ-4001" / ".mira" / "project.json"
+    meta_file = ui_channel.project_registry.default_project_parent / "PRJ-4001" / ".mira" / "project.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta["contract_version"] == 2
     assert meta["automation_policy"]["goals"][0]["metric"] == "Dice"
@@ -3453,3 +3453,242 @@ async def test_send_stream_reset_withdraws_partial_reply(ui_channel: UiChannel) 
     ))
     history = SessionManager(ui_channel.workspace).get_ui_history("ui:sid-reset")
     assert [entry["content"] for entry in history] == ["whole reply"]
+
+
+async def test_ws_quick_chat_message_gets_its_own_working_directory(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = _FakeWs([
+        _FakeWsMessage(
+            web.WSMsgType.TEXT,
+            json.dumps({
+                "type": "message",
+                "session_id": "chat-abc",
+                "loop_mode": "normal",
+                "content": "hello",
+            }),
+        ),
+    ])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    handled = []
+
+    async def _handle_message(**kwargs):
+        handled.append(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+
+    chat_dir = ui_channel.projects_root / "chats" / "chat-abc"
+    assert handled[0]["metadata"]["chat_dir"] == str(chat_dir.resolve())
+    assert "project_dir" not in handled[0]["metadata"]
+    assert chat_dir.is_dir()
+    # A chat is not a project: nothing is created or registered under projects/.
+    assert not (ui_channel.project_registry.default_project_parent / "chat-abc").exists()
+
+
+async def test_chat_workdir_reports_path_before_and_reuses_legacy_folder(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"chat_id": "chat-new"}
+    body = json.loads((await ui_channel._handle_chat_workdir(req)).text)
+    assert body["path"] == str((ui_channel.projects_root / "chats" / "chat-new").resolve())
+    assert body["exists"] is False
+
+    legacy = ui_channel.projects_root / ".mira" / "projects" / "chat-old"
+    legacy.mkdir(parents=True)
+    req.match_info = {"chat_id": "chat-old"}
+    body = json.loads((await ui_channel._handle_chat_workdir(req)).text)
+    assert body["path"] == str(legacy.resolve())
+    assert body["exists"] is True
+
+    req.match_info = {"chat_id": ".."}
+    assert (await ui_channel._handle_chat_workdir(req)).status == 400
+
+
+@pytest.fixture
+def browse_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    return home
+
+
+async def test_fs_list_shows_one_folder_and_stops_at_home(ui_channel: UiChannel, browse_home: Path) -> None:
+    folder = browse_home / "data"
+    (folder / "sub").mkdir(parents=True)
+    (folder / "b.txt").write_text("b", encoding="utf-8")
+    (folder / "A.csv").write_text("a,b", encoding="utf-8")
+    (folder / ".secret").write_text("x", encoding="utf-8")
+    (folder / ".DS_Store").write_text("x", encoding="utf-8")
+
+    req = MagicMock(spec=web.Request)
+    req.query = {"path": str(folder)}
+    body = json.loads((await ui_channel._handle_fs_list(req)).text)
+    assert [row["name"] for row in body["entries"]] == ["sub", "A.csv", "b.txt"]
+    assert body["entries"][0]["is_dir"] is True
+    assert body["entries"][1]["path"] == str((folder / "A.csv").resolve())
+    assert body["parent"] == str(browse_home.resolve())
+    assert body["home"] == str(browse_home.resolve())
+
+    req.query = {"path": str(folder), "hidden": "1"}
+    body = json.loads((await ui_channel._handle_fs_list(req)).text)
+    assert ".secret" in [row["name"] for row in body["entries"]]
+
+    req.query = {"path": str(browse_home)}
+    body = json.loads((await ui_channel._handle_fs_list(req)).text)
+    assert body["parent"] is None
+
+
+async def test_fs_list_rejects_paths_outside_home_and_workspace(ui_channel: UiChannel, browse_home: Path) -> None:
+    req = MagicMock(spec=web.Request)
+    for path, status in (("/", 403), ("relative/dir", 400), ("", 400), (str(browse_home / "missing"), 404)):
+        req.query = {"path": path}
+        assert (await ui_channel._handle_fs_list(req)).status == status, path
+
+
+async def test_fs_list_allows_a_workspace_outside_home(ui_channel: UiChannel, browse_home: Path) -> None:
+    # The fixture's workspace (tmp_path) is not under the fake home.
+    req = MagicMock(spec=web.Request)
+    req.query = {"path": str(ui_channel.projects_root)}
+    body = json.loads((await ui_channel._handle_fs_list(req)).text)
+    assert body["path"] == str(ui_channel.projects_root.resolve())
+    assert body["parent"] is None
+
+
+async def test_fs_file_serves_files_inside_and_refuses_escapes(ui_channel: UiChannel, browse_home: Path) -> None:
+    target = browse_home / "report.png"
+    target.write_bytes(b"png")
+    req = MagicMock(spec=web.Request)
+    req.query = {"path": str(target)}
+    resp = await ui_channel._handle_fs_file(req)
+    assert isinstance(resp, web.FileResponse)
+    assert Path(resp._path) == target.resolve()
+
+    req.query = {"path": str(target), "download": "1"}
+    resp = await ui_channel._handle_fs_file(req)
+    assert resp.headers["Content-Disposition"].startswith('attachment; filename="report.png"')
+
+    outside = ui_channel.projects_root.parent / "outside.txt"
+    outside.write_text("no", encoding="utf-8")
+    link = browse_home / "link.txt"
+    link.symlink_to(outside)
+    req.query = {"path": str(link)}
+    assert (await ui_channel._handle_fs_file(req)).status == 403
+
+
+def _upload_request(query: dict[str, str], *parts: _FakePart, session_id: str = "PRJ-0001") -> MagicMock:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"session_id": session_id}
+    req.query = query
+    req.multipart = AsyncMock(return_value=_FakeMultipart(list(parts)))
+    return req
+
+
+async def test_upload_into_a_chosen_project_folder(ui_channel: UiChannel) -> None:
+    project = ui_channel.project_registry.default_project_parent / "PRJ-0001"
+    (project / "results").mkdir(parents=True)
+    (project / "results" / "a.csv").write_text("old", encoding="utf-8")
+
+    req = _upload_request(
+        {"dir": "results"},
+        _FakePart(name="files", filename="a.csv", chunks=[b"new"]),
+        _FakePart(name="files", filename="batch/b.txt", chunks=[b"b"]),
+    )
+    body = json.loads((await ui_channel._handle_upload_project_files(req)).text)
+
+    assert body["dir"] == "results"
+    assert [item["path"] for item in body["uploaded"]] == ["results/a_1.csv", "results/batch/b.txt"]
+    assert (project / "results" / "a.csv").read_text(encoding="utf-8") == "old"
+    assert (project / "results" / "batch" / "b.txt").read_bytes() == b"b"
+
+
+async def test_upload_with_empty_dir_goes_to_the_project_root(ui_channel: UiChannel) -> None:
+    req = _upload_request({"dir": ""}, _FakePart(name="files", filename="notes.md", chunks=[b"n"]))
+    body = json.loads((await ui_channel._handle_upload_project_files(req)).text)
+
+    assert body["dir"] == ""
+    assert body["uploaded"][0]["path"] == "notes.md"
+    assert (ui_channel.project_registry.default_project_parent / "PRJ-0001" / "notes.md").is_file()
+
+
+async def test_upload_refuses_a_folder_outside_the_project(ui_channel: UiChannel) -> None:
+    req = _upload_request({"dir": "../escape"}, _FakePart(name="files", filename="x.txt", chunks=[b"x"]))
+    assert (await ui_channel._handle_upload_project_files(req)).status == 400
+    assert not (ui_channel.project_registry.default_project_parent / "escape").exists()
+
+
+async def test_fs_upload_creates_a_new_chat_folder(ui_channel: UiChannel, browse_home: Path) -> None:
+    chat_dir = ui_channel.projects_root / "chats" / "chat-new"
+    req = _upload_request({"dir": str(chat_dir)}, _FakePart(name="files", filename="scan.nii", chunks=[b"nii"]))
+    body = json.loads((await ui_channel._handle_fs_upload(req)).text)
+
+    assert body["uploaded"] == [{"name": "scan.nii", "path": str(chat_dir.resolve() / "scan.nii"), "size": 3}]
+    assert (chat_dir / "scan.nii").read_bytes() == b"nii"
+
+
+async def test_fs_upload_refuses_folders_outside_home_and_workspace(ui_channel: UiChannel, browse_home: Path) -> None:
+    req = _upload_request({"dir": "/"}, _FakePart(name="files", filename="x.txt", chunks=[b"x"]))
+    assert (await ui_channel._handle_fs_upload(req)).status == 403
+    req = _upload_request({"dir": str(browse_home)}, _FakePart(name="files", filename="../x.txt", chunks=[b"x"]))
+    assert (await ui_channel._handle_fs_upload(req)).status == 400
+
+
+async def _import_chat(ui_channel: UiChannel, chat_id: str) -> None:
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"chats": [{"id": chat_id, "title": "Question"}]})
+    assert (await ui_channel._handle_import_chats(req)).status == 200
+
+
+def _delete_chat_request(chat_id: str, query: dict[str, str]) -> MagicMock:
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"chat_id": chat_id}
+    req.query = query
+    return req
+
+
+async def test_delete_chat_keeps_its_folder_unless_asked(ui_channel: UiChannel) -> None:
+    await _import_chat(ui_channel, "chat-1")
+    folder = ui_channel.projects_root / "chats" / "chat-1"
+    folder.mkdir(parents=True)
+    (folder / "result.png").write_bytes(b"png")
+
+    body = json.loads((await ui_channel._handle_delete_chat(_delete_chat_request("chat-1", {}))).text)
+
+    assert body == {"deleted": True, "chat_id": "chat-1", "files_deleted": False}
+    assert (folder / "result.png").is_file()
+
+
+async def test_delete_chat_with_files_removes_its_folder(ui_channel: UiChannel) -> None:
+    await _import_chat(ui_channel, "chat-1")
+    folder = ui_channel.projects_root / "chats" / "chat-1"
+    (folder / "plots").mkdir(parents=True)
+    (folder / "plots" / "roc.png").write_bytes(b"png")
+    other = ui_channel.projects_root / "chats" / "chat-2"
+    other.mkdir(parents=True)
+
+    resp = await ui_channel._handle_delete_chat(_delete_chat_request("chat-1", {"delete_files": "1"}))
+    body = json.loads(resp.text)
+
+    assert body["files_deleted"] is True
+    assert not folder.exists()
+    assert other.is_dir()
+    assert "chat-1" not in [chat["id"] for chat in ui_channel.organization_store.snapshot()["chats"]]
+
+
+async def test_delete_chat_with_files_and_no_folder_still_removes_the_chat(ui_channel: UiChannel) -> None:
+    await _import_chat(ui_channel, "chat-1")
+    body = json.loads((await ui_channel._handle_delete_chat(_delete_chat_request("chat-1", {"delete_files": "1"}))).text)
+    assert body == {"deleted": True, "chat_id": "chat-1", "files_deleted": False}
+
+
+async def test_delete_chat_files_failure_keeps_the_chat(ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _import_chat(ui_channel, "chat-1")
+    (ui_channel.projects_root / "chats" / "chat-1").mkdir(parents=True)
+
+    def _fail(_path: Path) -> None:
+        raise PermissionError("busy")
+
+    monkeypatch.setattr(ui_channel_mod.shutil, "rmtree", _fail)
+    resp = await ui_channel._handle_delete_chat(_delete_chat_request("chat-1", {"delete_files": "1"}))
+
+    assert resp.status == 500
+    assert "chat-1" in [chat["id"] for chat in ui_channel.organization_store.snapshot()["chats"]]
