@@ -287,3 +287,62 @@ async def test_decide_prompt_includes_current_time(tmp_path) -> None:
     assert user_msg["role"] == "user"
     assert "Current Time:" in user_msg["content"]
 
+
+
+@pytest.mark.asyncio
+async def test_tick_delivers_the_text_of_an_outbound_message(tmp_path, monkeypatch) -> None:
+    """The agent loop answers ``on_execute`` with an OutboundMessage; the user
+    gets its text, not the object (which the UI channel could not serialise)."""
+    from mira_engine.bus.events import OutboundMessage
+
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] community mentions", encoding="utf-8")
+
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id="hb_1",
+                    name="heartbeat",
+                    arguments={"action": "run", "tasks": "answer the community mention"},
+                )
+            ],
+        ),
+    ])
+
+    evaluated: list[object] = []
+    notified: list[object] = []
+
+    async def _on_execute(tasks: str):
+        return OutboundMessage(channel="ui", chat_id="PRJ-0001", content="Replied to the mention.")
+
+    async def _on_notify(response: str) -> None:
+        notified.append(response)
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+        on_execute=_on_execute,
+        on_notify=_on_notify,
+    )
+
+    async def _eval_notify(*a, **kw):
+        evaluated.append(kw.get("response"))
+        return True
+
+    monkeypatch.setattr("mira_engine.utils.evaluator.evaluate_response", _eval_notify)
+
+    await service._tick()
+    assert evaluated == ["Replied to the mention."]
+    assert notified == ["Replied to the mention."]
+
+
+def test_response_text_unwraps_messages_and_tolerates_the_rest() -> None:
+    from mira_engine.bus.events import OutboundMessage
+    from mira_engine.heartbeat.service import response_text
+
+    assert response_text(OutboundMessage(channel="ui", chat_id="x", content="hello")) == "hello"
+    assert response_text("plain") == "plain"
+    assert response_text(None) == ""
+    assert response_text(42) == "42"

@@ -8,6 +8,26 @@ def _read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def test_frozen_bundle_ships_every_built_in_channel() -> None:
+    # channels/registry.py finds built-in channels by scanning the package at
+    # run time (pkgutil.iter_modules), which a frozen bundle can only do for
+    # modules PyInstaller collected. v0.6.0rc3 listed only channels.ui and so
+    # shipped without channels.community: the desktop app had no websocket to
+    # the Mira Community and its inbox stayed empty while REST calls worked.
+    spec = _read("mira-engine.spec")
+
+    assert "collect_submodules('mira_engine.channels')" in spec
+    channel_modules = sorted(
+        p.stem for p in (ROOT / "mira_engine" / "channels").glob("*.py") if p.stem not in {"__init__", "base", "manager", "registry"}
+    )
+    assert {"community", "ui"} <= set(channel_modules), channel_modules
+
+    # The release smoke test runs the frozen gateway and must see both channels come up.
+    workflow = _read(".github/workflows/agent-release.yml")
+    assert 'for channel in ("ui", "community"):' in workflow
+    assert 'f"{channel} channel enabled" not in gateway_log' in workflow
+
+
 def test_pyinstaller_spec_uses_windows_onedir_only() -> None:
     spec = _read("mira-engine.spec")
 

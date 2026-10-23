@@ -38,6 +38,22 @@ _HEARTBEAT_TOOL = [
 ]
 
 
+def response_text(result: Any) -> str:
+    """The text of what ``on_execute`` returned.
+
+    The agent loop answers with an ``OutboundMessage``; delivering that object
+    whole wrapped it in another message, the UI channel failed with "Object of
+    type OutboundMessage is not JSON serializable", and the heartbeat's
+    community replies never reached the user.
+    """
+    if result is None:
+        return ""
+    content = getattr(result, "content", None)
+    if isinstance(content, str):
+        return content
+    return result if isinstance(result, str) else str(result)
+
+
 class HeartbeatService:
     """
     Periodic heartbeat service that wakes the agent to check for tasks.
@@ -56,7 +72,7 @@ class HeartbeatService:
         workspace: Path,
         provider: LLMProvider,
         model: str,
-        on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
+        on_execute: Callable[[str], Coroutine[Any, Any, Any]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         extra_context: Callable[[], Coroutine[Any, Any, str]] | None = None,
         interval_s: int = 30 * 60,
@@ -176,7 +192,7 @@ class HeartbeatService:
 
             logger.info("Heartbeat: tasks found, executing...")
             if self.on_execute:
-                response = await self.on_execute(tasks)
+                response = response_text(await self.on_execute(tasks))
                 if response and self.on_notify:
                     from mira_engine.utils import evaluator
 
@@ -200,4 +216,4 @@ class HeartbeatService:
         action, tasks = await self._decide(content)
         if action != "run" or not self.on_execute:
             return None
-        return await self.on_execute(tasks)
+        return response_text(await self.on_execute(tasks))

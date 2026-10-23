@@ -52,7 +52,12 @@ a = Analysis(
         + _bundled_plugin_datas()
     ),
     hiddenimports=[
-        'mira_engine.channels.ui',
+        # Built-in channels are found at run time by scanning mira_engine/channels
+        # (channels/registry.py, pkgutil), which a frozen bundle can only do for
+        # modules that were collected. Listing just `ui` here shipped v0.6.0rc3
+        # without channels.community: the desktop app never opened its websocket
+        # to the Mira Community, so no notifications reached the inbox.
+        *collect_submodules('mira_engine.channels'),
         'tiktoken_ext.openai_public',
         # The CA bundle the executable falls back to when OpenSSL's compiled-in
         # path belongs to the build machine (scripts/mira_engine_entry.py →
