@@ -32,7 +32,7 @@ REMIND_AFTER_HOURS = 6
 REMIND_EVERY_HOURS = 24
 
 # Actions whose approval the agent follows up in the conversation it asked from.
-_FOLLOWED_UP = ("post_proposal", "claim_proposal", "open_pr")
+_FOLLOWED_UP = ("post_proposal", "claim_proposal", "open_pr", "update_pr")
 
 
 def approvals_path():
@@ -266,6 +266,12 @@ async def follow_up_prompt(record: dict[str, Any], result: dict[str, Any], commu
             f"[Community] Your user approved opening the pull request \"{title}\". {result.get('detail', '')} "
             "Tell your user briefly, with the link; you will hear here when it is reviewed, merged or reverted."
         )
+    if action == "update_pr":
+        return (
+            f"[Community] Your user approved pushing the follow-up to the pull request \"{title}\". "
+            f"{result.get('detail', '')} Tell your user briefly; you will hear here when CI and the "
+            "reviewers have looked at the new head."
+        )
     return None
 
 
@@ -313,9 +319,13 @@ async def execute_approval(record: dict[str, Any], community_config: Any) -> dic
 
                 remember("proposal", post_id, origin, title=payload.get("title", ""))
             return {"ok": True, "detail": f"post created ({res.get('id', '?')})", "post_id": res.get("id")}
-        if action == "open_pr":
-            from mira_engine.community.contribute import ContributeError, open_and_register_pr, pr_summary
-            from mira_engine.community.origins import remember
+        if action in ("open_pr", "update_pr"):
+            from mira_engine.community.contribute import (
+                ContributeError,
+                open_and_register_pr,
+                pr_summary,
+            )
+            from mira_engine.community.origins import remember, update
             from mira_engine.community.privacy import default_guard
 
             try:
@@ -334,6 +344,9 @@ async def execute_approval(record: dict[str, Any], community_config: Any) -> dic
                     "pr", out["pr_id"], origin,
                     url=out["url"], plugin_ids=out["plugin_ids"], working_dir=payload.get("working_dir", ""),
                 )
+            elif out.get("updated") and payload.get("pr_id"):
+                # A human looked at this PR: the follow-up pushes start counting afresh.
+                update("pr", str(payload["pr_id"]), fix_rounds=0)
             return {"ok": True, "detail": pr_summary(out), "pr_url": out["url"], "pr_id": out.get("pr_id")}
         if action == "accept_answer":
             res = await client.accept_answer(

@@ -531,9 +531,10 @@ class CommunityOpenPrTool(_FollowedUp):
             "community_start_contribution): commits the in-scope changes there, pushes the "
             "workspace branch to your user's GitHub fork with their local git credentials, "
             "opens the PR into the community landing branch and registers it so it can be "
-            "reviewed and bot-merged. Call it again after addressing a review: it pushes the "
-            "follow-up commits to the same PR. Refuses changes outside the workspace's scope or "
-            "containing credentials. High-impact: may require human approval."
+            "reviewed and bot-merged. Call it again after fixing CI, a conflict or a review: it "
+            "pushes the follow-up commits to the same PR (a few such pushes run without a new "
+            "approval; then one is asked for). Refuses changes outside the workspace's scope or "
+            "containing credentials. Opening a PR is high-impact: may require human approval."
         )
 
     @property
@@ -566,9 +567,31 @@ class CommunityOpenPrTool(_FollowedUp):
         proposal_id: str | None = None,
         **_: Any,
     ) -> str:
+        from mira_engine.community.origins import MAX_AUTO_FIX_ROUNDS, remember, update
+
+        # A follow-up push to a PR the user already approved opening (a CI fix,
+        # a rebase, a review's changes) is a lesser decision than a new PR: it
+        # runs on its own in hybrid mode, up to MAX_AUTO_FIX_ROUNDS times, then
+        # a human looks again (mira-community#72).
+        known = await self._open_pr_for(working_dir)
+        action, held_note = "open_pr", "Once your user approves it, the PR is opened and you will be told here."
+        rounds = 0
+        if known is not None:
+            rounds = int(known[1].get("fix_rounds") or 0)
+            if rounds < MAX_AUTO_FIX_ROUNDS:
+                action = "update_pr"
+            else:
+                held_note = (
+                    f"This PR already received {rounds} follow-up pushes without a human look; "
+                    "the next one needs your user's approval, after which the count starts over."
+                )
+
         async def run() -> str:
-            from mira_engine.community.contribute import ContributeError, open_and_register_pr, pr_summary
-            from mira_engine.community.origins import remember
+            from mira_engine.community.contribute import (
+                ContributeError,
+                open_and_register_pr,
+                pr_summary,
+            )
             from mira_engine.community.privacy import default_guard
 
             try:
@@ -585,15 +608,131 @@ class CommunityOpenPrTool(_FollowedUp):
             if out.get("pr_id"):
                 # Reviews, merges and reverts of this PR are reported back here.
                 remember("pr", out["pr_id"], self._origin(), url=out["url"], plugin_ids=out["plugin_ids"], working_dir=working_dir)
+            elif out.get("updated") and known is not None:
+                update("pr", known[0], fix_rounds=rounds + 1)
             return pr_summary(out)
 
-        return await self._gated(
-            "open_pr",
-            {"working_dir": working_dir, "title": title, "body": body, "proposal_id": proposal_id},
-            run,
-            origin=self._origin(),
-            held_note="Once your user approves it, the PR is opened and you will be told here.",
+        payload = {"working_dir": working_dir, "title": title, "body": body, "proposal_id": proposal_id}
+        if known is not None:
+            payload["pr_id"] = known[0]
+        return await self._gated(action, payload, run, origin=self._origin(), held_note=held_note)
+
+    async def _open_pr_for(self, working_dir: str) -> tuple[str, dict[str, Any]] | None:
+        """The still-open PR this workspace produced, as remembered locally and
+        confirmed with the platform; None when there is none (or we cannot tell,
+        which makes the push a new-PR decision: held, never silently pushed)."""
+        from mira_engine.community.origins import pr_for_working_dir
+
+        known = pr_for_working_dir(working_dir)
+        if known is None:
+            return None
+        try:
+            detail = await self._client.get_external_pr(known[0])
+        except Exception as e:  # noqa: BLE001 - treat an unreadable PR as not open
+            logger.debug("Could not confirm PR {} is open: {}", known[0], e)
+            return None
+        state = str((detail.get("pr") or {}).get("state") or "")
+        return known if state == "open" else None
+
+
+class CommunityPrStatusTool(_CommunityTool):
+    """Where one of the agent's own PRs stands, and what to do next (mira-community#72)."""
+
+    @property
+    def name(self) -> str:
+        return "community_pr_status"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Where one of YOUR pull requests stands and what to do next: live state, CI with each "
+            "failing check's log excerpt, merge conflicts, requested changes, the merge gate's verdict. "
+            "Use it first when the community reports pr_ci_failed, pr_conflict or pr_reviewed about your "
+            "PR, or lists a pr_needs_attention task; then fix the cause in the contribution workspace and "
+            "call community_open_pr again (same working_dir) to push to the same PR. Pass pr_id, or the "
+            "working_dir you opened it from; with neither it lists your registered PRs. For someone "
+            "else's PR use community_review_pr."
         )
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "pr_id": {"type": "string", "description": "Registered PR id (from the event or community_open_pr)."},
+                "working_dir": {
+                    "type": "string",
+                    "description": "The contribution workspace the PR was opened from, when you have no pr_id.",
+                },
+            },
+        }
+
+    async def execute(self, pr_id: str | None = None, working_dir: str | None = None, **_: Any) -> str:
+        from mira_engine.community.client import CommunityError
+        from mira_engine.community.origins import pr_for_working_dir
+
+        if not pr_id and working_dir:
+            known = pr_for_working_dir(working_dir)
+            if known is None:
+                return f"No pull request was opened from {working_dir} in this engine; pass pr_id instead."
+            pr_id = known[0]
+        if not pr_id:
+            prs = (await self._client.list_prs()).get("prs") or []
+            if not prs:
+                return "You have no registered pull requests."
+            lines = [
+                f"- {p.get('repo')}#{p.get('pr_number')} state={p.get('state')} ci={p.get('ci_state')} "
+                f"pr_id={p.get('id')} {p.get('url') or ''}".rstrip()
+                for p in prs
+            ]
+            return "Your registered pull requests:\n" + "\n".join(lines)
+        try:
+            data = await self._client.pr_checks(pr_id)
+        except CommunityError as e:
+            if e.status_code == 403:
+                return f"PR {pr_id} is not yours: use community_review_pr to inspect it."
+            if e.status_code == 404:
+                return f"PR {pr_id} is not registered with the community."
+            return f"Could not read the PR's status: {e}"
+        return render_pr_status(data)
+
+
+def render_pr_status(data: dict[str, Any]) -> str:
+    """The platform's checks view as text the agent can act on."""
+    pr = data.get("pr") or {}
+    lines = [
+        f"PR {pr.get('repo')}#{pr.get('pr_number')} {pr.get('url') or ''}".rstrip(),
+        f"state={pr.get('state')} ci={pr.get('ci_state')} head={pr.get('head_sha') or '?'} "
+        f"mergeable={pr.get('mergeable')} lane={pr.get('lane') or 'unknown'}"
+        + ("" if pr.get("live", True) else "  (as last stored: the platform has no code host to ask)"),
+    ]
+    reasons = [str(r) for r in (data.get("reasons") or []) if r]
+    if reasons:
+        lines.append("needs you because: " + "; ".join(reasons))
+    gate = data.get("gate") or {}
+    if isinstance(gate, dict) and gate.get("checked_sha"):
+        gate_reasons = [str(r) for r in (gate.get("reasons") or [])]
+        lines.append("merge gate: " + ("; ".join(gate_reasons) if gate_reasons else "passes — the bot merges it on the next run"))
+    checks = [c for c in (data.get("checks") or []) if isinstance(c, dict)]
+    if checks:
+        lines.append("failing checks:")
+        for c in checks:
+            head = f"- {c.get('name')}" + (f" — {c['summary']}" if c.get("summary") else "") + (f" ({c['url']})" if c.get("url") else "")
+            lines.append(head)
+            excerpt = str(c.get("log_excerpt") or "").strip()
+            if excerpt:
+                if len(excerpt) > 3000:
+                    excerpt = "…" + excerpt[-3000:]
+                lines.append("  log excerpt:\n" + "\n".join(f"    {ln}" for ln in excerpt.splitlines()))
+            elif c.get("url"):
+                lines.append("  (no log excerpt from the platform; read the check's page)")
+    if data.get("next_step"):
+        lines.append(f"next step: {data['next_step']}")
+    return "\n".join(lines)
 
 
 class CommunityReviewPrTool(_CommunityTool):
@@ -1191,6 +1330,7 @@ def build_community_tools(community_config: Any, workspace: Any = None) -> list[
         CommunityDraftPatchTool(client, gate, community_config),
         CommunityOpenPrTool(client, gate, community_config),
         CommunitySubmitPatchTool(client, gate, community_config),
+        CommunityPrStatusTool(client, gate, community_config),
         CommunityReviewPrTool(client, gate, community_config),
         CommunityListWorkOrdersTool(client, gate, community_config),
         CommunityClaimWorkOrderTool(client, gate, community_config),

@@ -26,9 +26,11 @@ AutonomyMode = Literal["fully_autonomous", "hitl", "hybrid"]
 # answer are discussion-level engagement, so they flow freely in hybrid mode
 # (#33), as does a code review (it only informs the merge gate,
 # mira-community#45). Renewing or giving back a work-order lease or a proposal
-# claim only affects the agent's own claim. The development proposal
-# ("post_proposal"), claiming a work order or a proposal, patches, and PRs stay
-# high.
+# claim only affects the agent's own claim. A follow-up push to a PR the user
+# already approved opening ("update_pr": a CI fix, a rebase, a review's
+# changes) is low too, within origins.MAX_AUTO_FIX_ROUNDS (mira-community#72).
+# The development proposal ("post_proposal"), claiming a work order or a
+# proposal, patches, and opening a PR stay high.
 _LOW_IMPACT = frozenset(
     {
         "read_feed",
@@ -41,6 +43,7 @@ _LOW_IMPACT = frozenset(
         "release_work_order",
         "renew_proposal_claim",
         "release_proposal_claim",
+        "update_pr",
     }
 )
 

@@ -26,6 +26,10 @@ from mira_engine.utils.locks import locked_update_text
 ORIGINS_FILENAME = "community_origins.json"
 MAX_PER_KIND = 300
 KINDS = ("proposal", "pr")
+# Follow-up pushes to one PR (a CI fix, a rebase, a review's changes) run
+# without a fresh approval in hybrid mode — up to this many; the next one is
+# held so a human looks at a PR that keeps missing (mira-community#72).
+MAX_AUTO_FIX_ROUNDS = 3
 
 # Platform events about a PR the agent opened / a proposal it posted.
 _PR_EVENTS = {
@@ -36,6 +40,10 @@ _PR_EVENTS = {
     "pr_merged": "was merged into the landing branch",
     "pr_landed": "landed: the landing branch is green with it",
     "pr_reverted": "was reverted after landing (the landing branch went red)",
+    "pr_ci_failed": "failed CI",
+    "pr_ci_passed": "passed CI again after your fix",
+    "pr_conflict": "no longer merges cleanly into the landing branch",
+    "pr_closed": "was closed on the code host without merging",
 }
 _PROPOSAL_EVENTS = {
     "proposal_claimed": "is now being built by {claimant}",
@@ -96,6 +104,56 @@ def lookup(kind: str, item_id: str) -> dict[str, Any] | None:
     return entry if isinstance(entry, dict) and isinstance(entry.get("origin"), dict) else None
 
 
+def pr_for_working_dir(working_dir: str) -> tuple[str, dict[str, Any]] | None:
+    """The PR the agent opened from a contribution workspace, as (pr_id, entry);
+    the most recent one when the workspace produced several."""
+    if not working_dir:
+        return None
+    try:
+        data = _load(origins_path().read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    want = str(Path(working_dir).expanduser())
+    found = [
+        (pr_id, entry)
+        for pr_id, entry in data["pr"].items()
+        if isinstance(entry, dict) and str(Path(str(entry.get("working_dir") or "")).expanduser()) == want
+    ]
+    if not found:
+        return None
+    return max(found, key=lambda item: str(item[1].get("at") or ""))
+
+
+def update(kind: str, item_id: str, **fields: Any) -> None:
+    """Merge ``fields`` into a remembered entry (e.g. the fix-round counter); a
+    missing entry is left alone."""
+    if kind not in KINDS or not item_id or not fields:
+        return
+
+    def apply(text: str) -> str:
+        data = _load(text)
+        entry = data[kind].get(str(item_id))
+        if isinstance(entry, dict):
+            entry.update(fields)
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    try:
+        locked_update_text(origins_path(), apply)
+    except Exception as e:  # noqa: BLE001 - a lost counter only costs an extra approval
+        logger.debug("Could not update the community origin of {} {}: {}", kind, item_id, e)
+
+
+def _check_names(event: dict[str, Any]) -> list[str]:
+    """The failing checks an event names, each with its page when given."""
+    names: list[str] = []
+    for check in event.get("checks") or []:
+        if isinstance(check, dict) and check.get("name"):
+            names.append(f"{check['name']} ({check['url']})" if check.get("url") else str(check["name"]))
+        elif isinstance(check, str) and check:
+            names.append(check)
+    return names
+
+
 def _plugin_install_hint(entry: dict[str, Any]) -> str:
     ids = [str(p) for p in (entry.get("plugin_ids") or []) if p]
     if not ids:
@@ -128,11 +186,38 @@ def origin_follow_up(event: dict[str, Any]) -> tuple[str, dict[str, str]] | None
             detail = ": " + "; ".join(str(p) for p in problems) if problems else ""
         elif etype == "pr_rejected" and event.get("reason"):
             detail = f": {event.get('reason')}"
+        elif etype == "pr_ci_failed":
+            names = _check_names(event)
+            detail = f": {', '.join(names)}" if names else ""
         tail = _plugin_install_hint(entry) if etype in ("pr_merged", "pr_landed") else ""
+        workspace = str(entry.get("working_dir") or "the contribution workspace")
         if etype == "pr_reviewed" and str(event.get("verdict") or "") == "request_changes":
             tail = (
-                " Read the review (community_review_pr with pr_id), address it in the contribution "
-                "workspace and call community_open_pr again: it pushes the follow-up commits to the same PR."
+                f" Read the review (community_review_pr with pr_id {pr_id}), address it in the contribution "
+                f"workspace `{workspace}` and call community_open_pr again with the same working_dir: it pushes "
+                "the follow-up commits to the same PR."
+            )
+        elif etype == "pr_ci_failed":
+            tail = (
+                f" Call community_pr_status with pr_id {pr_id} for each failing check's log excerpt and the "
+                f"next step. Fix the cause in the contribution workspace `{workspace}`, run the project's tests "
+                "there, then call community_open_pr again with the same working_dir and title: it pushes the "
+                "fix to this PR. If the failure is unrelated to this change (flaky, or already failing on the "
+                "landing branch), say so to your user instead of pushing."
+            )
+        elif etype == "pr_conflict":
+            landing = str(event.get("landing_branch") or "the landing branch")
+            tail = (
+                f" Update the workspace branch from the landing branch (`git fetch origin && git merge "
+                f"origin/{landing}` in `{workspace}`), resolve the conflicts, run the tests, then call "
+                "community_open_pr again with the same working_dir."
+            )
+        elif etype == "pr_ci_passed":
+            tail = " Nothing to do now: it waits for reviews or a maintainer."
+        elif etype == "pr_closed":
+            tail = (
+                " Ask your user whether to drop the change or reopen it (community_open_pr from the same "
+                "workspace opens a new PR)."
             )
     elif etype in _PROPOSAL_EVENTS:
         proposal_id = str(event.get("proposal_id") or "")
