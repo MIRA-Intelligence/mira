@@ -17,6 +17,14 @@ from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from mira_engine.providers.usage import extract_usage
 from mira_engine.providers.registry import find_by_model, find_gateway, model_overrides_for
 
+if os.name == "nt":
+    # litellm >= 1.106 runs error log records through a native (Rust) redactor,
+    # reached from asyncio's own error logging via the root handler. On Windows
+    # that call hung the engine's test run with every watchdog silent; its
+    # Python fallback is what every earlier version used. litellm reads the
+    # variable per call, so an explicit value in the environment still wins.
+    os.environ.setdefault("LITELLM_RUST", "0")
+
 # Standard chat-completion message keys.
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
 _ANTHROPIC_EXTRA_KEYS = frozenset({"thinking_blocks"})

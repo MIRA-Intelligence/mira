@@ -4,7 +4,8 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from loguru import logger
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -322,6 +323,7 @@ class AgentDefaults(Base):
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    language: str = ""  # Preferred response language(s), e.g. "English", "中文". Empty = auto.
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
@@ -469,7 +471,17 @@ class ModelParamRule(Base):
 
 
 class ProvidersConfig(Base):
-    """Configuration for LLM providers."""
+    """Configuration for LLM providers.
+
+    Providers contributed by plugins (``provides.providers``) have no field
+    here: their sections are kept as extra fields (``providers.<name>``, as
+    ProviderConfig). Use :meth:`entry` to read any provider's config.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    # Empty configs handed out for plugin providers without a section, kept
+    # so the same object comes back (not saved until stored with create=True).
+    _plugin_defaults: dict[str, "ProviderConfig"] = PrivateAttr(default_factory=dict)
 
     proxy: str | None = None  # Global proxy for LLM provider HTTP calls.
     # User-editable per-model parameter rules (see ModelParamRule). Empty by
@@ -508,18 +520,59 @@ class ProvidersConfig(Base):
     volcengine_agent_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Agent Plan
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
-    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
-    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
 
-    def entry(self, name: str) -> ProviderConfig | None:
-        """Return the config for a provider id, including additional custom providers."""
+    @model_validator(mode="after")
+    def _plugin_provider_sections(self) -> "ProvidersConfig":
+        # Extra keys are plugin providers' sections: give them the same shape
+        # as a field (camelCase keys accepted, serialised with the rest). One
+        # that isn't a provider section is kept as written but not used; it
+        # must not take the whole config down.
+        for key, value in list((self.model_extra or {}).items()):
+            if isinstance(value, dict):
+                try:
+                    self.model_extra[key] = ProviderConfig.model_validate(value)
+                except ValidationError as e:
+                    problems = "; ".join(str(err.get("msg", "")) for err in e.errors()[:3])
+                    logger.warning("providers.{} is not a provider section and is ignored: {}", key, problems)
+        return self
+
+    def entry(self, name: str, *, create: bool = False) -> ProviderConfig | None:
+        """Return the config for a provider id: a field, an additional custom
+        provider, or a plugin provider's section. A plugin provider without a
+        section gets an empty one (like a field's default); ``create`` stores
+        it, so changes to it are saved."""
         if name in self.custom_providers:
             return self.custom_providers[name]
         if name in {"proxy", "model_params", "custom_providers"}:
             return None
-        value = getattr(self, name, None)
-        return value if isinstance(value, ProviderConfig) else None
+        from mira_engine.providers.registry import find_by_name, provider_key
+
+        key = provider_key(name)
+        if key in type(self).model_fields:
+            value = getattr(self, key, None)
+            return value if isinstance(value, ProviderConfig) else None
+        extras = self.model_extra if self.model_extra is not None else {}
+        for extra_key, value in extras.items():
+            if provider_key(extra_key) == key:
+                return value if isinstance(value, ProviderConfig) else None
+        spec = find_by_name(key)
+        if spec is None or not spec.plugin_id:
+            return None
+        config = self._plugin_defaults.setdefault(key, ProviderConfig())
+        if create and self.model_extra is not None:
+            # Saved like the fields: camelCase in config.json.
+            self.model_extra[to_camel(key)] = self._plugin_defaults.pop(key)
+        return config
+
+    def provider_names(self) -> list[str]:
+        """Every provider that can be configured: the fields, then the
+        providers plugins contribute (custom providers not included)."""
+        from mira_engine.providers.registry import all_providers
+
+        names = [n for n in type(self).model_fields if n not in {"proxy", "model_params", "custom_providers"}]
+        names.extend(s.name for s in all_providers() if s.plugin_id and s.name not in names)
+        return names
 
 
 class HeartbeatConfig(Base):
@@ -550,6 +603,71 @@ class GatewayConfig(Base):
     # Overrides the generated <MIRA_HOME>/runtime/gateway-token; env MIRA_GATEWAY_TOKEN wins.
     auth_token: str = ""
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+
+
+class CommunityConfig(Base):
+    """Mira Community Platform (mira-intelligence) connection.
+
+    The ``community`` channel is always created (community is a first-class
+    feature): it idles until an ``agent_token`` is present, then opens a
+    websocket to the cloud for inbound events (replies, votes, review/build
+    invites) and posts the agent's actions back. It auto-connects on `mira
+    community login` and auto-disconnects on logout — no gateway restart needed.
+    Set ``enabled = false`` to opt out entirely. ``autonomy_mode`` controls how
+    much the agent may do without human approval.
+    """
+
+    enabled: bool = True
+    api_base: str = "https://mira-intelligence.com/community"
+    agent_token: str = ""
+    agent_id: str = ""
+    # The agent's community name (``Name #<id8>`` on the website, ``@Name`` in
+    # mentions), cached from the platform after login and profile edits.
+    agent_name: str = ""
+    # hybrid: discussion-level actions (comments, votes, discussion posts,
+    # reviews) run on their own; high-impact ones (development proposals,
+    # claims, PRs, patches) wait for the user's approval.
+    autonomy_mode: Literal["fully_autonomous", "hitl", "hybrid"] = "hybrid"
+    code_host: Literal["github", "cnb"] = "github"
+    domains: list[str] = Field(default_factory=list)
+    # Cached community rules (#33). Onboarding is acceptance: the server delivers
+    # the rules on the welcome reply and on version bumps, and the engine keeps
+    # them here so it can inject them into the community system prompt every turn
+    # without a network round-trip. ``rules_text`` is a pre-rendered block.
+    rules_version: int = 0
+    rules_text: str = ""
+    # Extra words that must never reach the community (project codenames,
+    # colleagues, internal hosts, …). The outbound privacy filter (mira#203)
+    # always also checks the profile name/emails, OS username and home path.
+    private_terms: list[str] = Field(default_factory=list)
+    # Which merge lanes this user lets the agent contribute to (mira#204):
+    # "plugin" (plugins/docs, community-reviewed) and/or "core" (engine/CI/
+    # tests, maintainer-reviewed). Enforced locally before anything is staged.
+    contribution_lanes: list[Literal["plugin", "core"]] = Field(
+        default_factory=lambda: ["plugin", "core"]
+    )
+    # Work orders the agent may claim on this user's behalf (mira#205): kinds
+    # (empty = any) and how many it may hold at once. Claiming is high-impact,
+    # so in hitl/hybrid mode it also waits for the user's approval.
+    work_order_kinds: list[str] = Field(default_factory=list)
+    max_active_work_orders: int = 1
+    # What the community may cost per day (mira#213). Tokens across community
+    # turns and triage; 0 = unlimited. Lower priorities pause as it runs down.
+    daily_token_budget: int = 300_000
+    # Optional cheap model that decides whether a low-priority community event
+    # deserves a full turn (empty = priority rules only).
+    triage_model: str = ""
+    # Days between local community harvest reports (0 = off) (mira#214).
+    harvest_report_days: int = 7
+    # Which community events reach the user's inbox (mira-ui Community panel):
+    # reply | mention | review | work | activity. Empty = no notifications; the
+    # agent then runs on its own. Approvals are always shown (they need a decision).
+    notifications: list[str] = Field(default_factory=lambda: ["reply", "mention", "review", "work"])
+    # The community website. Empty = use what the platform advertises (/agents/me).
+    web_url: str = ""
+    # The repo a development proposal is built in when the agent isn't told
+    # otherwise (community_start_contribution without `repo`, #72).
+    default_repo: str = "MIRA-Intelligence/mira"
 
 
 class WebSearchConfig(Base):
@@ -675,6 +793,34 @@ class ToolsConfig(Base):
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
 
 
+class ProfileConfig(Base):
+    """First-run profile onboarding state.
+
+    ``onboarded`` flips to true once the user has completed the first-run
+    wizard (desktop) or ``mira onboard`` (CLI), which fills ``USER.md`` and
+    ``SOUL.md``. It is the shared completion flag for both surfaces so neither
+    re-prompts after setup.
+    """
+
+    onboarded: bool = False
+
+
+class PluginsConfig(Base):
+    """Plugin kernel settings (mira#206, #210)."""
+
+    # Where the plugin registry lives. Its public disable list lets a bad
+    # plugin version be switched off on every install, community member or not.
+    registry_url: str = "https://mira-intelligence.com/community"
+    remote_disable: bool = True
+    poll_interval_s: int = 600
+    # Tier for plugins in ~/.mira/plugins that the registry hasn't rated
+    # (mira#211): "experimental" runs them out of process, sandboxed.
+    default_user_tier: str = "experimental"
+    # Without bwrap (e.g. macOS) experimental plugins don't load unless this is
+    # set: they then run out of process but their permissions aren't enforced.
+    unsandboxed_experimental: bool = False
+
+
 class Config(BaseSettings):
     """Root configuration for mira."""
 
@@ -683,7 +829,10 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    community: CommunityConfig = Field(default_factory=CommunityConfig)
+    profile: ProfileConfig = Field(default_factory=ProfileConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    plugins: PluginsConfig = Field(default_factory=PluginsConfig)
 
     # The user's own values of settings the host policy overrides
     # (security/host_policy.py), keyed by config.json path; save_config writes
@@ -715,7 +864,7 @@ class Config(BaseSettings):
         setting. Pass ``"auto"`` to explicitly force auto-detection even when a
         global provider is configured; pass ``None`` to inherit the global.
         """
-        from mira_engine.providers.registry import PROVIDERS, find_by_name
+        from mira_engine.providers.registry import all_providers, find_by_name
 
         def _normalized_provider_name(value: str | None) -> str | None:
             if not value:
@@ -738,7 +887,7 @@ class Config(BaseSettings):
             forced_normalized = _normalized_provider_name(forced)
             spec = find_by_name(forced_normalized or forced)
             if spec:
-                p = getattr(self.providers, spec.name, None)
+                p = self.providers.entry(spec.name)
                 return (p, spec.name) if p else (None, None)
             return None, None
 
@@ -751,16 +900,18 @@ class Config(BaseSettings):
             kw = kw.lower()
             return kw in model_lower or kw.replace("-", "_") in model_normalized
 
+        providers = all_providers()
+
         # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
-        for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
+        for spec in providers:
+            p = self.providers.entry(spec.name)
             if p and model_prefix and normalized_prefix == spec.name:
                 if spec.is_oauth or spec.is_local or p.api_key:
                     return p, spec.name
 
-        # Match by keyword (order follows PROVIDERS registry)
-        for spec in PROVIDERS:
-            p = getattr(self.providers, spec.name, None)
+        # Match by keyword (order follows the provider registry)
+        for spec in providers:
+            p = self.providers.entry(spec.name)
             if p and any(_kw_matches(kw) for kw in spec.keywords):
                 if spec.is_oauth or spec.is_local or p.api_key:
                     return p, spec.name
@@ -770,10 +921,10 @@ class Config(BaseSettings):
         # Prefer providers whose detect_by_base_keyword matches the configured api_base
         # (e.g. Ollama's "11434" in "http://localhost:11434") over plain registry order.
         local_fallback: tuple[ProviderConfig, str] | None = None
-        for spec in PROVIDERS:
+        for spec in providers:
             if not spec.is_local:
                 continue
-            p = getattr(self.providers, spec.name, None)
+            p = self.providers.entry(spec.name)
             if not (p and p.api_base):
                 continue
             if spec.detect_by_base_keyword and spec.detect_by_base_keyword in p.api_base:
@@ -785,10 +936,10 @@ class Config(BaseSettings):
 
         # Fallback: gateways first, then others (follows registry order)
         # OAuth providers are NOT valid fallbacks — they require explicit model selection
-        for spec in PROVIDERS:
+        for spec in providers:
             if spec.is_oauth:
                 continue
-            p = getattr(self.providers, spec.name, None)
+            p = self.providers.entry(spec.name)
             if p and p.api_key:
                 return p, spec.name
         return None, None

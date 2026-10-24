@@ -1,0 +1,30 @@
+{
+  "id": "slack",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Slack channel: Socket Mode for inbound events, Web API for replies.",
+  "requires": [
+    "slack_sdk",
+    "slackify_markdown"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "slack",
+        "entry": "slack_channel:SlackChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "slack.com",
+      "*.slack.com",
+      "*.slack-edge.com"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.slack"
+    ]
+  }
+}

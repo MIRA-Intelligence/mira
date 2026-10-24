@@ -1,0 +1,18 @@
+{
+  "id": "web",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Web search (Brave by default) and page fetching for the agent and its subagents.",
+  "provides": {
+    "tools": [
+      { "name": "web_search", "entry": "tools:make_search" },
+      { "name": "web_fetch", "entry": "tools:make_fetch" }
+    ]
+  },
+  "permissions": {
+    "network": ["*"],
+    "filesystem": "none",
+    "secrets": ["tools.web"]
+  }
+}

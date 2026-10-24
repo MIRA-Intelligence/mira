@@ -338,6 +338,84 @@ async def cmd_plan(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+def _reply(ctx: CommandContext, content: str) -> OutboundMessage:
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content, metadata=dict(ctx.msg.metadata or {})
+    )
+
+
+async def cmd_approvals(ctx: CommandContext) -> OutboundMessage:
+    """List the community actions waiting for the user's decision (#72)."""
+    from mira_engine.community import approvals
+
+    pending = approvals.list_approvals(status="pending")
+    if not pending:
+        return _reply(ctx, "No community actions are waiting for your approval.")
+    lines = [f"{len(pending)} community action(s) waiting for your approval:"]
+    for rec in pending:
+        lines.append(f"- {rec['id']} — {approvals.summarize(rec)}")
+    lines.append("Reply `/approve <id>` or `/reject <id>`.")
+    return _reply(ctx, "\n".join(lines))
+
+
+async def _decide(ctx: CommandContext, decision: str) -> OutboundMessage:
+    """Decide a held community action from any chat, like the app's Approvals
+    panel: reject records it; approve runs it and lets the agent follow up in
+    the conversation that asked (or this one)."""
+    from mira_engine.community import approvals
+
+    approval_id = ctx.args.strip().split()[0] if ctx.args.strip() else ""
+    if not approval_id:
+        return _reply(ctx, f"Usage: /{decision} <approval id> — `/approvals` lists them.")
+    record = approvals.get_approval(approval_id)
+    if record is None:
+        return _reply(ctx, f"No community approval {approval_id}. `/approvals` lists the pending ones.")
+    if record.get("status") != "pending":
+        return _reply(ctx, f"Approval {approval_id} is already {record.get('status')}.")
+    if decision == "reject":
+        approvals.set_status(approval_id, "rejected")
+        return _reply(ctx, f"Rejected: {approvals.summarize(record)}.")
+
+    from mira_engine.config.loader import load_config
+
+    try:
+        cfg = load_config()
+    except Exception as e:  # noqa: BLE001 - report, don't crash the turn
+        return _reply(ctx, f"Could not load the configuration to run the action: {e}")
+    result = await approvals.execute_approval(record, cfg.community)
+    status = "approved" if result.get("ok") else "failed"
+    approvals.set_status(approval_id, status, detail=str(result.get("detail") or ""))
+    text = (
+        f"Approved and done: {result.get('detail') or approvals.summarize(record)}"
+        if result.get("ok")
+        else f"Approved, but it failed: {result.get('detail')}"
+    )
+    # The agent picks up from here (offer to build the proposal, report the
+    # PR, or fix what failed) in the chat the action came from — this one
+    # when the record has no origin.
+    prompt = await approvals.follow_up_prompt(record, result, cfg.community)
+    loop = ctx.loop
+    if prompt and loop is not None and getattr(loop, "bus", None) is not None:
+        origin = record.get("origin") or {}
+        channel = origin.get("channel") or ctx.msg.channel
+        chat_id = origin.get("chat_id") or ctx.msg.chat_id
+        meta = {"project_id": origin["project_id"]} if origin.get("project_id") else {}
+        await loop.bus.publish_inbound(
+            InboundMessage(
+                channel="system", sender_id="community", chat_id=f"{channel}:{chat_id}", content=prompt, metadata=meta
+            )
+        )
+    return _reply(ctx, text)
+
+
+async def cmd_approve(ctx: CommandContext) -> OutboundMessage:
+    return await _decide(ctx, "approve")
+
+
+async def cmd_reject(ctx: CommandContext) -> OutboundMessage:
+    return await _decide(ctx, "reject")
+
+
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands."""
     return OutboundMessage(
@@ -360,6 +438,7 @@ def build_help_text() -> str:
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
+        "/approvals — Community actions waiting for your approval; /approve <id>, /reject <id>",
         "/help — Show available commands",
     ]
     return "\n".join(lines)
@@ -379,3 +458,6 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/dream-restore ", cmd_dream_restore)
     router.exact("/help", cmd_help)
+    router.exact("/approvals", cmd_approvals)
+    router.prefix("/approve ", cmd_approve)
+    router.prefix("/reject ", cmd_reject)

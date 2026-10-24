@@ -664,11 +664,14 @@ def _try_auto_fill_context_window(model: BaseModel, new_model_name: str) -> None
 # --- Provider Configuration ---
 
 
-@lru_cache(maxsize=1)
 def _get_provider_info() -> dict[str, tuple[str, bool, bool, str]]:
-    """Get provider info from registry (cached)."""
-    from mira_engine.providers.registry import PROVIDERS
+    """Get provider info from the registry (core and plugin providers)."""
+    from mira_engine.providers.registry import all_providers
 
+    return _provider_info(all_providers())
+
+
+def _provider_info(specs: tuple) -> dict[str, tuple[str, bool, bool, str]]:
     return {
         spec.name: (
             spec.display_name or spec.name,
@@ -676,7 +679,7 @@ def _get_provider_info() -> dict[str, tuple[str, bool, bool, str]]:
             spec.is_local,
             spec.default_api_base,
         )
-        for spec in PROVIDERS
+        for spec in specs
     }
 
 
@@ -767,7 +770,7 @@ def _configure_provider(config: Config, provider_name: str) -> None:
     from mira_engine.providers.registry import find_by_name
 
     spec = find_by_name(provider_name)
-    provider_config = getattr(config.providers, provider_name, None)
+    provider_config = config.providers.entry(provider_name, create=True)
     if provider_config is None:
         console.print(f"[red]Unknown provider: {provider_name}[/red]")
         return
@@ -855,7 +858,7 @@ def _configure_providers(config: Config) -> None:
         """Build provider choices with config status indicators."""
         choices = []
         for name, display in _get_provider_names().items():
-            provider = getattr(config.providers, name, None)
+            provider = config.providers.entry(name)
             spec = find_by_name(name)
             if spec and spec.is_oauth and config.agents.defaults.provider == name:
                 choices.append(f"{display} *")
@@ -906,7 +909,9 @@ def _get_channel_info() -> dict[str, tuple[str, type[BaseModel]]]:
     result: dict[str, tuple[str, type[BaseModel]]] = {}
     for name, channel_cls in discover_all().items():
         try:
-            mod = importlib.import_module(f"mira_engine.channels.{name}")
+            # The channel's own module: a built-in under mira_engine.channels
+            # or a plugin package (mira#209).
+            mod = importlib.import_module(channel_cls.__module__)
             config_name = channel_cls.__name__.replace("Channel", "Config")
             config_cls = getattr(mod, config_name, None)
             if config_cls and isinstance(config_cls, type) and issubclass(config_cls, BaseModel):
@@ -1100,7 +1105,7 @@ def _show_summary(config: Config) -> None:
     provider_rows = []
     for name, display in _get_provider_names().items():
         spec = find_by_name(name)
-        provider = getattr(config.providers, name, None)
+        provider = config.providers.entry(name)
         if spec and spec.is_oauth:
             status = (
                 "[green]selected (OAuth)[/green]"

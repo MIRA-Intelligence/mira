@@ -23,7 +23,6 @@ from mira_engine.agent.tools.filesystem import (
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.agent.tools.search import GlobTool, GrepTool
 from mira_engine.agent.tools.shell import ExecTool
-from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
 from mira_engine.config.schema import ExecToolConfig
@@ -53,6 +52,11 @@ ROLE_CONFIGS: dict[str, dict[str, Any]] = {
         "temperature": 0.2,
     },
 }
+
+# Plugin tools a subagent gets when its role has no allowlist: the web tools
+# (bundled `web` plugin) it has always had. Other plugin tools — `hub_install`,
+# community plugins — stay with the main loop unless a role names them.
+SUBAGENT_PLUGIN_TOOLS: frozenset[str] = frozenset({"web_search", "web_fetch"})
 
 
 @dataclass(frozen=True)
@@ -253,11 +257,22 @@ class SubagentManager:
                 sandbox_extra_dirs=sandbox_dirs,
                 python_runtime=self.exec_config.python,
             ))
-        if _permitted("web_search"):
-            tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
-        if _permitted("web_fetch"):
-            tools.register(WebFetchTool(proxy=self.web_proxy))
+        # web_search / web_fetch come from the bundled `web` plugin.
+        plugin_allowed = SUBAGENT_PLUGIN_TOOLS if allowed is None else allowed
+        self._register_plugin_tools(tools, run_workspace, lambda name: name in plugin_allowed and _permitted(name))
         return tools
+
+    def _register_plugin_tools(self, tools: ToolRegistry, run_workspace: Path, permitted) -> None:
+        """Plugin tools the role and delegation policy allow; built-ins win name clashes."""
+        from mira_engine.plugins import get_runtime
+
+        for tool in get_runtime().build_tools(
+            workspace=run_workspace,
+            proxy=self.web_proxy,
+            host={"brave_api_key": self.brave_api_key},
+        ):
+            if permitted(tool.name) and not tools.has(tool.name):
+                tools.register(tool)
 
     async def spawn(
         self,

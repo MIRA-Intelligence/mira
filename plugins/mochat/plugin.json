@@ -1,0 +1,28 @@
+{
+  "id": "mochat",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Mochat channel: Socket.IO with HTTP polling fallback.",
+  "requires": [
+    "socketio",
+    "msgpack"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "mochat",
+        "entry": "mochat_channel:MochatChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "*"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.mochat"
+    ]
+  }
+}

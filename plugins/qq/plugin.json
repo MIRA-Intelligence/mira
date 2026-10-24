@@ -1,0 +1,28 @@
+{
+  "id": "qq",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "QQ channel: botpy SDK for C2C and group messages.",
+  "requires": [
+    "botpy"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "qq",
+        "entry": "qq_channel:QQChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "api.sgroup.qq.com",
+      "*.qq.com"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.qq"
+    ]
+  }
+}

@@ -129,7 +129,7 @@ def parse_layer(data: Any) -> TeamLayer:
         raise TeamLayerError("providers must be an object")
     from mira_engine.config.schema import CUSTOM_PROVIDER_ID_PATTERN, is_custom_provider_id
 
-    known = set(ProvidersConfig.model_fields) - {"proxy", "model_params", "custom_providers"}
+    known = set(ProvidersConfig().provider_names())
 
     def usable(name: str) -> bool:
         if name in known or CUSTOM_PROVIDER_ID_PATTERN.match(name):

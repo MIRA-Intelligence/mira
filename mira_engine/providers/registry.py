@@ -6,6 +6,11 @@ Adding a new provider:
   2. Add a field to ProvidersConfig in config/schema.py.
   Done. Env vars, prefixing, config matching, status display all derive from here.
 
+A plugin can contribute a provider too (``provides.providers`` in its
+plugin.json: the spec as data plus the hooks that build it); see
+``all_providers()``. OpenAI Codex and GitHub Copilot come that way, from the
+first-party plugins in plugins/.
+
 Order matters — it controls match priority and fallback. Gateways first.
 Every entry writes out all fields so you can copy-paste as a template.
 """
@@ -70,6 +75,10 @@ class ProviderSpec:
     # Only set on specs whose entire model line-up is vision-capable; per-model
     # detection (see ``model_supports_vision``) covers the common mixed case.
     supports_vision: bool = False
+
+    # The plugin that contributes this provider (``provides.providers`` in its
+    # plugin.json); empty for the providers below.
+    plugin_id: str = ""
 
     @property
     def label(self) -> str:
@@ -361,44 +370,8 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
-    # OpenAI Codex: uses OAuth, not API key.
-    ProviderSpec(
-        name="openai_codex",
-        keywords=("openai-codex",),
-        env_key="",  # OAuth-based, no API key
-        display_name="OpenAI Codex",
-        litellm_prefix="",  # Not routed through LiteLLM
-        skip_prefixes=(),
-        env_extras=(),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="codex",
-        default_api_base="https://chatgpt.com/backend-api",
-        strip_model_prefix=False,
-        model_overrides=(),
-        is_oauth=True,  # OAuth-based authentication
-        is_subscription=True,  # Billed against the user's subscription
-    ),
-    # GitHub Copilot: uses OAuth, not API key.
-    ProviderSpec(
-        name="github_copilot",
-        keywords=("github_copilot", "copilot"),
-        env_key="",  # OAuth-based, no API key
-        display_name="GitHub Copilot",
-        litellm_prefix="github_copilot",  # github_copilot/model → github_copilot/model
-        skip_prefixes=("github_copilot/",),
-        env_extras=(),
-        is_gateway=False,
-        is_local=False,
-        detect_by_key_prefix="",
-        detect_by_base_keyword="",
-        default_api_base="",
-        strip_model_prefix=True,
-        model_overrides=(),
-        is_oauth=True,  # OAuth-based authentication
-        is_subscription=True,  # Billed against the user's subscription
-    ),
+    # OpenAI Codex and GitHub Copilot (OAuth) come from the first-party
+    # plugins plugins/openai-codex and plugins/github-copilot.
     # DeepSeek: routed natively through OpenAICompatProvider to sidestep
     # LiteLLM's buggy reasoning_content round-trip for thinking-mode models
     # (https://github.com/BerriAI/litellm/issues/26395). LiteLLM metadata is
@@ -685,6 +658,94 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# Providers from plugins
+# ---------------------------------------------------------------------------
+
+_PLUGIN_SPECS_TTL_S = 2.0
+_plugin_specs_cache: tuple[float, Any, tuple[ProviderSpec, ...]] | None = None
+
+
+def spec_from_manifest(data: dict[str, Any], plugin_id: str = "") -> ProviderSpec:
+    """A ProviderSpec from a plugin manifest's ``provides.providers[].spec``."""
+    import dataclasses
+
+    known = {f.name for f in dataclasses.fields(ProviderSpec)}
+    values: dict[str, Any] = {k: v for k, v in data.items() if k in known and k != "plugin_id"}
+    for key in ("keywords", "skip_prefixes"):
+        if key in values:
+            values[key] = tuple(str(v) for v in values[key] or ())
+    if "env_extras" in values:
+        values["env_extras"] = tuple(tuple(pair) for pair in values["env_extras"] or ())
+    if "model_overrides" in values:
+        values["model_overrides"] = tuple((str(p), dict(o)) for p, o in values["model_overrides"] or ())
+    values.setdefault("keywords", ())
+    values.setdefault("env_key", "")
+    return ProviderSpec(**values, plugin_id=plugin_id)
+
+
+def _plugin_specs() -> tuple[ProviderSpec, ...]:
+    """Providers contributed by enabled plugins: first-party ones and those
+    the platform registry rated ``verified`` (a provider sees every prompt and
+    holds the user's keys). Read from manifests alone — this runs while the
+    config is validated, so it must not import plugin code or load the config.
+    Core providers keep their names."""
+    global _plugin_specs_cache
+    import time
+
+    now = time.monotonic()
+    cached = _plugin_specs_cache
+    if cached is not None and now - cached[0] < _PLUGIN_SPECS_TTL_S:
+        return cached[2]
+    try:
+        from mira_engine.plugins import catalog
+
+        key = catalog.fingerprint()
+        if cached is not None and cached[1] == key:
+            _plugin_specs_cache = (now, key, cached[2])
+            return cached[2]
+        taken = {spec.name for spec in PROVIDERS}
+        specs: list[ProviderSpec] = []
+        for entry in catalog.entries():
+            if not entry.active or not (entry.source == "bundled" or entry.tier == "verified"):
+                continue
+            for provider in entry.manifest.providers:
+                if provider.name in taken:
+                    continue
+                try:
+                    specs.append(spec_from_manifest(provider.spec, entry.id))
+                except (TypeError, ValueError):
+                    continue
+                taken.add(provider.name)
+    except Exception:  # noqa: BLE001 - the core providers work without plugins
+        return ()
+    result = tuple(specs)
+    _plugin_specs_cache = (now, key, result)
+    return result
+
+
+def all_providers() -> tuple[ProviderSpec, ...]:
+    """Every known provider: the core registry, then those plugins contribute."""
+    return PROVIDERS + _plugin_specs()
+
+
+def plugin_provider(name: str) -> Any:
+    """The manifest entry (``ProviderEntry``) of a plugin-contributed
+    provider, or None."""
+    spec = find_by_name(name)
+    if spec is None or not spec.plugin_id:
+        return None
+    try:
+        from mira_engine.plugins import catalog
+
+        entry = catalog.get(spec.plugin_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if entry is None:
+        return None
+    return next((p for p in entry.manifest.providers if p.name == spec.name), None)
+
+
+# ---------------------------------------------------------------------------
 # Lookup helpers
 # ---------------------------------------------------------------------------
 
@@ -696,7 +757,7 @@ def find_by_model(model: str) -> ProviderSpec | None:
     model_normalized = model_lower.replace("-", "_")
     model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
     normalized_prefix = model_prefix.replace("-", "_")
-    std_specs = [s for s in PROVIDERS if not s.is_gateway and not s.is_local]
+    std_specs = [s for s in all_providers() if not s.is_gateway and not s.is_local]
 
     # Prefer explicit provider prefix — prevents `github-copilot/...codex` matching openai_codex.
     for spec in std_specs:
@@ -733,7 +794,7 @@ def find_gateway(
             return spec
 
     # 2. Auto-detect by api_key prefix / api_base keyword
-    for spec in PROVIDERS:
+    for spec in all_providers():
         if spec.detect_by_key_prefix and api_key and api_key.startswith(spec.detect_by_key_prefix):
             return spec
         if spec.detect_by_base_keyword and api_base and spec.detect_by_base_keyword in api_base:
@@ -742,10 +803,16 @@ def find_gateway(
     return None
 
 
+def provider_key(name: str) -> str:
+    """A provider's registry name from any way a config may write it
+    (``githubCopilot``, ``github-copilot`` -> ``github_copilot``)."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
+
+
 def find_by_name(name: str) -> ProviderSpec | None:
     """Find a provider spec by config field name, e.g. "dashscope"."""
-    key = re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
-    for spec in PROVIDERS:
+    key = provider_key(name)
+    for spec in all_providers():
         if spec.name == key:
             return spec
     return None

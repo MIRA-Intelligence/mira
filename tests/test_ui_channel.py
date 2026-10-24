@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from aiohttp import web
 
@@ -1404,30 +1405,31 @@ async def test_submit_feedback_sends_single_text_message(
     assert "Show workspace files as a tree." in posted[0]["content"]["text"]
 
 
-async def test_post_feishu_webhook_retries_ssl_verification_failure(
+async def test_post_feishu_webhook_never_retries_without_certificate_verification(
     ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The retry with ssl=False that papered over the frozen build's empty
+    # trust store (fixed in mira_engine.utils.tls) is gone: a certificate
+    # failure is an error the user sees, not a reason to stop verifying.
     relay = ui_channel_mod._FeedbackRelayConfig(
         feishu_webhook_url="https://open.feishu.cn/webhook/test",
         feishu_secret="super-secret",
     )
-    calls: list[bool | None] = []
+    calls: list[dict[str, Any]] = []
 
     async def _fake_post_once(
         _relay: ui_channel_mod._FeedbackRelayConfig,
-        _body: dict[str, Any],
-        *,
-        ssl: bool | None = None,
+        body: dict[str, Any],
     ) -> None:
-        calls.append(ssl)
-        if ssl is None:
-            raise ui_channel_mod.ClientError("CERTIFICATE_VERIFY_FAILED")
+        calls.append(body)
+        raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
 
     monkeypatch.setattr(ui_channel, "_post_feishu_webhook_once", _fake_post_once)
 
-    await ui_channel._post_feishu_webhook(relay, {"msg_type": "text", "content": {"text": "hello"}})
+    with pytest.raises(RuntimeError, match="CERTIFICATE_VERIFY_FAILED"):
+        await ui_channel._post_feishu_webhook(relay, {"msg_type": "text", "content": {"text": "hello"}})
 
-    assert calls == [None, False]
+    assert len(calls) == 1 and calls[0]["sign"]  # signed once, sent once
 
 
 async def test_post_feishu_webhook_wraps_non_certificate_network_error(
@@ -1441,15 +1443,45 @@ async def test_post_feishu_webhook_wraps_non_certificate_network_error(
     async def _fake_post_once(
         _relay: ui_channel_mod._FeedbackRelayConfig,
         _body: dict[str, Any],
-        *,
-        ssl: bool | None = None,
     ) -> None:
-        raise ui_channel_mod.ClientError("connection refused")
+        raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(ui_channel, "_post_feishu_webhook_once", _fake_post_once)
 
     with pytest.raises(RuntimeError, match="feishu webhook request failed: connection refused"):
         await ui_channel._post_feishu_webhook(relay, {"msg_type": "text", "content": {"text": "hello"}})
+
+
+async def test_post_feishu_webhook_once_reports_what_feishu_answered(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay = ui_channel_mod._FeedbackRelayConfig(
+        feishu_webhook_url="https://open.feishu.cn/webhook/test", feishu_secret=""
+    )
+    answers: list[httpx.Response] = []
+    sent: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return answers.pop(0)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)
+    )
+    body = {"msg_type": "text", "content": {"text": "hello"}}
+
+    answers.append(httpx.Response(200, json={"code": 0, "msg": "success"}))
+    await ui_channel._post_feishu_webhook_once(relay, body)
+    assert sent == [body]
+
+    answers.append(httpx.Response(200, json={"code": 19021, "msg": "sign match fail"}))
+    with pytest.raises(RuntimeError, match="feishu webhook error 19021: sign match fail"):
+        await ui_channel._post_feishu_webhook_once(relay, body)
+
+    answers.append(httpx.Response(502, text="bad gateway"))
+    with pytest.raises(RuntimeError, match="feishu webhook returned 502"):
+        await ui_channel._post_feishu_webhook_once(relay, body)
 
 
 async def test_handle_config_updates_runtime_fields_and_provider_secrets(
@@ -1952,8 +1984,22 @@ async def test_cors_allows_patch_method(ui_channel: UiChannel) -> None:
 
     resp = await ui_channel._cors_middleware(req, AsyncMock())
     assert resp.status == 204
-    assert resp.headers["Access-Control-Allow-Methods"] == "GET, POST, PATCH, DELETE, OPTIONS"
+    assert resp.headers["Access-Control-Allow-Methods"] == "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     assert resp.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+
+
+async def test_cors_allows_every_method_the_routes_use(ui_channel: UiChannel) -> None:
+    # PUT /api/community/notifications was blocked in the preflight ("Load
+    # failed" in the app) because PUT was missing from the allowed methods.
+    ui_channel.config.cors_origins = ["*"]
+    app = ui_channel._build_app()
+    used = {route.method for route in app.router.routes()} - {"HEAD", "*"}
+    req = MagicMock(spec=web.Request)
+    req.method = "OPTIONS"
+    req.headers = {"Origin": "http://localhost:5173"}
+    resp = await ui_channel._cors_middleware(req, AsyncMock())
+    allowed = {m.strip() for m in resp.headers["Access-Control-Allow-Methods"].split(",")}
+    assert "PUT" in used and used <= allowed
 
 
 async def test_cors_is_preserved_for_http_errors(ui_channel: UiChannel) -> None:
@@ -3127,6 +3173,283 @@ async def test_handle_remove_project_keeps_files_hidden_from_list(ui_channel: Ui
     assert [item["id"] for item in list_body["projects"]] == []
 
 
+# --- Mira Community Platform endpoints (#114) -----------------------------
+async def test_handle_community_status_reports_state_without_token(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = Config()
+    cfg.community.enabled = True
+    cfg.community.agent_token = "secret-token"
+    cfg.community.agent_id = "agent-1"
+    cfg.community.autonomy_mode = "hybrid"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "list_approvals",
+        lambda status=None: [{"id": "1"}] if status == "pending" else [],
+    )
+
+    resp = await ui_channel._handle_community_status(MagicMock(spec=web.Request))
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["enabled"] is True
+    assert body["logged_in"] is True
+    assert body["agent_id"] == "agent-1"
+    assert body["autonomy_mode"] == "hybrid"
+    assert body["pending_count"] == 1
+    # The agent token must never be exposed to the desktop UI.
+    assert "secret-token" not in resp.text
+
+
+async def test_handle_community_autonomy_persists_mode(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = Config()
+    saved: dict = {}
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+    monkeypatch.setattr(
+        ui_channel_mod.config_loader,
+        "save_config",
+        lambda c, p=None: saved.update(mode=c.community.autonomy_mode),
+    )
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"mode": "fully_autonomous"})
+    resp = await ui_channel._handle_community_autonomy(req)
+
+    assert resp.status == 200
+    assert saved["mode"] == "fully_autonomous"
+    assert json.loads(resp.text)["autonomy_mode"] == "fully_autonomous"
+
+
+async def test_handle_community_autonomy_rejects_bad_mode(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"mode": "yolo"})
+    resp = await ui_channel._handle_community_autonomy(req)
+    assert resp.status == 400
+
+
+async def test_handle_community_approvals_lists(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "list_approvals",
+        lambda status=None: [{"id": "1", "status": status or "pending"}],
+    )
+    req = MagicMock(spec=web.Request)
+    req.query = {"status": "pending"}
+    resp = await ui_channel._handle_community_approvals(req)
+    assert resp.status == 200
+    assert json.loads(resp.text)["approvals"][0]["id"] == "1"
+
+
+async def test_handle_community_approvals_rejects_bad_status(ui_channel: UiChannel) -> None:
+    req = MagicMock(spec=web.Request)
+    req.query = {"status": "weird"}
+    resp = await ui_channel._handle_community_approvals(req)
+    assert resp.status == 400
+
+
+async def test_handle_community_decide_reject(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {"id": "1", "action": "comment", "status": "pending", "payload": {}}
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "set_status",
+        lambda i, s: {"id": "1", "status": s},
+    )
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "reject"})
+    req.match_info = {"approval_id": "1"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 200
+    assert json.loads(resp.text)["approval"]["status"] == "rejected"
+
+
+async def test_handle_community_decide_approve_executes(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {"id": "2", "action": "post_proposal", "status": "pending", "payload": {}}
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "set_status",
+        lambda i, s: {**rec, "status": s},
+    )
+
+    async def fake_exec(r, c):
+        return {"ok": True, "detail": "proposal created (p1)"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: Config())
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "2"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["ok"] is True
+    assert body["approval"]["status"] == "approved"
+
+
+async def test_approving_a_proposal_follows_up_in_its_conversation(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {
+        "id": "3",
+        "action": "post_proposal",
+        "status": "pending",
+        "payload": {"title": "Local model picker", "body": "B", "category": "development"},
+        "origin": {"channel": "ui", "chat_id": "chat-7", "project_id": "PRJ-1"},
+    }
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "set_status", lambda i, s: {**rec, "status": s})
+
+    async def fake_exec(r, c):
+        return {"ok": True, "detail": "post created (p1)", "post_id": "p1"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    cfg = Config()
+    cfg.community.web_url = "http://web.test"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "3"}
+    assert (await ui_channel._handle_community_decide(req)).status == 200
+    msg = ui_channel.bus.publish_inbound.await_args.args[0]
+    assert msg.channel == "system" and msg.chat_id == "ui:chat-7"
+    assert msg.metadata == {"project_id": "PRJ-1"}
+    assert '"Local model picker"' in msg.content and "http://web.test/proposals/p1" in msg.content
+    assert "proposal_id='p1'" in msg.content
+
+    # Other approvals, and proposals without a conversation, are not followed up.
+    ui_channel.bus.publish_inbound.reset_mock()
+    rec["action"] = "comment"
+    await ui_channel._handle_community_decide(req)
+    rec["action"], rec["origin"] = "post_proposal", {}
+    await ui_channel._handle_community_decide(req)
+    ui_channel.bus.publish_inbound.assert_not_awaited()
+
+
+async def test_approving_a_claim_follows_up_in_its_conversation(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {
+        "id": "4",
+        "action": "claim_proposal",
+        "status": "pending",
+        "payload": {"proposal_id": "p1", "title": "Local model picker"},
+        "origin": {"channel": "ui", "chat_id": "chat-7"},
+    }
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "set_status", lambda i, s: {**rec, "status": s})
+
+    async def fake_exec(r, c):
+        return {"ok": True, "detail": "proposal claimed"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: Config())
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "4"}
+    assert (await ui_channel._handle_community_decide(req)).status == 200
+    msg = ui_channel.bus.publish_inbound.await_args.args[0]
+    assert msg.channel == "system" and msg.chat_id == "ui:chat-7" and msg.metadata == {}
+    assert "approved claiming" in msg.content and "community_start_contribution with proposal_id='p1'" in msg.content
+
+
+async def test_renewing_a_claim_from_the_inbox(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mira_engine.community.client import CommunityRuleError
+
+    cfg = Config()
+    cfg.community.agent_token = "tok"
+    cfg.community.api_base = "http://c.test"
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+    calls = []
+
+    async def claim(self, proposal_id):
+        calls.append(proposal_id)
+        if proposal_id == "gone":
+            raise CommunityRuleError("x", rule_id="proposal-claimed", reason="Ada #12345678 is building it.")
+        return {"claim": {"claim_expires_at": "2026-10-24T10:00:00Z"}}
+
+    monkeypatch.setattr("mira_engine.community.client.CommunityClient.claim_proposal", claim)
+    req = MagicMock(spec=web.Request)
+    req.match_info = {"proposal_id": "p1"}
+    resp = await ui_channel._handle_community_renew_claim(req)
+    assert resp.status == 200 and json.loads(resp.text) == {"ok": True, "claim_expires_at": "2026-10-24T10:00:00Z"}
+    req.match_info = {"proposal_id": "gone"}
+    resp = await ui_channel._handle_community_renew_claim(req)
+    assert resp.status == 409 and json.loads(resp.text)["error"] == "Ada #12345678 is building it."
+    assert calls == ["p1", "gone"]
+
+
+async def test_handle_community_decide_marks_failed_on_execution_failure(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = {"id": "3", "action": "comment", "status": "pending", "payload": {}}
+    set_calls: list = []
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "set_status",
+        lambda i, s, detail=None: set_calls.append(s) or {**rec, "status": s},
+    )
+
+    async def fake_exec(r, c):
+        return {"ok": False, "detail": "boom"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: Config())
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "3"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 502
+    # Execution failed: recorded as failed (#72), never as approved.
+    assert set_calls == ["failed"]
+
+
+async def test_handle_community_decide_not_found(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: None)
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "x"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 404
+
+
+async def test_handle_community_pair_start_requires_api_base(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = Config()
+    cfg.community.api_base = ""
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: cfg)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "save_config", lambda *a, **k: None)
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={})
+    resp = await ui_channel._handle_community_pair_start(req)
+    assert resp.status == 400
 def _model_cache(provider: str = "deepseek") -> "Any":
     from mira_engine.providers.model_fetch import ModelCache, ModelInfo
 
@@ -3455,6 +3778,43 @@ async def test_send_stream_reset_withdraws_partial_reply(ui_channel: UiChannel) 
     assert [entry["content"] for entry in history] == ["whole reply"]
 
 
+async def test_a_failed_approval_is_recorded_and_handed_back(
+    ui_channel: UiChannel, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #72: an execution failure (privacy filter, git) no longer leaves the item
+    # pending behind a 502 — it is marked failed and the agent is told, so it
+    # can fix the cause and ask again.
+    rec = {
+        "id": "9", "action": "open_pr", "status": "pending",
+        "payload": {"title": "Add retry", "working_dir": "/ws"},
+        "origin": {"channel": "ui", "chat_id": "chat-9"},
+    }
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "get_approval", lambda i: rec)
+    statuses: list[tuple] = []
+    monkeypatch.setattr(
+        ui_channel_mod.community_approvals,
+        "set_status",
+        lambda i, s, detail=None: statuses.append((i, s, detail)) or {**rec, "status": s},
+    )
+
+    async def fake_exec(r, c):
+        return {"ok": False, "detail": "privacy-filter: 'Acme' must not reach the community"}
+
+    monkeypatch.setattr(ui_channel_mod.community_approvals, "execute_approval", fake_exec)
+    monkeypatch.setattr(ui_channel_mod.config_loader, "get_config_path", lambda: tmp_path / "c.json")
+    monkeypatch.setattr(ui_channel_mod.config_loader, "load_config", lambda _p=None: Config())
+    ui_channel.bus.publish_inbound = AsyncMock()
+
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value={"decision": "approve"})
+    req.match_info = {"approval_id": "9"}
+    resp = await ui_channel._handle_community_decide(req)
+    assert resp.status == 502
+    assert statuses == [("9", "failed", "privacy-filter: 'Acme' must not reach the community")]
+    follow = ui_channel.bus.publish_inbound.await_args.args[0]
+    assert follow.chat_id == "ui:chat-9" and "could not be carried out" in follow.content
+
+
 async def test_ws_quick_chat_message_gets_its_own_working_directory(
     ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3540,7 +3900,8 @@ async def test_fs_list_shows_one_folder_and_stops_at_home(ui_channel: UiChannel,
 
 async def test_fs_list_rejects_paths_outside_home_and_workspace(ui_channel: UiChannel, browse_home: Path) -> None:
     req = MagicMock(spec=web.Request)
-    for path, status in (("/", 403), ("relative/dir", 400), ("", 400), (str(browse_home / "missing"), 404)):
+    root = browse_home.anchor  # "/" (POSIX) or "C:\\" (Windows): absolute, outside home and workspace
+    for path, status in ((root, 403), ("relative/dir", 400), ("", 400), (str(browse_home / "missing"), 404)):
         req.query = {"path": path}
         assert (await ui_channel._handle_fs_list(req)).status == status, path
 
@@ -3626,7 +3987,7 @@ async def test_fs_upload_creates_a_new_chat_folder(ui_channel: UiChannel, browse
 
 
 async def test_fs_upload_refuses_folders_outside_home_and_workspace(ui_channel: UiChannel, browse_home: Path) -> None:
-    req = _upload_request({"dir": "/"}, _FakePart(name="files", filename="x.txt", chunks=[b"x"]))
+    req = _upload_request({"dir": browse_home.anchor}, _FakePart(name="files", filename="x.txt", chunks=[b"x"]))
     assert (await ui_channel._handle_fs_upload(req)).status == 403
     req = _upload_request({"dir": str(browse_home)}, _FakePart(name="files", filename="../x.txt", chunks=[b"x"]))
     assert (await ui_channel._handle_fs_upload(req)).status == 400

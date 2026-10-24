@@ -51,6 +51,41 @@ class SkillPluginError(ValueError):
     """Raised for invalid plugin state or plugin package errors."""
 
 
+def _kernel_entries() -> list[Any]:
+    """The plugin kernel's catalog (manifests only, no plugin code). A broken
+    catalog must not take the skills down with it."""
+    try:
+        from mira_engine.plugins import catalog
+
+        return catalog.entries()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Plugin catalog unavailable: {}", exc)
+        return []
+
+
+def _kernel_fingerprint() -> Any:
+    try:
+        from mira_engine.plugins import catalog
+
+        return catalog.fingerprint()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _code_plugin_manifest(source_dir: Path) -> Any:
+    """The plugin-kernel manifest of a package that provides code (channels,
+    tools or hooks), else None (a skill pack)."""
+    if not (source_dir / PLUGIN_MANIFEST_FILENAME).is_file():
+        return None
+    from mira_engine.plugins.manifest import ManifestError, load_manifest
+
+    try:
+        manifest = load_manifest(source_dir)
+    except ManifestError:
+        return None  # the skill-pack manifest checks report what's wrong
+    return manifest if manifest.has_code else None
+
+
 def _is_valid_identifier(value: str) -> bool:
     if not value:
         return False
@@ -172,6 +207,7 @@ class SkillPluginManager:
                 signature.append((st.st_mtime_ns, st.st_size))
             except OSError:
                 signature.append(None)
+        signature.append(_kernel_fingerprint())
         return tuple(signature)
 
     def _iter_plugin_dirs(self) -> list[Path]:
@@ -274,6 +310,35 @@ class SkillPluginManager:
                 continue
             source = self._read_plugin_source(plugin_dir)
             records.append((manifest, plugin_dir, source))
+        records.extend(self._kernel_records({record[0]["id"] for record in records}))
+        return records
+
+    def _kernel_records(self, taken: set[str]) -> list[tuple[dict[str, Any], Path, dict[str, str]]]:
+        """Plugins from the plugin kernel (repo ``plugins/``, ``~/.mira/plugins``)
+        whose manifest provides skills: listed, toggled and loaded like skill
+        packs. A switched-off kernel plugin is listed with its skills off."""
+        records: list[tuple[dict[str, Any], Path, dict[str, str]]] = []
+        for entry in _kernel_entries():
+            if not entry.manifest.skills:
+                continue
+            if entry.id in taken:
+                logger.warning("Plugin {} is also installed as a skill pack; the skill pack wins", entry.id)
+                continue
+            raw = {
+                "id": entry.id,
+                "name": entry.manifest.name or entry.id,
+                "version": entry.manifest.version,
+                "description": entry.manifest.description,
+                "skills": list(entry.manifest.skills),
+                "groups": list(entry.manifest.groups),
+            }
+            try:
+                manifest = self._parse_manifest(entry.root, raw)
+            except SkillPluginError as exc:
+                logger.warning("Skip skills of plugin {}: {}", entry.id, exc)
+                continue
+            manifest["kernel"] = {"active": entry.active, "tier": entry.tier, "bundled": entry.source == "bundled"}
+            records.append((manifest, entry.root, {"type": "kernel", "path": str(entry.root)}))
         return records
 
     def _read_plugin_source(self, plugin_dir: Path) -> dict[str, str]:
@@ -482,7 +547,9 @@ class SkillPluginManager:
             raise SkillPluginError(f"Invalid plugin manifest: {manifest_file}") from exc
         if not isinstance(manifest_raw, dict):
             raise SkillPluginError("Plugin manifest must be a JSON object")
+        return self._parse_manifest(plugin_dir, manifest_raw)
 
+    def _parse_manifest(self, plugin_dir: Path, manifest_raw: dict[str, Any]) -> dict[str, Any]:
         plugin_id = manifest_raw.get("id")
         if not isinstance(plugin_id, str) or not _is_valid_identifier(plugin_id):
             raise SkillPluginError("Plugin manifest requires a valid string id")
@@ -667,7 +734,16 @@ class SkillPluginManager:
         plugin_id_hint: str,
         plugin_name_hint: str,
         manifest_defaults: dict[str, str] | None = None,
+        allow_code: bool = True,
     ) -> dict[str, Any]:
+        kernel_manifest = _code_plugin_manifest(source_dir)
+        if kernel_manifest is not None:
+            if not allow_code:
+                raise SkillPluginError(
+                    f"{kernel_manifest.id} contains code (channels, tools or hooks), not just skills; "
+                    "install it as a plugin instead"
+                )
+            return self._install_kernel_plugin(source_dir, kernel_manifest, source_type, source_path)
         manifest = self._ensure_manifest_for_install(
             source_dir,
             plugin_id_hint=plugin_id_hint,
@@ -691,7 +767,46 @@ class SkillPluginManager:
         installed_manifest["source"] = {"type": source_type, "path": source_path}
         return installed_manifest
 
-    def install_from_directory(self, source_dir: Path) -> dict[str, Any]:
+    def _install_kernel_plugin(
+        self,
+        source_dir: Path,
+        manifest: Any,
+        source_type: str,
+        source_path: str,
+    ) -> dict[str, Any]:
+        """A package with code is a plugin for the plugin kernel: it goes to the
+        user plugin directory, switched off until the user enables it (``mira
+        plugin enable``), and loads — out of process unless the platform rated
+        it — on the next start. Its manifest can't switch itself on."""
+        from mira_engine.plugins.paths import user_plugins_dir
+        from mira_engine.plugins.state import PluginState
+
+        root = user_plugins_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        destination = root / manifest.id
+        staging = root / f".tmp-{manifest.id}-{int(time.time() * 1000)}"
+        if staging.exists():
+            shutil.rmtree(staging)
+        shutil.copytree(source_dir, staging)
+        if destination.exists():
+            shutil.rmtree(destination)
+        staging.rename(destination)
+        PluginState().set_enabled(manifest.id, False)
+        self._plugins_cache = None
+        return {
+            "id": manifest.id,
+            "name": manifest.name or manifest.id,
+            "version": manifest.version,
+            "description": manifest.description,
+            "install_path": str(destination),
+            "groups": [],
+            "skills": [],
+            "source": {"type": "kernel", "path": source_path, "installed_from": source_type},
+            "kernel": {"active": False, "tier": "experimental", "bundled": False},
+            "note": f"Installed as a plugin with code; enable it with `mira plugin enable {manifest.id}` and restart.",
+        }
+
+    def install_from_directory(self, source_dir: Path, *, allow_code: bool = True) -> dict[str, Any]:
         resolved = source_dir.expanduser().resolve()
         if not resolved.is_dir():
             raise SkillPluginError(f"Plugin source directory not found: {resolved}")
@@ -701,6 +816,7 @@ class SkillPluginManager:
             source_path=str(resolved),
             plugin_id_hint=resolved.name,
             plugin_name_hint=resolved.name.replace("-", " ").replace("_", " ").title(),
+            allow_code=allow_code,
         )
 
     def install_from_zip(
@@ -711,12 +827,15 @@ class SkillPluginManager:
         source_type: str = "zip",
         source_path: str | None = None,
         manifest_defaults: dict[str, str] | None = None,
+        allow_code: bool = True,
     ) -> dict[str, Any]:
         """Install a zipped skill package.
 
         ``source_type``/``source_path`` record where it came from (default: the
         zip itself); ``manifest_defaults`` (name/version/description) fill an
-        inferred manifest when the package has no plugin.json.
+        inferred manifest when the package has no plugin.json. A package whose
+        plugin.json provides code installs into the plugin kernel, switched
+        off, unless ``allow_code`` is false (then it is refused).
         """
         resolved = archive_path.expanduser().resolve()
         if not resolved.is_file():
@@ -733,6 +852,7 @@ class SkillPluginManager:
                 plugin_id_hint=hint_stem,
                 plugin_name_hint=hint_stem.replace("-", " ").replace("_", " ").title(),
                 manifest_defaults=manifest_defaults,
+                allow_code=allow_code,
             )
 
     def uninstall(self, plugin_id: str) -> None:
@@ -742,7 +862,15 @@ class SkillPluginManager:
             raise SkillPluginError("Built-in skills cannot be uninstalled")
         plugin_dir = self.plugins_root / plugin_id
         if not plugin_dir.is_dir():
-            raise SkillPluginError(f"Plugin not installed: {plugin_id}")
+            entry = next((e for e in _kernel_entries() if e.id == plugin_id), None)
+            if entry is None:
+                raise SkillPluginError(f"Plugin not installed: {plugin_id}")
+            if entry.source == "bundled":
+                raise SkillPluginError(f"{plugin_id} ships with Mira and cannot be uninstalled; disable it instead")
+            from mira_engine.plugins.state import PluginState
+
+            PluginState().forget(plugin_id)
+            plugin_dir = entry.root
         shutil.rmtree(plugin_dir)
         self._plugins_cache = None
         for state_path in (self.global_state_path, self.project_overrides_path):
@@ -827,9 +955,10 @@ class SkillPluginManager:
             global_entry = global_state.get(plugin_id, {})
             project_entry = project_state.get(plugin_id, {})
 
-            # Plugin-level toggles are deprecated; keep plugin gate always enabled.
+            # Plugin-level toggles are deprecated; keep plugin gate always enabled
+            # (a kernel plugin's gate is its own on/off switch, `mira plugin`).
             plugin_enabled = _effective_scope_state(
-                True,
+                bool((manifest.get("kernel") or {}).get("active", True)),
                 None,
                 global_explicit=False,
                 project_explicit=False,

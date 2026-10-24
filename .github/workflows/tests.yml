@@ -6,6 +6,9 @@ on:
       - main
       - dev
       - release
+      # Community landing branch: its CI judges every bot merge before the
+      # next one, and a red merge is reverted (mira-community#51/#52).
+      - contrib
   pull_request:
   workflow_dispatch:
 
@@ -53,6 +56,8 @@ jobs:
       - name: Run tests with coverage
         env:
           MIRA_REQUIRE_BWRAP: "1"
+          # Every bundled plugin's SDK is installed (dev extra): a skipped contract is a failure.
+          MIRA_ALL_PLUGIN_SDKS: "1"
         run: |
           python -m pytest tests/ \
             --cov=mira_engine \
@@ -67,3 +72,61 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  sandbox-macos:
+    # The Seatbelt sandbox for experimental plugins (sandbox-exec) only exists
+    # on macOS; this job enforces it for real. Everything else runs on Linux.
+    runs-on: macos-latest
+    name: plugin sandbox (macOS)
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest pytest-asyncio
+
+      - name: Run the sandbox tests
+        run: python -m pytest tests/plugins/test_isolation.py tests/tools/test_sandbox.py -v
+
+  tests-windows:
+    # The release build (agent-release.yml) runs the whole suite on Windows
+    # with the bare package installed; this job is that run, on every PR,
+    # so a tag build cannot be the first time a test meets Windows. Hangs
+    # fail at the per-test timeout instead of stalling the job.
+    runs-on: windows-latest
+    name: tests (windows, release deps)
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (as the release build does)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-asyncio pytest-timeout aiohttp
+
+      - name: Run tests
+        # faulthandler_timeout dumps every thread's stack from C when a test
+        # overruns — it works where pytest-timeout's thread cannot get the GIL.
+        env:
+          # litellm >= 1.106 filters error log records through a native (Rust)
+          # redactor; on Windows that call hung the run with every timer dead.
+          LITELLM_RUST: "0"
+        run: python -m pytest tests -q -p no:cacheprovider --timeout=120 --timeout-method=thread -o faulthandler_timeout=150 -rfE --durations=25

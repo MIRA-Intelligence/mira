@@ -10,6 +10,11 @@ from typing import Any
 
 from mira_engine.agent.memory import MemoryStore
 from mira_engine.agent.skills import SkillsLoader
+from mira_engine.community.privacy import (
+    COMMUNITY_BOOTSTRAP_FILES,
+    COMMUNITY_CHANNEL,
+    COMMUNITY_PERSONA_FILE,
+)
 from mira_engine.utils.helpers import detect_image_mime
 from mira_engine.utils.prompt_templates import render_template
 
@@ -36,16 +41,33 @@ class ContextBuilder:
         channel: str | None = None,
         loaded_skills: list[str] | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, bootstrap files, memory, and skills.
+
+        Community turns (mira#203) talk to the public, so they get a reduced
+        prompt: no ``USER.md`` profile, no long-term memory and no recent
+        cross-session history — only the agent's own instructions/persona and
+        the user-approved ``COMMUNITY_PERSONA.md``.
+        """
+        community = channel == COMMUNITY_CHANNEL
         parts = [self._get_identity(channel=channel)]
 
-        bootstrap = self._load_bootstrap_files(agents_filename=agents_filename)
+        bootstrap = self._load_bootstrap_files(
+            agents_filename=agents_filename,
+            files=COMMUNITY_BOOTSTRAP_FILES if community else None,
+        )
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        if community:
+            persona = self.workspace / COMMUNITY_PERSONA_FILE
+            if persona.is_file():
+                text = persona.read_text(encoding="utf-8").strip()
+                if text:
+                    parts.append(f"## {COMMUNITY_PERSONA_FILE}\n\n{text}")
+        else:
+            memory = self.memory.get_memory_context()
+            if memory:
+                parts.append(f"# Memory\n\n{memory}")
 
         active_skills: list[str] = []
         for name in [*(skill_names or []), *self.skills.get_always_skills()]:
@@ -60,7 +82,7 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary).strip())
 
-        recent_history = self._build_recent_history_section()
+        recent_history = "" if community else self._build_recent_history_section()
         if recent_history:
             parts.append(recent_history)
 
@@ -91,7 +113,18 @@ class ContextBuilder:
             workspace_path=workspace_path,
             platform_policy=platform_policy.strip(),
             channel=channel,
+            agent_name=self._agent_name(),
         ).strip()
+
+    def _agent_name(self) -> str | None:
+        """The name the user gave this agent (project overlay first, then global)."""
+        from mira_engine.config.paths import get_workspace_path
+        from mira_engine.profile.onboarding import configured_agent_name
+
+        try:
+            return configured_agent_name(self.workspace, get_workspace_path(None))
+        except Exception:  # noqa: BLE001 - a missing name must never break the prompt
+            return None
 
     def _build_recent_history_section(self) -> str:
         """Build unprocessed history section for prompt cache continuity."""
@@ -147,8 +180,14 @@ class ContextBuilder:
             pass
         return None
 
-    def _load_bootstrap_files(self, agents_filename: str = "AGENTS.md") -> str:
+    def _load_bootstrap_files(
+        self,
+        agents_filename: str = "AGENTS.md",
+        files: tuple[str, ...] | list[str] | None = None,
+    ) -> str:
         """Load shared persona followed by project-specific overlays.
+
+        ``files`` restricts which bootstrap files are loaded (default: all).
 
         Per file (e.g. AGENTS.md):
           1. global workspace file, or built-in template as fallback
@@ -166,7 +205,7 @@ class ContextBuilder:
         workspace = self.workspace.expanduser().resolve(strict=False)
         global_workspace = global_workspace.expanduser().resolve(strict=False)
 
-        for filename in self.BOOTSTRAP_FILES:
+        for filename in files if files is not None else self.BOOTSTRAP_FILES:
             effective_name = agents_filename if filename == "AGENTS.md" else filename
             stem = effective_name.rsplit(".", 1)[0]
             layers: list[str] = []

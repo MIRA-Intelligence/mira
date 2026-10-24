@@ -1,0 +1,27 @@
+{
+  "id": "feishu",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Feishu / Lark channel: lark-oapi WebSocket long connection for inbound messages, REST for replies and media.",
+  "requires": [
+    "lark_oapi"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "feishu",
+        "entry": "feishu_channel:FeishuChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "*"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.feishu"
+    ]
+  }
+}

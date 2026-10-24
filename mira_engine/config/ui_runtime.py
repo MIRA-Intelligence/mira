@@ -14,7 +14,6 @@ from mira_engine.config.schema import (
     AgentDefaults,
     Config,
     ProviderConfig,
-    ProvidersConfig,
     is_custom_provider_id,
 )
 from mira_engine.providers.registry import find_by_name
@@ -37,18 +36,14 @@ def _mask_secret(value: str) -> str | None:
     return f"{text[:4]}...{text[-2:]}"
 
 
-def _provider_field_names() -> tuple[str, ...]:
-    # ProvidersConfig also contains global settings (`proxy`, `model_params`).
-    # The UI provider map below only serializes concrete ProviderConfig entries.
-    _non_provider = {"proxy", "model_params", "custom_providers"}
-    return tuple(name for name in ProvidersConfig.model_fields.keys() if name not in _non_provider)
-
-
 def _provider_entries(config: Config) -> list[tuple[str, ProviderConfig]]:
     """Every provider the UI can configure; additional custom providers follow ``custom``."""
     entries: list[tuple[str, ProviderConfig]] = []
-    for provider_name in _provider_field_names():
-        entries.append((provider_name, getattr(config.providers, provider_name)))
+    for provider_name in config.providers.provider_names():
+        provider_cfg = config.providers.entry(provider_name)
+        if provider_cfg is None:
+            continue
+        entries.append((provider_name, provider_cfg))
         if provider_name == "custom":
             entries.extend(config.providers.custom_providers.items())
     return entries
@@ -836,14 +831,14 @@ def apply_ui_runtime_update(
                     changed = True
                 provider_cfg = custom_providers[provider_name]
             else:
-                if provider_name not in _provider_field_names():
+                if provider_name not in config.providers.provider_names():
                     raise ValueError(f"unsupported provider: {provider_name}")
                 if not isinstance(provider_update, dict):
                     raise ValueError(f"providers.{provider_name} must be an object")
                 team_layer.check_provider_change(config, provider_name, provider_update)
                 if team_layer.managed_provider(config, provider_name):
                     continue  # unchanged (checked above); an empty api_key must not clear the proxy token
-                provider_cfg = getattr(config.providers, provider_name)
+                provider_cfg = config.providers.entry(provider_name, create=True)
 
             if "name" in provider_update:
                 if not is_custom_provider_id(provider_name):

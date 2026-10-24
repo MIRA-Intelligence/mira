@@ -1,0 +1,18 @@
+{
+  "id": "mira-hub",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Search MIRA Hub and install its skills (as custom skill packs) in one call each.",
+  "provides": {
+    "tools": [
+      { "name": "hub_search", "entry": "tools:make_search" },
+      { "name": "hub_install", "entry": "tools:make_install" }
+    ]
+  },
+  "permissions": {
+    "network": ["mira-intelligence.github.io"],
+    "filesystem": "none",
+    "secrets": []
+  }
+}

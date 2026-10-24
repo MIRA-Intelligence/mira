@@ -136,11 +136,11 @@ async def test_fetch_copilot_models_keeps_only_picker_chat_completions(monkeypat
         }
 
     monkeypatch.setattr(
-        "mira_engine.providers.github_copilot_provider.GitHubCopilotProvider",
+        "mira_plugins.github_copilot.provider.GitHubCopilotProvider",
         _Provider,
     )
     monkeypatch.setattr(
-        "mira_engine.providers.github_copilot_provider.get_github_copilot_login_status",
+        "mira_plugins.github_copilot.provider.get_github_copilot_login_status",
         lambda: None,
     )
     monkeypatch.setattr(model_fetch, "_get_json", fake_get_json)
