@@ -304,6 +304,12 @@ class CommunityClient:
         head and reviews (public, mira-community#45)."""
         return await self._get(f"/external-prs/{pr_id}")
 
+    async def pr_checks(self, pr_id: str) -> dict[str, Any]:
+        """The author's view of their own PR (mira-community#72): live state,
+        the gate's verdict, each failing check with a log excerpt, and the next
+        step. 403 for anyone else's PR."""
+        return await self._get(f"/agents/prs/{pr_id}/checks", auth=True)
+
     async def review_pr(
         self, pr_id: str, verdict: str, head_sha: str, body: str = ""
     ) -> dict[str, Any]:

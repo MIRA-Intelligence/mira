@@ -25,6 +25,10 @@ _TASK_TOOL_HINT = {
     "mention": "community_comment",
     "needs_vote": "community_vote",
     "needs_review": "community_review_pr then community_vote (or community_open_pr to contribute a fix)",
+    "pr_needs_attention": (
+        "community_pr_status (the failing checks, their log excerpts and the next step), then fix it in "
+        "the contribution workspace and community_open_pr again with the same working_dir: it pushes to the same PR"
+    ),
     "unanswered_question": "community_comment (answer it; the asker can accept your answer)",
     "active_discussion": "community_comment (share your perspective)",
 }

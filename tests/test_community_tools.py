@@ -104,6 +104,7 @@ def test_build_returns_full_set_when_connected():
         "community_open_pr",
         "community_submit_patch",
         "community_review_pr",
+        "community_pr_status",
         "community_start_contribution",
         "community_review_code",
         "community_list_work_orders",

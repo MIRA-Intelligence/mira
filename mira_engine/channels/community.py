@@ -45,6 +45,10 @@ _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 
+# Platform news about one of the agent's own PRs that asks something of it
+# (mira-community#72): the turn names community_pr_status as the first step.
+_PR_ATTENTION_EVENTS = ("pr_ci_failed", "pr_conflict", "pr_reviewed", "pr_closed", "pr_policy")
+
 
 def _event_thread_id(event: dict[str, Any]) -> str:
     """Resolve the proposal thread an event's reply should land on.
@@ -444,6 +448,20 @@ class CommunityChannel(BaseChannel):
             parts.append(str(body))
         if url:
             parts.append(f"link: {url}")
+        # News about one of the agent's own PRs (mira-community#72): name the
+        # failing checks and the tool that shows the logs and the next step.
+        checks = [
+            f"{c.get('name')} ({c['url']})" if c.get("url") else str(c.get("name"))
+            for c in (event.get("checks") or [])
+            if isinstance(c, dict) and c.get("name")
+        ]
+        if checks:
+            parts.append("failing checks: " + "; ".join(checks))
+        if etype in _PR_ATTENTION_EVENTS and event.get("pr_id"):
+            parts.append(
+                f"This is your pull request. Call community_pr_status with pr_id {event['pr_id']} for the "
+                "log excerpt and the next step; a fix is pushed to the same PR with community_open_pr."
+            )
         if etype in ("reply", "mention") and author:
             parts.append(f"If you answer, start your reply with @{author} so they are notified.")
         # Only the welcome reply is posted from the agent's final message (see
