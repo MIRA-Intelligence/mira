@@ -43,6 +43,7 @@ from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
 from mira_engine.agent.tools.consult import ConsultRoleTool
 from mira_engine.agent.tools.cron import CronTool
+from mira_engine.agent.tools.hub import HubInstallTool, HubSearchTool
 from mira_engine.agent.tools.knowledge import KnowledgeReadTool, KnowledgeScope, KnowledgeSearchTool
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
@@ -498,6 +499,8 @@ class BaseAgentLoop:
             self.tools.register(BgTool(registry=self._bg_registry))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        self.tools.register(HubSearchTool(proxy=self.web_proxy))
+        self.tools.register(HubInstallTool(workspace=self.workspace, proxy=self.web_proxy))
         self.tools.register(PubMedSearchTool(proxy=self.web_proxy))
         self._knowledge_scope = KnowledgeScope() if self.knowledge_config.enabled else None
         if self._knowledge_scope is not None:
@@ -584,6 +587,15 @@ class BaseAgentLoop:
         return ProjectRef(project_id=project_id, project_dir=project_dir, metadata=meta)
 
     @staticmethod
+    def _chat_dir_from_metadata(metadata: dict[str, Any] | None) -> Path | None:
+        """The Quick Chat working directory the UI channel created for this turn."""
+        raw_chat_dir = (metadata or {}).get("chat_dir")
+        if not isinstance(raw_chat_dir, str) or not raw_chat_dir.strip():
+            return None
+        chat_dir = Path(raw_chat_dir).expanduser()
+        return chat_dir if chat_dir.is_dir() else None
+
+    @staticmethod
     def _project_scope_key(project_ref: ProjectRef) -> str:
         project_dir = project_ref.project_dir.expanduser().resolve(strict=False)
         return hashlib.sha256(str(project_dir).encode("utf-8")).hexdigest()[:16]
@@ -657,6 +669,7 @@ class BaseAgentLoop:
         project_ref: ProjectRef | None = None,
         session_key: str | None = None,
         workflow_run_id: str | None = None,
+        chat_dir: Path | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         if project_ref is not None:
@@ -679,6 +692,9 @@ class BaseAgentLoop:
                     tool.clear_runtime_context()
                 if hasattr(tool, "clear_project_context"):
                     tool.clear_project_context()
+            if chat_dir is not None and (exec_tool := self.tools.get("exec")):
+                if hasattr(exec_tool, "set_default_cwd"):
+                    exec_tool.set_default_cwd(chat_dir)
 
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
@@ -1624,6 +1640,7 @@ class BaseAgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             meta = msg.metadata or {}
             project_ref = self._project_ref_from_metadata(meta)
+            chat_dir = None if project_ref else self._chat_dir_from_metadata(meta)
             raw_key = f"{channel}:{chat_id}"
             key = self._scoped_session_key(project_ref, raw_key)
             sessions_mgr = self._get_project_sessions(project_ref) if project_ref else self.sessions
@@ -1635,6 +1652,7 @@ class BaseAgentLoop:
                 meta.get("message_id"),
                 project_ref=project_ref,
                 session_key=key,
+                chat_dir=chat_dir,
             )
             history = session.get_history(max_messages=self.memory_window)
             ctx = self._get_project_context(project_ref)
@@ -1642,6 +1660,7 @@ class BaseAgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 project_dir=str(project_ref.project_dir) if project_ref else None,
+                working_dir=str(chat_dir) if chat_dir else None,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages, model_runtime=model_runtime)
             self._save_turn(session, all_msgs, 1 + len(history))
@@ -1654,6 +1673,7 @@ class BaseAgentLoop:
         meta = msg.metadata or {}
         project_ref = self._project_ref_from_metadata(meta)
         project_dir = str(project_ref.project_dir) if project_ref else None
+        chat_dir = None if project_ref else self._chat_dir_from_metadata(meta)
         raw_key = session_key or msg.session_key
         key = self._scoped_session_key(project_ref, raw_key)
         sessions_mgr = self._get_project_sessions(project_ref) if project_ref else self.sessions
@@ -1743,6 +1763,7 @@ class BaseAgentLoop:
             workflow_run_id=meta.get("workflow_run_id")
             if isinstance(meta.get("workflow_run_id"), str)
             else None,
+            chat_dir=chat_dir,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -1822,6 +1843,7 @@ class BaseAgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
             extra_system=extra_system,
+            working_dir=str(chat_dir) if chat_dir else None,
         )
 
         async def _bus_progress(
