@@ -44,6 +44,7 @@ from mira_engine.channels.base import BaseChannel
 from mira_engine.cli.agent_service import _current_engine_identity
 from mira_engine.community import approvals as community_approvals
 from mira_engine.community import inbox as community_inbox
+from mira_engine.community.chat import COMMUNITY_CHAT_ID
 from mira_engine.community.client import CommunityClient, CommunityError, CommunityRuleError
 from mira_engine.community.pairing import PairingError, fetch_me, poll_pairing, start_pairing
 from mira_engine.community.public_profile import (
@@ -3204,6 +3205,9 @@ class UiChannel(BaseChannel):
             "profile_onboarded": bool(cfg.profile.onboarded),
             # Kinds of community events the user receives (empty = none).
             "notifications": list(c.notifications or []),
+            # The reserved chat where the agent's background community work
+            # lands (heartbeat turns). The UI lists it once the user is a member.
+            "chat_id": COMMUNITY_CHAT_ID,
         }
 
     async def _handle_community_status(self, _request: web.Request) -> web.Response:

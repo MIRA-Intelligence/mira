@@ -11,6 +11,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 # Force UTF-8 encoding for Windows console
@@ -1655,45 +1656,77 @@ def gateway(
 
     register_dream_job(cron, config.agents.defaults.dream, default_tz)
 
-    def _pick_heartbeat_target() -> tuple[str, str]:
-        """Pick a routable channel/chat target for heartbeat-triggered messages."""
-        enabled = set(channels.enabled_channels)
-        # Prefer the most recently updated non-internal session on an enabled channel.
-        for item in session_manager.list_sessions():
-            key = item.get("key") or ""
-            if ":" not in key:
-                continue
-            channel, chat_id = key.split(":", 1)
-            if channel in {"cli", "system"}:
-                continue
-            if channel in enabled and chat_id:
-                return channel, chat_id
-        # Fallback keeps prior behavior but remains explicit.
-        return "cli", "direct"
+    from mira_engine.heartbeat.target import HeartbeatTarget, pick_heartbeat_target
 
-    # Create heartbeat service
-    async def on_heartbeat_execute(tasks: str) -> str:
-        """Phase 2: execute heartbeat tasks through the full agent loop."""
-        channel, chat_id = _pick_heartbeat_target()
+    # The target of the tick being executed, so delivery goes where the turn
+    # ran even if another session was touched in between.
+    heartbeat_target: HeartbeatTarget | None = None
+
+    def _heartbeat_target() -> HeartbeatTarget:
+        """Where this tick's turn runs and where what it says goes — never the
+        chat the user happens to be using (``heartbeat/target.py``)."""
+        return pick_heartbeat_target(
+            enabled_channels=channels.enabled_channels,
+            recent_session_keys=(
+                str(item.get("key") or "") for item in session_manager.list_sessions()
+            ),
+            deliver_to=config.gateway.heartbeat.deliver_to,
+        )
+
+    async def on_heartbeat_execute(tasks: str) -> Any:
+        """Phase 2: run the tasks through the full agent loop, in the target's session."""
+        nonlocal heartbeat_target
+        heartbeat_target = target = _heartbeat_target()
 
         async def _silent(*_args, **_kwargs):
             pass
 
+        metadata: dict[str, Any] = {"_background": "heartbeat"}
+        if target.dedicated:
+            # The same working directory a user's turn in that chat gets.
+            try:
+                from mira_engine.chats import ensure_chat_workdir
+
+                metadata["chat_dir"] = str(ensure_chat_workdir(config.workspace_path, target.chat_id))
+            except (OSError, ValueError) as exc:
+                logger.debug("No working directory for the {} chat: {}", target.chat_id, exc)
         return await agent.process_direct(
             tasks,
-            session_key="heartbeat",
-            channel=channel,
-            chat_id=chat_id,
+            session_key=target.session_key,
+            channel=target.channel,
+            chat_id=target.chat_id,
             on_progress=_silent,
+            metadata=metadata,
         )
 
     async def on_heartbeat_notify(response: str) -> None:
-        """Deliver a heartbeat response to the user's channel."""
+        """Deliver what the turn said where the turn ran."""
         from mira_engine.bus.events import OutboundMessage
-        channel, chat_id = _pick_heartbeat_target()
-        if channel == "cli":
-            return  # No external channel available to deliver to
-        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
+
+        target = heartbeat_target or _heartbeat_target()
+        if not target.deliverable:
+            return  # no channel to deliver to; the turn's work stays in its session
+        await bus.publish_outbound(OutboundMessage(
+            channel=target.channel,
+            chat_id=target.chat_id,
+            content=response,
+            metadata={"_background": "heartbeat"},
+        ))
+
+    async def heartbeat_should_notify(response: str, task_context: str) -> bool:
+        """A chat dedicated to background work gets everything the turn said;
+        someone's own conversation only what is worth interrupting them for."""
+        target = heartbeat_target or _heartbeat_target()
+        if target.dedicated:
+            return True
+        from mira_engine.utils import evaluator
+
+        return await evaluator.evaluate_response(
+            response=response,
+            task_context=task_context,
+            provider=heartbeat.provider,
+            model=heartbeat.model,
+        )
 
     async def gather_heartbeat_context() -> str:
         """Fold relevant community activity into the heartbeat decision."""
@@ -1711,6 +1744,7 @@ def gateway(
         extra_context=gather_heartbeat_context,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
+        should_notify=heartbeat_should_notify,
     )
 
     async def on_ui_runtime_config_updated(next_config: Config, projects_root: Path) -> None:

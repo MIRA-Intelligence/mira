@@ -11,13 +11,23 @@ older cloud without that endpoint it falls back to the public feed. The digest
 is plain text appended to the heartbeat decision prompt and never raises, so a
 flaky network never breaks the heartbeat. The human's autonomy mode remains the
 ceiling for any action the agent ultimately takes.
+
+An item is presented once (``fresh_items``): the platform lists an open task on
+every poll, and a task the agent skipped is not re-presented for ``REPEAT_HOURS``
+unless it changed. Where the agent's turn runs and where its summary lands is
+the heartbeat's business (``heartbeat/target.py``): the reserved Mira Community
+chat, never the chat the user is working in.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 from loguru import logger
+
+from mira_engine.config.paths import get_data_dir
 
 # Map each task type to the tool the agent should reach for.
 _TASK_TOOL_HINT = {
@@ -32,6 +42,75 @@ _TASK_TOOL_HINT = {
     "unanswered_question": "community_comment (answer it; the asker can accept your answer)",
     "active_discussion": "community_comment (share your perspective)",
 }
+
+# What the heartbeat already presented is not presented again for this long
+# unless it changed (same item, new ``updated_at`` / ``head_sha``). The platform
+# lists an open task on every poll; presenting it on every tick had the agent
+# say the same thing every half hour.
+REPEAT_HOURS = 24
+SEEN_FILENAME = "community_heartbeat_seen.json"
+
+
+def seen_path():
+    """Where the heartbeat records what it has presented, and when."""
+    return get_data_dir() / SEEN_FILENAME
+
+
+def _task_key(task: dict[str, Any]) -> str:
+    version = task.get("updated_at") or task.get("head_sha") or ""
+    return f"task:{task.get('type', '')}:{task.get('target_id', '')}:{version}"
+
+
+def _proposal_key(proposal: dict[str, Any]) -> str:
+    return f"feed:{proposal.get('id', '')}:{proposal.get('status', '')}"
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def fresh_items(
+    items: list[dict[str, Any]],
+    key_of: Callable[[dict[str, Any]], str],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """The items not presented within ``REPEAT_HOURS``, marked as presented now.
+
+    Items no longer listed are forgotten, so one that comes back is presented
+    again. Never raises: without a readable record everything is fresh.
+    """
+    now = now or datetime.now(timezone.utc)
+    path = seen_path()
+    seen: dict[str, Any] = {}
+    try:
+        if path.exists():
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                seen = loaded
+    except (OSError, ValueError) as e:
+        logger.debug("Heartbeat seen-record unreadable; everything counts as new: {}", e)
+
+    fresh: list[dict[str, Any]] = []
+    kept: dict[str, str] = {}
+    for item in items:
+        key = key_of(item)
+        last = _parse_ts(seen.get(key))
+        if last is None or now - last >= timedelta(hours=REPEAT_HOURS):
+            fresh.append(item)
+            kept[key] = now.isoformat()
+        else:
+            kept[key] = str(seen[key])
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(kept, indent=2), encoding="utf-8")
+    except OSError as e:
+        logger.debug("Heartbeat seen-record not written: {}", e)
+    return fresh
 
 
 def _matches_domains(proposal: dict[str, Any], domains: list[str]) -> bool:
@@ -132,9 +211,10 @@ def _render_tasks(tasks_resp: dict[str, Any]) -> str:
     the agent's system prompt, so they are not repeated here. ``rules_ack`` tasks
     are informational only (the client re-syncs automatically) and are dropped.
     """
-    tasks = [
-        t for t in (tasks_resp.get("tasks", []) or []) if t.get("type") != "rules_ack"
-    ]
+    tasks = fresh_items(
+        [t for t in (tasks_resp.get("tasks", []) or []) if t.get("type") != "rules_ack"],
+        _task_key,
+    )
     if not tasks:
         return ""
 
@@ -159,7 +239,7 @@ async def _render_feed(client: Any, community_config: Any, limit: int) -> str:
     data = await client.read_feed(limit=limit)
     proposals = data.get("proposals", []) or []
     domains = [str(d).lower() for d in (getattr(community_config, "domains", []) or [])]
-    relevant = [p for p in proposals if _matches_domains(p, domains)]
+    relevant = fresh_items([p for p in proposals if _matches_domains(p, domains)], _proposal_key)
     if not relevant:
         return ""
 
