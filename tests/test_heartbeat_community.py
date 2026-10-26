@@ -70,3 +70,56 @@ async def test_tick_runs_on_extra_context_only(tmp_path, monkeypatch):
     monkeypatch.setattr(svc, "_decide", fake_decide)
     await svc._tick()
     assert executed["tasks"] == "review p1"
+
+
+def _hooked_service(tmp_path, monkeypatch, *, verdict: bool):
+    """A service whose gateway decides delivery itself (a chat dedicated to
+    background work gets everything); the built-in evaluator must not run."""
+    delivered: list[str] = []
+    asked: list[tuple[str, str]] = []
+
+    async def extra():
+        return "[Mira Community] 1 actionable item"
+
+    async def on_execute(tasks):
+        return "I voted on p1."
+
+    async def on_notify(response):
+        delivered.append(response)
+
+    async def should_notify(response, task_context):
+        asked.append((response, task_context))
+        return verdict
+
+    svc = _service(
+        tmp_path,
+        extra_context=extra,
+        on_execute=on_execute,
+        on_notify=on_notify,
+        should_notify=should_notify,
+    )
+
+    async def fake_decide(content):
+        return "run", "vote on p1"
+
+    monkeypatch.setattr(svc, "_decide", fake_decide)
+
+    async def evaluator_must_not_run(**_kwargs):
+        raise AssertionError("the built-in evaluator must not run when should_notify is set")
+
+    monkeypatch.setattr("mira_engine.utils.evaluator.evaluate_response", evaluator_must_not_run)
+    return svc, asked, delivered
+
+
+async def test_should_notify_replaces_the_built_in_evaluator(tmp_path, monkeypatch):
+    svc, asked, delivered = _hooked_service(tmp_path, monkeypatch, verdict=True)
+    await svc._tick()
+    assert asked == [("I voted on p1.", "vote on p1")]
+    assert delivered == ["I voted on p1."]
+
+
+async def test_should_notify_can_hold_the_result_back(tmp_path, monkeypatch):
+    svc, asked, delivered = _hooked_service(tmp_path, monkeypatch, verdict=False)
+    await svc._tick()
+    assert len(asked) == 1
+    assert delivered == []
