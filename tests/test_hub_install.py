@@ -70,6 +70,7 @@ def manager_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 def test_parse_slug_accepts_slug_and_page_url() -> None:
     assert parse_slug("pubmed-search") == "pubmed-search"
+    assert parse_slug("https://hub.mira-intelligence.com/skills/scanpy/") == "scanpy"
     assert parse_slug("https://mira-intelligence.github.io/mira-hub/skills/scanpy/") == "scanpy"
     with pytest.raises(HubInstallError):
         parse_slug("../etc/passwd")
