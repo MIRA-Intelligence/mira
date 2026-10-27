@@ -1,0 +1,15 @@
+{
+  "id": "discord",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Discord channel: Gateway websocket for inbound messages, REST for replies and attachments.",
+  "provides": {
+    "channels": [{ "name": "discord", "entry": "discord_channel:DiscordChannel" }]
+  },
+  "permissions": {
+    "network": ["discord.com", "gateway.discord.gg", "cdn.discordapp.com"],
+    "filesystem": "workspace:write",
+    "secrets": ["channels.discord.token"]
+  }
+}

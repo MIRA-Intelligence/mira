@@ -9,8 +9,6 @@ __all__ = [
     "LLMResponse",
     "AnthropicProvider",
     "OpenAICompatProvider",
-    "OpenAICodexProvider",
-    "GitHubCopilotProvider",
     "AzureOpenAIProvider",
     "NvidiaProvider",
 ]
@@ -25,14 +23,6 @@ def __getattr__(name: str):
         from mira_engine.providers.openai_compat_provider import OpenAICompatProvider
 
         return OpenAICompatProvider
-    if name == "OpenAICodexProvider":
-        from mira_engine.providers.openai_codex_provider import OpenAICodexProvider
-
-        return OpenAICodexProvider
-    if name == "GitHubCopilotProvider":
-        from mira_engine.providers.github_copilot_provider import GitHubCopilotProvider
-
-        return GitHubCopilotProvider
     if name == "AzureOpenAIProvider":
         from mira_engine.providers.azure_openai_provider import AzureOpenAIProvider
 

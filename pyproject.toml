@@ -74,6 +74,9 @@ dev = [
     "matrix-nio[e2e]>=0.25.2",
     "mistune>=3.0.0,<4.0.0",
     "nh3>=0.2.17,<1.0.0",
+    # Bundled channel plugins whose SDK isn't a core dependency: installed
+    # here so every bundled plugin's contract runs in CI (none is skipped).
+    "wecom-aibot-sdk>=1.0.8,<2.0.0",
 ]
 
 [project.scripts]
@@ -103,6 +106,8 @@ packages = ["mira_engine", "mira_server"]
 # Deployment files (PAM services, unit, policy, installer) for `mira-server deploy-dir`.
 [tool.hatch.build.targets.wheel.force-include]
 "deploy/mira-server" = "mira_server/deploy"
+# First-party plugins, loaded by the plugin kernel (mira_engine/plugins).
+"plugins" = "mira_engine/_bundled_plugins"
 
 # Include non-Python files in skills and templates
 [tool.hatch.build]
@@ -121,6 +126,7 @@ include = [
     "mira_engine/",
     "mira_server/",
     "deploy/mira-server/",
+    "plugins/",
     "bridge/",
     "README.md",
     "LICENSE",

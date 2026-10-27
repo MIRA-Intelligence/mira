@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from importlib.machinery import ModuleSpec
 from types import SimpleNamespace
 
 from mira_engine.bus.events import OutboundMessage
@@ -35,10 +36,16 @@ class _DummyChannel(BaseChannel):
         self.sent.append(msg)
 
 
-def _install_channel_module(monkeypatch, module_name: str, cls_name: str) -> None:
+def _install_module(monkeypatch, module_name: str) -> types.ModuleType:
     mod = types.ModuleType(module_name)
-    setattr(mod, cls_name, _DummyChannel)
+    # A spec, so importlib.util.find_spec (the loader's `requires` check) sees it.
+    mod.__spec__ = ModuleSpec(module_name, loader=None)
     monkeypatch.setitem(sys.modules, module_name, mod)
+    return mod
+
+
+def _install_channel_module(monkeypatch, module_name: str, cls_name: str) -> None:
+    setattr(_install_module(monkeypatch, module_name), cls_name, _DummyChannel)
 
 
 def _enable_all_channels(cfg: Config) -> None:
@@ -63,19 +70,25 @@ def _enable_all_channels(cfg: Config) -> None:
 
 def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
     for module_name, cls_name in (
-        ("mira_engine.channels.telegram", "TelegramChannel"),
-        ("mira_engine.channels.whatsapp", "WhatsAppChannel"),
+        ("mira_plugins.telegram.telegram_channel", "TelegramChannel"),
+        ("mira_plugins.whatsapp.whatsapp_channel", "WhatsAppChannel"),
         ("mira_engine.channels.discord", "DiscordChannel"),
-        ("mira_engine.channels.feishu", "FeishuChannel"),
-        ("mira_engine.channels.mochat", "MochatChannel"),
-        ("mira_engine.channels.dingtalk", "DingTalkChannel"),
-        ("mira_engine.channels.email", "EmailChannel"),
-        ("mira_engine.channels.slack", "SlackChannel"),
-        ("mira_engine.channels.qq", "QQChannel"),
-        ("mira_engine.channels.matrix", "MatrixChannel"),
+        ("mira_plugins.feishu.feishu_channel", "FeishuChannel"),
+        ("mira_plugins.mochat.mochat_channel", "MochatChannel"),
+        ("mira_plugins.dingtalk.dingtalk_channel", "DingTalkChannel"),
+        ("mira_plugins.email.email_channel", "EmailChannel"),
+        ("mira_plugins.slack.slack_channel", "SlackChannel"),
+        ("mira_plugins.qq.qq_channel", "QQChannel"),
+        ("mira_plugins.matrix.matrix_channel", "MatrixChannel"),
         ("mira_engine.channels.ui", "UiChannel"),
+        ("mira_engine.channels.community", "CommunityChannel"),
     ):
         _install_channel_module(monkeypatch, module_name, cls_name)
+    # The matrix plugin declares `requires: [nio, mistune, nh3]` and the loader
+    # reports it unavailable without them. A bare install (the release build)
+    # has no matrix SDK; stand them in — this test is about the manager.
+    for sdk in ("nio", "mistune", "nh3"):
+        _install_module(monkeypatch, sdk)
 
     cfg = Config()
     _enable_all_channels(cfg)
@@ -92,6 +105,8 @@ def test_init_channels_registers_enabled_channels(monkeypatch) -> None:
         "qq",
         "matrix",
         "ui",
+        # Always on (config.community.enabled defaults to True); idles until login.
+        "community",
     }
 
 
@@ -140,7 +155,10 @@ def test_ui_channel_receives_restrict_to_workspace_from_config(monkeypatch) -> N
 
 
 async def test_start_all_and_stop_all_with_channels(monkeypatch) -> None:
-    _install_channel_module(monkeypatch, "mira_engine.channels.telegram", "TelegramChannel")
+    _install_channel_module(monkeypatch, "mira_plugins.telegram.telegram_channel", "TelegramChannel")
+    # The community channel is enabled by default and its real start() waits
+    # for credentials forever, so start_all() would never return without a stub.
+    _install_channel_module(monkeypatch, "mira_engine.channels.community", "CommunityChannel")
     cfg = Config()
     cfg.channels.telegram.enabled = True
     cfg.channels.telegram.allow_from = ["*"]

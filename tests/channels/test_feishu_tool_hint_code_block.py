@@ -8,7 +8,7 @@ from pytest import mark
 
 # Check optional Feishu dependencies before running tests
 try:
-    from mira_engine.channels import feishu
+    from mira_plugins.feishu import feishu_channel as feishu
     FEISHU_AVAILABLE = getattr(feishu, "FEISHU_AVAILABLE", False)
 except ImportError:
     FEISHU_AVAILABLE = False
@@ -17,7 +17,7 @@ if not FEISHU_AVAILABLE:
     pytest.skip("Feishu dependencies not installed (lark-oapi)", allow_module_level=True)
 
 from mira_engine.bus.events import OutboundMessage
-from mira_engine.channels.feishu import FeishuChannel
+from mira_plugins.feishu.feishu_channel import FeishuChannel
 
 
 @pytest.fixture

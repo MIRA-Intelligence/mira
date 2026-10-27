@@ -69,3 +69,25 @@ def test_gateway_service_args_use_hidden_command_when_frozen(monkeypatch):
         "--port",
         "18790",
     ]
+
+
+def test_run_gateway_repairs_the_service_environment_before_the_gateway_starts(monkeypatch):
+    # launchd/systemd/Windows services start with the system PATH; the
+    # gateway must see Homebrew/winget directories (where `gh` lives) first.
+    # The Windows service also needs APPDATA/LOCALAPPDATA pointed at the user
+    # (gh's login lives there) before PATH, whose candidates use LOCALAPPDATA.
+    import mira_engine.cli.commands as commands
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        "mira_engine.cli.agent_service.ensure_user_profile_dirs", lambda *a, **k: order.append("profile") or {}
+    )
+    monkeypatch.setattr(
+        "mira_engine.cli.agent_service.ensure_service_path", lambda *a, **k: order.append("path") or []
+    )
+    monkeypatch.setattr(commands, "gateway", lambda **kwargs: order.append(f"gateway:{kwargs['port']}"))
+
+    result = CliRunner().invoke(app, ["run-gateway", "--port", "18791"])
+
+    assert result.exit_code == 0, result.output
+    assert order == ["profile", "path", "gateway:18791"]

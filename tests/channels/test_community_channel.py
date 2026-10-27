@@ -1,0 +1,314 @@
+"""Tests for the community channel's event handling (#33).
+
+Focus: lifecycle events (rules_updated / onboarded) are intercepted to cache
+rules client-side and must NOT spawn an agent turn, while ordinary events still
+publish an inbound message.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from mira_engine.channels.community import CommunityChannel, _event_thread_id
+from mira_engine.community import rules as rules_mod
+
+_UUID = "24110f35-3c7d-4006-81e4-02a54584a7a4"
+_UUID2 = "11111111-1111-4111-8111-111111111111"
+
+
+class _FakeBus:
+    def __init__(self) -> None:
+        self.published: list[object] = []
+
+    async def publish_inbound(self, msg) -> None:
+        self.published.append(msg)
+
+
+def _channel() -> tuple[CommunityChannel, _FakeBus]:
+    bus = _FakeBus()
+    config = SimpleNamespace(
+        api_base="http://x/community",
+        agent_token="tok",
+        agent_id="a1",
+        rules_version=0,
+        rules_text="",
+    )
+    return CommunityChannel(config, bus), bus
+
+
+def test_read_credentials_from_disk(tmp_path, monkeypatch):
+    import json
+
+    from mira_engine.config import loader
+
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {"community": {"apiBase": "https://x/community/", "agentToken": "T2", "agentId": "id2"}}
+        )
+    )
+    monkeypatch.setattr(loader, "get_config_path", lambda: cfg_file)
+    channel, _ = _channel()
+    assert channel._read_credentials() == ("https://x/community", "T2", "id2")
+
+
+def test_read_credentials_falls_back_to_snapshot(tmp_path, monkeypatch):
+    from mira_engine.config import loader
+
+    missing = tmp_path / "nope.json"
+    monkeypatch.setattr(loader, "get_config_path", lambda: missing)
+    channel, _ = _channel()
+    # No file on disk → use the construction snapshot.
+    assert channel._read_credentials() == ("http://x/community", "tok", "a1")
+
+
+def test_read_credentials_logged_out(tmp_path, monkeypatch):
+    import json
+
+    from mira_engine.config import loader
+
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"community": {"apiBase": "https://x/community", "agentToken": ""}}))
+    monkeypatch.setattr(loader, "get_config_path", lambda: cfg_file)
+    channel, _ = _channel()
+    _, token, _ = channel._read_credentials()
+    assert token == ""
+
+
+async def test_rules_updated_event_caches_rules_without_turn(monkeypatch):
+    channel, bus = _channel()
+    calls: list[dict] = []
+
+    async def fake_sync(community_config, *, rules=None, **kw):
+        calls.append({"config": community_config, "rules": rules})
+        return True
+
+    monkeypatch.setattr(rules_mod, "sync_community_rules", fake_sync)
+
+    await channel._handle_event(
+        {"type": "rules_updated", "rules": {"version": 2, "items": [{"title": "R"}]}}
+    )
+
+    assert bus.published == []  # no agent turn spawned
+    assert len(calls) == 1
+    assert calls[0]["rules"] == {"version": 2, "items": [{"title": "R"}]}
+
+
+async def test_onboarded_event_caches_rules_without_turn(monkeypatch):
+    channel, bus = _channel()
+    calls: list[dict] = []
+
+    async def fake_sync(community_config, *, rules=None, **kw):
+        calls.append(rules)
+        return True
+
+    monkeypatch.setattr(rules_mod, "sync_community_rules", fake_sync)
+
+    await channel._handle_event(
+        {"type": "onboarded", "rules": {"version": 1, "items": []}}
+    )
+
+    assert bus.published == []
+    assert calls == [{"version": 1, "items": []}]
+
+
+def test_event_thread_id_prefers_action_body_thread():
+    # Onboarding/mention tasks carry the thread in action.body.thread_id; the
+    # event row id must NOT be used (that was the dropped-reply bug).
+    event = {
+        "type": "onboarding",
+        "id": 2,
+        "target_id": _UUID,
+        "action": {"method": "POST", "path": "/agents/messages", "body": {"thread_id": _UUID}},
+    }
+    assert _event_thread_id(event) == _UUID
+
+
+def test_event_thread_id_uses_proposal_id_for_votes():
+    event = {
+        "type": "needs_vote",
+        "id": 7,
+        "target_id": _UUID,
+        "action": {"method": "POST", "path": "/agents/votes", "body": {"proposal_id": _UUID, "value": 1}},
+    }
+    assert _event_thread_id(event) == _UUID
+
+
+def test_event_thread_id_falls_back_to_target_then_sentinel():
+    assert _event_thread_id({"type": "x", "id": 9, "target_id": _UUID2}) == _UUID2
+    # No UUID anywhere -> sentinel (never the bigint row id).
+    assert _event_thread_id({"type": "x", "id": 9, "target_id": "rules:2"}) == "community"
+    assert _event_thread_id({"type": "ready"}) == "community"
+
+
+async def test_onboarding_event_routes_reply_to_thread(monkeypatch, tmp_path):
+    from mira_engine.config.schema import Config
+
+    cfg = Config()
+    cfg.community.rules_version = 6
+    cfg.agents.defaults.workspace = str(tmp_path)
+    monkeypatch.setattr("mira_engine.config.loader.load_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr("mira_engine.config.paths.get_workspace_path", lambda *_a, **_k: tmp_path)
+    channel, bus = _channel()
+
+    async def no_sync(*a, **k):
+        return False
+
+    monkeypatch.setattr(rules_mod, "sync_community_rules", no_sync)
+
+    await channel._handle_event(
+        {
+            "type": "onboarding",
+            "id": 3,
+            "target_id": _UUID,
+            "title": "Complete your connection test",
+            "action": {"method": "POST", "path": "/agents/messages", "body": {"thread_id": _UUID}},
+        }
+    )
+    assert len(bus.published) == 1
+    # The inbound message's chat_id is the onboarding thread UUID, so the agent's
+    # reply lands on the right thread (not the event row id).
+    assert bus.published[0].chat_id == _UUID
+    # Onboarding drives a self-introduction (not the server's terse "connection
+    # test" title), matching the manual `mira community onboard` nudge.
+    from mira_engine.community.onboarding import onboarding_prompt
+
+    assert bus.published[0].content == onboarding_prompt(None, 6)
+    assert 'exact sentence: "I acknowledge the Mira Community Rules v6."' in bus.published[0].content
+    assert "introduce yourself" in bus.published[0].content.lower()
+
+
+async def test_ordinary_event_still_publishes(monkeypatch):
+    channel, bus = _channel()
+
+    async def boom(*a, **k):
+        raise AssertionError("ordinary events must not trigger rules sync")
+
+    monkeypatch.setattr(rules_mod, "sync_community_rules", boom)
+
+    await channel._handle_event(
+        {
+            "type": "mention",
+            "thread_id": "11111111-1111-4111-8111-111111111111",
+            "content": "hey @you",
+            "actor": "other",
+        }
+    )
+
+    assert len(bus.published) == 1
+    assert bus.published[0].channel == "community"
+
+
+async def test_ready_and_error_events_do_not_spawn_turn(monkeypatch):
+    channel, bus = _channel()
+
+    async def boom(*a, **k):
+        raise AssertionError("housekeeping events must not trigger rules sync")
+
+    monkeypatch.setattr(rules_mod, "sync_community_rules", boom)
+
+    await channel._handle_event({"type": "ready", "agent_id": "a1", "name": "mira"})
+    await channel._handle_event({"type": "error", "error": "onboarding required"})
+
+    # Neither the connection greeting nor a denial envelope becomes an agent turn.
+    assert bus.published == []
+
+
+async def test_welcome_reply_without_the_acknowledgement_is_completed_and_reposted(monkeypatch):
+    import json
+
+    import httpx
+
+    from mira_engine.bus.events import OutboundMessage
+
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rules"):
+            return httpx.Response(200, json={"version": 6, "onboarding_thread_id": _UUID})
+        if request.url.path.endswith("/agents/me"):
+            return httpx.Response(200, json={"status": "pending"})
+        content = json.loads(request.content)["content"]
+        posted.append(content)
+        if "I acknowledge the Mira Community Rules v6" not in content:
+            return httpx.Response(403, json={
+                "error": "rules acknowledgement required", "rule_id": "onboarding",
+                "reason": "x", "how_to_resolve": "y",
+            })
+        return httpx.Response(200, json={"ok": True, "comment_id": "c1", "rules": {"version": 6, "items": []}})
+
+    synced: list[dict] = []
+
+    async def fake_sync(config, *, rules=None, **_):
+        synced.append(rules)
+
+    monkeypatch.setattr(rules_mod, "sync_community_rules", fake_sync)
+    ch, _ = _channel()
+    ch._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID, content="Hi, I'm Nova. I acknowledge the rules."))
+    assert len(posted) == 2
+    assert posted[1] == "Hi, I'm Nova. I acknowledge the rules.\n\nI acknowledge the Mira Community Rules v6."
+    assert synced and synced[0]["version"] == 6  # activation delivers the rules
+
+
+def _posting_channel(posted: list[dict], status: str = "pending"):
+    import json
+
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rules"):
+            return httpx.Response(200, json={"version": 6, "onboarding_thread_id": _UUID})
+        if request.url.path.endswith("/agents/me"):
+            return httpx.Response(200, json={"status": status})
+        posted.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "comment_id": "c1"})
+
+    ch, _ = _channel()
+    ch._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return ch
+
+
+async def test_only_the_welcome_reply_is_posted_from_the_final_message():
+    from mira_engine.bus.events import OutboundMessage
+
+    posted: list[dict] = []
+    ch = _posting_channel(posted)
+    # Elsewhere the agent already answered with community_comment; its closing
+    # summary must not become a second comment.
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID2, content="Answered Nova on the thread."))
+    assert posted == []
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID, content="Hi, I'm Nova. I acknowledge the Mira Community Rules v6."))
+    assert [p["thread_id"] for p in posted] == [_UUID]
+
+
+async def test_engine_errors_are_never_posted():
+    from mira_engine.bus.events import OutboundMessage
+
+    posted: list[dict] = []
+    ch = _posting_channel(posted)
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID, content="Model call failed", metadata={"error_type": "X"}))
+    assert posted == []
+
+
+def test_events_tell_the_agent_where_and_how_to_answer():
+    text = CommunityChannel._format_event({
+        "type": "mention", "author": "Nova", "content": "@MIRAI thoughts?",
+        "thread_id": _UUID2, "target_id": _UUID,
+    })
+    assert f"thread_id: {_UUID2}" in text and f"comment_id: {_UUID}" in text
+    assert "final message in this turn is not posted" in text
+    assert f"community_comment with thread_id {_UUID2} and reply_to {_UUID}" in text
+    badge = CommunityChannel._format_event({"type": "badge_earned", "title": "Badge"})
+    assert "not posted to the community" in badge and "thread_id" not in badge
+
+
+async def test_no_closing_note_after_the_agent_posted_its_own_introduction():
+    from mira_engine.bus.events import OutboundMessage
+
+    # The agent introduced itself with community_comment, which activated it;
+    # its final message must not follow as a second welcome-thread comment.
+    posted: list[dict] = []
+    ch = _posting_channel(posted, status="active")
+    await ch.send(OutboundMessage(channel="community", chat_id=_UUID, content="Onboarding reply posted."))
+    assert posted == []

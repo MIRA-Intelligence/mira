@@ -1,0 +1,29 @@
+{
+  "id": "matrix",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "Matrix (Element) channel: sync for inbound messages, end-to-end encryption, media delivery. Needs the `matrix` extra.",
+  "requires": [
+    "nio",
+    "mistune",
+    "nh3"
+  ],
+  "provides": {
+    "channels": [
+      {
+        "name": "matrix",
+        "entry": "matrix_channel:MatrixChannel"
+      }
+    ]
+  },
+  "permissions": {
+    "network": [
+      "*"
+    ],
+    "filesystem": "none",
+    "secrets": [
+      "channels.matrix"
+    ]
+  }
+}

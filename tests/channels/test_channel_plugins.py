@@ -133,11 +133,14 @@ def test_discover_all_includes_builtins():
     with patch(_EP_TARGET, return_value=[]):
         result = discover_all()
 
-    # discover_all() only returns channels that are actually available (dependencies installed)
-    # discover_channel_names() returns all built-in channel names
-    # So we check that all actually loaded channels are in the result
+    # discover_all() only returns channels that are actually available (dependencies installed):
+    # built-ins, plus channels provided by loaded mira plugins (e.g. the bundled discord plugin).
+    from mira_engine.plugins import get_runtime
+
+    plugin_channels = set(get_runtime().channels())
+    assert "discord" in plugin_channels and "discord" in result
     for name in result:
-        assert name in discover_channel_names()
+        assert name in discover_channel_names() or name in plugin_channels
 
 
 def test_discover_all_includes_external_plugin():
@@ -301,7 +304,7 @@ async def test_manager_skips_disabled_plugin():
 
 def test_builtin_channel_default_config():
     """Built-in channels expose default_config() returning a dict with 'enabled': False."""
-    from mira_engine.channels.telegram import TelegramChannel
+    from mira_plugins.telegram.telegram_channel import TelegramChannel
     cfg = TelegramChannel.default_config()
     assert isinstance(cfg, dict)
     assert cfg["enabled"] is False
@@ -310,7 +313,7 @@ def test_builtin_channel_default_config():
 
 def test_builtin_channel_init_from_dict():
     """Built-in channels accept a raw dict and convert to Pydantic internally."""
-    from mira_engine.channels.telegram import TelegramChannel
+    from mira_plugins.telegram.telegram_channel import TelegramChannel
     bus = MessageBus()
     ch = TelegramChannel({"enabled": False, "token": "test-tok", "allowFrom": ["*"]}, bus)
     assert ch.config.token == "test-tok"

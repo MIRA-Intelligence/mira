@@ -1,0 +1,36 @@
+{
+  "id": "github-copilot",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "GitHub Copilot models through a Copilot subscription (GitHub device-flow login).",
+  "requires": ["oauth_cli_kit"],
+  "provides": {
+    "providers": [
+      {
+        "spec": {
+          "name": "github_copilot",
+          "keywords": ["github_copilot", "copilot"],
+          "env_key": "",
+          "display_name": "GitHub Copilot",
+          "litellm_prefix": "github_copilot",
+          "skip_prefixes": ["github_copilot/"],
+          "strip_model_prefix": true,
+          "is_oauth": true,
+          "is_subscription": true
+        },
+        "entry": "provider:create",
+        "login": "provider:login",
+        "login_status": "provider:login_status",
+        "models": "provider:fetch_models",
+        "endpoint": "https://github.com",
+        "model_examples": ["gpt-4o", "gpt-5"]
+      }
+    ]
+  },
+  "permissions": {
+    "network": ["github.com", "api.github.com", "*.githubcopilot.com"],
+    "filesystem": "none",
+    "secrets": ["providers.github_copilot"]
+  }
+}

@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 
 # Optional: a pre-fetched ``uv`` binary placed under ``bundled/`` (see
@@ -13,6 +13,22 @@ from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 _UV_BINARY_NAME = "uv.exe" if sys.platform == "win32" else "uv"
 _BUNDLED_UV = Path(SPECPATH) / "bundled" / _UV_BINARY_NAME  # noqa: F821 - SPECPATH is injected by PyInstaller
 _extra_binaries = [(str(_BUNDLED_UV), ".")] if _BUNDLED_UV.exists() else []
+
+
+def _bundled_plugin_datas():
+    """First-party plugins (repo ``plugins/``) ship as source next to the
+    package, where ``mira_engine.plugins.paths.bundled_plugins_dir`` finds them.
+    Their third-party imports are invisible to the analysis, so anything a
+    plugin needs on the desktop must also be in ``hiddenimports`` below; a
+    plugin whose ``requires`` are missing shows up as unavailable."""
+    root = Path(SPECPATH) / "plugins"  # noqa: F821 - SPECPATH is injected by PyInstaller
+    out = []
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if not path.is_file() or "__pycache__" in rel.parts or "tests" in rel.parts:
+            continue
+        out.append((str(path), str(Path("mira_engine/_bundled_plugins") / rel.parent)))
+    return out
 
 
 a = Analysis(
@@ -27,12 +43,37 @@ a = Analysis(
             includes=[
                 'templates/**/*',
                 'channels/ui_assets/**/*',
-                'skills/**/*',
+                # The skills submodule's skills/ is the MIRA Hub catalogue,
+                # installed on demand; only builtin_skills/ ships.
+                'skills/builtin_skills/**/*',
             ],
         )
         + copy_metadata('mira-engine')
+        + _bundled_plugin_datas()
     ),
-    hiddenimports=['mira_engine.channels.ui', 'tiktoken_ext.openai_public'],
+    hiddenimports=[
+        # Built-in channels are found at run time by scanning mira_engine/channels
+        # (channels/registry.py, pkgutil), which a frozen bundle can only do for
+        # modules that were collected. Listing just `ui` here shipped v0.6.0rc3
+        # without channels.community: the desktop app never opened its websocket
+        # to the Mira Community, so no notifications reached the inbox.
+        *collect_submodules('mira_engine.channels'),
+        'tiktoken_ext.openai_public',
+        # The CA bundle the executable falls back to when OpenSSL's compiled-in
+        # path belongs to the build machine (scripts/mira_engine_entry.py →
+        # mira_engine.utils.tls). Collected via PyInstaller's certifi hook.
+        'certifi',
+        # Out-of-process plugin host (`mira-engine --mira-plugin-host`).
+        'mira_engine.plugins.host',
+        # Engine modules only the bundled plugins (plugins/web, plugins/mira-hub) import.
+        'mira_engine.agent.tools.web',
+        'mira_engine.agent.tools.hub',
+        # plugins/openai-codex and plugins/github-copilot (OAuth providers).
+        'mira_engine.providers.oauth_state',
+        'mira_engine.providers.openai_compat_provider',
+        'mira_engine.providers.usage',
+        *collect_submodules('oauth_cli_kit'),
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

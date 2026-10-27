@@ -233,4 +233,7 @@ class HubInstallTool(Tool):
                 source_type=SOURCE_TYPE,
                 source_path=page_url,
                 manifest_defaults=defaults,
+                # The agent installs skills, never code: a package with
+                # channels, tools or hooks needs the user (mira plugin).
+                allow_code=False,
             )

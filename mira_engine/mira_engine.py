@@ -9,7 +9,7 @@ from typing import Any
 from mira_engine.agent.hook import AgentHook
 from mira_engine.agent.loop import AgentLoop
 from mira_engine.bus.queue import MessageBus
-from mira_engine.providers.factory import make_provider, resolve_provider_proxy
+from mira_engine.providers.factory import make_provider
 
 
 @dataclass(slots=True)
@@ -124,23 +124,6 @@ class Mira:
 
 def _make_provider(config: Any) -> Any:
     """Create the LLM provider from config (extracted from CLI)."""
-    forced = str(getattr(config.agents.defaults, "provider", "") or "").replace("-", "_")
-    model = getattr(config.agents.defaults, "model", None)
-    provider_proxy = resolve_provider_proxy(config)
-    if forced == "github_copilot":
-        from mira_engine.providers.github_copilot_provider import GitHubCopilotProvider
-
-        resolved_model = model or "github-copilot/gpt-4.1"
-        return GitHubCopilotProvider(
-            default_model=resolved_model,
-            api_base=config.get_api_base(resolved_model),
-            proxy=provider_proxy,
-        )
-    if forced == "openai_codex":
-        from mira_engine.providers.openai_codex_provider import OpenAICodexProvider
-
-        return OpenAICodexProvider(
-            default_model=model or "openai-codex/gpt-5.1-codex",
-            proxy=provider_proxy,
-        )
-    return make_provider(config, model)
+    # Providers that plugins contribute (OpenAI Codex, GitHub Copilot) are
+    # built by make_provider through their plugin.
+    return make_provider(config, getattr(config.agents.defaults, "model", None))

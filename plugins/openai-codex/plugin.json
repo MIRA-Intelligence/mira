@@ -1,0 +1,34 @@
+{
+  "id": "openai-codex",
+  "version": "1.0.0",
+  "plugin_api": ">=1.0,<2.0",
+  "owner": "github:MIRA-Intelligence",
+  "description": "OpenAI Codex models through a ChatGPT subscription (OAuth login).",
+  "requires": ["oauth_cli_kit"],
+  "provides": {
+    "providers": [
+      {
+        "spec": {
+          "name": "openai_codex",
+          "keywords": ["openai-codex"],
+          "env_key": "",
+          "display_name": "OpenAI Codex",
+          "detect_by_base_keyword": "codex",
+          "default_api_base": "https://chatgpt.com/backend-api",
+          "is_oauth": true,
+          "is_subscription": true
+        },
+        "entry": "provider:create",
+        "login": "provider:login",
+        "login_status": "provider:login_status",
+        "endpoint": "https://chatgpt.com",
+        "model_examples": ["gpt-5-codex", "gpt-5.1-codex"]
+      }
+    ]
+  },
+  "permissions": {
+    "network": ["chatgpt.com", "auth.openai.com"],
+    "filesystem": "none",
+    "secrets": ["providers.openai_codex"]
+  }
+}

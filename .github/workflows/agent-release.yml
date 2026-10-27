@@ -18,6 +18,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11"]
     runs-on: ${{ matrix.os }}
+    # A hang must not hold a release for hours (the suite is slow on Windows).
+    timeout-minutes: 75
 
     steps:
       - name: Checkout
@@ -42,6 +44,8 @@ jobs:
           pip install pytest pytest-asyncio pytest-cov aiohttp ruff build pyinstaller
 
       - name: Run tests
+        env:
+          LITELLM_RUST: "0"  # see tests.yml (Windows hang in litellm's native log filter)
         run: python -m pytest tests -q
 
       - name: Fetch bundled uv binary
@@ -228,6 +232,15 @@ jobs:
                   raise RuntimeError(f"standalone version does not match release tag: {version_payload}")
               if version_payload.get("api_contract") != "v1":
                   raise RuntimeError(f"unexpected api contract payload: {version_payload}")
+
+              # The frozen bundle must carry every built-in channel: v0.6.0rc3
+              # shipped without channels.community (no websocket to the Mira
+              # Community, an empty inbox) because only channels.ui was a hidden
+              # import. The channel manager logs each channel it enables at start.
+              gateway_log = log_path.read_text(encoding="utf-8", errors="replace")
+              for channel in ("ui", "community"):
+                  if f"{channel} channel enabled" not in gateway_log:
+                      raise RuntimeError(f"frozen gateway did not enable the {channel} channel")
 
               config_payload = fetch_json(f"{base_url}/api/config")
               if "runtime" not in config_payload or "providers" not in config_payload:

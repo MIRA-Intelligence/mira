@@ -259,15 +259,13 @@ def _ensure_bridge_setup() -> Path:
     if not npm_path:
         raise RuntimeError("npm not found. Please install Node.js >= 18.")
 
-    current_file = Path(__file__)
-    pkg_bridge = current_file.parent.parent / "bridge"
-    src_bridge = current_file.parent.parent.parent / "bridge"
+    # The bridge's sources: next to the installed package, or the repo's
+    # bridge/ in a source checkout (this module lives in a plugin directory,
+    # so it can't be found relative to __file__).
+    import mira_engine
 
-    source = None
-    if (pkg_bridge / "package.json").exists():
-        source = pkg_bridge
-    elif (src_bridge / "package.json").exists():
-        source = src_bridge
+    pkg = Path(mira_engine.__file__).resolve().parent
+    source = next((d for d in (pkg / "bridge", pkg.parent / "bridge") if (d / "package.json").exists()), None)
     if not source:
         raise RuntimeError("WhatsApp bridge source not found.")
 

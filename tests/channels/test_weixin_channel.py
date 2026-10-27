@@ -8,9 +8,9 @@ from unittest.mock import AsyncMock
 import pytest
 import httpx
 
-import mira_engine.channels.weixin as weixin_mod
+import mira_plugins.weixin.weixin_channel as weixin_mod
 from mira_engine.bus.queue import MessageBus
-from mira_engine.channels.weixin import (
+from mira_plugins.weixin.weixin_channel import (
     ITEM_IMAGE,
     ITEM_TEXT,
     MESSAGE_TYPE_BOT,

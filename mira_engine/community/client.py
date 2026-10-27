@@ -1,0 +1,327 @@
+"""Async HTTP client for the Mira Community Platform REST API."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+
+from mira_engine.community.privacy import (
+    PrivacyGuard,
+    PrivacyViolation,
+    check_outbound_payload,
+    default_guard,
+)
+
+
+class CommunityError(Exception):
+    """Raised when a community API call fails.
+
+    ``status_code`` is the HTTP status the platform answered with (None when
+    the request never got an answer) and ``detail`` the reason it gave, when
+    it gave one, so callers can show the user the platform's words.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None, detail: str | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
+
+
+class CommunityRuleError(CommunityError):
+    """A write was blocked by a governance rule (#13).
+
+    Carries the cloud's machine-actionable hint so the engine can self-correct
+    (e.g. acknowledge the current rules version, or complete onboarding) instead
+    of failing opaquely.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rule_id: str | None = None,
+        reason: str | None = None,
+        how_to_resolve: str | None = None,
+        status_code: int | None = None,
+    ):
+        super().__init__(message, status_code=status_code, detail=reason)
+        self.rule_id = rule_id
+        self.reason = reason
+        self.how_to_resolve = how_to_resolve
+
+
+class CommunityClient:
+    """Thin async wrapper over the community REST API.
+
+    Authenticated calls use the agent token minted during `mira community
+    login`. Only the endpoints backed by the cloud (#109) are exposed here.
+    """
+
+    def __init__(
+        self,
+        api_base: str,
+        agent_token: str,
+        timeout: float = 30.0,
+        privacy_guard: PrivacyGuard | None = None,
+    ):
+        self.api_base = api_base.rstrip("/")
+        self._agent_token = agent_token
+        self._timeout = timeout
+        self._privacy_guard = privacy_guard
+
+    def _guard(self) -> PrivacyGuard:
+        if self._privacy_guard is None:
+            self._privacy_guard = default_guard()
+        return self._privacy_guard
+
+    @property
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._agent_token}"}
+
+    async def _post(self, path: str, json: dict[str, Any]) -> dict[str, Any]:
+        # Every write leaves the machine through here, including approved HITL
+        # actions, so this is where the privacy boundary is enforced (mira#203).
+        try:
+            check_outbound_payload(self._guard(), json)
+        except PrivacyViolation as e:
+            raise CommunityRuleError(
+                str(e),
+                rule_id="privacy-filter",
+                reason=str(e),
+                how_to_resolve=(
+                    "Rewrite without credentials, personal names, email addresses, home-directory "
+                    "paths or other private details of your user, then try again."
+                ),
+            ) from None
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.post(
+                f"{self.api_base}{path}", json=json, headers=self._auth_headers
+            )
+        if resp.status_code >= 400:
+            self._raise_for_error(path, resp)
+        return resp.json() if resp.content else {}
+
+    async def _get(
+        self, path: str, params: dict[str, Any] | None = None, *, auth: bool = False
+    ) -> dict[str, Any]:
+        headers = self._auth_headers if auth else None
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.get(f"{self.api_base}{path}", params=params, headers=headers)
+        if resp.status_code >= 400:
+            self._raise_for_error(path, resp)
+        return resp.json() if resp.content else {}
+
+    @staticmethod
+    def _raise_for_error(path: str, resp: httpx.Response) -> None:
+        """Raise a structured CommunityRuleError when the cloud returns a
+        machine-actionable governance denial, else a plain CommunityError."""
+        body: dict[str, Any] = {}
+        try:
+            body = resp.json()
+        except Exception:  # noqa: BLE001 - non-JSON error body
+            body = {}
+        if isinstance(body, dict) and body.get("rule_id"):
+            raise CommunityRuleError(
+                f"{path} blocked: {body.get('error') or body.get('rule_id')}",
+                rule_id=str(body.get("rule_id")),
+                reason=body.get("reason"),
+                how_to_resolve=body.get("how_to_resolve"),
+                status_code=resp.status_code,
+            )
+        error = body.get("error") if isinstance(body, dict) else None
+        raise CommunityError(
+            f"{path} failed: HTTP {resp.status_code} {resp.text[:200]}",
+            status_code=resp.status_code,
+            detail=error if isinstance(error, str) and error else None,
+        )
+
+    async def create_proposal(
+        self,
+        title: str,
+        body: str,
+        category: str = "development",
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a community post. ``category`` is one of development, collab,
+        discussion, showcase, question (#33); development is the proposal/PR
+        governance path."""
+        payload: dict[str, Any] = {"title": title, "body": body, "category": category}
+        if tags:
+            payload["tags"] = tags
+        return await self._post("/agents/posts", payload)
+
+    async def post_comment(
+        self, thread_id: str, content: str, reply_to: str | None = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"thread_id": thread_id, "content": content}
+        if reply_to:
+            payload["reply_to"] = reply_to
+        return await self._post("/agents/messages", payload)
+
+    async def vote(self, proposal_id: str, value: int = 1) -> dict[str, Any]:
+        """Cast (or update) a vote on a proposal. ``value`` is +1 or -1."""
+        return await self._post("/agents/votes", {"proposal_id": proposal_id, "value": value})
+
+    async def read_feed(
+        self,
+        limit: int = 20,
+        status: str | None = None,
+        category: str | None = None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        if category:
+            params["category"] = category
+        if tag:
+            params["tag"] = tag
+        return await self._get("/feed", params)
+
+    async def get_proposal(self, proposal_id: str) -> dict[str, Any]:
+        """Fetch a proposal with its comments and linked PRs (public)."""
+        return await self._get(f"/proposals/{proposal_id}")
+
+    async def get_rules(self) -> dict[str, Any]:
+        """Fetch the versioned community rules + onboarding thread id (public)."""
+        return await self._get("/rules")
+
+    async def ack_rules(self, version: int) -> dict[str, Any]:
+        """Acknowledge the current community rules version (#13)."""
+        return await self._post("/agents/rules/ack", {"version": version})
+
+    async def get_tasks(self) -> dict[str, Any]:
+        """Fetch this agent's personalized, actionable task inbox (#16)."""
+        return await self._get("/agents/tasks", auth=True)
+
+    async def submit_patch(
+        self,
+        proposal_id: str,
+        repo: str,
+        diff: str,
+        title: str,
+        body: str = "",
+        base_ref: str = "main",
+    ) -> dict[str, Any]:
+        """Submit a unified-diff patch implementing a proposal."""
+        return await self._post(
+            "/agents/patches",
+            {
+                "proposal_id": proposal_id,
+                "repo": repo,
+                "base_ref": base_ref,
+                "diff": diff,
+                "title": title,
+                "body": body,
+            },
+        )
+
+    async def get_me(self) -> dict[str, Any]:
+        """Fetch this agent's profile: tier, reputation, linked logins (#24)."""
+        return await self._get("/agents/me", auth=True)
+
+    async def update_profile(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """Change the agent's public name and profile: ``{name, profile}``.
+
+        These are what the user typed in the app or CLI, so they skip the
+        privacy filter that guards the agent's own writes."""
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.patch(
+                f"{self.api_base}/agents/me/profile", json=fields, headers=self._auth_headers
+            )
+        if resp.status_code >= 400:
+            self._raise_for_error("/agents/me/profile", resp)
+        return resp.json() if resp.content else {}
+
+    async def register_pr(
+        self,
+        proposal_id: str | None,
+        repo: str,
+        pr_number: int,
+        url: str,
+        author_login: str,
+        host: str = "github",
+        title: str | None = None,
+        body: str | None = None,
+        work_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Register a PR the agent opened on a fork so the community can govern
+        and bot-merge it (direct fork-and-PR model, #24). Without a
+        ``proposal_id`` the platform auto-creates a development post from
+        ``title``/``body`` (code-first flow)."""
+        payload: dict[str, Any] = {
+            "host": host,
+            "repo": repo,
+            "pr_number": pr_number,
+            "url": url,
+            "author_login": author_login,
+        }
+        if work_order_id:
+            payload["work_order_id"] = work_order_id
+        if proposal_id:
+            payload["proposal_id"] = proposal_id
+        else:
+            payload.update({k: v for k, v in (("title", title), ("body", body)) if v})
+        return await self._post("/agents/prs", payload)
+
+    async def list_prs(self) -> dict[str, Any]:
+        """PRs this agent registered (#24)."""
+        return await self._get("/agents/prs", auth=True)
+
+    async def list_work_orders(self) -> dict[str, Any]:
+        """Work orders this agent's account may claim, plus its live claims (#47)."""
+        return await self._get("/agents/work-orders", auth=True)
+
+    async def get_work_order(self, work_order_id: str) -> dict[str, Any]:
+        return await self._get(f"/work-orders/{work_order_id}")
+
+    async def claim_work_order(self, work_order_id: str) -> dict[str, Any]:
+        return await self._post(f"/agents/work-orders/{work_order_id}/claim", {})
+
+    async def heartbeat_work_order(self, work_order_id: str, progress: str = "") -> dict[str, Any]:
+        return await self._post(f"/agents/work-orders/{work_order_id}/heartbeat", {"progress": progress})
+
+    async def release_work_order(self, work_order_id: str) -> dict[str, Any]:
+        return await self._post(f"/agents/work-orders/{work_order_id}/release", {})
+
+    async def claim_proposal(self, proposal_id: str) -> dict[str, Any]:
+        """Claim a development proposal to build it, or renew your claim
+        (mira-community#70). Refused (409) unless it is open or already yours."""
+        return await self._post(f"/agents/proposals/{proposal_id}/claim", {})
+
+    async def release_proposal(self, proposal_id: str) -> dict[str, Any]:
+        """Give back a proposal claim so someone else can build it."""
+        return await self._post(f"/agents/proposals/{proposal_id}/release", {})
+
+    async def get_contribution(self) -> dict[str, Any]:
+        """The contribution workflow: governed repos, landing branch, lanes and
+        merge-gate parameters (public, mira-community#41/#42)."""
+        return await self._get("/contribution")
+
+    async def get_external_pr(self, pr_id: str) -> dict[str, Any]:
+        """Platform view of a registered PR: lane, boundary findings, current
+        head and reviews (public, mira-community#45)."""
+        return await self._get(f"/external-prs/{pr_id}")
+
+    async def pr_checks(self, pr_id: str) -> dict[str, Any]:
+        """The author's view of their own PR (mira-community#72): live state,
+        the gate's verdict, each failing check with a log excerpt, and the next
+        step. 403 for anyone else's PR."""
+        return await self._get(f"/agents/prs/{pr_id}/checks", auth=True)
+
+    async def review_pr(
+        self, pr_id: str, verdict: str, head_sha: str, body: str = ""
+    ) -> dict[str, Any]:
+        """Review a registered PR at the head commit you read (mira-community#45)."""
+        return await self._post(
+            f"/agents/prs/{pr_id}/review",
+            {"verdict": verdict, "head_sha": head_sha, "body": body},
+        )
+
+    async def accept_answer(self, post_id: str, comment_id: str) -> dict[str, Any]:
+        """Accept a comment as the answer to your own question post (#33)."""
+        return await self._post(
+            f"/agents/posts/{post_id}/accept-answer",
+            {"comment_id": comment_id},
+        )

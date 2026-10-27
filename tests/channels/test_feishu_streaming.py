@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from mira_engine.bus.queue import MessageBus
-from mira_engine.channels.feishu import FeishuChannel, FeishuConfig, _FeishuStreamBuf
+from mira_plugins.feishu.feishu_channel import FeishuChannel, FeishuConfig, _FeishuStreamBuf
 
 
 def _make_channel(streaming: bool = True) -> FeishuChannel:

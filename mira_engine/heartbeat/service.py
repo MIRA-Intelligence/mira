@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from loguru import logger
+
 from mira_engine.utils.helpers import current_time_str
 
 if TYPE_CHECKING:
@@ -38,6 +39,22 @@ _HEARTBEAT_TOOL = [
 ]
 
 
+def response_text(result: Any) -> str:
+    """The text of what ``on_execute`` returned.
+
+    The agent loop answers with an ``OutboundMessage``; delivering that object
+    whole wrapped it in another message, the UI channel failed with "Object of
+    type OutboundMessage is not JSON serializable", and the heartbeat's
+    community replies never reached the user.
+    """
+    if result is None:
+        return ""
+    content = getattr(result, "content", None)
+    if isinstance(content, str):
+        return content
+    return result if isinstance(result, str) else str(result)
+
+
 class HeartbeatService:
     """
     Periodic heartbeat service that wakes the agent to check for tasks.
@@ -49,6 +66,12 @@ class HeartbeatService:
     Phase 2 (execution): only triggered when Phase 1 returns ``run``.  The
     ``on_execute`` callback runs the task through the full agent loop and
     returns the result to deliver.
+
+    Phase 3 (delivery): ``should_notify(response, task_context)`` decides
+    whether ``on_notify`` gets the result. Without it, the built-in evaluator
+    asks whether the result is worth interrupting the user for; a gateway
+    delivering into a chat dedicated to background work passes one that
+    always says yes (see ``heartbeat/target.py``).
     """
 
     def __init__(
@@ -56,16 +79,22 @@ class HeartbeatService:
         workspace: Path,
         provider: LLMProvider,
         model: str,
-        on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
+        on_execute: Callable[[str], Coroutine[Any, Any, Any]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        extra_context: Callable[[], Coroutine[Any, Any, str]] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
+        should_notify: Callable[[str, str], Coroutine[Any, Any, bool]] | None = None,
     ):
         self.workspace = workspace
         self.provider = provider
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
+        self.should_notify = should_notify
+        # Optional async provider of extra context (e.g. a community feed digest)
+        # folded into each tick so background participation feels seamless.
+        self.extra_context = extra_context
         self.interval_s = interval_s
         self.enabled = enabled
         self._running = False
@@ -82,6 +111,21 @@ class HeartbeatService:
             except Exception:
                 return None
         return None
+
+    async def _gather_extra(self) -> str:
+        """Collect optional extra context (e.g. community digest). Never raises."""
+        if not self.extra_context:
+            return ""
+        try:
+            return (await self.extra_context()) or ""
+        except Exception as e:
+            logger.warning("Heartbeat extra context failed: {}", e)
+            return ""
+
+    async def _build_content(self) -> str:
+        """Combine HEARTBEAT.md with any extra context into one decision prompt."""
+        parts = [p for p in (self._read_heartbeat_file(), await self._gather_extra()) if p and p.strip()]
+        return "\n\n".join(parts)
 
     async def _decide(self, content: str) -> tuple[str, str]:
         """Phase 1: ask LLM to decide skip/run via virtual tool call.
@@ -141,9 +185,9 @@ class HeartbeatService:
 
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
-        content = self._read_heartbeat_file()
+        content = await self._build_content()
         if not content:
-            logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
+            logger.debug("Heartbeat: nothing to review (no HEARTBEAT.md or context)")
             return
 
         logger.info("Heartbeat: checking for tasks...")
@@ -157,16 +201,19 @@ class HeartbeatService:
 
             logger.info("Heartbeat: tasks found, executing...")
             if self.on_execute:
-                response = await self.on_execute(tasks)
+                response = response_text(await self.on_execute(tasks))
                 if response and self.on_notify:
-                    from mira_engine.utils import evaluator
+                    if self.should_notify is not None:
+                        should_notify = await self.should_notify(response, tasks or content)
+                    else:
+                        from mira_engine.utils import evaluator
 
-                    should_notify = await evaluator.evaluate_response(
-                        response=response,
-                        task_context=tasks or content,
-                        provider=self.provider,
-                        model=self.model,
-                    )
+                        should_notify = await evaluator.evaluate_response(
+                            response=response,
+                            task_context=tasks or content,
+                            provider=self.provider,
+                            model=self.model,
+                        )
                     if should_notify:
                         logger.info("Heartbeat: completed, delivering response")
                         await self.on_notify(response)
@@ -175,10 +222,10 @@ class HeartbeatService:
 
     async def trigger_now(self) -> str | None:
         """Manually trigger a heartbeat."""
-        content = self._read_heartbeat_file()
+        content = await self._build_content()
         if not content:
             return None
         action, tasks = await self._decide(content)
         if action != "run" or not self.on_execute:
             return None
-        return await self.on_execute(tasks)
+        return response_text(await self.on_execute(tasks))

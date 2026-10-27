@@ -52,9 +52,11 @@ def discover_plugins() -> dict[str, type[BaseChannel]]:
 
 
 def discover_all() -> dict[str, type[BaseChannel]]:
-    """Return all channels: built-in (pkgutil) merged with external (entry_points).
+    """Return all channels: built-in (pkgutil) and first-party plugin channels,
+    merged with external ones (entry_points, other mira plugins).
 
-    Built-in channels take priority — an external plugin cannot shadow a built-in name.
+    Built-in and first-party (core-bundled) channels take priority — an
+    external plugin cannot shadow their names.
     """
     builtin: dict[str, type[BaseChannel]] = {}
     for modname in discover_channel_names():
@@ -64,8 +66,21 @@ def discover_all() -> dict[str, type[BaseChannel]]:
             logger.debug("Skipping built-in channel '{}': {}", modname, e)
 
     external = discover_plugins()
-    shadowed = set(external) & set(builtin)
+    first_party: dict[str, type[BaseChannel]] = {}
+    # Channels from mira plugins (mira#206): the repo's plugins/ ship the
+    # messaging channels and rank as built-ins; any other plugin ranks below
+    # entry points, as before.
+    try:
+        from mira_engine.plugins import get_runtime
+
+        runtime = get_runtime()
+        first_party = runtime.channels(core=True)
+        external = {**runtime.channels(core=False), **external}
+    except Exception as e:  # noqa: BLE001 - channels must come up without plugins
+        logger.warning("Could not load plugin channels: {}", e)
+    first_party = {**first_party, **builtin}
+    shadowed = set(external) & set(first_party)
     if shadowed:
         logger.warning("Plugin(s) shadowed by built-in channels (ignored): {}", shadowed)
 
-    return {**external, **builtin}
+    return {**external, **first_party}

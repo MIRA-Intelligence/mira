@@ -159,12 +159,10 @@ async def fetch_provider_models(config: Config, provider_name: str) -> ModelCach
     if not spec:
         raise ModelFetchError(f"Unknown provider: {provider_name}")
 
-    if provider_name == "github_copilot":
-        return await _fetch_github_copilot_models(config)
+    if spec.plugin_id:
+        return await _fetch_plugin_provider_models(config, spec)
     if provider_name == "ollama":
         return await _fetch_ollama_models(config)
-    if provider_name == "openai_codex":
-        raise ModelFetchError("OpenAI Codex model fetch is not supported yet.")
 
     return await _fetch_openai_compatible_models(config, provider_name)
 
@@ -232,35 +230,17 @@ def _cache_from_payload(payload: dict[str, Any]) -> ModelCache:
     )
 
 
-async def _fetch_github_copilot_models(config: Config) -> ModelCache:
-    from mira_engine.providers.github_copilot_provider import (
-        GitHubCopilotProvider,
-        get_github_copilot_login_status,
-    )
+async def _fetch_plugin_provider_models(config: Config, spec: Any) -> ModelCache:
+    """A plugin-contributed provider lists its models through its plugin's
+    ``models`` hook (``async fetch_models(*, model, api_base, proxy)``)."""
+    from mira_engine.plugins import get_runtime
 
-    provider = GitHubCopilotProvider(
-        default_model=config.agents.defaults.model or "github_copilot/gpt-4.1",
-        api_base=config.get_api_base("github_copilot/gpt-4.1"),
-        proxy=resolve_provider_proxy(config),
-    )
-    token = await provider._get_copilot_access_token()
-    api_base = provider.api_base.rstrip("/")
-    payload = await _get_json(
-        f"{api_base}/models",
-        headers={
-            **provider.extra_headers,
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
-        proxy=provider.proxy,
-    )
-    models = _parse_openai_compatible_models(payload, "github_copilot")
-    return _new_cache(
-        provider="github_copilot",
-        models=models,
-        api_base=provider.api_base,
-        account_id=getattr(get_github_copilot_login_status(), "account_id", None),
-    )
+    fetch = get_runtime().provider_hook(spec.name, "models")
+    if fetch is None:
+        raise ModelFetchError(f"{spec.label} can't list its models.")
+    provider_cfg = config.providers.entry(spec.name)
+    api_base = (provider_cfg.api_base if provider_cfg else None) or spec.default_api_base or None
+    return await fetch(model=config.agents.defaults.model, api_base=api_base, proxy=resolve_provider_proxy(config))
 
 
 async def _fetch_ollama_models(config: Config) -> ModelCache:
@@ -362,8 +342,6 @@ def _model_from_payload_item(item: Any, provider_name: str) -> ModelInfo | None:
         model_id = item.strip()
         payload: dict[str, Any] = {}
     elif isinstance(item, dict):
-        if provider_name == "github_copilot" and not _is_supported_copilot_chat_model(item):
-            return None
         model_id = str(item.get("id") or item.get("name") or item.get("model") or "").strip()
         payload = item
     else:
@@ -420,21 +398,6 @@ def _extract_context_window(payload: dict[str, Any]) -> int | None:
             if isinstance(context, int) and context > 0:
                 return context
     return None
-
-
-def _is_supported_copilot_chat_model(payload: dict[str, Any]) -> bool:
-    capabilities = payload.get("capabilities")
-    if isinstance(capabilities, dict) and capabilities.get("type") != "chat":
-        return False
-    if payload.get("model_picker_enabled") is False:
-        return False
-    policy = payload.get("policy")
-    if isinstance(policy, dict) and policy.get("state") == "disabled":
-        return False
-    endpoints = payload.get("supported_endpoints")
-    if isinstance(endpoints, list):
-        return "/chat/completions" in endpoints
-    return True
 
 
 def _new_cache(
