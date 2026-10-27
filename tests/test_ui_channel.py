@@ -3198,6 +3198,8 @@ async def test_handle_community_status_reports_state_without_token(
     assert body["agent_id"] == "agent-1"
     assert body["autonomy_mode"] == "hybrid"
     assert body["pending_count"] == 1
+    # The reserved chat the agent's background community work lands in.
+    assert body["chat_id"] == "community"
     # The agent token must never be exposed to the desktop UI.
     assert "secret-token" not in resp.text
 

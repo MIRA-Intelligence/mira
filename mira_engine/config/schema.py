@@ -581,6 +581,11 @@ class HeartbeatConfig(Base):
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
     keep_recent_messages: int = 8
+    # Where what a background turn did is delivered, as "channel:chat_id"
+    # (e.g. "telegram:12345"). Empty: the Mira Community chat of the desktop
+    # UI when the UI channel is on, else the most recent conversation on a
+    # messaging channel. Never the chat the user happens to be using.
+    deliver_to: str = ""
 
 
 class ApiConfig(Base):

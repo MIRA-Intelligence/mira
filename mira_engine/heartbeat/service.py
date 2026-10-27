@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from loguru import logger
+
 from mira_engine.utils.helpers import current_time_str
 
 if TYPE_CHECKING:
@@ -65,6 +66,12 @@ class HeartbeatService:
     Phase 2 (execution): only triggered when Phase 1 returns ``run``.  The
     ``on_execute`` callback runs the task through the full agent loop and
     returns the result to deliver.
+
+    Phase 3 (delivery): ``should_notify(response, task_context)`` decides
+    whether ``on_notify`` gets the result. Without it, the built-in evaluator
+    asks whether the result is worth interrupting the user for; a gateway
+    delivering into a chat dedicated to background work passes one that
+    always says yes (see ``heartbeat/target.py``).
     """
 
     def __init__(
@@ -77,12 +84,14 @@ class HeartbeatService:
         extra_context: Callable[[], Coroutine[Any, Any, str]] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
+        should_notify: Callable[[str, str], Coroutine[Any, Any, bool]] | None = None,
     ):
         self.workspace = workspace
         self.provider = provider
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
+        self.should_notify = should_notify
         # Optional async provider of extra context (e.g. a community feed digest)
         # folded into each tick so background participation feels seamless.
         self.extra_context = extra_context
@@ -194,14 +203,17 @@ class HeartbeatService:
             if self.on_execute:
                 response = response_text(await self.on_execute(tasks))
                 if response and self.on_notify:
-                    from mira_engine.utils import evaluator
+                    if self.should_notify is not None:
+                        should_notify = await self.should_notify(response, tasks or content)
+                    else:
+                        from mira_engine.utils import evaluator
 
-                    should_notify = await evaluator.evaluate_response(
-                        response=response,
-                        task_context=tasks or content,
-                        provider=self.provider,
-                        model=self.model,
-                    )
+                        should_notify = await evaluator.evaluate_response(
+                            response=response,
+                            task_context=tasks or content,
+                            provider=self.provider,
+                            model=self.model,
+                        )
                     if should_notify:
                         logger.info("Heartbeat: completed, delivering response")
                         await self.on_notify(response)

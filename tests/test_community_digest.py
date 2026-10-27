@@ -1,9 +1,18 @@
 """Tests for the heartbeat community digest (#112, #16)."""
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+
+import pytest
 
 from mira_engine.community import client as client_mod
 from mira_engine.community import digest
+
+
+@pytest.fixture(autouse=True)
+def _seen_record_in_tmp(monkeypatch, tmp_path):
+    """The heartbeat's seen-record never touches the user's data dir in tests."""
+    monkeypatch.setattr(digest, "get_data_dir", lambda: tmp_path / "data")
 
 
 def _cfg(**kw):
@@ -157,3 +166,52 @@ async def test_network_error_returns_empty(monkeypatch):
 
     monkeypatch.setattr(client_mod, "CommunityClient", BoomClient)
     assert await digest.gather_community_digest(_cfg()) == ""
+
+
+async def test_a_task_is_presented_once_a_day_unless_it_changes(monkeypatch):
+    task = {"type": "needs_vote", "target_id": "p1", "title": "Vote", "reason": "open"}
+    _install_client(monkeypatch, tasks=[task])
+    assert "p1" in await digest.gather_community_digest(_cfg())
+    # The platform lists it again on the next tick; the agent is not asked again.
+    assert await digest.gather_community_digest(_cfg()) == ""
+    # It changed (a new head, a new update): presented again.
+    updated = {**task, "updated_at": "2026-10-26T10:00:00+00:00"}
+    _install_client(monkeypatch, tasks=[updated])
+    assert "p1" in await digest.gather_community_digest(_cfg())
+    # Another task is new even while the first is quiet.
+    _install_client(monkeypatch, tasks=[updated, {**task, "target_id": "p2"}])
+    out = await digest.gather_community_digest(_cfg())
+    assert "p2" in out and "p1" not in out
+
+
+async def test_the_feed_fallback_is_presented_once_too(monkeypatch):
+    _install_client(
+        monkeypatch,
+        tasks_raises=client_mod.CommunityError("HTTP 404"),
+        feed=[{"id": "p1", "status": "open", "title": "Anything", "author_handle": "a"}],
+    )
+    assert "p1" in await digest.gather_community_digest(_cfg())
+    assert await digest.gather_community_digest(_cfg()) == ""
+
+
+def test_fresh_items_repeat_after_the_quiet_period_and_forget_what_is_gone():
+    now = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)
+
+    def key(item):
+        return item["id"]
+
+    assert digest.fresh_items([{"id": "a"}, {"id": "b"}], key, now=now) == [{"id": "a"}, {"id": "b"}]
+    assert digest.fresh_items([{"id": "a"}], key, now=now + timedelta(hours=1)) == []
+    # "b" was not listed in the previous call, so it is new again when it returns.
+    assert digest.fresh_items([{"id": "a"}, {"id": "b"}], key, now=now + timedelta(hours=2)) == [{"id": "b"}]
+    # After the quiet period an unchanged item is presented again.
+    assert digest.fresh_items([{"id": "a"}], key, now=now + timedelta(hours=25)) == [{"id": "a"}]
+
+
+def test_fresh_items_treat_an_unreadable_record_as_empty(tmp_path):
+    path = digest.seen_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    assert digest.fresh_items([{"id": "a"}], lambda item: item["id"]) == [{"id": "a"}]
+    # And the record is usable afterwards.
+    assert digest.fresh_items([{"id": "a"}], lambda item: item["id"]) == []
