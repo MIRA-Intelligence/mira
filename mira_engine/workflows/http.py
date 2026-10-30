@@ -16,7 +16,13 @@ from mira_engine.utils.slide_decks import deck_response, is_deck_file
 from .journals import PROFILE_VERSION, journal_catalog
 from .models import WORKFLOW_CONTRACT_VERSION, WorkflowEvent
 from .repository import JsonWorkflowRepository
-from .service import WorkflowError, WorkflowService, error_payload
+from .service import (
+    WorkflowError,
+    WorkflowService,
+    clear_default_event_listener,
+    error_payload,
+    set_default_event_listener,
+)
 
 
 @dataclass
@@ -38,6 +44,7 @@ class WorkflowHttpApi:
         self.registry = registry
         self._subscribers: dict[str, dict[str, _Subscriber]] = defaultdict(dict)
         self._socket_subscriptions: dict[web.WebSocketResponse, set[tuple[str, str]]] = defaultdict(set)
+        set_default_event_listener(self._schedule_event)
 
     def add_routes(self, app: web.Application) -> None:
         app.router.add_get("/api/workflow/v1/contract", self.contract)
@@ -470,6 +477,7 @@ class WorkflowHttpApi:
             self._remove_subscription(project_id, subscription_id)
 
     async def close(self) -> None:
+        clear_default_event_listener(self._schedule_event)
         sockets = list(self._socket_subscriptions)
         self._subscribers.clear()
         self._socket_subscriptions.clear()

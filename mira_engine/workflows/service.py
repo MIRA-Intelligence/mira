@@ -57,6 +57,22 @@ class WorkflowError(Exception):
 
 EventListener = Callable[[WorkflowEvent], None]
 
+# Services built outside the HTTP API (agent tools, the module runtime) would
+# otherwise commit events nobody hears: the desktop learnt about a requested
+# interaction only when a turn ended. The API registers its broadcaster here.
+_default_listener: EventListener | None = None
+
+
+def set_default_event_listener(listener: EventListener | None) -> None:
+    global _default_listener
+    _default_listener = listener
+
+
+def clear_default_event_listener(listener: EventListener) -> None:
+    global _default_listener
+    if _default_listener == listener:
+        _default_listener = None
+
 
 class WorkflowService:
     @staticmethod
@@ -1458,8 +1474,9 @@ class WorkflowService:
         )
 
     def _publish(self, event: WorkflowEvent) -> None:
-        if self.on_event:
-            self.on_event(event)
+        listener = self.on_event or _default_listener
+        if listener:
+            listener(event)
 
 
 def error_payload(error: Exception) -> tuple[int, dict[str, Any]]:
