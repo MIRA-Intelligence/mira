@@ -327,7 +327,12 @@ class WorkflowService:
             self.repository.save_run(run)
             self.repository.append_event(event)
             published_events.append(event)
-            if event_type == "run.completed" and workflow.handoff_policy.mode == "auto":
+            if (
+                event_type == "run.completed"
+                and workflow.handoff_policy.mode == "auto"
+                # A revised Run already handed off when it first completed.
+                and not run.module_data.get("revision_requests")
+            ):
                 published_events.extend(
                     self._create_auto_handoffs_locked(
                         workflow,
@@ -348,6 +353,48 @@ class WorkflowService:
             project_sequence=event.project_sequence,
             event=event,
         )
+
+    def prepare_for_chat(
+        self,
+        run_id: str,
+        *,
+        text: str,
+        selection: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """Bring a Run to ``queued`` so a chat message can drive its next turn.
+
+        A user who types in the chat expects an answer whatever state the Run is
+        in: a paused or failed Run continues, a pending interaction is answered
+        by the message, and a completed Run reopens for a revision of its
+        deliverables. Returns the commands applied, in order.
+        """
+        applied: list[str] = []
+        for _ in range(3):
+            try:
+                status = self.repository.load_run(run_id).status
+            except FileNotFoundError as exc:
+                raise WorkflowError("run_not_found", str(exc), status=404) from exc
+            command_type: str | None = None
+            payload: dict[str, Any] = {}
+            if status == "paused":
+                command_type = "resume"
+            elif status == "failed":
+                command_type = "retry"
+            elif status == "waiting_input":
+                command_type, payload = "answer_in_chat", {"text": text}
+            elif status == "completed":
+                command_type = "reopen"
+                payload = {"text": text, **({"selection": selection} if selection else {})}
+            if command_type is None:
+                return applied
+            self.command_run(
+                run_id,
+                command_id=f"chat-{command_type}:{new_id()}",
+                command_type=command_type,
+                payload=payload,
+            )
+            applied.append(command_type)
+        return applied
 
     def claim_run(
         self,
@@ -1069,6 +1116,39 @@ class WorkflowService:
             run.attempt.lease_expires_at = None
             self._close_attempt(run, "completed", utc_now())
             return "completed", "run.completed", "applied"
+        if command == "answer_in_chat" and status == "waiting_input":
+            interaction = run.module_data.get("interaction")
+            if not isinstance(interaction, dict) or interaction.get("response") is not None:
+                raise WorkflowError("interaction_not_found", "no pending interaction to answer", status=409)
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise WorkflowError("interaction_response_invalid", "a chat answer must not be blank", status=422)
+            # A chat message is feedback or a question, never an approval: an
+            # approve_* gate records it as a revision and must be asked again.
+            response: dict[str, Any] = {"chat_reply": text.strip(), "source": "chat"}
+            if str(interaction.get("interaction_type", "")).startswith("approve_"):
+                response = {"selection": "revise", "notes": text.strip(), "source": "chat"}
+            self._resolve_interaction(run, interaction, response)
+            return "queued", "interaction.resolved", "accepted"
+        if command == "reopen" and status == "completed":
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise WorkflowError("revision_request_invalid", "a revision request must not be blank", status=422)
+            request: dict[str, Any] = {
+                "text": text.strip(),
+                "requested_at": utc_now(),
+                "previous_outputs": list(run.outputs),
+            }
+            selection = payload.get("selection")
+            if isinstance(selection, dict):
+                request["selection"] = selection
+            history = run.module_data.get("revision_requests")
+            run.module_data["revision_requests"] = [
+                *(history if isinstance(history, list) else []),
+                request,
+            ][-20:]
+            run.pending_control = None
+            return "queued", "run.reopened", "accepted"
         if command == "submit_interaction" and status == "waiting_input":
             interaction = run.module_data.get("interaction")
             interaction_id = payload.get("interaction_id")
@@ -1099,15 +1179,7 @@ class WorkflowService:
                     raise WorkflowError(
                         "interaction_response_invalid", "revision requires explanatory notes", status=422
                     )
-            interaction["response"] = response
-            interaction["resolved_at"] = utc_now()
-            history = run.module_data.setdefault("interaction_history", [])
-            if not isinstance(history, list):
-                history = []
-            run.module_data["interaction_history"] = [
-                *history,
-                copy.deepcopy(interaction),
-            ][-100:]
+            self._resolve_interaction(run, interaction, response)
             return "queued", "interaction.resolved", "accepted"
         raise WorkflowError(
             "invalid_transition",
@@ -1224,6 +1296,18 @@ class WorkflowService:
             if rule_source in {None, "*", source} and rule_target in {None, "*", target}:
                 return bool(rule.get("enabled", True))
         return False
+
+    @staticmethod
+    def _resolve_interaction(run: ModuleRun, interaction: dict[str, Any], response: Any) -> None:
+        interaction["response"] = response
+        interaction["resolved_at"] = utc_now()
+        history = run.module_data.setdefault("interaction_history", [])
+        if not isinstance(history, list):
+            history = []
+        run.module_data["interaction_history"] = [
+            *history,
+            copy.deepcopy(interaction),
+        ][-100:]
 
     @staticmethod
     def _close_attempt(run: ModuleRun, outcome: str, ended_at: str) -> None:

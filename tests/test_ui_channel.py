@@ -2938,6 +2938,96 @@ async def test_ws_handler_normal_message_skips_project_runtime_state(
     assert not (ui_channel.projects_root / session_id).exists()
 
 
+def _workflow_message(session_id: str, run_id: str, content: str, **extra: Any) -> _FakeWsMessage:
+    return _FakeWsMessage(web.WSMsgType.TEXT, json.dumps({
+        "type": "message", "session_id": session_id, "user_id": "u1", "loop_mode": "project",
+        "mode": "manual", "agent_profile": "research", "content": content, "media": [],
+        "workflow_run_id": run_id, **extra,
+    }))
+
+
+async def test_ws_message_to_completed_run_reopens_it_for_a_revision_turn(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4200"
+    (ui_channel.projects_root / session_id).mkdir(parents=True, exist_ok=True)
+    service = ui_channel._workflow_api._service(session_id)
+    run_id = service.create_run(command_id="c1", module_type="initiation", enqueue=True).run_id or ""
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.command_run(run_id, command_id="c2", command_type="complete", payload={"outputs": []})
+    selection = {"run_id": run_id, "item_id": "direction-2", "label": "Direction 2"}
+    ws = _FakeWs([_workflow_message(session_id, run_id, "Polish direction 2", workflow_selection=selection)])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+
+    assert [frame for frame in ws.sent if frame.get("type") == "error"] == []
+    assert captured["content"] == "Polish direction 2"
+    assert captured["metadata"]["workflow_run_id"] == run_id
+    instructions = captured["metadata"]["_ui_system_instructions"]
+    assert "reopened it from the chat to revise" in instructions
+    assert "Direction 2" in instructions
+    assert service.repository.load_run(run_id).status == "running"
+
+
+async def test_ws_message_during_approval_gate_is_answered_not_dropped(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4201"
+    (ui_channel.projects_root / session_id).mkdir(parents=True, exist_ok=True)
+    service = ui_channel._workflow_api._service(session_id)
+    run_id = service.create_run(
+        command_id="c1", module_type="initiation",
+        module_data={"confirmation_policy": {"mode": "required"}}, enqueue=True,
+    ).run_id or ""
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.request_interaction(run_id, command_id="c2", interaction={
+        "interaction_id": "i1", "interaction_type": "approve_research_scope", "title": "Approve",
+        "prompt": "Brief", "response_schema": {"type": "object"},
+        "choices": [{"value": "approve"}, {"value": "revise"}],
+    })
+    ws = _FakeWs([_workflow_message(session_id, run_id, "Why only PubMed?")])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+
+    assert captured["content"] == "Why only PubMed?"
+    assert "It is never an approval" in captured["metadata"]["_ui_system_instructions"]
+    run = service.repository.load_run(run_id)
+    assert run.status == "running"
+    assert run.module_data["interaction"]["response"]["selection"] == "revise"
+
+
+async def test_ws_message_rejected_for_a_run_reports_to_that_conversation(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4202"
+    (ui_channel.projects_root / session_id).mkdir(parents=True, exist_ok=True)
+    service = ui_channel._workflow_api._service(session_id)
+    run_id = service.create_run(command_id="c1", module_type="planning", enqueue=True).run_id or ""
+    service.command_run(run_id, command_id="c2", command_type="cancel")
+    ws = _FakeWs([_workflow_message(session_id, run_id, "hello")])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    monkeypatch.setattr(ui_channel, "_handle_message", AsyncMock())
+
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+
+    errors = [frame for frame in ws.sent if frame.get("type") == "error"]
+    assert len(errors) == 1
+    assert errors[0]["session_id"] == session_id
+    assert errors[0]["metadata"] == {"workflow_run_id": run_id}
+
+
 async def test_ws_handler_injects_guard_notice_on_id_reassignment(
     ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
