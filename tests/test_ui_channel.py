@@ -2946,7 +2946,7 @@ def _workflow_message(session_id: str, run_id: str, content: str, **extra: Any) 
     }))
 
 
-async def test_ws_message_to_completed_run_reopens_it_for_a_revision_turn(
+async def test_ws_message_to_completed_run_gets_a_follow_up_turn_and_stays_completed(
     ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = "PRJ-4200"
@@ -2970,9 +2970,9 @@ async def test_ws_message_to_completed_run_reopens_it_for_a_revision_turn(
     assert captured["content"] == "Polish direction 2"
     assert captured["metadata"]["workflow_run_id"] == run_id
     instructions = captured["metadata"]["_ui_system_instructions"]
-    assert "reopened it from the chat to revise" in instructions
+    assert "stays completed" in instructions
     assert "Direction 2" in instructions
-    assert service.repository.load_run(run_id).status == "running"
+    assert service.repository.load_run(run_id).status == "completed"
 
 
 async def test_ws_message_during_approval_gate_is_answered_not_dropped(

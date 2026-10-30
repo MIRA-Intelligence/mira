@@ -599,7 +599,7 @@ def test_chat_message_answers_a_choice_interaction(service: WorkflowService) -> 
     }
 
 
-def test_chat_message_reopens_a_completed_run_for_revision(service: WorkflowService) -> None:
+def test_chat_message_on_a_completed_run_keeps_it_completed(service: WorkflowService) -> None:
     (service.repository.project_dir / "report.md").write_text("# Result\n", encoding="utf-8")
     artifact, _ = service.import_artifact(
         command_id="cmd-import",
@@ -621,26 +621,21 @@ def test_chat_message_reopens_a_completed_run_for_revision(service: WorkflowServ
     applied = service.prepare_for_chat(run_id, text="Polish direction 2", selection=selection)
 
     run = service.repository.load_run(run_id)
-    assert applied == ["reopen"]
-    assert run.status == "queued"
-    assert run.last_transition and run.last_transition.event_type == "run.reopened"
+    assert applied == ["request_revision"]
+    # The next-step actions depend on `completed`; an unrelated chat must not hide them.
+    assert run.status == "completed"
+    assert run.outputs == [artifact.artifact_id]
+    assert run.last_transition and run.last_transition.event_type == "run.revision_requested"
     request = run.module_data["revision_requests"][-1]
     assert request["text"] == "Polish direction 2"
     assert request["selection"] == selection
     assert request["previous_outputs"] == [artifact.artifact_id]
-    service.claim_run(run_id, lease_owner="ui:test")
-    service.command_run(
-        run_id,
-        command_id="cmd-complete-revised",
-        command_type="complete",
-        payload={"outputs": [artifact.artifact_id]},
-    )
-    revised = service.repository.load_run(run_id)
-    assert revised.status == "completed"
-    assert revised.attempt.number == 2
+    with pytest.raises(WorkflowError) as exc_info:
+        service.claim_run(run_id, lease_owner="ui:test")
+    assert exc_info.value.code == "run_not_queued"
 
 
-def test_completing_a_revised_run_does_not_repeat_auto_handoffs(
+def test_revising_outputs_keeps_the_run_completed_and_skips_handoffs(
     service: WorkflowService,
 ) -> None:
     service.ensure_project()
@@ -653,16 +648,35 @@ def test_completing_a_revised_run_does_not_repeat_auto_handoffs(
     )
     created = service.create_run(command_id="cmd-source", module_type="planning", enqueue=True)
     run_id = created.run_id or ""
-    complete = {"outputs": [], "suggested_handoffs": [{"target_module_type": "experiment"}]}
     service.claim_run(run_id, lease_owner="ui:test")
-    service.command_run(run_id, command_id="cmd-complete-1", command_type="complete", payload=complete)
+    service.command_run(
+        run_id,
+        command_id="cmd-complete",
+        command_type="complete",
+        payload={"outputs": [], "suggested_handoffs": [{"target_module_type": "experiment"}]},
+    )
     assert len(service.repository.list_runs()) == 2
+    (service.repository.project_dir / "plan.md").write_text("# Plan v2\n", encoding="utf-8")
+    revised, _ = service.import_artifact(command_id="cmd-import", source_path="plan.md", artifact_type="plan")
 
     service.prepare_for_chat(run_id, text="Tighten the risks section")
-    service.claim_run(run_id, lease_owner="ui:test")
-    service.command_run(run_id, command_id="cmd-complete-2", command_type="complete", payload=complete)
+    service.command_run(
+        run_id,
+        command_id="cmd-revise",
+        command_type="revise_outputs",
+        payload={"outputs": [revised.artifact_id], "summary": "Risks tightened"},
+    )
 
+    run = service.repository.load_run(run_id)
+    assert run.status == "completed"
+    assert run.outputs == [revised.artifact_id]
+    assert run.module_data["completion_summary"] == "Risks tightened"
     assert len(service.repository.list_runs()) == 2
+    with pytest.raises(WorkflowError) as exc_info:
+        service.command_run(
+            run_id, command_id="cmd-bad", command_type="revise_outputs", payload={"outputs": ["missing"]}
+        )
+    assert exc_info.value.code == "artifact_not_found"
 
 
 @pytest.mark.parametrize(("interruption", "expected"), [("pause", ["resume"]), ("fail", ["retry"])])

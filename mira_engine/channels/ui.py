@@ -500,7 +500,7 @@ def _normalize_workflow_selection(value: Any) -> dict[str, Any] | None:
 
 
 def _chat_revision_instructions(run: Any, repository: Any) -> str | None:
-    """Tell the agent a completed Run was reopened to revise its deliverables."""
+    """Tell the agent how a follow-up message on a completed Run may revise it."""
     requests = run.module_data.get("revision_requests")
     if not isinstance(requests, list) or not requests or not isinstance(requests[-1], dict):
         return None
@@ -523,17 +523,18 @@ def _chat_revision_instructions(run: Any, repository: Any) -> str | None:
         "current_deliverables": deliverables,
     }
     return (
-        "This Run had completed and the user reopened it from the chat to revise its "
-        "results. Do not redo the module from scratch and do not ask for a new execution "
-        "approval unless the request materially changes the approved scope. Apply the "
-        "requested change to the existing deliverables (the selected one when given, "
-        "otherwise the one the request refers to; ask with clarify_requirements only if "
-        "that is genuinely ambiguous). Answer questions directly. When content changes, "
-        "publish the revised file with publish_workflow_artifact and call "
-        "complete_workflow_run once with outputs listing every current deliverable: the "
-        "revised artifact in place of the one it replaces, unchanged ones kept. If the "
-        "user only asked a question and nothing changes, call complete_workflow_run with "
-        "the unchanged outputs.\n"
+        "This Run is already completed and stays completed; the user is following up in "
+        "the chat. Reply to the message directly. If it is a question or unrelated, just "
+        "answer and call no workflow tools. Do not redo the module from scratch. If the "
+        "user asks to change a result, apply the change to the existing deliverables (the "
+        "selected one when given, otherwise the one the message refers to; if that is "
+        "genuinely ambiguous, ask in your reply instead of a workflow interaction). For "
+        "file deliverables, publish the revised file with publish_workflow_artifact and "
+        "call complete_workflow_run once with output_artifact_ids listing every current "
+        "deliverable (the revised artifact in place of the one it replaces, unchanged ones "
+        "kept); this updates the deliverables without reopening the Run. For an "
+        "initiation research result, record the full revised result with "
+        "record_initiation_research_result.\n"
         + json.dumps(context, ensure_ascii=False)
     )
 
@@ -2280,10 +2281,14 @@ class UiChannel(BaseChannel):
                                         data.get("workflow_selection")
                                     ),
                                 )
-                                claim_receipt = workflow_service.claim_run(
-                                    workflow_run_id,
-                                    lease_owner=f"ui:{self._workflow_executor_id}:{user_id}",
-                                    agent_profile=agent_profile,
+                                # A follow-up on a completed Run talks to it without
+                                # claiming it, so it stays completed.
+                                claim_receipt = None if "request_revision" in chat_commands else (
+                                    workflow_service.claim_run(
+                                        workflow_run_id,
+                                        lease_owner=f"ui:{self._workflow_executor_id}:{user_id}",
+                                        agent_profile=agent_profile,
+                                    )
                                 )
                                 workflow_run = workflow_service.repository.load_run(
                                     workflow_run_id
@@ -2462,7 +2467,7 @@ class UiChannel(BaseChannel):
                                     "execution brief still needs approval, revise the brief as "
                                     "needed and request that confirmation again."
                                 )
-                            if "reopen" in chat_commands:
+                            if "request_revision" in chat_commands:
                                 revision = _chat_revision_instructions(
                                     workflow_run, workflow_service.repository
                                 )

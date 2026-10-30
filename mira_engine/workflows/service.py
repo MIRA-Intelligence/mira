@@ -327,12 +327,7 @@ class WorkflowService:
             self.repository.save_run(run)
             self.repository.append_event(event)
             published_events.append(event)
-            if (
-                event_type == "run.completed"
-                and workflow.handoff_policy.mode == "auto"
-                # A revised Run already handed off when it first completed.
-                and not run.module_data.get("revision_requests")
-            ):
+            if event_type == "run.completed" and workflow.handoff_policy.mode == "auto":
                 published_events.extend(
                     self._create_auto_handoffs_locked(
                         workflow,
@@ -361,12 +356,15 @@ class WorkflowService:
         text: str,
         selection: dict[str, Any] | None = None,
     ) -> list[str]:
-        """Bring a Run to ``queued`` so a chat message can drive its next turn.
+        """Prepare a Run so a chat message can drive its next turn.
 
         A user who types in the chat expects an answer whatever state the Run is
-        in: a paused or failed Run continues, a pending interaction is answered
-        by the message, and a completed Run reopens for a revision of its
-        deliverables. Returns the commands applied, in order.
+        in: a paused or failed Run continues and a pending interaction is
+        answered by the message, both leaving the Run ``queued`` for a claim. A
+        completed Run stays completed (its next-step actions remain available);
+        the message is recorded as a revision request for a follow-up turn that
+        may replace deliverables with ``revise_outputs``. Returns the commands
+        applied, in order.
         """
         applied: list[str] = []
         for _ in range(3):
@@ -383,7 +381,7 @@ class WorkflowService:
             elif status == "waiting_input":
                 command_type, payload = "answer_in_chat", {"text": text}
             elif status == "completed":
-                command_type = "reopen"
+                command_type = "request_revision"
                 payload = {"text": text, **({"selection": selection} if selection else {})}
             if command_type is None:
                 return applied
@@ -394,6 +392,8 @@ class WorkflowService:
                 payload=payload,
             )
             applied.append(command_type)
+            if status == "completed":
+                return applied
         return applied
 
     def claim_run(
@@ -919,7 +919,7 @@ class WorkflowService:
             return "created", "run.draft_updated", "applied"
         if command == "enqueue" and status == "created":
             return "queued", "run.queued", "accepted"
-        if command == "record_research_result" and status == "running":
+        if command == "record_research_result" and status in {"running", "completed"}:
             if run.module_type != "initiation":
                 raise WorkflowError(
                     "invalid_module",
@@ -991,8 +991,8 @@ class WorkflowService:
                 if isinstance(search, dict)
             ]
             run.module_data["research_result"] = result.model_dump(mode="json")
-            return "running", "run.research_result_updated", "applied"
-        if command == "record_literature_search" and status == "running":
+            return status, "run.research_result_updated", "applied"
+        if command == "record_literature_search" and status in {"running", "completed"}:
             if run.module_type != "initiation":
                 raise WorkflowError(
                     "invalid_module",
@@ -1013,7 +1013,7 @@ class WorkflowService:
                 searches = []
                 run.module_data["research_searches"] = searches
             searches.append(search.model_dump(mode="json"))
-            return "running", "run.literature_search_recorded", "applied"
+            return status, "run.literature_search_recorded", "applied"
         if command == "pause" and status in {"queued", "waiting_input"}:
             return "paused", "run.paused", "applied"
         if command == "pause" and status == "running":
@@ -1130,7 +1130,7 @@ class WorkflowService:
                 response = {"selection": "revise", "notes": text.strip(), "source": "chat"}
             self._resolve_interaction(run, interaction, response)
             return "queued", "interaction.resolved", "accepted"
-        if command == "reopen" and status == "completed":
+        if command == "request_revision" and status == "completed":
             text = payload.get("text")
             if not isinstance(text, str) or not text.strip():
                 raise WorkflowError("revision_request_invalid", "a revision request must not be blank", status=422)
@@ -1147,8 +1147,24 @@ class WorkflowService:
                 *(history if isinstance(history, list) else []),
                 request,
             ][-20:]
-            run.pending_control = None
-            return "queued", "run.reopened", "accepted"
+            return "completed", "run.revision_requested", "applied"
+        if command == "revise_outputs" and status == "completed":
+            # A follow-up turn replaced deliverables; the Run never leaves
+            # completed and its handoffs are not repeated.
+            outputs = payload.get("outputs", [])
+            if not isinstance(outputs, list) or not all(isinstance(item, str) for item in outputs):
+                raise WorkflowError("invalid_outputs", "outputs must be an array of Artifact IDs", status=422)
+            unique_outputs = list(dict.fromkeys(outputs))
+            for artifact_id in unique_outputs:
+                try:
+                    self.repository.load_artifact(artifact_id)
+                except FileNotFoundError as exc:
+                    raise WorkflowError("artifact_not_found", str(exc), status=404) from exc
+            run.outputs = unique_outputs
+            summary = payload.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                run.module_data["completion_summary"] = summary.strip()
+            return "completed", "run.outputs_revised", "applied"
         if command == "submit_interaction" and status == "waiting_input":
             interaction = run.module_data.get("interaction")
             interaction_id = payload.get("interaction_id")

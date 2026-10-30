@@ -167,3 +167,75 @@ async def test_native_artifact_and_completion_tools_publish_run_outputs(
     assert result["status"] == "completed"
     assert run.status == "completed"
     assert run.outputs == [published["artifact_id"]]
+
+
+async def test_follow_up_on_a_completed_run_revises_deliverables_without_reopening(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "PRJ-revise-tool"
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
+        json.dumps({"schema_version": 1, "id": "PRJ-revise-tool"}), encoding="utf-8"
+    )
+    (project_dir / "report.md").write_text("# Report\n", encoding="utf-8")
+    (project_dir / "report-v2.md").write_text("# Polished report\n", encoding="utf-8")
+    service = WorkflowService(JsonWorkflowRepository(project_dir, "PRJ-revise-tool"))
+    run_id = service.create_run(command_id="c1", module_type="delivery", enqueue=True).run_id or ""
+    service.claim_run(run_id, lease_owner="agent:test")
+    first, _ = service.import_artifact(command_id="c2", source_path="report.md", artifact_type="final_report")
+    service.command_run(run_id, command_id="c3", command_type="complete", payload={"outputs": [first.artifact_id]})
+    service.prepare_for_chat(run_id, text="Polish the report")
+
+    artifact_tool = WorkflowArtifactTool()
+    artifact_tool.set_project_context("PRJ-revise-tool", str(project_dir))
+    artifact_tool.set_workflow_run_context(run_id)
+    published = json.loads(await artifact_tool.execute(
+        source_path="report-v2.md", artifact_type="final_report",
+        label="Final report (polished)", media_type="text/markdown",
+    ))
+    completion_tool = WorkflowCompletionTool()
+    completion_tool.set_project_context("PRJ-revise-tool", str(project_dir))
+    completion_tool.set_workflow_run_context(run_id)
+    result = json.loads(await completion_tool.execute(
+        summary="Polished", output_artifact_ids=[published["artifact_id"]], suggested_handoffs=[],
+    ))
+
+    run = service.repository.load_run(run_id)
+    assert result["deliverables_revised"] is True
+    assert run.status == "completed"
+    assert run.outputs == [published["artifact_id"]]
+    assert run.attempt.number == 1
+    assert [event.event_type for event in service.list_events()][-2:] == [
+        "artifact.imported",
+        "run.outputs_revised",
+    ]
+
+
+async def test_follow_up_can_revise_a_completed_initiation_research_result(tmp_path: Path) -> None:
+    project_dir = tmp_path / "PRJ-revise-research"
+    (project_dir / ".mira").mkdir(parents=True)
+    (project_dir / ".mira" / "project.json").write_text(
+        json.dumps({"schema_version": 1, "id": "PRJ-revise-research"}), encoding="utf-8"
+    )
+    service = WorkflowService(JsonWorkflowRepository(project_dir, "PRJ-revise-research"))
+    run_id = service.create_run(command_id="c1", module_type="initiation", enqueue=True).run_id or ""
+    service.claim_run(run_id, lease_owner="agent:test")
+    tool = InitiationResearchResultTool()
+    tool.set_project_context("PRJ-revise-research", str(project_dir))
+    tool.set_workflow_run_context(run_id)
+
+    def direction(title: str) -> list[dict[str, str]]:
+        return [{"id": "direction-1", "title": title, "rationale": "r", "tradeoffs": "t", "next_step": "n"}]
+
+    await tool.execute(survey="s", references=[], notes=[], gaps=[], directions=direction("Draft title"))
+    service.command_run(run_id, command_id="c2", command_type="complete", payload={"outputs": []})
+    service.prepare_for_chat(run_id, text="Polish direction 1")
+
+    response = json.loads(await tool.execute(
+        survey="s", references=[], notes=[], gaps=[], directions=direction("Polished title"),
+    ))
+
+    run = service.repository.load_run(run_id)
+    assert response["status"] == "recorded"
+    assert run.status == "completed"
+    assert run.module_data["research_result"]["directions"][0]["title"] == "Polished title"
