@@ -2458,8 +2458,11 @@ class UiChannel(BaseChannel):
                                         ensure_ascii=False,
                                     )
                                 )
+                            # NativeModuleRuntime replaces _ui_system_instructions with
+                            # the executor's; these notes ride on their own key.
+                            chat_notes: list[str] = []
                             if "answer_in_chat" in chat_commands:
-                                instruction_parts.append(
+                                chat_notes.append(
                                     "The user answered the pending interaction by typing in the "
                                     "chat instead of using the form; their message is this turn's "
                                     "input. Reply to it directly: answer a question, or take it as "
@@ -2472,7 +2475,9 @@ class UiChannel(BaseChannel):
                                     workflow_run, workflow_service.repository
                                 )
                                 if revision:
-                                    instruction_parts.append(revision)
+                                    chat_notes.append(revision)
+                            if chat_notes:
+                                metadata["_workflow_chat_instructions"] = "\n\n".join(chat_notes)
                         else:
                             instruction_parts = (
                                 [self._ui_instructions] if self._ui_instructions else []

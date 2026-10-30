@@ -52,6 +52,9 @@ class NativeModuleRuntime:
         repository = JsonWorkflowRepository(project_ref.project_dir, project_ref.project_id)
         service = WorkflowService(repository)
         run = repository.load_run(run_id)
+        # A chat message on a completed Run is a follow-up turn: the Run is not
+        # claimed and stays completed, so the guards below must not end it.
+        follow_up = run.status == "completed"
         active_attempt = next(
             (
                 candidate
@@ -92,7 +95,12 @@ class NativeModuleRuntime:
             }
             clean_metadata["run_mode"] = "manual"
             clean_metadata["agent_profile"] = agent_profile
-            clean_metadata["_ui_system_instructions"] = invocation.system_instructions
+            chat_instructions = metadata.get("_workflow_chat_instructions")
+            clean_metadata["_ui_system_instructions"] = (
+                f"{invocation.system_instructions}\n\n{chat_instructions}"
+                if isinstance(chat_instructions, str) and chat_instructions
+                else invocation.system_instructions
+            )
             clean_metadata["_audit_context"] = {
                 "project_id": project_ref.project_id,
                 "run_id": run_id,
@@ -112,6 +120,9 @@ class NativeModuleRuntime:
                 session_key_override=msg.session_key_override,
             )
             visible_tools = set(loop.tools.all_tool_names) - set(invocation.blocked_tools)
+            if follow_up:
+                # Interactions need a running attempt; a follow-up asks in its reply.
+                visible_tools.discard("request_workflow_interaction")
             pre_confirmation_tools = {
                 "read_file",
                 "list_dir",
@@ -162,6 +173,15 @@ class NativeModuleRuntime:
                 return current
 
             async def control_guard(_tool_name: str, _arguments: dict[str, Any]) -> str | None:
+                if follow_up:
+                    current = repository.load_run(run_id)
+                    if current.status == "completed":
+                        return None
+                    return (
+                        '{"workflow_control":"turn_closed","status":"'
+                        + current.status
+                        + '","instruction":"Stop. This Run changed state; end the turn."}'
+                    )
                 current = request_manual_boundary(repository.load_run(run_id))
                 if (
                     current.status != "running"
@@ -218,6 +238,11 @@ class NativeModuleRuntime:
                 return None
 
             async def turn_stop_guard() -> str | None:
+                if follow_up:
+                    current = repository.load_run(run_id)
+                    if current.status == "completed":
+                        return None
+                    return f"This module turn has ended (status: {current.status})."
                 current = request_manual_boundary(repository.load_run(run_id))
                 if current.status == "waiting_input":
                     interaction = current.module_data.get("interaction") or {}

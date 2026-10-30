@@ -2969,7 +2969,7 @@ async def test_ws_message_to_completed_run_gets_a_follow_up_turn_and_stays_compl
     assert [frame for frame in ws.sent if frame.get("type") == "error"] == []
     assert captured["content"] == "Polish direction 2"
     assert captured["metadata"]["workflow_run_id"] == run_id
-    instructions = captured["metadata"]["_ui_system_instructions"]
+    instructions = captured["metadata"]["_workflow_chat_instructions"]
     assert "stays completed" in instructions
     assert "Direction 2" in instructions
     assert service.repository.load_run(run_id).status == "completed"
@@ -3002,7 +3002,7 @@ async def test_ws_message_during_approval_gate_is_answered_not_dropped(
     await ui_channel._ws_handler(MagicMock(spec=web.Request))
 
     assert captured["content"] == "Why only PubMed?"
-    assert "It is never an approval" in captured["metadata"]["_ui_system_instructions"]
+    assert "It is never an approval" in captured["metadata"]["_workflow_chat_instructions"]
     run = service.repository.load_run(run_id)
     assert run.status == "running"
     assert run.module_data["interaction"]["response"]["selection"] == "revise"
