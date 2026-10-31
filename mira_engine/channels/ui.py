@@ -3747,7 +3747,7 @@ class UiChannel(BaseChannel):
         if body is None:
             return web.json_response({"error": "invalid JSON object"}, status=400)
         try:
-            folder = self.organization_store.create_folder(body.get("name"))
+            folder = self.organization_store.create_folder(body.get("name"), body.get("kind"))
         except FileExistsError as exc:
             return web.json_response({"error": str(exc)}, status=409)
         except (OSError, ValueError) as exc:

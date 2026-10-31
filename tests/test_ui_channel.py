@@ -1682,10 +1682,11 @@ async def test_handle_validate_data_path_allows_outside_when_unrestricted(ui_cha
 @pytest.mark.asyncio
 async def test_organization_folder_and_chat_handlers(ui_channel: UiChannel) -> None:
     create_folder_request = MagicMock(spec=web.Request)
-    create_folder_request.json = AsyncMock(return_value={"name": "Lung cancer"})
+    create_folder_request.json = AsyncMock(return_value={"name": "Lung cancer", "kind": "chat"})
     folder_response = await ui_channel._handle_create_folder(create_folder_request)
     assert folder_response.status == 201
     folder = json.loads(folder_response.text)
+    assert folder["kind"] == "chat"
 
     import_request = MagicMock(spec=web.Request)
     import_request.json = AsyncMock(return_value={
