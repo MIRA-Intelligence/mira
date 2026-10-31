@@ -225,3 +225,64 @@ def test_tool_schema_has_no_dangling_refs():
         "id": "Exp001", "title": "Baseline", "status": "completed",
         "replan": {"action": "finish", "rationale": "Done"},
     }})
+
+
+def _ask_boundary(service, run_id, command_id="ask-boundary"):
+    """What the module runtime does when a manual experiment ends."""
+    boundary = service.repository.load_run(run_id).module_data["_manual_experiment_boundary"]
+    service.request_interaction(run_id, command_id=command_id, interaction={
+        "interaction_id": boundary["interaction_id"],
+        "interaction_type": "confirm_experiment_continuation",
+        "title": "Exp001 finished: confirm the next step",
+        "prompt": "Continue or finish?",
+        "response_schema": {"type": "object", "required": ["selection"]},
+        "choices": [
+            {"value": "continue", "label": "按建议继续 / Continue as proposed"},
+            {"value": "finish", "label": "结束并汇总 / Finish and summarize"},
+        ],
+        "allow_freeform": True,
+    })
+    return boundary["interaction_id"]
+
+
+def _finished_manual_experiment(tmp_path):
+    service, run_id = make_service(tmp_path, experiment_execution_mode="manual")
+    record(service, run_id)
+    record(service, run_id, command_id="finish", status="completed", replan=CONTINUE)
+    return service, run_id
+
+
+@pytest.mark.parametrize("reply", ["结束并汇总。", "finish and summarize", "Finish"])
+def test_a_chat_reply_naming_a_choice_decides_the_manual_boundary(tmp_path, reply):
+    service, run_id = _finished_manual_experiment(tmp_path)
+    _ask_boundary(service, run_id)
+
+    assert service.prepare_for_chat(run_id, text=reply) == ["answer_in_chat"]
+
+    response = service.repository.load_run(run_id).module_data["interaction"]["response"]
+    assert response == {"chat_reply": reply, "source": "chat", "selection": "finish"}
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.command_run(run_id, command_id="complete", command_type="complete")
+    assert service.repository.load_run(run_id).status == "completed"
+
+
+def test_a_free_text_reply_asks_the_manual_boundary_again(tmp_path):
+    service, run_id = _finished_manual_experiment(tmp_path)
+    first = _ask_boundary(service, run_id)
+
+    service.prepare_for_chat(run_id, text="Looks good, what did the plot show?")
+    service.claim_run(run_id, lease_owner="ui:test")
+
+    run = service.repository.load_run(run_id)
+    assert "selection" not in run.module_data["interaction"]["response"]
+    with pytest.raises(WorkflowError, match="continuation form"):
+        service.command_run(run_id, command_id="complete", command_type="complete")
+    # Before this fix the boundary kept the answered id and the Run could never complete.
+    second = _ask_boundary(service, run_id, command_id="ask-again")
+    assert second != first
+    service.command_run(run_id, command_id="answer", command_type="submit_interaction", payload={
+        "interaction_id": second, "response": {"selection": "finish"},
+    })
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.command_run(run_id, command_id="complete", command_type="complete")
+    assert service.repository.load_run(run_id).status == "completed"
