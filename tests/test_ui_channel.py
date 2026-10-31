@@ -3805,6 +3805,8 @@ async def test_auto_decided_form_starts_the_next_turn_without_a_desktop(
         captured.update(kwargs)
 
     monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    desktop = _FakeWs([])
+    ui_channel._clients[session_id] = desktop
     assert await ui_channel._auto_decider.fire(session_id, run_id, "i1") is True
     ui_channel._auto_decider.close()
 
@@ -3816,3 +3818,12 @@ async def test_auto_decided_form_starts_the_next_turn_without_a_desktop(
     assert captured["metadata"]["workflow_run_id"] == run_id
     assert '"selection": "small"' in captured["metadata"]["_ui_system_instructions"]
     assert "Small pilot" in captured["content"]
+    # An open desktop sees the notice live, the same entry its history replays.
+    [notice] = [m for m in desktop.sent if m.get("type") == "response"]
+    assert notice["metadata"]["workflow_run_id"] == run_id
+    assert notice["metadata"]["_user"] is True
+    assert notice["metadata"]["_auto_decided"] == {
+        "label": "Small pilot", "title": "Which cohort?", "selection": "small", "seconds": 10,
+    }
+    history = SessionManager(ui_channel.projects_root / session_id).get_ui_history(captured["session_key"])
+    assert history[-1]["metadata"]["_auto_decided"] == notice["metadata"]["_auto_decided"]

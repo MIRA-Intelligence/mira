@@ -1612,13 +1612,34 @@ class UiChannel(BaseChannel):
             f"No answer within {AUTO_DECIDE_SECONDS}s, so the recommended option "
             f"\"{decision['label']}\" was selected for \"{decision['title']}\". Continue execution."
         )
+        # The desktop renders the localized notice from ``_auto_decided``; content is for the model.
+        notice_meta = {
+            "_user": True,
+            "_auto_decided": {
+                "label": decision["label"],
+                "title": decision["title"],
+                "selection": decision["selection"],
+                "seconds": AUTO_DECIDE_SECONDS,
+            },
+        }
         SessionManager(project_dir).append_ui_event(
             key=session_key,
             role="user",
             content=content,
             msg_type="response",
-            metadata={"_user": True, "_auto_decided": True},
+            metadata=notice_meta,
         )
+        ws = self._clients.get(project_id)
+        if ws is not None and not ws.closed:
+            try:
+                await ws.send_json({
+                    "type": "response",
+                    "session_id": project_id,
+                    "content": content,
+                    "metadata": {**notice_meta, "project_id": project_id, "workflow_run_id": run_id},
+                })
+            except Exception as exc:  # noqa: BLE001 - the notice is in the history either way
+                logger.debug("Auto-decide notice delivery deferred to history: {}", exc)
         metadata: dict[str, Any] = {
             "source": "ui",
             "loop_mode": "project",
