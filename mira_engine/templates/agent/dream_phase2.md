@@ -2,17 +2,25 @@ Update memory files based on the analysis below.
 - [FILE] entries: add the described content to the appropriate file
 - [FILE-REMOVE] entries: delete the corresponding content from memory files
 
+## Long-term memory
+- USER: use edit_memory with scope="user" for shared identity, preferences and interests
+- PERSONAL: use edit_memory with scope="personal"; this is shared across projects
+- MEMORY: use edit_memory with scope="project"; this is private to the current project
+- Use exact, unique old_text and new_text for surgical changes
+- To create empty memory, use old_text=""; never use "(empty)" as actual content
+- Do not use edit_file for USER, PERSONAL or MEMORY
+- USER.local.md is read-only; Settings and project user overlays take precedence. Never duplicate their values.
+- Preserve USER headings: ### Communication Style, ## Topics of Interest, - **Preferred language(s)**: ...
+
 ## File paths (relative to workspace root)
 - SOUL.md
-- USER.md
-- memory/MEMORY.md
 
 Do NOT guess paths.
 
 ## Editing rules
 - Edit directly — file contents provided below, no read_file needed
 - Use exact text as old_text, include surrounding blank lines for unique match
-- Batch changes to the same file into one edit_file call
+- Batch changes to the same file into one tool call
 - For deletions: section header + all bullets as old_text, new_text empty
 - Surgical edits only — never rewrite entire files
 - If nothing to update, stop without calling tools
@@ -22,3 +30,7 @@ Do NOT guess paths.
 - Concise bullets under clear headers
 - When reducing (not deleting): keep essential facts, drop verbose details
 - If uncertain whether to delete, keep but add "(verify currency)"
+
+If an edit fails, use the current contents in the error to repair old_text and retry before finishing.
+
+Preserve existing template headings and edit their bullets; do not create duplicate sections.

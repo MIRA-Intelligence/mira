@@ -1,8 +1,9 @@
 """Tests for the restructured MemoryStore — pure file I/O layer."""
 
-from datetime import datetime
 import json
-from pathlib import Path
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import pytest
 
@@ -79,13 +80,14 @@ class TestHistoryWithCursor:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 2
 
-    def test_compact_history_drops_oldest(self, tmp_path):
+    def test_compact_history_drops_oldest_processed_entries(self, tmp_path):
         store = MemoryStore(tmp_path, max_history_entries=2)
         store.append_history("event 1")
         store.append_history("event 2")
         store.append_history("event 3")
         store.append_history("event 4")
         store.append_history("event 5")
+        store.set_last_dream_cursor(5)
         store.compact_history()
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 2
@@ -265,3 +267,79 @@ class TestLegacyHistoryMigration:
         assert entries[0]["timestamp"] == "2026-04-01 10:00"
         assert "Broken" in entries[0]["content"]
         assert "migration." in entries[0]["content"]
+
+
+@pytest.mark.parametrize("processed,first_kept", [(0, 1), (1, 2), (4, 5), (5, 5), (7, 5)])
+def test_compaction_keeps_all_pending_history(tmp_path, processed, first_kept):
+    store = MemoryStore(tmp_path, max_history_entries=3)
+    for cursor in range(1, 8):
+        store.append_history(f"Fact {cursor}")
+    store.set_last_dream_cursor(processed)
+    store.compact_history()
+    assert [e["cursor"] for e in store.read_unprocessed_history(0)] == list(range(first_kept, 8))
+    assert [e["cursor"] for e in store.read_unprocessed_history(processed)] == list(range(processed + 1, 8))
+    assert store.get_last_dream_cursor() == processed
+    assert store.append_history("Next fact") == 8
+
+
+def test_compaction_and_append_do_not_lose_concurrent_history(tmp_path, monkeypatch):
+    store = MemoryStore(tmp_path, max_history_entries=2)
+    for cursor in range(1, 6):
+        store.append_history(f"Fact {cursor}")
+    store.set_last_dream_cursor(5)
+    snapshot, resume, append_started, append_finished = (threading.Event() for _ in range(4))
+    read_history = store.read_unprocessed_history
+
+    def paused_snapshot(since_cursor):
+        entries = read_history(since_cursor)
+        snapshot.set()
+        assert resume.wait(3)
+        return entries
+
+    def append():
+        append_started.set()
+        cursor = store.append_history("Concurrent fact")
+        append_finished.set()
+        return cursor
+
+    monkeypatch.setattr(store, "read_unprocessed_history", paused_snapshot)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        compaction = pool.submit(store.compact_history)
+        assert snapshot.wait(3)
+        addition = pool.submit(append)
+        assert append_started.wait(3)
+        try:
+            assert not append_finished.wait(0.1)
+        finally:
+            resume.set()
+        compaction.result(timeout=3)
+        assert addition.result(timeout=3) == 6
+    assert [e["cursor"] for e in read_history(0)] == [4, 5, 6]
+
+
+def test_failed_compaction_write_keeps_original_history(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    store = MemoryStore(tmp_path, max_history_entries=2)
+    for cursor in range(1, 6):
+        store.append_history(f"Fact {cursor}")
+    store.set_last_dream_cursor(5)
+    store.history_jsonl_file.chmod(0o600)
+    before = store.history_jsonl_file.read_bytes()
+    write = Path.write_text
+
+    def interrupted_write(path, content, *args, **kwargs):
+        if path.name.startswith(".history.jsonl.") and path.name.endswith(".tmp"):
+            write(path, "partial", encoding="utf-8")
+            raise OSError("Simulated disk write failure")
+        return write(path, content, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", interrupted_write)
+    with pytest.raises(OSError, match="disk write failure"):
+        store.compact_history()
+    assert store.history_jsonl_file.read_bytes() == before
+    assert not list(store.history_jsonl_file.parent.glob(".history.jsonl.*.tmp"))
+    monkeypatch.setattr(Path, "write_text", write)
+    store.compact_history()
+    assert store.history_jsonl_file.stat().st_mode & 0o777 == 0o600
+    assert [e["cursor"] for e in store.read_unprocessed_history(0)] == [4, 5]

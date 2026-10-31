@@ -21,6 +21,76 @@ It separates memory into layers, because different kinds of remembering deserve 
 
 This keeps the system light in the moment, but reflective over time.
 
+## Personal memory across projects
+
+Shared knowledge lives in `$MIRA_HOME/workspace/memory/MEMORY.md` (by default,
+`~/.mira/workspace/memory/MEMORY.md`). Each project loads this alongside its own
+`.mira/memory/MEMORY.md`. Stable user identity, preferences and interests stay in
+`$MIRA_HOME/workspace/USER.md`, which is also shared across projects. Project
+`USER.md` overlays and `USER.local.md` Settings take precedence. Dream reads those
+overrides without editing them or duplicating their configured values.
+
+Dream classifies reusable workflows and cross-project knowledge as `PERSONAL`,
+stable identity/preferences as `USER`, and project architecture, paths and decisions
+as `MEMORY`. Its `edit_memory` tool supports `personal`, `user` and `project` scopes,
+with exact replacements, file locks and concurrency checks. Project edits also
+update the legacy file and backup. Errors include current contents so the model can
+repair a bad or stale edit within the same run.
+
+USER.md retains the communication-style, interests and preferred-language format
+used by community persona drafts. Sharing still requires PrivacyGuard filtering
+and user approval; shared knowledge is not automatically published as a persona.
+
+Dream tracks only failed writes to PERSONAL, project memory, shared USER.md or
+SOUL.md, keyed by canonical target file. Reads, read-only files
+and path-policy refusals do not block a completed run. The first shared USER.md
+edit uses the bundled template if no file exists, preserving its profile sections.
+
+Only one Dream can run per workspace at a time; overlapping calls report busy
+without making model calls or consuming retry attempts. Invalid-scope memory writes
+remain unresolved until repaired.
+
+Each invocation performs at most one analysis phase and one editing phase (up to
+`maxIterations` model turns, excluding the provider's own transport retries). On an
+iteration-budget failure, empty final reply, or unresolved write, the next invocation retries a smaller
+batch using fresh memory snapshots. Retry state is persisted in
+`.mira/memory/.dream_retry.json`, including across process restarts. There are at
+most three failed attempts at the same cursor position; the final attempt always
+isolates one entry. A successful batch acknowledges only its completed prefix.
+
+If the isolated entry still fails, Dream saves its full content, original cursor,
+timestamp, attempt count and failure reason to `.mira/memory/dream_skipped.jsonl`,
+then advances past **only that entry**. It logs a warning and reports the skip as an
+error, so it is visible in cron logs and `/dream` responses. Subsequent invocations
+can process the remaining history. After correcting the cause, re-archive the saved
+`entry.content` as a new history entry to retry it; do not reset the cursor and
+reprocess unrelated history. The saved record survives ordinary history compaction.
+Earlier successful memory edits remain saved and appear in fresh retry snapshots.
+History compaction retains the latest configured number of entries plus all pending
+entries, even if that temporarily exceeds the limit. Compaction and appends share
+a lock so concurrent archiving cannot be overwritten.
+
+Provider/credential/transport failures retain history and do not consume the
+bad-entry allowance: an API outage never causes entries to be skipped. Only idle
+runs return `False`; failures and skips raise `DreamRunError` for accurate logging.
+
+In the UI, `/dream` processes the current project's archived history and keeps its
+completion response attached to that project. Archive the conversation first
+(for example with `/new`), then run `/dream`. When the community scheduler is used,
+automatic Dream currently covers **only the default workspace**. Project histories
+need `/dream` inside each project before their learned preferences reach shared
+USER.md or PERSONAL. Automatic scheduling across registered projects is a follow-up,
+not part of this PR.
+
+For example, “I prefer Chinese replies” belongs in USER.md; a reusable debugging
+workflow belongs in PERSONAL; “this project uses PostgreSQL” stays in project memory.
+Existing global knowledge remains available without automatically migrating facts
+between files. Credentials and secrets should never be stored in shared memory.
+
+You can inspect or edit the shared Markdown files directly to correct or remove a
+fact. `/dream-log` and `/dream-restore` cover project snapshots; they do not version
+or restore shared knowledge or shared USER.md from another project.
+
 ## The Flow
 
 Memory moves through mira in two stages.
