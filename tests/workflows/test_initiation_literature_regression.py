@@ -244,7 +244,7 @@ async def test_progress_only_reply_continues_into_real_pubmed_research(
                             "interaction_type": "choose_direction",
                             "title": "选择下一步研究方向",
                             "prompt": "请选择希望继续探索的方向。",
-                            "choices": [{"id": "direction-1", "label": "跨病因外部验证"}],
+                            "choices": [{"id": "direction-1", "label": "跨病因外部验证", "recommended": True}],
                             "allow_freeform": True,
                         },
                     )

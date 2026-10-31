@@ -3783,3 +3783,36 @@ async def test_delete_chat_files_failure_keeps_the_chat(ui_channel: UiChannel, m
 
     assert resp.status == 500
     assert "chat-1" in [chat["id"] for chat in ui_channel.organization_store.snapshot()["chats"]]
+
+
+async def test_auto_decided_form_starts_the_next_turn_without_a_desktop(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4210"
+    (ui_channel.projects_root / session_id).mkdir(parents=True, exist_ok=True)
+    service = ui_channel._workflow_api._service(session_id)
+    run_id = service.create_run(command_id="c1", module_type="experiment", enqueue=True).run_id or ""
+    service.claim_run(run_id, lease_owner="agent:test")
+    service.request_interaction(run_id, command_id="c2", interaction={
+        "interaction_id": "i1", "interaction_type": "clarify_requirements", "title": "Which cohort?",
+        "prompt": "Pick one", "response_schema": {"type": "object"},
+        "choices": [{"id": "small", "label": "Small pilot", "value": "small", "recommended": True}],
+        "auto_decide": {"selection": "small", "label": "Small pilot", "seconds": 0},
+    })
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    assert await ui_channel._auto_decider.fire(session_id, run_id, "i1") is True
+    ui_channel._auto_decider.close()
+
+    run = service.repository.load_run(run_id)
+    assert run.status == "running"  # claimed by the same owner a desktop message would use
+    assert run.attempt.lease_owner == f"ui:{ui_channel._workflow_executor_id}:ui_user"
+    assert run.module_data["interaction"]["resolved_by"] == "auto"
+    assert captured["session_key"] == f"ui:{session_id}:run:{run_id}"
+    assert captured["metadata"]["workflow_run_id"] == run_id
+    assert '"selection": "small"' in captured["metadata"]["_ui_system_instructions"]
+    assert "Small pilot" in captured["content"]

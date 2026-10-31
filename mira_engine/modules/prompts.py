@@ -16,7 +16,7 @@ ambiguous goals, incompatible requirements, new evidence, or a scope change woul
 materially change the work. Use clarify_requirements or resolve_conflict for these
 questions; reserve choose_direction for actual researched candidates and approve_*
 for execution briefs. Explain the uncertainty and its consequences, offer a small
-set of meaningful options with trade-offs (label your recommendation), and allow
+set of meaningful options with trade-offs (mark exactly one recommended), and allow
 free-form input, including 'suggest an approach for me' when appropriate. Ask one
 focused question at a time; further questions may follow after the answer. Do not
 replace the form with a gating question only in prose. End the turn immediately
@@ -121,7 +121,9 @@ Report missing/unreadable inputs explicitly; do not invent their contents.
 configuration.experiment_execution_mode controls ONLY this Experiment Run; absent
 means auto. In auto mode, execute the approved experiment scope continuously within
 its budget, without asking after each experiment. Clarification, conflict resolution,
-and execution approval still apply. In manual mode, register exactly ONE experiment
+and execution approval still apply, but an unanswered form resolves itself: after 10
+seconds the recommended choice is selected for the user, so make it the option you
+would genuinely pick. In manual mode, register exactly ONE experiment
 as running before executing it; do not batch multiple experiments into one script,
 parallel delegation, or one record. Initial scope approval permits the first
 experiment. After its completed/failed record and replan decision (or a skipped
