@@ -12,6 +12,7 @@ import httpx
 
 from mira_engine.agent.tools.base import Tool
 from mira_engine.workflows import JsonWorkflowRepository, WorkflowService
+from mira_engine.workflows.auto_decide import AUTO_DECIDE_SECONDS, auto_decides, recommended_choice
 from mira_engine.workflows.models import new_id
 
 
@@ -281,9 +282,12 @@ class WorkflowInteractionTool(Tool):
             "Use clarify_requirements for missing objectives or deliverables, resolve_conflict "
             "for incompatible user requirements, approve_* for execution approval, and "
             "choose_direction only for researched candidate directions. Explain why the answer "
-            "matters, offer concise choices with trade-offs and a recommended option, and allow "
-            "free-form input. Reuse saved answers unless new evidence changes the decision. After "
-            "calling it, briefly say that the Run is waiting and end the turn."
+            "matters, offer concise choices with trade-offs, mark exactly one choice recommended "
+            "(approve_* gates recommend approve), and allow free-form input. An experiment Run in "
+            "auto mode selects the recommended choice itself if the user does not answer within "
+            f"{AUTO_DECIDE_SECONDS} seconds, so it must offer choices. Reuse saved answers unless new "
+            "evidence changes the decision. After calling it, briefly say that the Run is waiting "
+            "and end the turn."
         )
 
     @property
@@ -306,6 +310,10 @@ class WorkflowInteractionTool(Tool):
                             "label": {"type": "string"},
                             "description": {"type": "string"},
                             "value": {"type": "string"},
+                            "recommended": {
+                                "type": "boolean",
+                                "description": "True on exactly one choice: the option you would pick for the user.",
+                            },
                         },
                         "required": ["id", "label"],
                     },
@@ -367,11 +375,35 @@ class WorkflowInteractionTool(Tool):
                         else {}
                     ),
                     "value": str(choice.get("value") or choice["id"]),
+                    **({"recommended": True} if choice.get("recommended") is True else {}),
                 }
             )
+        approval = interaction_type.startswith("approve_")
+        if sum(1 for choice in normalized_choices if choice.get("recommended")) > 1:
+            return "Error: mark at most one choice recommended"
+        if approval:
+            for choice in normalized_choices:
+                choice.pop("recommended", None)
+                if choice["value"] == "approve":
+                    choice["recommended"] = True
+        elif normalized_choices and not any(choice.get("recommended") for choice in normalized_choices):
+            return "Error: mark exactly one choice recommended: true (the option you would pick for the user)"
+        auto_decide: dict[str, Any] | None = None
+        if auto_decides(run):
+            recommended = recommended_choice(interaction_type, normalized_choices)
+            if recommended is None:
+                return (
+                    "Error: this experiment Run is in auto mode and answers for the user after "
+                    f"{AUTO_DECIDE_SECONDS} seconds; offer choices and mark one recommended"
+                )
+            auto_decide = {
+                "selection": recommended["value"],
+                "label": recommended["label"],
+                "seconds": AUTO_DECIDE_SECONDS,
+            }
         interaction_id = new_id()
         selection_schema: dict[str, Any] = {"type": "string", "minLength": 1, "maxLength": 4000}
-        if interaction_type.startswith("approve_"):
+        if approval:
             selection_schema["enum"] = ["approve", "revise"]
         elif not allow_freeform:
             if not normalized_choices:
@@ -398,6 +430,7 @@ class WorkflowInteractionTool(Tool):
                 },
                 "choices": normalized_choices,
                 "allow_freeform": allow_freeform,
+                **({"auto_decide": auto_decide} if auto_decide else {}),
             },
         )
         return json.dumps(

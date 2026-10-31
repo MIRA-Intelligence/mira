@@ -99,6 +99,7 @@ from mira_engine.task_plan.guardrails import (
     guard_task_plan_file,
     reconcile_task_plan_data,
 )
+from mira_engine.workflows.auto_decide import AUTO_DECIDE_SECONDS, AutoDecider
 from mira_engine.workflows.http import WorkflowHttpApi
 from mira_engine.workflows.input_paths import resolve_input_path
 
@@ -497,6 +498,26 @@ def _normalize_workflow_selection(value: Any) -> dict[str, Any] | None:
             item for item in artifact_ids if isinstance(item, str) and item.strip()
         ][:20]
     return selection or None
+
+
+def _workflow_run_instructions(run: Any, run_id: str) -> str:
+    """Module instructions, plus the latest answer when the Run resumes from a form."""
+    parts = [module_system_instructions(run.module_type, run_id)]
+    interaction = run.module_data.get("interaction")
+    if isinstance(interaction, dict) and interaction.get("response") is not None:
+        parts.append(
+            "The latest structured interaction has been resolved. "
+            "Continue from this authoritative response:\n"
+            + json.dumps(
+                {
+                    "interaction_id": interaction.get("interaction_id"),
+                    "interaction_type": interaction.get("interaction_type"),
+                    "response": interaction.get("response"),
+                },
+                ensure_ascii=False,
+            )
+        )
+    return "\n\n".join(parts)
 
 
 def _chat_revision_instructions(run: Any, repository: Any) -> str | None:
@@ -1152,6 +1173,13 @@ class UiChannel(BaseChannel):
             audit=lambda action, details: self._audit(source="ui", action=action, details=details),
         )
         self._workflow_executor_id = uuid4().hex
+        # Auto-mode experiment forms answer themselves with the recommended choice.
+        self._auto_decider = AutoDecider(
+            self._workflow_api._service,
+            self._start_auto_decided_turn,
+            is_busy=self._run_turn_active,
+        )
+        self._workflow_api.add_event_observer(self._auto_decider.observe)
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
         self._migrate_global_to_project()
@@ -1515,6 +1543,7 @@ class UiChannel(BaseChannel):
         )
         await self._site.start()
         self._running = True
+        self._auto_decider.rearm(ref.project_id for ref in self.project_registry.list_projects())
         logger.info(
             "UI channel listening on {}:{} (WebSocket + HTTP)",
             self.bind_host,
@@ -1540,6 +1569,7 @@ class UiChannel(BaseChannel):
         self._clients.clear()
         self._client_project_dirs.clear()
         await self._close_sockets(sockets, code=WSCloseCode.GOING_AWAY, message=b"engine shutting down")
+        self._auto_decider.close()
         await self._workflow_api.close()
         await self._knowledge.close()
 
@@ -1548,6 +1578,99 @@ class UiChannel(BaseChannel):
             self._runner = None
         self._app = None
         logger.info("UI channel stopped")
+
+    def _run_turn_active(self, project_id: str, run_id: str) -> bool:
+        return any(
+            turn.get("workflow_run_id") == run_id
+            for turn in self._active_turns.get(project_id, {}).values()
+        )
+
+    async def _start_auto_decided_turn(
+        self, project_id: str, run_id: str, decision: dict[str, Any]
+    ) -> None:
+        """Continue a Run whose form the engine answered with the recommended choice.
+
+        Same path as a desktop message, so the turn streams to an open window and
+        lands in the Run's history when none is open.
+        """
+        project_dir = self._resolve_project_dir(project_id)
+        if project_dir is None:
+            return
+        meta = self._ensure_project_meta(project_dir)
+        agent_profile = _normalize_agent_profile(meta.get("agent_profile"))
+        service = self._workflow_api._service(project_id)
+        receipt = service.claim_run(
+            run_id,
+            lease_owner=f"ui:{self._workflow_executor_id}:ui_user",
+            agent_profile=agent_profile,
+        )
+        if receipt and receipt.event and receipt.event.event_type == "run.recovery_required":
+            return
+        run = service.repository.load_run(run_id)
+        session_key = f"ui:{project_id}:run:{run_id}"
+        content = (
+            f"No answer within {AUTO_DECIDE_SECONDS}s, so the recommended option "
+            f"\"{decision['label']}\" was selected for \"{decision['title']}\". Continue execution."
+        )
+        # The desktop renders the localized notice from ``_auto_decided``; content is for the model.
+        notice_meta = {
+            "_user": True,
+            "_auto_decided": {
+                "label": decision["label"],
+                "title": decision["title"],
+                "selection": decision["selection"],
+                "seconds": AUTO_DECIDE_SECONDS,
+            },
+        }
+        SessionManager(project_dir).append_ui_event(
+            key=session_key,
+            role="user",
+            content=content,
+            msg_type="response",
+            metadata=notice_meta,
+        )
+        ws = self._clients.get(project_id)
+        if ws is not None and not ws.closed:
+            try:
+                await ws.send_json({
+                    "type": "response",
+                    "session_id": project_id,
+                    "content": content,
+                    "metadata": {**notice_meta, "project_id": project_id, "workflow_run_id": run_id},
+                })
+            except Exception as exc:  # noqa: BLE001 - the notice is in the history either way
+                logger.debug("Auto-decide notice delivery deferred to history: {}", exc)
+        metadata: dict[str, Any] = {
+            "source": "ui",
+            "loop_mode": "project",
+            "run_mode": "manual",
+            "agent_profile": agent_profile,
+            "contract_version": _normalize_contract_version(meta.get("contract_version")),
+            "_allow_result_write": False,
+            "turn_id": uuid4().hex,
+            "selected_skill_ids": [],
+            "_wants_stream": True,
+            "project_id": project_id,
+            "project_dir": str(project_dir),
+            "workflow_run_id": run_id,
+            "workflow_module_type": run.module_type,
+            "_ui_system_instructions": _workflow_run_instructions(run, run_id),
+            "_workflow_chat_instructions": (
+                "Auto mode: the user did not answer the form in time, so the recommended "
+                "choice was selected on their behalf. Treat it as their answer and continue."
+            ),
+        }
+        policy = _normalize_automation_policy(meta.get("automation_policy"))
+        if policy:
+            metadata["automation_policy"] = policy
+        await self._handle_message(
+            sender_id="ui_user",
+            chat_id=project_id,
+            content=content,
+            media=[],
+            metadata=metadata,
+            session_key=session_key,
+        )
 
     async def _close_active_clients(self) -> None:
         clients = set(self._clients.values())
@@ -2437,27 +2560,8 @@ class UiChannel(BaseChannel):
                     if loop_mode == "project":
                         if workflow_run is not None:
                             instruction_parts = [
-                                module_system_instructions(
-                                    workflow_run.module_type, workflow_run_id
-                                )
+                                _workflow_run_instructions(workflow_run, workflow_run_id)
                             ]
-                            interaction = workflow_run.module_data.get("interaction")
-                            if (
-                                isinstance(interaction, dict)
-                                and interaction.get("response") is not None
-                            ):
-                                instruction_parts.append(
-                                    "The latest structured interaction has been resolved. "
-                                    "Continue from this authoritative response:\n"
-                                    + json.dumps(
-                                        {
-                                            "interaction_id": interaction.get("interaction_id"),
-                                            "interaction_type": interaction.get("interaction_type"),
-                                            "response": interaction.get("response"),
-                                        },
-                                        ensure_ascii=False,
-                                    )
-                                )
                             # NativeModuleRuntime replaces _ui_system_instructions with
                             # the executor's; these notes ride on their own key.
                             chat_notes: list[str] = []

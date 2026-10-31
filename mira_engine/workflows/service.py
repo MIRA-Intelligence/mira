@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from mira_engine.task_plan.guardrails import validate_experiment_contract
 
+from .auto_decide import stamp_deadline
 from .confirmations import confirmation_approved, confirmation_required
 from .experiments import (
     ExperimentRecord,
@@ -794,6 +795,7 @@ class WorkflowService:
             self._close_attempt(run, target_status, now)
             if payload and isinstance(payload.get("interaction"), dict):
                 run.module_data["interaction"] = payload["interaction"]
+                stamp_deadline(run.module_data["interaction"])
             run.last_transition = Transition(
                 event_id=event_id,
                 event_type=event_type,
@@ -1040,6 +1042,7 @@ class WorkflowService:
             run.module_data.pop("recovery", None)
             interaction = run.module_data.get("interaction")
             if isinstance(interaction, dict) and interaction.get("response") is None:
+                stamp_deadline(interaction)  # a restored form gets a fresh countdown
                 return "waiting_input", "run.waiting_input", "applied"
             return "queued", "run.queued", "accepted"
         if command == "cancel" and status not in {"completed", "cancelled"}:
@@ -1052,6 +1055,7 @@ class WorkflowService:
             run.module_data.pop("failure", None)
             interaction = run.module_data.get("interaction")
             if isinstance(interaction, dict) and interaction.get("response") is None:
+                stamp_deadline(interaction)  # a restored form gets a fresh countdown
                 return "waiting_input", "run.waiting_input", "applied"
             return "queued", "run.queued", "accepted"
         if command == "fail" and status in {"queued", "running", "waiting_input"}:
@@ -1211,8 +1215,18 @@ class WorkflowService:
                     raise WorkflowError(
                         "interaction_response_invalid", "revision requires explanatory notes", status=422
                     )
+            if payload.get("auto_decided") is True:
+                interaction["resolved_by"] = "auto"
             self._resolve_interaction(run, interaction, response)
             return "queued", "interaction.resolved", "accepted"
+        if command == "cancel_auto_decision" and status == "waiting_input":
+            interaction = run.module_data.get("interaction")
+            if not isinstance(interaction, dict) or interaction.get("interaction_id") != payload.get("interaction_id"):
+                raise WorkflowError("interaction_not_found", "active interaction does not match", status=409)
+            auto = interaction.get("auto_decide")
+            if isinstance(auto, dict) and not auto.get("cancelled_at"):
+                auto["cancelled_at"] = utc_now()
+            return "waiting_input", "interaction.auto_decide_cancelled", "applied"
         raise WorkflowError(
             "invalid_transition",
             f"cannot apply {command!r} while Run is {status!r}",
