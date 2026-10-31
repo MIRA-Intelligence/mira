@@ -516,3 +516,185 @@ def test_auto_handoff_creates_a_queued_downstream_run_atomically(
         "run.completed",
         "run.auto_handoff_created",
     ]
+
+
+def _approval_gate(service: WorkflowService) -> str:
+    created = service.create_run(
+        command_id="cmd-create-gated",
+        module_type="initiation",
+        module_data={"confirmation_policy": {"mode": "required"}},
+        enqueue=True,
+    )
+    run_id = created.run_id or ""
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.request_interaction(
+        run_id,
+        command_id="signal-approval",
+        interaction={
+            "interaction_id": "interaction-approval",
+            "interaction_type": "approve_research_scope",
+            "title": "Approve the research brief",
+            "prompt": "Brief: review lung cancer staging literature.",
+            "response_schema": {"type": "object", "required": ["selection"]},
+            "choices": [{"value": "approve"}, {"value": "revise"}],
+            "allow_freeform": True,
+        },
+    )
+    return run_id
+
+
+def test_chat_message_answers_an_approval_gate_as_a_revision(
+    service: WorkflowService,
+) -> None:
+    run_id = _approval_gate(service)
+
+    applied = service.prepare_for_chat(run_id, text="Also cover small-cell carcinoma")
+
+    run = service.repository.load_run(run_id)
+    assert applied == ["answer_in_chat"]
+    assert run.status == "queued"
+    assert run.module_data["interaction"]["response"] == {
+        "selection": "revise",
+        "notes": "Also cover small-cell carcinoma",
+        "source": "chat",
+    }
+    service.claim_run(run_id, lease_owner="ui:test")
+    with pytest.raises(WorkflowError) as exc_info:
+        service.command_run(
+            run_id,
+            command_id="cmd-complete-unapproved",
+            command_type="complete",
+            payload={"outputs": []},
+        )
+    # Typing in the chat must never count as approving the brief.
+    assert exc_info.value.code == "confirmation_required"
+
+
+def test_chat_message_answers_a_choice_interaction(service: WorkflowService) -> None:
+    created = service.create_run(command_id="cmd-create", module_type="initiation", enqueue=True)
+    run_id = created.run_id or ""
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.request_interaction(
+        run_id,
+        command_id="signal-direction",
+        interaction={
+            "interaction_id": "interaction-direction",
+            "interaction_type": "choose_direction",
+            "title": "Choose a direction",
+            "prompt": "Which direction?",
+            "response_schema": {"type": "object", "required": ["direction_id"]},
+            "choices": [{"id": "a", "label": "A"}],
+            "allow_freeform": False,
+        },
+    )
+
+    assert service.prepare_for_chat(run_id, text="What is the difference between them?") == [
+        "answer_in_chat"
+    ]
+    run = service.repository.load_run(run_id)
+    assert run.status == "queued"
+    assert run.module_data["interaction"]["response"] == {
+        "chat_reply": "What is the difference between them?",
+        "source": "chat",
+    }
+
+
+def test_chat_message_on_a_completed_run_keeps_it_completed(service: WorkflowService) -> None:
+    (service.repository.project_dir / "report.md").write_text("# Result\n", encoding="utf-8")
+    artifact, _ = service.import_artifact(
+        command_id="cmd-import",
+        source_path="report.md",
+        artifact_type="research_report",
+        media_type="text/markdown",
+    )
+    created = service.create_run(command_id="cmd-create", module_type="initiation", enqueue=True)
+    run_id = created.run_id or ""
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.command_run(
+        run_id,
+        command_id="cmd-complete",
+        command_type="complete",
+        payload={"outputs": [artifact.artifact_id]},
+    )
+    selection = {"run_id": run_id, "item_id": "direction-2", "artifact_ids": [artifact.artifact_id]}
+
+    applied = service.prepare_for_chat(run_id, text="Polish direction 2", selection=selection)
+
+    run = service.repository.load_run(run_id)
+    assert applied == ["request_revision"]
+    # The next-step actions depend on `completed`; an unrelated chat must not hide them.
+    assert run.status == "completed"
+    assert run.outputs == [artifact.artifact_id]
+    assert run.last_transition and run.last_transition.event_type == "run.revision_requested"
+    request = run.module_data["revision_requests"][-1]
+    assert request["text"] == "Polish direction 2"
+    assert request["selection"] == selection
+    assert request["previous_outputs"] == [artifact.artifact_id]
+    with pytest.raises(WorkflowError) as exc_info:
+        service.claim_run(run_id, lease_owner="ui:test")
+    assert exc_info.value.code == "run_not_queued"
+
+
+def test_revising_outputs_keeps_the_run_completed_and_skips_handoffs(
+    service: WorkflowService,
+) -> None:
+    service.ensure_project()
+    workflow = service.repository.load_workflow()
+    service.command_project(
+        command_id="cmd-policy",
+        command_type="set_handoff_policy",
+        expected_revision=workflow.revision,
+        payload={"handoff_policy": {"mode": "auto", "rules": []}},
+    )
+    created = service.create_run(command_id="cmd-source", module_type="planning", enqueue=True)
+    run_id = created.run_id or ""
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.command_run(
+        run_id,
+        command_id="cmd-complete",
+        command_type="complete",
+        payload={"outputs": [], "suggested_handoffs": [{"target_module_type": "experiment"}]},
+    )
+    assert len(service.repository.list_runs()) == 2
+    (service.repository.project_dir / "plan.md").write_text("# Plan v2\n", encoding="utf-8")
+    revised, _ = service.import_artifact(command_id="cmd-import", source_path="plan.md", artifact_type="plan")
+
+    service.prepare_for_chat(run_id, text="Tighten the risks section")
+    service.command_run(
+        run_id,
+        command_id="cmd-revise",
+        command_type="revise_outputs",
+        payload={"outputs": [revised.artifact_id], "summary": "Risks tightened"},
+    )
+
+    run = service.repository.load_run(run_id)
+    assert run.status == "completed"
+    assert run.outputs == [revised.artifact_id]
+    assert run.module_data["completion_summary"] == "Risks tightened"
+    assert len(service.repository.list_runs()) == 2
+    with pytest.raises(WorkflowError) as exc_info:
+        service.command_run(
+            run_id, command_id="cmd-bad", command_type="revise_outputs", payload={"outputs": ["missing"]}
+        )
+    assert exc_info.value.code == "artifact_not_found"
+
+
+@pytest.mark.parametrize(("interruption", "expected"), [("pause", ["resume"]), ("fail", ["retry"])])
+def test_chat_message_continues_a_paused_or_failed_run(
+    service: WorkflowService, interruption: str, expected: list[str]
+) -> None:
+    created = service.create_run(command_id="cmd-create", module_type="planning", enqueue=True)
+    run_id = created.run_id or ""
+    service.command_run(run_id, command_id="cmd-interrupt", command_type=interruption)
+
+    assert service.prepare_for_chat(run_id, text="Please continue") == expected
+    assert service.repository.load_run(run_id).status == "queued"
+
+
+def test_chat_message_leaves_queued_and_cancelled_runs_alone(service: WorkflowService) -> None:
+    created = service.create_run(command_id="cmd-create", module_type="planning", enqueue=True)
+    run_id = created.run_id or ""
+    assert service.prepare_for_chat(run_id, text="hi") == []
+    service.command_run(run_id, command_id="cmd-cancel", command_type="cancel")
+    assert service.prepare_for_chat(run_id, text="hi") == []
+    assert service.repository.load_run(run_id).status == "cancelled"

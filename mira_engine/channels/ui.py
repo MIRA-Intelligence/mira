@@ -482,6 +482,63 @@ def _normalize_agent_profile(value: Any) -> str:
     return "research"
 
 
+def _normalize_workflow_selection(value: Any) -> dict[str, Any] | None:
+    """Keep the deliverable the user selected in the UI, if it is well formed."""
+    if not isinstance(value, dict):
+        return None
+    selection: dict[str, Any] = {}
+    for key in ("run_id", "item_id", "label"):
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            selection[key] = item.strip()[:200]
+    artifact_ids = value.get("artifact_ids")
+    if isinstance(artifact_ids, list):
+        selection["artifact_ids"] = [
+            item for item in artifact_ids if isinstance(item, str) and item.strip()
+        ][:20]
+    return selection or None
+
+
+def _chat_revision_instructions(run: Any, repository: Any) -> str | None:
+    """Tell the agent how a follow-up message on a completed Run may revise it."""
+    requests = run.module_data.get("revision_requests")
+    if not isinstance(requests, list) or not requests or not isinstance(requests[-1], dict):
+        return None
+    request = requests[-1]
+    deliverables = []
+    for artifact_id in request.get("previous_outputs") or []:
+        try:
+            artifact = repository.load_artifact(artifact_id)
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        deliverables.append({
+            "artifact_id": artifact.artifact_id,
+            "label": artifact.label,
+            "media_type": artifact.media_type,
+            "payload_ref": artifact.payload_ref,
+        })
+    context = {
+        "revision_request": request.get("text"),
+        "selected_deliverable": request.get("selection"),
+        "current_deliverables": deliverables,
+    }
+    return (
+        "This Run is already completed and stays completed; the user is following up in "
+        "the chat. Reply to the message directly. If it is a question or unrelated, just "
+        "answer and call no workflow tools. Do not redo the module from scratch. If the "
+        "user asks to change a result, apply the change to the existing deliverables (the "
+        "selected one when given, otherwise the one the message refers to; if that is "
+        "genuinely ambiguous, ask in your reply instead of a workflow interaction). For "
+        "file deliverables, publish the revised file with publish_workflow_artifact and "
+        "call complete_workflow_run once with output_artifact_ids listing every current "
+        "deliverable (the revised artifact in place of the one it replaces, unchanged ones "
+        "kept); this updates the deliverables without reopening the Run. For an "
+        "initiation research result, record the full revised result with "
+        "record_initiation_research_result.\n"
+        + json.dumps(context, ensure_ascii=False)
+    )
+
+
 def _normalize_contract_version(value: Any) -> int:
     """Normalize project-level contract version with safe fallback."""
     if isinstance(value, int):
@@ -2158,6 +2215,7 @@ class UiChannel(BaseChannel):
                     incoming_policy = _normalize_automation_policy(data.get("automation_policy"))
                     workflow_run_id = data.get("workflow_run_id")
                     workflow_run = None
+                    chat_commands: list[str] = []
                     allow_result_write = bool(data.get("allow_result_write"))
                     turn_id = data.get("turn_id")
                     selected_skill_ids = data.get("selected_skill_ids")
@@ -2205,13 +2263,32 @@ class UiChannel(BaseChannel):
                             if not isinstance(workflow_run_id, str) or not workflow_run_id:
                                 await ws.send_json({"type": "error", "content": "invalid workflow_run_id"})
                                 continue
+                            # Errors carry the Run so the UI shows them in that conversation.
+                            run_error_scope = {
+                                "session_id": session_id,
+                                "metadata": {"workflow_run_id": workflow_run_id},
+                            }
                             try:
                                 workflow_service = self._workflow_api._service(session_id)
-                                workflow_run = workflow_service.repository.load_run(workflow_run_id)
-                                claim_receipt = workflow_service.claim_run(
+                                chat_commands = workflow_service.prepare_for_chat(
                                     workflow_run_id,
-                                    lease_owner=f"ui:{self._workflow_executor_id}:{user_id}",
-                                    agent_profile=agent_profile,
+                                    text=(
+                                        content.strip()
+                                        if isinstance(content, str) and content.strip()
+                                        else "(The user sent attachments without text.)"
+                                    ),
+                                    selection=_normalize_workflow_selection(
+                                        data.get("workflow_selection")
+                                    ),
+                                )
+                                # A follow-up on a completed Run talks to it without
+                                # claiming it, so it stays completed.
+                                claim_receipt = None if "request_revision" in chat_commands else (
+                                    workflow_service.claim_run(
+                                        workflow_run_id,
+                                        lease_owner=f"ui:{self._workflow_executor_id}:{user_id}",
+                                        agent_profile=agent_profile,
+                                    )
                                 )
                                 workflow_run = workflow_service.repository.load_run(
                                     workflow_run_id
@@ -2229,10 +2306,11 @@ class UiChannel(BaseChannel):
                                             "The Run is paused to avoid repeating uncertain work; "
                                             "review it and choose Resume to continue."
                                         ),
+                                        **run_error_scope,
                                     })
                                     continue
                             except Exception as exc:
-                                await ws.send_json({"type": "error", "content": str(exc)})
+                                await ws.send_json({"type": "error", "content": str(exc), **run_error_scope})
                                 continue
                     elif workflow_run_id is not None:
                         await ws.send_json({
@@ -2380,6 +2458,26 @@ class UiChannel(BaseChannel):
                                         ensure_ascii=False,
                                     )
                                 )
+                            # NativeModuleRuntime replaces _ui_system_instructions with
+                            # the executor's; these notes ride on their own key.
+                            chat_notes: list[str] = []
+                            if "answer_in_chat" in chat_commands:
+                                chat_notes.append(
+                                    "The user answered the pending interaction by typing in the "
+                                    "chat instead of using the form; their message is this turn's "
+                                    "input. Reply to it directly: answer a question, or take it as "
+                                    "the requested change. It is never an approval: if a module "
+                                    "execution brief still needs approval, revise the brief as "
+                                    "needed and request that confirmation again."
+                                )
+                            if "request_revision" in chat_commands:
+                                revision = _chat_revision_instructions(
+                                    workflow_run, workflow_service.repository
+                                )
+                                if revision:
+                                    chat_notes.append(revision)
+                            if chat_notes:
+                                metadata["_workflow_chat_instructions"] = "\n\n".join(chat_notes)
                         else:
                             instruction_parts = (
                                 [self._ui_instructions] if self._ui_instructions else []

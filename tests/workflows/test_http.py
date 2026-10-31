@@ -266,3 +266,47 @@ async def test_slide_deck_content_is_sandboxed_and_editable_on_request(workflow_
     assert "connect-src data: blob:" in csp
     assert "readonly" not in await edit.text()
     assert '"readonly": true' in (ref.project_dir / "slides.bento.html").read_text(encoding="utf-8")
+
+
+async def test_events_from_agent_tool_services_reach_subscribers(tmp_path: Path) -> None:
+    from mira_engine.workflows import JsonWorkflowRepository, WorkflowService
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    registry = ProjectRegistry(
+        projects_root,
+        workspace_path=tmp_path / "workspace.json",
+        legacy_index_path=tmp_path / "project-dirs.json",
+    )
+    registry.create_project(project_id="PRJ-tools", display_name="Tools")
+    api = WorkflowHttpApi(registry)
+    app = web.Application()
+    api.add_routes(app)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        ref = registry.resolve("PRJ-tools")
+        # Agent tools build their own service without an on_event listener.
+        service = WorkflowService(JsonWorkflowRepository(ref.project_dir, ref.project_id))
+        run_id = service.create_run(command_id="c1", module_type="delivery", enqueue=True).run_id or ""
+        service.claim_run(run_id, lease_owner="agent:test")
+        ws = await client.ws_connect("/ws/workflow/v1")
+        await ws.send_json({
+            "message_type": "subscribe", "workflow_contract_version": 1, "subscription_id": "sub",
+            "project_id": "PRJ-tools", "after_project_sequence": 2,
+        })
+        while (await ws.receive_json())["message_type"] != "subscribed":
+            pass
+
+        service.request_interaction(run_id, command_id="c2", interaction={
+            "interaction_id": "i1", "interaction_type": "approve_delivery_brief",
+            "title": "Confirm the brief", "prompt": "Brief", "response_schema": {"type": "object"},
+        })
+
+        live = await ws.receive_json(timeout=5)
+        assert live["message_type"] == "workflow_event"
+        assert live["event_type"] == "interaction.requested"
+        await ws.close()
+    finally:
+        await api.close()
+        await client.close()

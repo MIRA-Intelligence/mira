@@ -164,7 +164,7 @@ class PubMedSearchTool(Tool):
         project_id, project_dir, run_id = context
         service = WorkflowService(JsonWorkflowRepository(project_dir, project_id))
         run = service.repository.load_run(run_id)
-        if run.module_type != "initiation" or run.status != "running":
+        if run.module_type != "initiation" or run.status not in {"running", "completed"}:
             return
         service.command_run(
             run_id,
@@ -471,7 +471,8 @@ class WorkflowArtifactTool(Tool):
         project_id, project_dir, run_id = context
         service = WorkflowService(JsonWorkflowRepository(project_dir, project_id))
         run = service.repository.load_run(run_id)
-        if run.status != "running":
+        # A completed Run may publish revised deliverables in a follow-up turn.
+        if run.status not in {"running", "completed"}:
             return f"Error: ModuleRun is not actively running (status={run.status})"
         artifact, event = service.import_artifact(
             command_id=f"executor-artifact:{new_id()}",
@@ -590,7 +591,7 @@ class InitiationResearchResultTool(Tool):
         project_id, project_dir, run_id = context
         service = WorkflowService(JsonWorkflowRepository(project_dir, project_id))
         run = service.repository.load_run(run_id)
-        if run.module_type != "initiation" or run.status != "running":
+        if run.module_type != "initiation" or run.status not in {"running", "completed"}:
             return (
                 "Error: record_initiation_research_result requires an actively "
                 f"running initiation Run (module={run.module_type}, status={run.status})"
@@ -771,20 +772,23 @@ class WorkflowCompletionTool(Tool):
                 "Error: enabled literature research must be recorded with "
                 "record_initiation_research_result before completing the Run"
             )
+        revising = run.status == "completed"
         receipt = service.command_run(
             run_id,
             command_id=f"executor-complete:{new_id()}",
-            command_type="complete",
+            # A follow-up turn on a completed Run only replaces its deliverables.
+            command_type="revise_outputs" if revising else "complete",
             expected_revision=run.revision,
             payload={
                 "summary": summary,
                 "outputs": output_artifact_ids,
-                "suggested_handoffs": suggested_handoffs,
+                **({} if revising else {"suggested_handoffs": suggested_handoffs}),
             },
         )
         return json.dumps(
             {
                 "status": "completed",
+                "deliverables_revised": revising,
                 "run_id": run_id,
                 "project_sequence": receipt.project_sequence,
                 "instruction": "End this turn without more tool calls.",

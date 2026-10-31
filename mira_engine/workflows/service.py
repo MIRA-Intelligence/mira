@@ -57,6 +57,22 @@ class WorkflowError(Exception):
 
 EventListener = Callable[[WorkflowEvent], None]
 
+# Services built outside the HTTP API (agent tools, the module runtime) would
+# otherwise commit events nobody hears: the desktop learnt about a requested
+# interaction only when a turn ended. The API registers its broadcaster here.
+_default_listener: EventListener | None = None
+
+
+def set_default_event_listener(listener: EventListener | None) -> None:
+    global _default_listener
+    _default_listener = listener
+
+
+def clear_default_event_listener(listener: EventListener) -> None:
+    global _default_listener
+    if _default_listener == listener:
+        _default_listener = None
+
 
 class WorkflowService:
     @staticmethod
@@ -348,6 +364,53 @@ class WorkflowService:
             project_sequence=event.project_sequence,
             event=event,
         )
+
+    def prepare_for_chat(
+        self,
+        run_id: str,
+        *,
+        text: str,
+        selection: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """Prepare a Run so a chat message can drive its next turn.
+
+        A user who types in the chat expects an answer whatever state the Run is
+        in: a paused or failed Run continues and a pending interaction is
+        answered by the message, both leaving the Run ``queued`` for a claim. A
+        completed Run stays completed (its next-step actions remain available);
+        the message is recorded as a revision request for a follow-up turn that
+        may replace deliverables with ``revise_outputs``. Returns the commands
+        applied, in order.
+        """
+        applied: list[str] = []
+        for _ in range(3):
+            try:
+                status = self.repository.load_run(run_id).status
+            except FileNotFoundError as exc:
+                raise WorkflowError("run_not_found", str(exc), status=404) from exc
+            command_type: str | None = None
+            payload: dict[str, Any] = {}
+            if status == "paused":
+                command_type = "resume"
+            elif status == "failed":
+                command_type = "retry"
+            elif status == "waiting_input":
+                command_type, payload = "answer_in_chat", {"text": text}
+            elif status == "completed":
+                command_type = "request_revision"
+                payload = {"text": text, **({"selection": selection} if selection else {})}
+            if command_type is None:
+                return applied
+            self.command_run(
+                run_id,
+                command_id=f"chat-{command_type}:{new_id()}",
+                command_type=command_type,
+                payload=payload,
+            )
+            applied.append(command_type)
+            if status == "completed":
+                return applied
+        return applied
 
     def claim_run(
         self,
@@ -872,7 +935,7 @@ class WorkflowService:
             return "created", "run.draft_updated", "applied"
         if command == "enqueue" and status == "created":
             return "queued", "run.queued", "accepted"
-        if command == "record_research_result" and status == "running":
+        if command == "record_research_result" and status in {"running", "completed"}:
             if run.module_type != "initiation":
                 raise WorkflowError(
                     "invalid_module",
@@ -944,8 +1007,8 @@ class WorkflowService:
                 if isinstance(search, dict)
             ]
             run.module_data["research_result"] = result.model_dump(mode="json")
-            return "running", "run.research_result_updated", "applied"
-        if command == "record_literature_search" and status == "running":
+            return status, "run.research_result_updated", "applied"
+        if command == "record_literature_search" and status in {"running", "completed"}:
             if run.module_type != "initiation":
                 raise WorkflowError(
                     "invalid_module",
@@ -966,7 +1029,7 @@ class WorkflowService:
                 searches = []
                 run.module_data["research_searches"] = searches
             searches.append(search.model_dump(mode="json"))
-            return "running", "run.literature_search_recorded", "applied"
+            return status, "run.literature_search_recorded", "applied"
         if command == "pause" and status in {"queued", "waiting_input"}:
             return "paused", "run.paused", "applied"
         if command == "pause" and status == "running":
@@ -1069,6 +1132,55 @@ class WorkflowService:
             run.attempt.lease_expires_at = None
             self._close_attempt(run, "completed", utc_now())
             return "completed", "run.completed", "applied"
+        if command == "answer_in_chat" and status == "waiting_input":
+            interaction = run.module_data.get("interaction")
+            if not isinstance(interaction, dict) or interaction.get("response") is not None:
+                raise WorkflowError("interaction_not_found", "no pending interaction to answer", status=409)
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise WorkflowError("interaction_response_invalid", "a chat answer must not be blank", status=422)
+            # A chat message is feedback or a question, never an approval: an
+            # approve_* gate records it as a revision and must be asked again.
+            response: dict[str, Any] = {"chat_reply": text.strip(), "source": "chat"}
+            if str(interaction.get("interaction_type", "")).startswith("approve_"):
+                response = {"selection": "revise", "notes": text.strip(), "source": "chat"}
+            self._resolve_interaction(run, interaction, response)
+            return "queued", "interaction.resolved", "accepted"
+        if command == "request_revision" and status == "completed":
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise WorkflowError("revision_request_invalid", "a revision request must not be blank", status=422)
+            request: dict[str, Any] = {
+                "text": text.strip(),
+                "requested_at": utc_now(),
+                "previous_outputs": list(run.outputs),
+            }
+            selection = payload.get("selection")
+            if isinstance(selection, dict):
+                request["selection"] = selection
+            history = run.module_data.get("revision_requests")
+            run.module_data["revision_requests"] = [
+                *(history if isinstance(history, list) else []),
+                request,
+            ][-20:]
+            return "completed", "run.revision_requested", "applied"
+        if command == "revise_outputs" and status == "completed":
+            # A follow-up turn replaced deliverables; the Run never leaves
+            # completed and its handoffs are not repeated.
+            outputs = payload.get("outputs", [])
+            if not isinstance(outputs, list) or not all(isinstance(item, str) for item in outputs):
+                raise WorkflowError("invalid_outputs", "outputs must be an array of Artifact IDs", status=422)
+            unique_outputs = list(dict.fromkeys(outputs))
+            for artifact_id in unique_outputs:
+                try:
+                    self.repository.load_artifact(artifact_id)
+                except FileNotFoundError as exc:
+                    raise WorkflowError("artifact_not_found", str(exc), status=404) from exc
+            run.outputs = unique_outputs
+            summary = payload.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                run.module_data["completion_summary"] = summary.strip()
+            return "completed", "run.outputs_revised", "applied"
         if command == "submit_interaction" and status == "waiting_input":
             interaction = run.module_data.get("interaction")
             interaction_id = payload.get("interaction_id")
@@ -1099,15 +1211,7 @@ class WorkflowService:
                     raise WorkflowError(
                         "interaction_response_invalid", "revision requires explanatory notes", status=422
                     )
-            interaction["response"] = response
-            interaction["resolved_at"] = utc_now()
-            history = run.module_data.setdefault("interaction_history", [])
-            if not isinstance(history, list):
-                history = []
-            run.module_data["interaction_history"] = [
-                *history,
-                copy.deepcopy(interaction),
-            ][-100:]
+            self._resolve_interaction(run, interaction, response)
             return "queued", "interaction.resolved", "accepted"
         raise WorkflowError(
             "invalid_transition",
@@ -1224,6 +1328,18 @@ class WorkflowService:
             if rule_source in {None, "*", source} and rule_target in {None, "*", target}:
                 return bool(rule.get("enabled", True))
         return False
+
+    @staticmethod
+    def _resolve_interaction(run: ModuleRun, interaction: dict[str, Any], response: Any) -> None:
+        interaction["response"] = response
+        interaction["resolved_at"] = utc_now()
+        history = run.module_data.setdefault("interaction_history", [])
+        if not isinstance(history, list):
+            history = []
+        run.module_data["interaction_history"] = [
+            *history,
+            copy.deepcopy(interaction),
+        ][-100:]
 
     @staticmethod
     def _close_attempt(run: ModuleRun, outcome: str, ended_at: str) -> None:
@@ -1358,8 +1474,9 @@ class WorkflowService:
         )
 
     def _publish(self, event: WorkflowEvent) -> None:
-        if self.on_event:
-            self.on_event(event)
+        listener = self.on_event or _default_listener
+        if listener:
+            listener(event)
 
 
 def error_payload(error: Exception) -> tuple[int, dict[str, Any]]:
