@@ -1682,10 +1682,11 @@ async def test_handle_validate_data_path_allows_outside_when_unrestricted(ui_cha
 @pytest.mark.asyncio
 async def test_organization_folder_and_chat_handlers(ui_channel: UiChannel) -> None:
     create_folder_request = MagicMock(spec=web.Request)
-    create_folder_request.json = AsyncMock(return_value={"name": "Lung cancer"})
+    create_folder_request.json = AsyncMock(return_value={"name": "Lung cancer", "kind": "chat"})
     folder_response = await ui_channel._handle_create_folder(create_folder_request)
     assert folder_response.status == 201
     folder = json.loads(folder_response.text)
+    assert folder["kind"] == "chat"
 
     import_request = MagicMock(spec=web.Request)
     import_request.json = AsyncMock(return_value={
@@ -2938,6 +2939,96 @@ async def test_ws_handler_normal_message_skips_project_runtime_state(
     assert not (ui_channel.projects_root / session_id).exists()
 
 
+def _workflow_message(session_id: str, run_id: str, content: str, **extra: Any) -> _FakeWsMessage:
+    return _FakeWsMessage(web.WSMsgType.TEXT, json.dumps({
+        "type": "message", "session_id": session_id, "user_id": "u1", "loop_mode": "project",
+        "mode": "manual", "agent_profile": "research", "content": content, "media": [],
+        "workflow_run_id": run_id, **extra,
+    }))
+
+
+async def test_ws_message_to_completed_run_gets_a_follow_up_turn_and_stays_completed(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4200"
+    (ui_channel.projects_root / session_id).mkdir(parents=True, exist_ok=True)
+    service = ui_channel._workflow_api._service(session_id)
+    run_id = service.create_run(command_id="c1", module_type="initiation", enqueue=True).run_id or ""
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.command_run(run_id, command_id="c2", command_type="complete", payload={"outputs": []})
+    selection = {"run_id": run_id, "item_id": "direction-2", "label": "Direction 2"}
+    ws = _FakeWs([_workflow_message(session_id, run_id, "Polish direction 2", workflow_selection=selection)])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+
+    assert [frame for frame in ws.sent if frame.get("type") == "error"] == []
+    assert captured["content"] == "Polish direction 2"
+    assert captured["metadata"]["workflow_run_id"] == run_id
+    instructions = captured["metadata"]["_workflow_chat_instructions"]
+    assert "stays completed" in instructions
+    assert "Direction 2" in instructions
+    assert service.repository.load_run(run_id).status == "completed"
+
+
+async def test_ws_message_during_approval_gate_is_answered_not_dropped(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4201"
+    (ui_channel.projects_root / session_id).mkdir(parents=True, exist_ok=True)
+    service = ui_channel._workflow_api._service(session_id)
+    run_id = service.create_run(
+        command_id="c1", module_type="initiation",
+        module_data={"confirmation_policy": {"mode": "required"}}, enqueue=True,
+    ).run_id or ""
+    service.claim_run(run_id, lease_owner="ui:test")
+    service.request_interaction(run_id, command_id="c2", interaction={
+        "interaction_id": "i1", "interaction_type": "approve_research_scope", "title": "Approve",
+        "prompt": "Brief", "response_schema": {"type": "object"},
+        "choices": [{"value": "approve"}, {"value": "revise"}],
+    })
+    ws = _FakeWs([_workflow_message(session_id, run_id, "Why only PubMed?")])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+
+    assert captured["content"] == "Why only PubMed?"
+    assert "It is never an approval" in captured["metadata"]["_workflow_chat_instructions"]
+    run = service.repository.load_run(run_id)
+    assert run.status == "running"
+    assert run.module_data["interaction"]["response"]["selection"] == "revise"
+
+
+async def test_ws_message_rejected_for_a_run_reports_to_that_conversation(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4202"
+    (ui_channel.projects_root / session_id).mkdir(parents=True, exist_ok=True)
+    service = ui_channel._workflow_api._service(session_id)
+    run_id = service.create_run(command_id="c1", module_type="planning", enqueue=True).run_id or ""
+    service.command_run(run_id, command_id="c2", command_type="cancel")
+    ws = _FakeWs([_workflow_message(session_id, run_id, "hello")])
+    monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
+    monkeypatch.setattr(ui_channel, "_handle_message", AsyncMock())
+
+    await ui_channel._ws_handler(MagicMock(spec=web.Request))
+
+    errors = [frame for frame in ws.sent if frame.get("type") == "error"]
+    assert len(errors) == 1
+    assert errors[0]["session_id"] == session_id
+    assert errors[0]["metadata"] == {"workflow_run_id": run_id}
+
+
 async def test_ws_handler_injects_guard_notice_on_id_reassignment(
     ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3693,3 +3784,47 @@ async def test_delete_chat_files_failure_keeps_the_chat(ui_channel: UiChannel, m
 
     assert resp.status == 500
     assert "chat-1" in [chat["id"] for chat in ui_channel.organization_store.snapshot()["chats"]]
+
+
+async def test_auto_decided_form_starts_the_next_turn_without_a_desktop(
+    ui_channel: UiChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "PRJ-4210"
+    (ui_channel.projects_root / session_id).mkdir(parents=True, exist_ok=True)
+    service = ui_channel._workflow_api._service(session_id)
+    run_id = service.create_run(command_id="c1", module_type="experiment", enqueue=True).run_id or ""
+    service.claim_run(run_id, lease_owner="agent:test")
+    service.request_interaction(run_id, command_id="c2", interaction={
+        "interaction_id": "i1", "interaction_type": "clarify_requirements", "title": "Which cohort?",
+        "prompt": "Pick one", "response_schema": {"type": "object"},
+        "choices": [{"id": "small", "label": "Small pilot", "value": "small", "recommended": True}],
+        "auto_decide": {"selection": "small", "label": "Small pilot", "seconds": 0},
+    })
+    captured: dict[str, Any] = {}
+
+    async def _handle_message(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(ui_channel, "_handle_message", _handle_message)
+    desktop = _FakeWs([])
+    ui_channel._clients[session_id] = desktop
+    assert await ui_channel._auto_decider.fire(session_id, run_id, "i1") is True
+    ui_channel._auto_decider.close()
+
+    run = service.repository.load_run(run_id)
+    assert run.status == "running"  # claimed by the same owner a desktop message would use
+    assert run.attempt.lease_owner == f"ui:{ui_channel._workflow_executor_id}:ui_user"
+    assert run.module_data["interaction"]["resolved_by"] == "auto"
+    assert captured["session_key"] == f"ui:{session_id}:run:{run_id}"
+    assert captured["metadata"]["workflow_run_id"] == run_id
+    assert '"selection": "small"' in captured["metadata"]["_ui_system_instructions"]
+    assert "Small pilot" in captured["content"]
+    # An open desktop sees the notice live, the same entry its history replays.
+    [notice] = [m for m in desktop.sent if m.get("type") == "response"]
+    assert notice["metadata"]["workflow_run_id"] == run_id
+    assert notice["metadata"]["_user"] is True
+    assert notice["metadata"]["_auto_decided"] == {
+        "label": "Small pilot", "title": "Which cohort?", "selection": "small", "seconds": 10,
+    }
+    history = SessionManager(ui_channel.projects_root / session_id).get_ui_history(captured["session_key"])
+    assert history[-1]["metadata"]["_auto_decided"] == notice["metadata"]["_auto_decided"]

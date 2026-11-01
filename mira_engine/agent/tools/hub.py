@@ -17,7 +17,9 @@ from mira_engine.agent.skill_plugins import SkillPluginError, SkillPluginManager
 from mira_engine.agent.tools.base import Tool
 from mira_engine.security.host_policy import HostPolicyError, load_host_policy
 
-HUB_URL = "https://mira-intelligence.github.io/mira-hub/"
+# Served from Tencent Cloud for mainland users; the GitHub Pages copy
+# (mira-intelligence.github.io/mira-hub/) stays up for older engines.
+HUB_URL = "https://hub.mira-intelligence.com/"
 SOURCE_TYPE = "mirahub"
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _PAGE_SLUG_RE = re.compile(r"/skills/([a-z0-9][a-z0-9-]{0,63})/?$")
@@ -30,7 +32,7 @@ class HubInstallError(Exception):
 
 
 def parse_slug(value: str) -> str:
-    """Accept a bare slug or a hub skill page URL (…/mira-hub/skills/<slug>/)."""
+    """Accept a bare slug or a hub skill page URL (…/skills/<slug>/ on either hub site)."""
     text = value.strip()
     if _SLUG_RE.match(text):
         return text
@@ -137,7 +139,7 @@ class HubInstallTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Install a skill from MIRA Hub (mira-intelligence.github.io/mira-hub) by its slug "
+            "Install a skill from MIRA Hub (hub.mira-intelligence.com) by its slug "
             "or hub page URL. One call downloads the published zip, verifies its sha256 and "
             "installs it as a custom skill plugin for all projects (Settings → Skills & Plugins). "
             "Use this for any MIRA Hub install instead of downloading or unpacking archives "

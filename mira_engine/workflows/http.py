@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
 from aiohttp import WSMsgType, web
+from loguru import logger
 
 from mira_engine.projects import ProjectRegistry
 from mira_engine.utils.slide_decks import deck_response, is_deck_file
@@ -16,7 +18,13 @@ from mira_engine.utils.slide_decks import deck_response, is_deck_file
 from .journals import PROFILE_VERSION, journal_catalog
 from .models import WORKFLOW_CONTRACT_VERSION, WorkflowEvent
 from .repository import JsonWorkflowRepository
-from .service import WorkflowError, WorkflowService, error_payload
+from .service import (
+    WorkflowError,
+    WorkflowService,
+    clear_default_event_listener,
+    error_payload,
+    set_default_event_listener,
+)
 
 
 @dataclass
@@ -38,6 +46,12 @@ class WorkflowHttpApi:
         self.registry = registry
         self._subscribers: dict[str, dict[str, _Subscriber]] = defaultdict(dict)
         self._socket_subscriptions: dict[web.WebSocketResponse, set[tuple[str, str]]] = defaultdict(set)
+        self._event_observers: list[Callable[[WorkflowEvent], None]] = []
+        set_default_event_listener(self._schedule_event)
+
+    def add_event_observer(self, observer: Callable[[WorkflowEvent], None]) -> None:
+        """See every committed workflow event in this process, before it is broadcast."""
+        self._event_observers.append(observer)
 
     def add_routes(self, app: web.Application) -> None:
         app.router.add_get("/api/workflow/v1/contract", self.contract)
@@ -89,6 +103,11 @@ class WorkflowHttpApi:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        for observer in self._event_observers:
+            try:
+                observer(event)
+            except Exception:  # noqa: BLE001 - an observer never blocks delivery
+                logger.exception("workflow event observer failed")
         loop.create_task(self._broadcast(event))
 
     @staticmethod
@@ -470,6 +489,7 @@ class WorkflowHttpApi:
             self._remove_subscription(project_id, subscription_id)
 
     async def close(self) -> None:
+        clear_default_event_listener(self._schedule_event)
         sockets = list(self._socket_subscriptions)
         self._subscribers.clear()
         self._socket_subscriptions.clear()

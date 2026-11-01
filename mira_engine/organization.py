@@ -13,6 +13,9 @@ from mira_engine.utils.locks import locked_write_text
 ORGANIZATION_FILENAME = "organization.json"
 ORGANIZATION_SCHEMA_VERSION = 1
 FOLDER_NAME_MAX_CHARS = 60
+# A folder lives in exactly one sidebar list. ``None`` marks a folder from an
+# older client that has not held anything yet; its first item fixes the kind.
+FOLDER_KINDS = ("chat", "project")
 
 
 def _now() -> str:
@@ -28,6 +31,12 @@ def _valid_item_id(value: Any) -> str:
     if any(ch in item_id for ch in {"/", "\\", ":", "\x00"}) or any(ord(ch) < 32 for ch in item_id):
         raise ValueError("item id contains invalid characters")
     return item_id
+
+
+def _valid_kind(value: Any) -> str:
+    if value not in FOLDER_KINDS:
+        raise ValueError("kind must be chat or project")
+    return value
 
 
 def _valid_folder_name(value: Any) -> str:
@@ -71,7 +80,7 @@ class OrganizationStore:
 
         data = self._empty()
         folder_ids: set[str] = set()
-        names: set[str] = set()
+        names: set[tuple[str | None, str]] = set()
         for item in raw.get("folders", []):
             if not isinstance(item, dict):
                 continue
@@ -80,14 +89,16 @@ class OrganizationStore:
                 name = _valid_folder_name(item.get("name"))
             except ValueError:
                 continue
+            kind = item.get("kind") if item.get("kind") in FOLDER_KINDS else None
             folded = name.casefold()
-            if folder_id in folder_ids or folded in names:
+            if folder_id in folder_ids or (kind, folded) in names:
                 continue
             folder_ids.add(folder_id)
-            names.add(folded)
+            names.add((kind, folded))
             data["folders"].append({
                 "id": folder_id,
                 "name": name,
+                "kind": kind,
                 "created_at": item.get("created_at") if isinstance(item.get("created_at"), str) else _now(),
                 "updated_at": item.get("updated_at") if isinstance(item.get("updated_at"), str) else _now(),
             })
@@ -124,7 +135,37 @@ class OrganizationStore:
                         continue
                     if folder_id in folder_ids:
                         data["assignments"][kind][item_id] = folder_id
+        self._scope_folders(data)
         return data
+
+    @staticmethod
+    def _scope_folders(data: dict[str, Any]) -> None:
+        """Give each folder one kind; drop assignments that cross kinds.
+
+        Folders written before kinds existed were shared by both lists. One
+        holding only chats or only projects takes that kind; one holding both
+        stays a project folder and its chats move to a new same-named chat folder.
+        """
+        used: dict[str, set[str]] = {}
+        for kind in FOLDER_KINDS:
+            for folder_id in data["assignments"][kind].values():
+                used.setdefault(folder_id, set()).add(kind)
+        for folder in list(data["folders"]):
+            kinds = used.get(folder["id"], set())
+            if folder["kind"] is None and len(kinds) == 1:
+                folder["kind"] = next(iter(kinds))
+            elif folder["kind"] is None and len(kinds) == 2:
+                folder["kind"] = "project"
+                twin = {**folder, "id": f"folder-{uuid.uuid4().hex}", "kind": "chat"}
+                data["folders"].append(twin)
+                mapping = data["assignments"]["chat"]
+                for item_id in [key for key, value in mapping.items() if value == folder["id"]]:
+                    mapping[item_id] = twin["id"]
+        kind_of = {folder["id"]: folder["kind"] for folder in data["folders"]}
+        for kind in FOLDER_KINDS:
+            mapping = data["assignments"][kind]
+            for item_id in [key for key, value in mapping.items() if kind_of.get(value) not in (kind, None)]:
+                mapping.pop(item_id)
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,16 +180,29 @@ class OrganizationStore:
     def _folder(self, folder_id: str) -> dict[str, Any] | None:
         return next((item for item in self._data["folders"] if item["id"] == folder_id), None)
 
-    def _assert_unique_name(self, name: str, *, excluding: str | None = None) -> None:
+    def _assert_unique_name(self, name: str, kind: str | None, *, excluding: str | None = None) -> None:
+        # Chat and project folders may share a name; an unscoped one clashes with both.
         folded = name.casefold()
-        if any(item["id"] != excluding and item["name"].casefold() == folded for item in self._data["folders"]):
+        if any(
+            item["id"] != excluding
+            and item["name"].casefold() == folded
+            and (kind is None or item["kind"] is None or item["kind"] == kind)
+            for item in self._data["folders"]
+        ):
             raise FileExistsError("a folder with this name already exists")
 
-    def create_folder(self, name: Any) -> dict[str, Any]:
+    def create_folder(self, name: Any, kind: Any = None) -> dict[str, Any]:
         normalized = _valid_folder_name(name)
-        self._assert_unique_name(normalized)
+        scoped = None if kind is None else _valid_kind(kind)
+        self._assert_unique_name(normalized, scoped)
         now = _now()
-        folder = {"id": f"folder-{uuid.uuid4().hex}", "name": normalized, "created_at": now, "updated_at": now}
+        folder = {
+            "id": f"folder-{uuid.uuid4().hex}",
+            "name": normalized,
+            "kind": scoped,
+            "created_at": now,
+            "updated_at": now,
+        }
         self._data["folders"].append(folder)
         self._save()
         return dict(folder)
@@ -159,7 +213,7 @@ class OrganizationStore:
         if folder is None:
             raise KeyError(folder_id)
         normalized = _valid_folder_name(name)
-        self._assert_unique_name(normalized, excluding=folder_id)
+        self._assert_unique_name(normalized, folder["kind"], excluding=folder_id)
         folder["name"] = normalized
         folder["updated_at"] = _now()
         self._save()
@@ -184,8 +238,14 @@ class OrganizationStore:
             mapping.pop(item_id, None)
         else:
             normalized_folder_id = _valid_item_id(folder_id)
-            if self._folder(normalized_folder_id) is None:
+            folder = self._folder(normalized_folder_id)
+            if folder is None:
                 raise KeyError(normalized_folder_id)
+            if folder["kind"] is None:
+                self._assert_unique_name(folder["name"], kind, excluding=folder["id"])
+                folder["kind"] = kind
+            elif folder["kind"] != kind:
+                raise ValueError(f"folder holds {folder['kind']}s, not {kind}s")
             mapping[item_id] = normalized_folder_id
         self._save()
 

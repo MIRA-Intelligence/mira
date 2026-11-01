@@ -151,7 +151,7 @@ async def test_repeatable_clarifications_stop_batches_and_restore_decisions(
         return LLMResponse(content=None, tool_calls=[
             ToolCallRequest(id=kind, name="request_workflow_interaction", arguments={
                 "interaction_type": kind, "title": title, "prompt": f"Decide: {title}",
-                "choices": [{"id": "option_a", "label": label}], "allow_freeform": True,
+                "choices": [{"id": "option_a", "label": label, "recommended": True}], "allow_freeform": True,
             }),
             ToolCallRequest(id=f"bad-write-{kind}", name="write_file", arguments={
                 "path": str(service.repository.project_dir / "must-not-exist.txt"),
@@ -629,7 +629,7 @@ async def test_native_initiation_records_research_before_direction_choice(
                             "title": "Choose a direction",
                             "prompt": "Which direction should continue?",
                             "choices": [
-                                {"id": "direction-1", "label": "Validate prospectively"}
+                                {"id": "direction-1", "label": "Validate prospectively", "recommended": True}
                             ],
                             "allow_freeform": True,
                         },
