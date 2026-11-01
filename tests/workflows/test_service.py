@@ -570,6 +570,15 @@ def test_chat_message_answers_an_approval_gate_as_a_revision(
     assert exc_info.value.code == "confirmation_required"
 
 
+def test_typing_approve_in_the_chat_is_not_an_approval(service: WorkflowService) -> None:
+    run_id = _approval_gate(service)
+
+    service.prepare_for_chat(run_id, text="approve")
+
+    response = service.repository.load_run(run_id).module_data["interaction"]["response"]
+    assert response == {"selection": "revise", "notes": "approve", "source": "chat"}
+
+
 def test_chat_message_answers_a_choice_interaction(service: WorkflowService) -> None:
     created = service.create_run(command_id="cmd-create", module_type="initiation", enqueue=True)
     run_id = created.run_id or ""

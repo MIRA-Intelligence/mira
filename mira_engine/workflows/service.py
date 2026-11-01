@@ -75,6 +75,28 @@ def clear_default_event_listener(listener: EventListener) -> None:
         _default_listener = None
 
 
+_CHAT_ANSWER_TRIM = " \t\r\n。．.!！"
+
+
+def _choice_named_by(interaction: dict[str, Any], text: str) -> str | None:
+    """The choice a chat reply names exactly (its value, id, label or one side of "zh / en")."""
+    wanted = text.strip(_CHAT_ANSWER_TRIM).casefold()
+    if not wanted:
+        return None
+    named: set[str] = set()
+    for choice in interaction.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        selection = choice.get("value") or choice.get("id")
+        if not isinstance(selection, str):
+            continue
+        label = choice.get("label") if isinstance(choice.get("label"), str) else ""
+        names = {selection, str(choice.get("id") or ""), label, *label.split(" / ")}
+        if wanted in {name.strip(_CHAT_ANSWER_TRIM).casefold() for name in names if name}:
+            named.add(selection)
+    return named.pop() if len(named) == 1 else None
+
+
 class WorkflowService:
     @staticmethod
     def _validate_experiment_mode(module_type: str, data: dict[str, Any]) -> None:
@@ -1148,6 +1170,18 @@ class WorkflowService:
             response: dict[str, Any] = {"chat_reply": text.strip(), "source": "chat"}
             if str(interaction.get("interaction_type", "")).startswith("approve_"):
                 response = {"selection": "revise", "notes": text.strip(), "source": "chat"}
+            elif (named := _choice_named_by(interaction, text)) is not None:
+                # "结束并汇总" typed in the chat is the same answer as clicking it.
+                response["selection"] = named
+            boundary = run.module_data.get("_manual_experiment_boundary")
+            if (
+                isinstance(boundary, dict)
+                and boundary.get("interaction_id") == interaction.get("interaction_id")
+                and "selection" not in response
+            ):
+                # Free text does not decide a manual experiment boundary: the
+                # runtime asks it again as a new form before the next tool call.
+                boundary["interaction_id"] = new_id()
             self._resolve_interaction(run, interaction, response)
             return "queued", "interaction.resolved", "accepted"
         if command == "request_revision" and status == "completed":
