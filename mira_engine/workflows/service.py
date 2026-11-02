@@ -25,6 +25,7 @@ from .experiments import (
 )
 from .input_paths import normalize_input_paths
 from .journals import normalize_journal_selection
+from .legacy import LegacyProjectImporter
 from .models import (
     MODULE_TYPES,
     Actor,
@@ -138,9 +139,11 @@ class WorkflowService:
         self.on_event = on_event
 
     def ensure_project(self) -> ProjectWorkflow:
+        LegacyProjectImporter(self.repository).import_if_needed()
         return self.repository.ensure_workflow()
 
     def snapshot(self) -> tuple[ProjectWorkflow, list[ModuleRun]]:
+        LegacyProjectImporter(self.repository).import_if_needed()
         workflow = self.repository.ensure_workflow()
         return workflow, self.repository.list_runs()
 
@@ -230,6 +233,7 @@ class WorkflowService:
         if not command_id:
             raise WorkflowError("command_id_required", "command_id is required", status=422)
         self._validate_experiment_mode(module_type, module_data or {})
+        LegacyProjectImporter(self.repository).import_if_needed()
         if module_type == "experiment":
             module_data = dict(module_data or {})
             module_data.setdefault("experiment_execution_mode", "auto")
