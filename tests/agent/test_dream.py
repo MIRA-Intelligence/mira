@@ -1,8 +1,8 @@
 """Tests for the Dream class — two-phase memory consolidation via AgentRunner."""
 
-import pytest
-
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from mira_engine.agent.memory import Dream, MemoryStore
 from mira_engine.agent.runner import AgentRunResult

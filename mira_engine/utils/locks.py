@@ -63,11 +63,15 @@ def interprocess_lock(target: Path, *, timeout: float = _DEFAULT_TIMEOUT) -> Ite
             pass
 
 
-def atomic_write_text(path: Path, content: str) -> None:
-    """Atomically replace ``path``. The caller must provide synchronization."""
+def atomic_write_text(path: Path, content: str, *, mode: int | None = None) -> None:
+    """Replace under a caller-held lock; optionally apply explicit permission bits."""
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
+        if mode is not None:
+            tmp.touch(mode=0o600, exist_ok=False)
         tmp.write_text(content, encoding="utf-8")
+        if mode is not None:
+            tmp.chmod(mode)
         tmp.replace(path)
     finally:
         if tmp.exists():
