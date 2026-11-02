@@ -159,6 +159,8 @@ def project_experiments(repository: JsonWorkflowRepository) -> list[dict[str, An
                 workflow_run_id=run.run_id,
                 workflow_run_label=run.label,
             )
+            if run.module_data.get("legacy_import"):
+                item["legacy_import"] = True
             if item.get("parent"):
                 item["parent"] = scoped_experiment_id(run.run_id, item["parent"])
             experiments.append(item)

@@ -3661,8 +3661,14 @@ class UiChannel(BaseChannel):
         if project_dir is not None:
             from mira_engine.workflows import JsonWorkflowRepository
             from mira_engine.workflows.experiments import project_experiments
+            from mira_engine.workflows.legacy import LegacyProjectImporter, link_legacy_experiments
 
-            records = project_experiments(JsonWorkflowRepository(project_dir, session_id))
+            repository = JsonWorkflowRepository(project_dir, session_id)
+            LegacyProjectImporter(repository).import_if_needed()
+            records = project_experiments(repository)
+            if data is not None:
+                # Old experiments stay as served from task_plan.json; imported Runs only link to them.
+                records = link_legacy_experiments(data, records)
             if records:
                 data = {**(data or {}), "experiments": [*(data or {}).get("experiments", []), *records]}
         if data is None:
