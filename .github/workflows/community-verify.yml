@@ -12,8 +12,11 @@ name: Community Verify
 # - Every test that exists on the landing branch runs in its landing-branch
 #   version, with the landing branch's pytest config and lint rules; tests the
 #   PR *adds* run too. Deleting, skipping or loosening an existing test in a PR
-#   therefore cannot turn it green. (A PR that legitimately rewrites existing
-#   tests is core-lane by definition: a maintainer reviews and merges it.)
+#   therefore cannot turn it green. A PR that legitimately changes tested
+#   behaviour is resolved by its author: when the AI maintainer decides the new
+#   behaviour stands, it authorizes that PR (on the platform, not in the PR) to
+#   rewrite exactly the failing test files, and only those keep the PR's
+#   version here (see "Overlay the trusted test harness").
 #
 # Security model:
 # - `verify` executes PR code. It has a read-only token, references no secrets,
@@ -22,7 +25,9 @@ name: Community Verify
 # - `pending` / `report` never check out PR code; only they may write the status.
 # - This protects the *verdict* from PRs that edit tests or CI. It does not make
 #   hostile code trustworthy: code under test can always sabotage its own run.
-#   Merge lanes and review (core lane = maintainer) exist for that.
+#   Merge lanes and review (core lane = the AI maintainer) exist for that.
+# - The authorized list is read from the platform's public read-only endpoint
+#   in the overlay step, before any PR code runs.
 
 on:
   pull_request_target:
@@ -96,6 +101,10 @@ jobs:
           git submodule update --init --recursive
 
       - name: Overlay the trusted test harness
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMUNITY_API: ${{ vars.MIRA_COMMUNITY_API || 'https://mira-intelligence.com/community' }}
         run: |
           set -euo pipefail
           # Restore every landing-branch test file (modified or deleted by the
@@ -105,6 +114,34 @@ jobs:
           # Root-level pytest/conftest config would be picked up from the PR's
           # rootdir; pytest is pointed at the base pyproject instead.
           rm -f pr/conftest.py pr/pytest.ini pr/tox.ini pr/setup.cfg
+          # Baseline updates (MIRA-Intelligence/mira-community#88): a PR that
+          # deliberately changes tested behaviour cannot pass the landing-branch
+          # tests that assert the old one. When the AI maintainer decides the new
+          # behaviour stands, it authorizes THIS PR to rewrite exactly those test
+          # files. The list comes from the platform — only the AI maintainer
+          # writes it — never from the PR; those files keep the PR's version, and
+          # every other test stays restored. No answer means no exceptions.
+          authorized=""
+          if ! authorized="$(curl -fsS --max-time 20 \
+              "$COMMUNITY_API/external-prs/baseline-updates?host=github&repo=$REPO&pr=$PR_NUMBER" \
+              | jq -r '.files[]?')"; then
+            echo "::warning::could not read the authorized baseline updates; every landing-branch test stays restored"
+            authorized=""
+          fi
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if ! [[ "$f" =~ ^tests/[A-Za-z0-9_./-]+\.py$ ]] || [[ "$f" == *..* ]]; then
+              echo "::warning::ignoring an authorized path that is not a test file: $f"
+              continue
+            fi
+            # Rewriting is authorized, deleting is not: a test the PR removed stays restored.
+            if git -C pr cat-file -e "HEAD:$f" 2>/dev/null; then
+              git -C pr checkout HEAD -- "$f"
+              echo "baseline update: keeping the PR's version of $f"
+            else
+              echo "::warning::$f is authorized for an update but the PR deletes it; the landing-branch version runs"
+            fi
+          done <<< "$authorized"
 
       - uses: actions/setup-python@v5
         with:
