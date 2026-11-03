@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from loguru import logger
 
 from mira_engine.agent.runner import AgentRunner, AgentRunSpec
+from mira_engine.agent.skill_turn import invoked_skills_metadata
 from mira_engine.agent.token_usage import record_token_usage
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.utils.gitstore import GitStore
@@ -769,6 +770,7 @@ class Consolidator:
             current_message="[token-probe]",
             channel=channel,
             chat_id=chat_id,
+            invoked_skills=invoked_skills_metadata(session.metadata),
         )
         return estimate_prompt_tokens_chain(
             self.provider,

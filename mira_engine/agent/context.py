@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from mira_engine.agent.memory import MemoryStore
+from mira_engine.agent.skill_turn import invoked_skill_names
 from mira_engine.agent.skills import SkillsLoader
 from mira_engine.utils.helpers import detect_image_mime
 from mira_engine.utils.prompt_templates import render_template
@@ -20,6 +21,10 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
+    # Skills re-attached after their tool result left the conversation
+    # (consolidation, history window): head of each body, newest first.
+    _REATTACH_SKILL_CHARS = 20_000
+    _REATTACH_TOTAL_CHARS = 40_000
 
     def __init__(self, workspace: Path):
         from mira_engine.utils.helpers import get_mira_dir
@@ -31,12 +36,18 @@ class ContextBuilder:
 
     def build_system_prompt(
         self,
-        skill_names: list[str] | None = None,
         agents_filename: str = "AGENTS.md",
         channel: str | None = None,
         loaded_skills: list[str] | None = None,
+        history: list[dict[str, Any]] | None = None,
+        invoked_skills: list[str] | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the system prompt from identity, bootstrap files, memory, and skills.
+
+        Only always-on skills are inlined; the rest are listed and loaded on
+        demand by the `skill` tool. ``invoked_skills`` whose tool result is no
+        longer in ``history`` are re-attached so their guidance survives.
+        """
         parts = [self._get_identity(channel=channel)]
 
         bootstrap = self._load_bootstrap_files(agents_filename=agents_filename)
@@ -47,18 +58,21 @@ class ContextBuilder:
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
-        active_skills: list[str] = []
-        for name in [*(skill_names or []), *self.skills.get_always_skills()]:
-            if name and name not in active_skills:
-                active_skills.append(name)
-        if active_skills:
-            active_content = self.skills.load_skills_for_context(active_skills, loaded_skills=loaded_skills)
+        always_skills = self.skills.get_always_skills()
+        if always_skills:
+            active_content = self.skills.load_skills_for_context(always_skills, loaded_skills=loaded_skills)
             if active_content:
                 parts.append(f"# Active Skills\n\n{active_content}")
 
-        skills_summary = self.skills.build_skills_summary()
-        if skills_summary:
-            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary).strip())
+        skills_listing = self.skills.build_skills_listing()
+        if skills_listing:
+            parts.append(render_template("agent/skills_section.md", skills_listing=skills_listing).strip())
+
+        invoked_section = self._build_invoked_skills_section(
+            invoked_skills or [], history or [], exclude=set(always_skills), loaded_skills=loaded_skills,
+        )
+        if invoked_section:
+            parts.append(invoked_section)
 
         recent_history = self._build_recent_history_section()
         if recent_history:
@@ -93,6 +107,42 @@ class ContextBuilder:
             channel=channel,
         ).strip()
 
+    def _build_invoked_skills_section(
+        self,
+        invoked_skills: list[str],
+        history: list[dict[str, Any]],
+        *,
+        exclude: set[str],
+        loaded_skills: list[str] | None = None,
+    ) -> str:
+        in_context = set(invoked_skill_names(history)) | exclude
+        blocks: list[str] = []
+        used = 0
+        for name in reversed(invoked_skills):
+            if name in in_context:
+                continue
+            content = self.skills.render_skill(name)
+            if not content:
+                continue
+            if len(content) > self._REATTACH_SKILL_CHARS:
+                content = (
+                    content[: self._REATTACH_SKILL_CHARS]
+                    + "\n\n[... skill content truncated; call the skill tool again if you need the full text]"
+                )
+            if used + len(content) > self._REATTACH_TOTAL_CHARS:
+                break
+            used += len(content)
+            blocks.append(f"### Skill: {name}\n\n{content}")
+            if loaded_skills is not None:
+                loaded_skills.append(name)
+        if not blocks:
+            return ""
+        return (
+            "# Invoked Skills\n\nThese skills were loaded earlier in this session and their tool results "
+            "are no longer in the conversation. Continue to follow these guidelines:\n\n"
+            + "\n\n---\n\n".join(blocks)
+        )
+
     def _build_recent_history_section(self) -> str:
         """Build unprocessed history section for prompt cache continuity."""
         since_cursor = self.memory.get_last_dream_cursor()
@@ -119,6 +169,7 @@ class ContextBuilder:
         project_dir: str | None = None,
         run_mode: str | None = None,
         working_dir: str | None = None,
+        relevant_skills: list[str] | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
@@ -132,6 +183,11 @@ class ContextBuilder:
                 lines.append(f"Working Directory: {working_dir} (save files for this chat here)")
             if run_mode:
                 lines.append(f"Run Mode: {run_mode}")
+        if relevant_skills:
+            lines.append(
+                f"Possibly Relevant Skills: {', '.join(relevant_skills)} "
+                "(load one with the skill tool if it applies to this request)"
+            )
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     @staticmethod
@@ -251,7 +307,6 @@ class ContextBuilder:
         self,
         history: list[dict[str, Any]],
         current_message: str,
-        skill_names: list[str] | None = None,
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
@@ -262,10 +317,13 @@ class ContextBuilder:
         current_role: str = "user",
         loaded_skills: list[str] | None = None,
         working_dir: str | None = None,
+        relevant_skills: list[str] | None = None,
+        invoked_skills: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(
-            channel, chat_id, project_dir, run_mode, working_dir=working_dir
+            channel, chat_id, project_dir, run_mode, working_dir=working_dir,
+            relevant_skills=relevant_skills,
         )
         user_content = self._build_user_content(current_message, media)
 
@@ -286,10 +344,11 @@ class ContextBuilder:
             current_role = "user"
 
         system_prompt = self.build_system_prompt(
-            skill_names,
             agents_filename=agents_filename,
             channel=channel,
             loaded_skills=loaded_skills,
+            history=history_copy,
+            invoked_skills=invoked_skills,
         )
         if extra_system:
             system_prompt += "\n\n---\n\n" + extra_system

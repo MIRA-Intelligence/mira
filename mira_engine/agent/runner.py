@@ -10,6 +10,7 @@ from typing import Any
 from loguru import logger
 
 from mira_engine.agent.hook import AgentHook, AgentHookContext
+from mira_engine.agent.skills import SKILL_RESULT_MAX_CHARS, SKILL_TOOL_NAME
 from mira_engine.agent.token_usage import record_token_usage
 from mira_engine.utils.prompt_templates import render_template
 from mira_engine.agent.tools.registry import ToolRegistry
@@ -532,13 +533,19 @@ class AgentRunner:
         result: Any,
     ) -> Any:
         result = ensure_nonempty_tool_result(tool_name, result)
+        # Skill instructions must reach the model whole, not as a file preview.
+        max_chars = (
+            max(spec.max_tool_result_chars, SKILL_RESULT_MAX_CHARS)
+            if tool_name == SKILL_TOOL_NAME
+            else spec.max_tool_result_chars
+        )
         try:
             content = maybe_persist_tool_result(
                 spec.workspace,
                 spec.session_key,
                 tool_call_id,
                 result,
-                max_chars=spec.max_tool_result_chars,
+                max_chars=max_chars,
             )
         except Exception as exc:
             logger.warning(
@@ -548,8 +555,8 @@ class AgentRunner:
                 exc,
             )
             content = result
-        if isinstance(content, str) and len(content) > spec.max_tool_result_chars:
-            return truncate_text(content, spec.max_tool_result_chars)
+        if isinstance(content, str) and len(content) > max_chars:
+            return truncate_text(content, max_chars)
         return content
 
     @staticmethod

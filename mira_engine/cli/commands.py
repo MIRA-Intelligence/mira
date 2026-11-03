@@ -1958,7 +1958,7 @@ def _run_cli_agent_session(
 
             async def _cli_audit_once(details: dict[str, object]) -> None:
                 event = str(details.get("tool", "") or "")
-                if event != "read_file":
+                if event not in ("read_file", "skill"):
                     return
                 skill_name = str(details.get("skill_name", "") or "").strip()
                 if not skill_name:

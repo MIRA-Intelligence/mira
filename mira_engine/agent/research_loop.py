@@ -24,7 +24,11 @@ from mira_engine.agent.base_loop import (
     set_turn_stop_reason,
 )
 from mira_engine.agent.context import ContextBuilder
-from mira_engine.agent.skill_events import skill_loaded
+from mira_engine.agent.skill_turn import (
+    invoked_skills_metadata,
+    prepare_turn_skills,
+    record_invoked_skills,
+)
 from mira_engine.agent.token_usage import track_token_usage
 from mira_engine.agent.tools.message import MessageTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
@@ -1241,8 +1245,10 @@ class ResearchAgentLoop(BaseAgentLoop):
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 project_dir=str(project_ref.project_dir) if project_ref else None,
+                invoked_skills=invoked_skills_metadata(session.metadata),
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages, model_runtime=model_runtime)
+            record_invoked_skills(session.metadata, all_msgs[1 + len(history):])
             self._save_turn(session, all_msgs, 1 + len(history))
             sessions_mgr.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -1437,56 +1443,16 @@ class ResearchAgentLoop(BaseAgentLoop):
         )
         extra_system = self._with_knowledge(extra_system, meta, project_ref)
 
-        raw_selected_skills = meta.get("selected_skill_ids")
-        selected_skills = [
-            name for name in (
-                str(item).strip() for item in raw_selected_skills
-                if isinstance(item, str)
-            )
-            if name and ctx.skills.load_skill(name)
-        ] if isinstance(raw_selected_skills, list) else []
-
-        suggested_skills = ctx.skills.suggest_skills(
-            msg.content,
-            recent=recent_skill_names,
-            limit=3,
+        turn_skills = prepare_turn_skills(
+            ctx.skills, meta, msg.content, recent=recent_skill_names, history=history,
         )
-        active_skills: list[str] = []
-        for name in [*selected_skills, *suggested_skills]:
-            if name not in active_skills:
-                active_skills.append(name)
-        active_skills = active_skills[:8]
-        skill_hint = ""
-        if selected_skills:
-            fallback_instruction = (
-                "The user approved the previously proposed fallback for this turn. "
-                "Deviate only as narrowly as that proposal requires."
-                if meta.get("_skill_fallback_approved")
-                else "If their workflow cannot continue, stop using tools and reply with "
-                     "`MIRA_SKILL_FALLBACK_REQUIRED:` followed by the exact error and proposed "
-                     "fallback. Wait for explicit user approval before deviating."
-            )
-            skill_hint = (
-                "User-selected skills are mandatory system-level instructions for this turn:\n"
-                + "\n".join(f"- {name}" for name in selected_skills)
-                + "\nFollow their documented workflow and recommended calls. Do not bypass them "
-                  "by inspecting implementation source, calling internal functions, or writing a "
-                  "replacement implementation. " + fallback_instruction
-            )
-        elif suggested_skills:
-            skill_hint = (
-                "Skill routing selected these active skills. Their full instructions are included "
-                "in the system prompt; prefer their documented workflow when relevant:\n"
-                + "\n".join(f"- {name}" for name in suggested_skills)
-            )
-        if on_progress and (selected_skills or suggested_skills):
+        selected_skills = turn_skills.selected
+        if on_progress and selected_skills:
             try:
-                await on_progress(
-                    f"skill -> {', '.join(selected_skills or suggested_skills)}",
-                    tool_hint=True,
-                )
+                await on_progress(f"skill -> {', '.join(selected_skills)}", tool_hint=True)
             except TypeError:
-                await on_progress(f"skill -> {', '.join(selected_skills or suggested_skills)}")
+                await on_progress(f"skill -> {', '.join(selected_skills)}")
+        skill_hint = turn_skills.mandatory_hint
         if extra_system:
             extra_system = skill_hint + "\n\n" + extra_system if skill_hint else extra_system
         else:
@@ -1495,7 +1461,6 @@ class ResearchAgentLoop(BaseAgentLoop):
         initial_messages = ctx.build_messages(
             history=history,
             current_message=msg.content,
-            skill_names=active_skills or None,
             loaded_skills=loaded_skills,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
@@ -1503,7 +1468,12 @@ class ResearchAgentLoop(BaseAgentLoop):
             run_mode=run_mode,
             agents_filename=agents_filename,
             extra_system=extra_system,
+            relevant_skills=turn_skills.suggested,
+            invoked_skills=[
+                name for name in invoked_skills_metadata(session.metadata) if name not in turn_skills.injected
+            ],
         )
+        initial_messages.extend(turn_skills.synthetic_messages)
 
         async def _bus_progress(
             content: str,
@@ -1560,15 +1530,9 @@ class ResearchAgentLoop(BaseAgentLoop):
 
             audit_cb = _audit
         if audit_cb:
-            for name in loaded_skills:
-                source = "manual" if name in selected_skills else "auto" if name in suggested_skills else "recent" if name in recent_skill_names else "always"
-                await audit_cb(skill_loaded(name, source, tool="system_prompt"))
-            for selected_skill in selected_skills:
-                await audit_cb({
-                    "tool": "system_prompt",
-                    "skill_name": selected_skill,
-                    "selected": True,
-                })
+            await self._audit_turn_skills(
+                audit_cb, turn_skills, loaded_skills, set(ctx.skills.get_always_skills()),
+            )
         run_kwargs: dict[str, Any] = {
             "model_runtime": model_runtime,
             "on_progress": progress_cb,
@@ -1823,10 +1787,11 @@ class ResearchAgentLoop(BaseAgentLoop):
         if isinstance(session.metadata, dict):
             merged: list[str] = []
             # Remember this task's skills, not an ever-growing list of old topics.
-            for item in [*(name for name in active_skills if name in loaded_skills), *sorted(current_turn_skills)]:
+            for item in [*selected_skills, *sorted(current_turn_skills)]:
                 if item not in merged:
                     merged.append(item)
             session.metadata["_recent_skills"] = merged[-10:]
+            record_invoked_skills(session.metadata, all_msgs[1 + len(history):])
 
         self._save_turn(session, all_msgs, 1 + len(history))
         sessions_mgr.save(session)
