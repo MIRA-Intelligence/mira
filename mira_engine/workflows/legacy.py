@@ -47,7 +47,7 @@ from .repository import JsonWorkflowRepository
 
 LEGACY_PLAN_FILENAME = "task_plan.json"
 LEGACY_MARKER_FILENAME = "legacy_import.json"
-LEGACY_IMPORT_VERSION = 1
+LEGACY_IMPORT_VERSION = 2  # 2: imported Runs carry parent_run_id / upstream_selection
 _ACTOR_ID = "legacy-task-plan"
 _EXPERIMENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 _TEXT_EXPERIMENT_FIELDS = ("question", "hypothesis", "prediction", "method", "conclusion", "next")
@@ -90,6 +90,32 @@ def _iso(moment: datetime) -> str:
 def legacy_import_done(repository: JsonWorkflowRepository) -> bool:
     marker = _read_marker(repository)
     return bool(marker and marker.get("status") == "complete")
+
+
+def _lineage(module_type: str, by_type: dict[str, ModuleRun]) -> dict[str, Any]:
+    """The branch fields the UI uses to scope experiments / deliveries to their upstream Run.
+
+    The UI lists an experiment Run only under the research direction that names it as
+    ``parent_run_id``; without these fields an imported Run falls out of every scope and
+    the experiment list is empty even though the Run exists.
+    """
+    if module_type == "experiment" and "initiation" in by_type:
+        parent = by_type["initiation"]
+        return {
+            "parent_run_id": parent.run_id,
+            "upstream_selection": {
+                "module_type": "initiation", "run_id": parent.run_id, "item_id": "legacy-core-question",
+                "label": _text(parent.module_data.get("intent"), 500) or parent.label,
+            },
+        }
+    if module_type == "delivery" and "experiment" in by_type:
+        parent = by_type["experiment"]
+        # No item_id: the legacy result summarized the whole experiment sequence.
+        return {
+            "parent_run_id": parent.run_id,
+            "upstream_selection": {"module_type": "experiment", "run_id": parent.run_id, "label": parent.label},
+        }
+    return {}
 
 
 def link_legacy_experiments(
@@ -362,6 +388,7 @@ class LegacyProjectImporter:
     def import_if_needed(self) -> bool:
         """Return True when this call imported the Project. Never raises."""
         if not self.pending():
+            self._repair_lineage()
             return False
         try:
             return self._import()
@@ -420,6 +447,7 @@ class LegacyProjectImporter:
                 module_data: dict[str, Any],
             ) -> None:
                 nonlocal previous_outputs
+                module_data = {**module_data, **_lineage(module_type, {r.module_type: r for r in runs})}
                 at = _iso(started + (finished - started) * order / 4)
                 sequence = workflow.last_project_sequence + len(runs) + 1
                 event_id = new_id()
@@ -571,6 +599,33 @@ class LegacyProjectImporter:
                 repo.project_id, ", ".join(run.module_type for run in runs) or "no",
             )
             return True
+
+    def _repair_lineage(self) -> None:
+        """Projects imported before version 2 have Runs the UI cannot scope; link them once."""
+        marker = _read_marker(self.repository)
+        if not marker or marker.get("status") != "complete" or int(marker.get("version") or 1) >= 2:
+            return
+        repo = self.repository
+        try:
+            with repo.transaction():
+                marker = _read_marker(repo)
+                if not marker or int(marker.get("version") or 1) >= 2:
+                    return
+                runs = []
+                for run_id in marker.get("run_ids") or []:
+                    try:
+                        runs.append(repo.load_run(str(run_id)))
+                    except (FileNotFoundError, ValueError):
+                        continue
+                by_type = {run.module_type: run for run in runs}
+                for run in runs:
+                    extra = _lineage(run.module_type, by_type)
+                    if extra and "parent_run_id" not in run.module_data:
+                        run.module_data.update(extra)
+                        repo.save_run(run)
+                self._write_marker({**marker, "version": LEGACY_IMPORT_VERSION})
+        except Exception:  # noqa: BLE001 - repairing lineage must never block the Project
+            logger.exception("Legacy lineage repair failed for {}", repo.project_id)
 
     def _project_file(self, relative: str) -> Path | None:
         if not relative:

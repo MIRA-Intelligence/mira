@@ -225,3 +225,36 @@ def test_imported_records_surface_when_the_legacy_file_lists_no_experiments(tmp_
 
     records = link_legacy_experiments({"experiments": []}, project_experiments(repository))
     assert len(records) == 4
+
+
+def test_imported_runs_carry_the_lineage_the_ui_scopes_by(tmp_path: Path) -> None:
+    runs = {run.module_type: run for run in _service(_project(tmp_path)).snapshot()[1]}
+
+    experiment = runs["experiment"].module_data
+    assert experiment["parent_run_id"] == runs["initiation"].run_id
+    assert experiment["upstream_selection"]["item_id"] == "legacy-core-question"
+    assert runs["initiation"].module_data["research_result"]["directions"][0]["id"] == "legacy-core-question"
+    delivery = runs["delivery"].module_data
+    assert delivery["parent_run_id"] == runs["experiment"].run_id
+    assert "item_id" not in delivery["upstream_selection"]
+    assert "parent_run_id" not in runs["initiation"].module_data
+
+
+def test_projects_imported_before_lineage_existed_are_repaired_once(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    repository = JsonWorkflowRepository(project, project.name)
+    _service(project).snapshot()
+    # Recreate what the first release wrote: no lineage, marker version 1.
+    for run in repository.list_runs():
+        run.module_data.pop("parent_run_id", None)
+        run.module_data.pop("upstream_selection", None)
+        repository.save_run(run)
+    marker_path = project / ".mira" / "legacy_import.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker_path.write_text(json.dumps({**marker, "version": 1}), encoding="utf-8")
+
+    runs = {run.module_type: run for run in _service(project).snapshot()[1]}
+
+    assert runs["experiment"].module_data["parent_run_id"] == runs["initiation"].run_id
+    assert runs["delivery"].module_data["parent_run_id"] == runs["experiment"].run_id
+    assert json.loads(marker_path.read_text(encoding="utf-8"))["version"] == 2
