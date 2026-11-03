@@ -466,8 +466,16 @@ def build_status_content(
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
-    """Sync bundled templates to workspace. Only creates missing files."""
+    """Sync bundled templates to workspace. Only creates missing files.
+
+    Long-term memory is not part of the workspace: it lives in MIRA_HOME/mind,
+    and an older workspace's memory is moved there first.
+    """
     from importlib.resources import files as pkg_files
+
+    from mira_engine.agent.memory import migrate_to_mind_dir
+
+    migrate_to_mind_dir(workspace)
     try:
         tpl = pkg_files("mira_engine") / "templates"
     except Exception:
@@ -489,10 +497,7 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
             continue
         if item.name.endswith(".md") and not item.name.startswith("."):
             _write(item, workspace / item.name)
-    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
-    _write(None, workspace / "memory" / "HISTORY.md")
-    _write(None, workspace / "memory" / "history.jsonl")
-    (workspace / "skills").mkdir(exist_ok=True)
+    (workspace / "skills").mkdir(parents=True, exist_ok=True)
 
     if added and not silent:
         from rich.console import Console

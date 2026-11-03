@@ -117,12 +117,10 @@ def test_split_message_multiple_chunks() -> None:
 
 
 def test_sync_workspace_templates_fresh_creates_files(tmp_path: Path) -> None:
-    added = sync_workspace_templates(tmp_path, silent=True)
-    assert added
+    sync_workspace_templates(tmp_path, silent=True)
     assert (tmp_path / "skills").is_dir()
-    assert (tmp_path / "memory" / "MEMORY.md").is_file()
-    assert (tmp_path / "memory" / "HISTORY.md").is_file()
-    assert (tmp_path / "memory" / "HISTORY.md").read_text(encoding="utf-8") == ""
+    # Long-term memory lives in MIRA_HOME/mind; the workspace gets none.
+    assert not (tmp_path / "memory").exists()
     for name in helpers._RUNTIME_BOOTSTRAP:
         assert not (tmp_path / name).exists()
 
@@ -159,14 +157,3 @@ def test_sync_workspace_templates_silent_suppresses_output(
 ) -> None:
     sync_workspace_templates(tmp_path, silent=True)
     mock_console.assert_not_called()
-
-
-@patch("rich.console.Console")
-def test_sync_workspace_templates_not_silent_uses_console(
-    mock_console_cls: object,
-    tmp_path: Path,
-) -> None:
-    sync_workspace_templates(tmp_path, silent=False)
-    mock_console_cls.assert_called()
-    instance = mock_console_cls.return_value
-    assert instance.print.called

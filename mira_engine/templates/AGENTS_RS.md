@@ -115,7 +115,7 @@ Observation → Critical Review → Hypothesis (Scientific Mechanism) → Falsif
 
 ## Scientific Record Format
 
-Every experiment recorded in MEMORY.md must include:
+Every experiment recorded in the project's `memory/MEMORY.md` must include:
 
 ```
 ExpNNN: <Title> (commit: <hash>)

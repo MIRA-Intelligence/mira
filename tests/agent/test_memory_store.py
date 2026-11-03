@@ -42,8 +42,7 @@ class TestMemoryStoreBasicIO:
     def test_get_memory_context_returns_formatted_content(self, store):
         store.write_memory("important fact")
         ctx = store.get_memory_context()
-        assert "Long-term Memory" in ctx
-        assert "important fact" in ctx
+        assert ctx == "## Project Memory\nimportant fact"
 
 
 class TestHistoryWithCursor:
@@ -144,8 +143,8 @@ class TestLegacyHistoryMigration:
         assert "USER: hello" in entries[1]["content"]
         assert entries[2]["timestamp"] == fallback_timestamp
         assert entries[2]["content"].startswith("Legacy chunk without timestamp.")
-        assert store.read_file(store._cursor_file).strip() == "3"
         assert store.read_file(store._dream_cursor_file).strip() == "3"
+        assert store.append_history("next") == 4
         assert not legacy_file.exists()
         assert (memory_dir / "HISTORY.md.bak").read_text(encoding="utf-8") == legacy_content
 

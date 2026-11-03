@@ -16,7 +16,7 @@ from mira_engine.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
-from mira_engine.config.paths import get_media_dir
+from mira_engine.config.paths import get_media_dir, get_mind_dir
 from mira_engine.utils.helpers import build_image_content_blocks, detect_image_mime
 
 
@@ -64,8 +64,11 @@ class _FsTool(Tool):
         extra_allowed_dirs: list[Path] | None = None,
         supports_vision: bool = True,
         read_paths: tuple[Path, ...] = (),
+        protect_mind: bool = True,
     ):
         self._workspace = workspace
+        # Only Dream may change the long-term mind; agents get a refusal.
+        self._protect_mind = protect_mind
         self._allowed_dir = allowed_dir
         self._extra_allowed_dirs = extra_allowed_dirs
         self._read_paths: ContextVar[tuple[Path, ...]] = ContextVar(
@@ -136,6 +139,15 @@ class _FsTool(Tool):
             allowed_dir=allowed_dir if allowed_dir is not None else self._allowed_dir,
             extra_allowed_dirs=extra_allowed_dirs,
         )
+
+    def _resolve_writable(self, path: str) -> Path:
+        fp = self._resolve(path)
+        if self._protect_mind and _is_under(fp, get_mind_dir().resolve()):
+            raise PermissionError(
+                f"{fp} is long-term memory maintained by Dream; do not edit it. "
+                "Project facts belong in the project's memory/MEMORY.md."
+            )
+        return fp
 
 
 @tool_parameters(
@@ -292,7 +304,7 @@ class WriteFileTool(_FsTool):
                 raise ValueError("Unknown path")
             if content is None:
                 raise ValueError("Unknown content")
-            fp = self._resolve(path)
+            fp = self._resolve_writable(path)
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {fp}"
@@ -362,7 +374,7 @@ class EditFileTool(_FsTool):
             if new_text is None:
                 raise ValueError("Unknown new_text")
 
-            fp = self._resolve(path)
+            fp = self._resolve_writable(path)
             if not fp.exists():
                 return f"Error: File not found: {path}"
 

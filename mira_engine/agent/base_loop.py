@@ -82,7 +82,12 @@ from mira_engine.session.manager import Session, SessionManager
 from mira_engine.utils.helpers import normalize_citations
 
 if TYPE_CHECKING:
-    from mira_engine.config.schema import ChannelsConfig, ExecToolConfig, KnowledgeConfig
+    from mira_engine.config.schema import (
+        ChannelsConfig,
+        DreamConfig,
+        ExecToolConfig,
+        KnowledgeConfig,
+    )
     from mira_engine.cron.service import CronService
 
 UNIFIED_SESSION_KEY = "unified:default"
@@ -192,7 +197,7 @@ class BaseAgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
 
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(workspace, project=False)
         self.sessions = session_manager or SessionManager(workspace)
         self._project_sessions: dict[str, SessionManager] = {}
         self._project_contexts: dict[str, ContextBuilder] = {}
@@ -240,27 +245,8 @@ class BaseAgentLoop:
         from mira_engine.command.builtin import register_builtin_commands
 
         register_builtin_commands(self._command_router)
-        generation_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", None)
-        completion_tokens = (
-            int(generation_max_tokens)
-            if isinstance(generation_max_tokens, int | float)
-            else self.max_tokens
-        )
-        self.consolidator = Consolidator(
-            store=MemoryStore(self.workspace),
-            provider=self.provider,
-            model=self.model,
-            sessions=self.sessions,
-            context_window_tokens=self.context_window_tokens,
-            build_messages=self.context.build_messages,
-            get_tool_definitions=self.tools.get_definitions,
-            max_completion_tokens=completion_tokens,
-        )
-        self.dream = Dream(
-            store=self.consolidator.store,
-            provider=self.provider,
-            model=self.model,
-        )
+        self._dream_config: DreamConfig | None = None
+        self._rebuild_memory_helpers()
 
     def _rebuild_memory_helpers(self) -> None:
         generation_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", None)
@@ -270,7 +256,7 @@ class BaseAgentLoop:
             else self.max_tokens
         )
         self.consolidator = Consolidator(
-            store=MemoryStore(self.workspace),
+            store=MemoryStore(self.workspace, project=False),
             provider=self.provider,
             model=self.model,
             sessions=self.sessions,
@@ -279,11 +265,21 @@ class BaseAgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=completion_tokens,
         )
+        from mira_engine.config.schema import DreamConfig
+
+        dream_config = self._dream_config or DreamConfig()
         self.dream = Dream(
             store=self.consolidator.store,
             provider=self.provider,
-            model=self.model,
+            model=dream_config.model_override or self.model,
+            max_batch_size=dream_config.max_batch_size,
+            max_iterations=dream_config.max_iterations,
         )
+
+    def configure_dream(self, config: DreamConfig) -> None:
+        """Apply the configured Dream batch size, tool budget and model override."""
+        self._dream_config = config
+        self._rebuild_memory_helpers()
 
     async def reconfigure_runtime(
         self,
@@ -440,7 +436,7 @@ class BaseAgentLoop:
             self.context_window_tokens = context_window_tokens
 
         if workspace_changed:
-            self.context = ContextBuilder(next_workspace)
+            self.context = ContextBuilder(next_workspace, project=False)
             self.sessions = SessionManager(next_workspace)
             self._project_sessions.clear()
 
@@ -532,8 +528,10 @@ class BaseAgentLoop:
         if not (self.restrict_to_workspace or self.exec_config.sandbox):
             return []
         from mira_engine.agent.skills import skill_access_dirs
+        from mira_engine.config.paths import get_mind_dir
 
-        return skill_access_dirs(workspace)
+        # The mind is readable (history grep, MEMORY.md); file tools refuse writes.
+        return [*skill_access_dirs(workspace), get_mind_dir().resolve()]
 
         from mira_engine.agent.skills import SkillsLoader
 
@@ -635,7 +633,7 @@ class BaseAgentLoop:
         cache_key = self._project_scope_key(project_ref)
         ctx = self._project_contexts.get(cache_key)
         if ctx is None or ctx.workspace.resolve(strict=False) != project_ref.project_dir.resolve(strict=False):
-            ctx = ContextBuilder(project_ref.project_dir)
+            ctx = ContextBuilder(project_ref.project_dir, project=True)
             self._project_contexts[cache_key] = ctx
         return ctx
 
@@ -657,7 +655,7 @@ class BaseAgentLoop:
                 else self.max_tokens
             )
             consolidator = Consolidator(
-                store=MemoryStore(project_ref.project_dir),
+                store=MemoryStore(project_ref.project_dir, project=True),
                 provider=self.provider,
                 model=self.model,
                 sessions=sessions_mgr,
@@ -2090,7 +2088,8 @@ class BaseAgentLoop:
     ) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
         ws = workspace_override or self.workspace
-        return await MemoryStore(ws).consolidate(
+        project = ws.resolve(strict=False) != self.workspace.resolve(strict=False)
+        return await MemoryStore(ws, project=project).consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )

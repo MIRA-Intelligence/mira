@@ -22,6 +22,7 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     # Scaffolds that say nothing until someone fills them in.
     _SKIP_UNEDITED_BOOTSTRAP = frozenset({"USER.md"})
+    _MIND_FILES = frozenset({"SOUL.md", "USER.md"})
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     # Skills re-attached after their tool result left the conversation
@@ -29,12 +30,9 @@ class ContextBuilder:
     _REATTACH_SKILL_CHARS = 20_000
     _REATTACH_TOTAL_CHARS = 40_000
 
-    def __init__(self, workspace: Path):
-        from mira_engine.utils.helpers import get_mira_dir
-
+    def __init__(self, workspace: Path, *, project: bool | None = None):
         self.workspace = workspace
-        self.mira_dir = get_mira_dir(workspace)
-        self.memory = MemoryStore(workspace)
+        self.memory = MemoryStore(workspace, project=project)
         self.skills = SkillsLoader(workspace)
 
     def build_system_prompt(
@@ -85,7 +83,7 @@ class ContextBuilder:
 
     def _get_identity(self, channel: str | None = None) -> str:
         """Get the core identity section."""
-        workspace_path = str(self.mira_dir.expanduser().resolve())
+        workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
@@ -106,6 +104,9 @@ class ContextBuilder:
             "agent/identity.md",
             runtime=runtime,
             workspace_path=workspace_path,
+            project_memory_path=str(self.memory.memory_file) if self.memory.is_project else "",
+            history_path=str(self.memory.history_jsonl_file),
+            mind_path=str(self.memory.mind_dir),
             platform_policy=platform_policy.strip(),
             channel=channel,
         ).strip()
@@ -210,7 +211,8 @@ class ContextBuilder:
         """Load shared persona followed by project-specific overlays.
 
         Per file (e.g. AGENTS.md):
-          1. global workspace file, or built-in template as fallback (also for
+          1. global file (workspace; SOUL.md and USER.md come from the mind in
+             MIRA_HOME), or built-in template as fallback (also for
              an unedited copy of an older template; skipped entirely for an
              unedited ``USER.md``)
           2. global ``*.local.md``
@@ -232,9 +234,13 @@ class ContextBuilder:
             stem = effective_name.rsplit(".", 1)[0]
             layers: list[str] = []
 
-            global_file = global_workspace / effective_name
+            # SOUL.md and USER.md belong to the mind, which Dream maintains.
+            global_dir = self.memory.mind_dir if effective_name in self._MIND_FILES else global_workspace
+            global_file = global_dir / effective_name
             builtin = self._load_builtin_template(effective_name) or ""
             text = global_file.read_text(encoding="utf-8") if global_file.exists() else builtin
+            if global_dir != global_workspace and not text.strip():
+                text = builtin  # an emptied mind file means "no customisation"
             if is_shipped_template(effective_name, text):
                 text = "" if effective_name in self._SKIP_UNEDITED_BOOTSTRAP else builtin
             layers.append(text)

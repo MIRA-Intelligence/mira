@@ -66,7 +66,7 @@ Requirement Analysis → Constraint Check → Solution Design → Implementation
 
 ## Implementation Record Format
 
-Every engineering attempt recorded in MEMORY.md must include:
+Every engineering attempt recorded in the project's `memory/MEMORY.md` must include:
 
 ```
 ExpNNN: <Title> (commit: <hash>)

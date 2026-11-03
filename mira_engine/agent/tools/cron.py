@@ -6,7 +6,7 @@ from typing import Any
 
 from mira_engine.agent.tools.base import UNSET, Tool, turn_value
 from mira_engine.cron.service import CronService
-from mira_engine.cron.types import CronSchedule
+from mira_engine.cron.types import DREAM_JOB_ID, CronSchedule
 
 
 class CronTool(Tool):
@@ -233,7 +233,7 @@ class CronTool(Tool):
         lines: list[str] = []
         for j in jobs:
             lines.append(f"- {j.name} (id: {j.id}, {self._format_timing(j.schedule)})")
-            if j.id == "dream":
+            if j.id == DREAM_JOB_ID:
                 lines.append("  Dream memory consolidation for long-term memory.")
                 lines.append("  This job is protected and cannot be removed.")
             lines.extend(self._format_state(j.state, j.schedule))

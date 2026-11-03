@@ -1369,15 +1369,14 @@ class UiChannel(BaseChannel):
     # ── migration ──────────────────────────────────────────────────
 
     def _migrate_global_to_project(self) -> None:
-        """One-time migration: move global sessions/memory into per-project dirs.
+        """One-time migration: move global sessions into per-project dirs.
 
         Scans workspace_root/sessions/ for files named web_PRJ-XXXX.jsonl and
-        moves them into PRJ-XXXX/sessions/.  Similarly moves global memory/ into
-        the first project that exists (as a best-effort fallback).
+        moves them into PRJ-XXXX/sessions/. Global memory is not a project's:
+        it lives in MIRA_HOME/mind.
         """
         root = self.projects_root
         global_sessions = root / "sessions"
-        global_memory = root / "memory"
 
         if global_sessions.is_dir():
             for f in list(global_sessions.iterdir()):
@@ -1402,28 +1401,6 @@ class UiChannel(BaseChannel):
                     global_sessions.rmdir()
                 except OSError:
                     pass
-
-        if global_memory.is_dir():
-            projects = [
-                d for d in sorted(root.iterdir())
-                if d.is_dir() and d.name.startswith("PRJ-")
-            ]
-            if len(projects) == 1:
-                dest_dir = projects[0] / "memory"
-                if not dest_dir.exists():
-                    try:
-                        shutil.move(str(global_memory), str(dest_dir))
-                        logger.info("Migrated global memory → {}", dest_dir)
-                    except OSError as e:
-                        logger.warning("Failed to migrate memory: {}", e)
-            elif not projects:
-                pass
-            else:
-                logger.info(
-                    "Multiple projects exist; skipping global memory migration. "
-                    "Manually move {} into the correct project.",
-                    global_memory,
-                )
 
     # ── lifecycle ────────────────────────────────────────────────────
 

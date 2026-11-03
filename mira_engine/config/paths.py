@@ -91,6 +91,15 @@ def get_workspace_path(workspace: str | None = None) -> Path:
     return ensure_dir(path)
 
 
+def get_mind_dir() -> Path:
+    """Return the assistant's long-term mind: MEMORY.md, USER.md, SOUL.md, history.
+
+    It lives in MIRA_HOME rather than the workspace so it follows the user,
+    not whichever directory the agent happens to work in. Only Dream edits it.
+    """
+    return ensure_dir(get_home_dir() / "mind")
+
+
 def is_default_workspace(workspace: str | Path | None) -> bool:
     """Return whether workspace resolves to mira's default workspace path."""
     current = (

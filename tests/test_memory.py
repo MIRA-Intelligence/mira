@@ -1,3 +1,4 @@
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,48 +25,40 @@ def test_consolidation_does_not_overwrite_newer_memory(tmp_path) -> None:
     first = MemoryStore(tmp_path)
     second = MemoryStore(tmp_path)
     first.write_long_term("initial")
-    expected_local = first.read_long_term()
-    expected_global = first.read_global_term()
+    expected = first.read_long_term()
 
     second.write_long_term("newer instance")
 
-    committed = first.commit_consolidated_memories(
-        expected_local=expected_local,
-        local_update="stale consolidation",
-        expected_global=expected_global,
-        global_update=None,
-    )
-    assert committed is False
+    assert first.commit_consolidated_memory(expected=expected, update="stale consolidation") is False
     assert first.read_long_term() == "newer instance"
 
 
-def test_default_workspace_local_memory_does_not_bypass_global_lock(
-    tmp_path,
-    monkeypatch,
-) -> None:
+def test_default_workspace_memory_is_the_mind(tmp_path, monkeypatch) -> None:
     import mira_engine.config.paths
 
     monkeypatch.setattr(mira_engine.config.paths, "get_workspace_path", lambda _value: tmp_path)
     store = MemoryStore(tmp_path)
-    store.write_long_term("local")
+    store.write_long_term("long-term")
 
-    assert store.memory_file.read_text(encoding="utf-8") == "local"
-    assert not store.global_memory_file.exists()
+    assert not store.is_project
+    assert store.memory_file == store.global_memory_file == store.mind_dir / "MEMORY.md"
+    assert store.read_global_term() == ""
+    assert not (tmp_path / "memory").exists()
 
 
 def test_append_history_format_and_accumulation(tmp_path) -> None:
     store = MemoryStore(tmp_path)
     store.append_history("first")
     store.append_history("second\n")
-    text = store.history_file.read_text(encoding="utf-8")
-    assert text == "first\n\nsecond\n\n"
+    rows = [json.loads(line) for line in store.history_jsonl_file.read_text(encoding="utf-8").splitlines()]
+    assert [(r["cursor"], r["content"]) for r in rows] == [(1, "first"), (2, "second")]
 
 
 def test_get_memory_context_empty_and_nonempty(tmp_path) -> None:
     store = MemoryStore(tmp_path)
     assert store.get_memory_context() == ""
     store.write_long_term("remember this")
-    assert store.get_memory_context() == "## Long-term Memory\nremember this"
+    assert store.get_memory_context() == "## Project Memory\nremember this"
 
 
 def test_align_boundary_to_user() -> None:
@@ -109,7 +102,7 @@ async def test_consolidate_archive_all_updates_memory_and_resets_marker(tmp_path
     assert ok is True
     assert session.last_consolidated == 0
     assert "new memory" == store.read_long_term()
-    assert "[2025-01-01 12:00] summary" in store.history_file.read_text(encoding="utf-8")
+    assert "[2025-01-01 12:00] summary" in store.history_jsonl_file.read_text(encoding="utf-8")
     provider.chat.assert_awaited_once()
     kwargs = provider.chat.await_args.kwargs
     assert kwargs["tool_choice"] == {"type": "function", "function": {"name": "save_memory"}}

@@ -68,7 +68,12 @@ def test_onboard_fresh_install(mock_paths):
     assert "mira is ready" in result.stdout
     assert config_file.exists()
     assert (workspace_dir / "AGENTS.md").exists()
-    assert (workspace_dir / "memory" / "MEMORY.md").exists()
+    # The persona and long-term memory live in MIRA_HOME/mind, not the workspace.
+    from mira_engine.config.paths import get_mind_dir
+
+    assert (get_mind_dir() / "SOUL.md").exists() and (get_mind_dir() / "USER.md").exists()
+    assert not (workspace_dir / "SOUL.md").exists()
+    assert not (workspace_dir / "memory").exists()
     expected_workspace = Config().workspace_path
     assert mock_ws.call_args.args == (expected_workspace,)
 
@@ -1200,12 +1205,29 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     class _FakeCron:
         def __init__(self, _store_path: Path) -> None:
             self.on_job = None
+            self.system_jobs: list[CronJob] = []
             seen["cron"] = self
+
+        def register_system_job(self, job: CronJob) -> CronJob:
+            self.system_jobs.append(job)
+            return job
+
+    class _FakeDream:
+        runs = 0
+
+        async def run(self) -> bool:
+            self.runs += 1
+            return True
 
     class _FakeAgentLoop:
         def __init__(self, *args, **kwargs) -> None:
             self.model = "test-model"
             self.tools = {}
+            self.dream = _FakeDream()
+            seen["agent"] = self
+
+        def configure_dream(self, dream_config) -> None:
+            seen["dream_config"] = dream_config
 
         async def process_direct(self, *_args, **_kwargs):
             return OutboundMessage(
@@ -1253,6 +1275,13 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
     cron = seen["cron"]
     assert isinstance(cron, _FakeCron)
     assert cron.on_job is not None
+    # Dream runs on its own schedule, not through an agent turn.
+    assert seen["dream_config"] is config.agents.defaults.dream
+    [dream_job] = cron.system_jobs
+    assert dream_job.id == "dream" and dream_job.payload.kind == "system_event"
+    assert dream_job.schedule.every_ms == 2 * 3_600_000
+    assert asyncio.run(cron.on_job(dream_job)) is None
+    assert seen["agent"].dream.runs == 1
 
     job = CronJob(
         id="cron-1",
