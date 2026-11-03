@@ -335,7 +335,7 @@ No new deployable artifact is introduced. The new protocol ships through the exi
 - Keep `projects.py` responsible for Project discovery and filesystem locations. Evolve its existing `.mira/project.json` metadata into the Project-level workflow document through a schema-version migration, while delegating per-Run state to the workflow repository; do not create a second competing Project manifest.
 - Extend `channels/ui.py` with versioned `/api/workflow/...` endpoints and Run-scoped WebSocket envelopes. Existing `/api/plan` and project-wide messages remain the legacy compatibility path.
 - Extend `session/manager.py` to accept a Run-scoped thread identity while retaining legacy project session keys.
-- Replace global prompt rules in `channels/ui_assets/AGENTS_UI.md` and `SKILL_UI.md` only as each executor is extracted. Module contracts belong beside each executor, not in one four-stage prompt.
+- Module contracts belong beside each executor, not in one four-stage prompt. (The global `channels/ui_assets/AGENTS_UI.md` / `SKILL_UI.md` task_plan prompt has been removed; project chats outside a Run no longer receive it.)
 - Keep `task_plan/guardrails.py` on the Experiment path initially, then expose its checks behind the Experiment executor boundary.
 
 ### `mira-ui`

@@ -162,7 +162,6 @@ def plugin_install_refusal() -> web.Response | None:
             status=403,
         )
     return None
-_ASSETS_DIR = Path(__file__).parent / "ui_assets"
 _PROJECT_AUDIT_REL_PATH = Path(".mira") / "logs" / "actions.jsonl"
 _GLOBAL_AUDIT_FILENAME = "project_actions.jsonl"
 _PROJECT_EXPERIMENT_SNAPSHOT_REL_DIR = Path(".mira") / "snapshots" / "experiments"
@@ -444,16 +443,6 @@ def _resolve_project_workspace_path() -> Path:
 
 def _resolve_organization_path() -> Path:
     return _resolve_project_workspace_path().with_name(ORGANIZATION_FILENAME)
-
-
-def _load_ui_instructions() -> str:
-    """Load AGENTS_UI.md + SKILL_UI.md and return as a single system-prompt block."""
-    parts: list[str] = []
-    for name in ("AGENTS_UI.md", "SKILL_UI.md"):
-        fp = _ASSETS_DIR / name
-        if fp.is_file():
-            parts.append(fp.read_text(encoding="utf-8"))
-    return "\n\n---\n\n".join(parts)
 
 
 def _normalize_run_mode(value: Any) -> str:
@@ -1151,7 +1140,6 @@ class UiChannel(BaseChannel):
         # ``/version`` would make the old, still-running engine appear to
         # match the new bundled identity and skip the reinstall flow.
         self._engine_identity: dict[str, Any] = _current_engine_identity()
-        self._ui_instructions: str = _load_ui_instructions()
         self._clients: dict[str, web.WebSocketResponse] = {}
         # Every open WebSocket, bound to a session or not, so shutdown can close them all.
         self._sockets: set[web.WebSocketResponse] = set()
@@ -2582,11 +2570,6 @@ class UiChannel(BaseChannel):
                                     chat_notes.append(revision)
                             if chat_notes:
                                 metadata["_workflow_chat_instructions"] = "\n\n".join(chat_notes)
-                        else:
-                            instruction_parts = (
-                                [self._ui_instructions] if self._ui_instructions else []
-                            )
-                        if instruction_parts:
                             metadata["_ui_system_instructions"] = "\n\n".join(instruction_parts)
                     if guard_notice:
                         metadata["_task_plan_guard_notice"] = guard_notice
@@ -2703,8 +2686,6 @@ class UiChannel(BaseChannel):
                     }
                     if effective_policy:
                         metadata["automation_policy"] = effective_policy
-                    if self._ui_instructions:
-                        metadata["_ui_system_instructions"] = self._ui_instructions
                     await self._handle_message(
                         sender_id=user_id,
                         chat_id=session_id,
@@ -2777,8 +2758,6 @@ class UiChannel(BaseChannel):
                         metadata["_plan_feedback"] = feedback
                     if effective_policy:
                         metadata["automation_policy"] = effective_policy
-                    if self._ui_instructions:
-                        metadata["_ui_system_instructions"] = self._ui_instructions
                     await self._handle_message(
                         sender_id=user_id,
                         chat_id=session_id,

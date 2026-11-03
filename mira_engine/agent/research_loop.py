@@ -1239,6 +1239,7 @@ class ResearchAgentLoop(BaseAgentLoop):
                 project_ref=project_ref,
                 session_key=key,
             )
+            self._scope_turn_tools(meta)
             history = session.get_history(max_messages=self.memory_window)
             ctx = self._get_project_context(project_ref)
             messages = ctx.build_messages(
@@ -1425,6 +1426,7 @@ class ResearchAgentLoop(BaseAgentLoop):
             project_ref=project_ref,
             session_key=key,
         )
+        self._scope_turn_tools(meta)
         if plan_tool := self.tools.get("set_plan"):
             if hasattr(plan_tool, "set_project_dir"):
                 plan_tool.set_project_dir(project_dir)

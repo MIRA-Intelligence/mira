@@ -19,13 +19,26 @@ class ToolRegistry:
         self._visible_tools: ContextVar[frozenset[str] | None] = ContextVar(
             f"visible_tools_{id(self)}", default=None
         )
+        self._hidden_tools: ContextVar[frozenset[str]] = ContextVar(
+            f"hidden_tools_{id(self)}", default=frozenset()
+        )
         self._execution_guard: ContextVar[
             Callable[[str, dict[str, Any]], Awaitable[str | None]] | None
         ] = ContextVar(f"execution_guard_{id(self)}", default=None)
 
     def _is_visible(self, name: str) -> bool:
+        if name in self._hidden_tools.get():
+            return False
         visible = self._visible_tools.get()
         return visible is None or name in visible
+
+    def hide_for_turn(self, names: set[str] | frozenset[str]) -> None:
+        """Hide ``names`` from definitions and execution for the current turn's task.
+
+        Set at the start of every turn (``BaseAgentLoop._scope_turn_tools``), so
+        it never carries over; unlike ``restrict_to`` it composes with it.
+        """
+        self._hidden_tools.set(frozenset(names))
 
     @contextmanager
     def restrict_to(

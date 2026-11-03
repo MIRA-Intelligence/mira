@@ -669,6 +669,27 @@ class BaseAgentLoop:
             self._project_consolidators[cache_key] = consolidator
         return consolidator
 
+    # Tools that fail outside a ModuleRun / legacy plan event. Hiding them keeps
+    # their schemas (~2.5K tokens) off every ordinary chat request.
+    _MODULE_RUN_ONLY_TOOLS = frozenset({
+        "request_workflow_interaction",
+        "record_initiation_research_result",
+        "publish_workflow_artifact",
+        "record_workflow_experiment",
+        "complete_workflow_run",
+    })
+    _PLAN_EVENT_ONLY_TOOLS = frozenset({"set_plan"})
+
+    def _scope_turn_tools(self, meta: dict[str, Any]) -> None:
+        """Hide tools this turn cannot use; a ModuleRun scopes its own tools."""
+        if meta.get("workflow_run_id"):
+            hidden: set[str] = set()
+        else:
+            hidden = set(self._MODULE_RUN_ONLY_TOOLS)
+            if not meta.get("_plan_event"):
+                hidden |= self._PLAN_EVENT_ONLY_TOOLS
+        self.tools.hide_for_turn(hidden)
+
     def _set_tool_context(
         self,
         channel: str,
@@ -1677,6 +1698,7 @@ class BaseAgentLoop:
                 session_key=key,
                 chat_dir=chat_dir,
             )
+            self._scope_turn_tools(meta)
             history = session.get_history(max_messages=self.memory_window)
             ctx = self._get_project_context(project_ref)
             messages = ctx.build_messages(
@@ -1790,6 +1812,7 @@ class BaseAgentLoop:
             else None,
             chat_dir=chat_dir,
         )
+        self._scope_turn_tools(meta)
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
