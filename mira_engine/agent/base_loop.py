@@ -218,6 +218,7 @@ class BaseAgentLoop:
             provider_factory=provider_factory,
             model_candidates=self.model_candidates,
             role_provider_factory=role_provider_factory,
+            max_iterations=self.max_iterations,
         )
         self._session_model_runtimes: dict[str, RoutedProviderManager] = {}
         self._hook = CompositeHook(list(hooks)) if hooks else None
@@ -373,6 +374,7 @@ class BaseAgentLoop:
             subagents.temperature = self.temperature
             subagents.max_tokens = self.max_tokens
             subagents.reasoning_effort = self.reasoning_effort
+            subagents.max_iterations = self.max_iterations
 
     async def _apply_pending_runtime_swap(self) -> None:
         while self._pending_runtime_swap is not None:

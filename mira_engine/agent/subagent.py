@@ -38,23 +38,22 @@ from mira_engine.providers.base import LLMProvider
 # loop's ``role_provider_factory`` (see SubagentManager._resolve_role).
 ROLE_CONFIGS: dict[str, dict[str, Any]] = {
     "student": {
-        # Implementer: full read/write/exec/search/web toolset, no spawning.
+        # Executor: full read/write/exec/search/web toolset, no spawning.
         "allowed_tools": None,
         "temperature": 0.1,
     },
     "critic": {
-        # Reviewer: read-only. No write/edit/exec — it only inspects and
-        # returns a verdict, so it must not mutate the workspace.
+        # Reviewer: read-only. No write/edit/exec — it checks the evidence
+        # files the student delivers, so it must not mutate the workspace.
         "allowed_tools": {"read_file", "list_dir", "grep", "glob", "web_search", "web_fetch", "skill"},
         "temperature": 0.1,
     },
-    "supervisor": {
-        # Planner/orchestrator. Rarely run as a subagent (the main loop plays
-        # supervisor); included for completeness / direct consults.
-        "allowed_tools": None,
-        "temperature": 0.2,
-    },
 }
+# The main loop plays the supervisor; it is never consulted or spawned.
+DELEGATE_ROLES = tuple(ROLE_CONFIGS)
+_STEP_LIMIT_MESSAGE = (
+    "Stopped after {max_iterations} steps before finishing. Work done so far is in the workspace."
+)
 
 
 @dataclass(frozen=True)
@@ -123,6 +122,7 @@ class SubagentManager:
         model_candidates: list[str] | None = None,
         role_provider_factory: "Callable[[str], tuple[LLMProvider, str, tuple[str, ...]]] | None" = None,
         max_tool_result_chars: int = 16_000,
+        max_iterations: int = 500,
     ):
         from mira_engine.config.schema import ExecToolConfig
         self.provider = provider
@@ -140,6 +140,9 @@ class SubagentManager:
         self.model_candidates = list(model_candidates) if model_candidates else None
         self.role_provider_factory = role_provider_factory
         self.max_tool_result_chars = max_tool_result_chars
+        # Delegates get the same step budget as the main loop: a student runs
+        # whole experiments, and a short cap ends them mid-run.
+        self.max_iterations = max_iterations
         self.runner = AgentRunner(provider)
         self._session_runtimes: dict[str, RoutedProviderManager] = {}
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -341,8 +344,8 @@ class SubagentManager:
                     initial_messages=messages,
                     tools=tools,
                     model=model,
-                    max_iterations=15,
-                    max_iterations_message="Task completed but no final response was generated.",
+                    max_iterations=self.max_iterations,
+                    max_iterations_message=_STEP_LIMIT_MESSAGE,
                     max_tool_result_chars=self.max_tool_result_chars,
                     temperature=role_temperature,
                     max_tokens=self.max_tokens,
@@ -455,31 +458,66 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
     # Role-specific instruction blocks appended to the base subagent prompt.
     _ROLE_PROMPTS: dict[str, str] = {
-        "student": """## Role: Student (Implementer)
-You are the implementer on a research team. The supervisor has handed you a
-concrete, already-approved task. Execute it directly and thoroughly:
-- Do the actual work (write/edit files, run code) — do NOT re-plan or re-debate scope.
-- Keep a tight todo discipline and verify your changes before reporting.
-- You CANNOT delegate or spawn other agents; you work alone on implementation.
-- Report what you did, what you verified, and any blockers.""",
-        "critic": """## Role: Critic (Reviewer / Red Team)
-You are the skeptical reviewer on a research team. You evaluate the supervisor's
-plan for scientific rigor, falsifiability, confounds, and feasibility. You are
-READ-ONLY: you inspect but never modify the workspace.
+        "student": """## Role: Student (Executor)
+You do the research work on a team: search the literature, design experiments,
+run them, and organize the results. The supervisor decides whether the work is
+worth doing and whether to continue, pivot, or stop; a read-only critic checks
+whether your evidence supports your claim.
 
-Boundaries:
-- Challenge rigor, hidden assumptions, missing controls/ablations, and whether
-  claims are falsifiable — NOT cosmetic preferences.
-- Respect the chosen research direction; critique whether it is sound and
-  well-specified enough to execute, not whether a different topic would be "better".
+- **Literature:** cite what you actually read (title, year, link). Say plainly
+  when you found nothing relevant.
+- **Design** (when asked): hypothesis and falsifiable prediction; the data split
+  and its unit (e.g. patient); controls, baselines, and the null version;
+  metrics; the statistical plan (seeds, confidence intervals, tests); and the
+  evidence package you will deliver.
+- **Run:** follow the approved design. Record every deviation and why. Verify
+  the results before reporting; never drop failed runs or round away bad seeds.
+- **Evidence package:** the critic cannot run code, so save files it can read
+  and list their paths: exact commands, config and commit hash; the split
+  manifest (IDs per split at the split unit) with an overlap check; raw
+  per-fold / per-seed metrics; test-set predictions (id, label, score); training
+  and validation logs; baseline and control results on the same split.
+- Do not decide the direction, and do not spawn other agents.
 
-End EVERY review with a machine-readable verdict line, exactly:
-`**[OKAY]**` if the plan is rigorous and ready, or `**[REJECT]**` if not,
-followed by the top 3-5 concrete improvements needed.""",
-        "supervisor": """## Role: Supervisor (Planner)
-You design the research strategy and decompose it into precise, executable tasks.
-Specify hypotheses, controls, and acceptance criteria so an implementer can act
-without guessing.""",
+Report in this format:
+```
+## What was done
+## What was obtained   (numbers with variance or CI; file paths)
+## Deviations from the approved design
+## Tentative claim     (one or two sentences, clearly marked)
+## Open issues
+```""",
+        "critic": """## Role: Critic (Reviewer)
+You check whether the evidence supports the conclusion. You are READ-ONLY: you
+read files and search, but never modify the workspace or run code. You do not
+judge whether the topic is worth pursuing; that is the supervisor's call.
+
+The task says which review to do.
+
+**Design review** (before the run). Look for: leakage risk (split unit,
+preprocessing or feature selection fit on all data, duplicates, temporal
+order); missing controls, baselines, or the null version; unsuitable metrics;
+a weak statistical plan (seeds, intervals, multiple comparisons, sample size);
+and whether the promised evidence package will let you verify the claim.
+
+**Evidence review** (after the run). Read the evidence package and check:
+- **Data leakage:** do the split manifests overlap at the split unit?
+- **Overfitting:** was the test set used for model selection or tuning? Is the
+  validation-test gap plausible?
+- **Statistics:** is the claimed gain larger than the seed / fold variance? Are
+  the intervals, tests, and multiple comparisons handled?
+- **Missing controls:** is there a baseline and a null version on the same split?
+- **Alternative explanations:** what else could produce this result, and what
+  evidence would tell the explanations apart?
+If a file you need is missing, report that as a finding; never assume it.
+
+Tag each issue **[BLOCKING]** or **[SUGGESTION]**, and cite the file or number
+behind it.
+
+End EVERY review with one verdict line, exactly:
+- Design review: `**[DESIGN: OKAY]**` or `**[DESIGN: REVISE]**`
+- Evidence review: `**[SUPPORTED]**`, `**[PARTIAL]**`, or `**[NOT SUPPORTED]**`
+followed by the top 3-5 issues.""",
     }
 
     def _build_subagent_prompt(
@@ -522,7 +560,7 @@ Stay focused on the assigned task. Your final response will be reported back to 
         task: str,
         workspace: Path | None = None,
         session_id: str | None = None,
-        max_iterations: int = 15,
+        max_iterations: int | None = None,
     ) -> tuple[str, str]:
         """Run a role subagent synchronously and return (result, session_id).
 
@@ -553,8 +591,8 @@ Stay focused on the assigned task. Your final response will be reported back to 
                 initial_messages=messages,
                 tools=tools,
                 model=model,
-                max_iterations=max_iterations,
-                max_iterations_message="Consult finished without a final response.",
+                max_iterations=max_iterations or self.max_iterations,
+                max_iterations_message=_STEP_LIMIT_MESSAGE + " Consult again with this session_id to resume.",
                 max_tool_result_chars=self.max_tool_result_chars,
                 temperature=role_temperature,
                 max_tokens=self.max_tokens,

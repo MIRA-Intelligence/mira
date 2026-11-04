@@ -54,6 +54,7 @@ SHIPPED_TEMPLATE_DIGESTS: dict[str, frozenset[str]] = {
     }),
     "AGENTS_TM.md": frozenset({
         "3cc5b72b1fa89a7e",
+        "58e333d05b570fe2",
         "81c83707aa9a0ebb",
         "a4c1d12a4d66f585",
     }),

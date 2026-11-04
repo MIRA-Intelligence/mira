@@ -8,7 +8,7 @@ from pathlib import Path
 from loguru import logger
 
 from mira_engine.config import team_layer
-from mira_engine.config.schema import Config
+from mira_engine.config.schema import AgentDefaults, Config
 from mira_engine.providers.registry import set_user_model_param_rules
 from mira_engine.security.gateway_auth import ALLOWED_ORIGINS_ENV, DEFAULT_ALLOWED_ORIGINS
 from mira_engine.security.host_policy import enforce as enforce_host_policy
@@ -182,7 +182,22 @@ def _migrate_config(data: dict) -> dict:
             ui.pop("host", None)
             ui.pop("port", None)
             _migrate_legacy_cors_origins(ui)
+    _migrate_old_iteration_default(data)
     return data
+
+
+# Older versions saved the whole config, so the old default is not a choice.
+_OLD_MAX_TOOL_ITERATIONS = 200
+
+
+def _migrate_old_iteration_default(data: dict) -> None:
+    """Raise a saved step cap still at the old default to the current default."""
+    defaults = data.get("agents", {}).get("defaults")
+    if not isinstance(defaults, dict):
+        return
+    for key in ("maxToolIterations", "max_tool_iterations"):
+        if defaults.get(key) == _OLD_MAX_TOOL_ITERATIONS:
+            defaults[key] = AgentDefaults.model_fields["max_tool_iterations"].default
 
 
 def _migrate_legacy_cors_origins(ui: dict) -> None:

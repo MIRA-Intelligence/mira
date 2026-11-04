@@ -14,8 +14,8 @@ def test_profile_policy_preserves_custom_constraints_without_legacy_orchestratio
     assert "Scientific Record Format" in research
     assert "results-oriented Machine Learning Engineering Assistant" in engineer
     assert "Implementation Record Format" in engineer
-    assert "Bounded Debate Protocol" in team
-    assert "Delegation Discipline" in team
+    assert "The Research Cycle" in team
+    assert "What the Student Delivers" in team
 
     for policy in (research, engineer, team):
         assert "Interactive Plan Mode" not in policy

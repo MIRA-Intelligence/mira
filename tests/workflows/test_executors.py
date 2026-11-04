@@ -797,7 +797,7 @@ async def test_native_executor_acknowledges_pause_before_next_tool_call(
     [
         ("research", "Scientific Tenacity", False),
         ("engineer", "results-oriented Machine Learning Engineering Assistant", False),
-        ("team", "Bounded Debate Protocol", True),
+        ("team", "The Research Cycle", True),
     ],
 )
 async def test_native_executor_composes_profile_policy_and_capabilities(
