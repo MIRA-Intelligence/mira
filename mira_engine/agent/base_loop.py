@@ -39,6 +39,12 @@ from mira_engine.agent.python_runtime_hint import build_python_runtime_hint
 from mira_engine.agent.routing import RoutedProviderManager
 from mira_engine.agent.runner import AgentRunner
 from mira_engine.agent.skill_events import skill_loaded, skill_read_details
+from mira_engine.agent.skill_turn import (
+    invoked_skills_metadata,
+    prepare_turn_skills,
+    record_invoked_skills,
+)
+from mira_engine.agent.skills import SKILL_RESULT_MAX_CHARS, SKILL_TOOL_NAME
 from mira_engine.agent.subagent import SubagentManager
 from mira_engine.agent.tools.bg import BackgroundJobRegistry, BgTool
 from mira_engine.agent.tools.consult import ConsultRoleTool
@@ -56,6 +62,7 @@ from mira_engine.agent.tools.plan import SetPlanTool
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.agent.tools.search import GlobTool, GrepTool
 from mira_engine.agent.tools.shell import ExecTool
+from mira_engine.agent.tools.skill import SkillTool
 from mira_engine.agent.tools.spawn import SpawnTool
 from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
@@ -499,6 +506,7 @@ class BaseAgentLoop:
             self.tools.register(BgTool(registry=self._bg_registry))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        self.tools.register(SkillTool(workspace=self.workspace))
         self.tools.register(HubSearchTool(proxy=self.web_proxy))
         self.tools.register(HubInstallTool(workspace=self.workspace, proxy=self.web_proxy))
         self.tools.register(PubMedSearchTool(proxy=self.web_proxy))
@@ -796,7 +804,12 @@ class BaseAgentLoop:
         tool_name: str,
         arguments: object,
     ) -> dict[str, Any] | None:
-        """Build audit payload when agent reads a skill file."""
+        """Build audit payload when agent loads a skill (skill tool or SKILL.md read)."""
+        if tool_name == SKILL_TOOL_NAME:
+            skill_name = arguments.get("skill") if isinstance(arguments, dict) else None
+            if not isinstance(skill_name, str) or not skill_name.strip():
+                return None
+            return {"tool": tool_name, "skill_name": skill_name.strip().lstrip("/")}
         if tool_name != "read_file":
             return None
         path = cls._extract_read_file_path(arguments)
@@ -810,6 +823,16 @@ class BaseAgentLoop:
             "skill_name": skill_name,
             "path": path,
         }
+
+    @staticmethod
+    async def _audit_turn_skills(audit_cb, turn_skills, loaded_skills: list[str], always: set[str]) -> None:
+        """Audit skills in context at turn start: always-on/re-attached ones and UI selections."""
+        for name in loaded_skills:
+            await audit_cb(skill_loaded(name, "always" if name in always else "recent", tool="system_prompt"))
+        for name in turn_skills.injected:
+            await audit_cb(skill_loaded(name, "manual", tool=SKILL_TOOL_NAME))
+        for name in turn_skills.selected:
+            await audit_cb({"tool": SKILL_TOOL_NAME, "skill_name": name, "selected": True})
 
     def _compose_extra_system(
         self,
@@ -1661,8 +1684,10 @@ class BaseAgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 project_dir=str(project_ref.project_dir) if project_ref else None,
                 working_dir=str(chat_dir) if chat_dir else None,
+                invoked_skills=invoked_skills_metadata(session.metadata),
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages, model_runtime=model_runtime)
+            record_invoked_skills(session.metadata, all_msgs[1 + len(history):])
             self._save_turn(session, all_msgs, 1 + len(history))
             sessions_mgr.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -1779,56 +1804,16 @@ class BaseAgentLoop:
         )
         extra_system = self._with_knowledge(extra_system, meta, project_ref)
 
-        raw_selected_skills = meta.get("selected_skill_ids")
-        selected_skills = [
-            name for name in (
-                str(item).strip() for item in raw_selected_skills
-                if isinstance(item, str)
-            )
-            if name and ctx.skills.load_skill(name)
-        ] if isinstance(raw_selected_skills, list) else []
-
-        suggested_skills = ctx.skills.suggest_skills(
-            msg.content,
-            recent=recent_skill_names,
-            limit=3,
+        turn_skills = prepare_turn_skills(
+            ctx.skills, meta, msg.content, recent=recent_skill_names, history=history,
         )
-        active_skills: list[str] = []
-        for name in [*selected_skills, *suggested_skills]:
-            if name not in active_skills:
-                active_skills.append(name)
-        active_skills = active_skills[:8]
-        skill_hint = ""
-        if selected_skills:
-            fallback_instruction = (
-                "The user approved the previously proposed fallback for this turn. "
-                "Deviate only as narrowly as that proposal requires."
-                if meta.get("_skill_fallback_approved")
-                else "If their workflow cannot continue, stop using tools and reply with "
-                     "`MIRA_SKILL_FALLBACK_REQUIRED:` followed by the exact error and proposed "
-                     "fallback. Wait for explicit user approval before deviating."
-            )
-            skill_hint = (
-                "User-selected skills are mandatory system-level instructions for this turn:\n"
-                + "\n".join(f"- {name}" for name in selected_skills)
-                + "\nFollow their documented workflow and recommended calls. Do not bypass them "
-                  "by inspecting implementation source, calling internal functions, or writing a "
-                  "replacement implementation. " + fallback_instruction
-            )
-        elif suggested_skills:
-            skill_hint = (
-                "Skill routing selected these active skills. Their full instructions are included "
-                "in the system prompt; prefer their documented workflow when relevant:\n"
-                + "\n".join(f"- {name}" for name in suggested_skills)
-            )
-        if on_progress and (selected_skills or suggested_skills):
+        selected_skills = turn_skills.selected
+        if on_progress and selected_skills:
             try:
-                await on_progress(
-                    f"skill -> {', '.join(selected_skills or suggested_skills)}",
-                    tool_hint=True,
-                )
+                await on_progress(f"skill -> {', '.join(selected_skills)}", tool_hint=True)
             except TypeError:
-                await on_progress(f"skill -> {', '.join(selected_skills or suggested_skills)}")
+                await on_progress(f"skill -> {', '.join(selected_skills)}")
+        skill_hint = turn_skills.mandatory_hint
         if extra_system:
             extra_system = skill_hint + "\n\n" + extra_system if skill_hint else extra_system
         else:
@@ -1837,14 +1822,18 @@ class BaseAgentLoop:
         initial_messages = ctx.build_messages(
             history=history,
             current_message=msg.content,
-            skill_names=active_skills or None,
             loaded_skills=loaded_skills,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
             project_dir=project_dir,
             extra_system=extra_system,
             working_dir=str(chat_dir) if chat_dir else None,
+            relevant_skills=turn_skills.suggested,
+            invoked_skills=[
+                name for name in invoked_skills_metadata(session.metadata) if name not in turn_skills.injected
+            ],
         )
+        initial_messages.extend(turn_skills.synthetic_messages)
 
         async def _bus_progress(
             content: str,
@@ -1901,15 +1890,9 @@ class BaseAgentLoop:
 
             audit_cb = _audit
         if audit_cb:
-            for name in loaded_skills:
-                source = "manual" if name in selected_skills else "auto" if name in suggested_skills else "recent" if name in recent_skill_names else "always"
-                await audit_cb(skill_loaded(name, source, tool="system_prompt"))
-            for selected_skill in selected_skills:
-                await audit_cb({
-                    "tool": "system_prompt",
-                    "skill_name": selected_skill,
-                    "selected": True,
-                })
+            await self._audit_turn_skills(
+                audit_cb, turn_skills, loaded_skills, set(ctx.skills.get_always_skills()),
+            )
         run_kwargs: dict[str, Any] = {
             "model_runtime": model_runtime,
             "on_progress": progress_cb,
@@ -1931,10 +1914,11 @@ class BaseAgentLoop:
         if isinstance(session.metadata, dict):
             merged: list[str] = []
             # Remember this task's skills, not an ever-growing list of old topics.
-            for item in [*(name for name in active_skills if name in loaded_skills), *sorted(current_turn_skills)]:
+            for item in [*selected_skills, *sorted(current_turn_skills)]:
                 if item not in merged:
                     merged.append(item)
             session.metadata["_recent_skills"] = merged[-10:]
+            record_invoked_skills(session.metadata, all_msgs[1 + len(history):])
 
         self._save_turn(session, all_msgs, 1 + len(history))
         sessions_mgr.save(session)
@@ -1962,8 +1946,11 @@ class BaseAgentLoop:
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
             if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                if len(content) > getattr(self, "max_tool_result_chars", self._TOOL_RESULT_MAX_CHARS):
-                    cap = int(getattr(self, "max_tool_result_chars", self._TOOL_RESULT_MAX_CHARS))
+                cap = int(getattr(self, "max_tool_result_chars", self._TOOL_RESULT_MAX_CHARS))
+                # Skill instructions stay whole so later turns keep following them.
+                if entry.get("name") == SKILL_TOOL_NAME:
+                    cap = max(cap, SKILL_RESULT_MAX_CHARS)
+                if len(content) > cap:
                     entry["content"] = content[:cap] + "\n... (truncated)"
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):

@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import time
 from pathlib import Path
@@ -36,6 +37,43 @@ def invalidate_skill_caches() -> None:
     """Drop every memoised skill scan (tests and plugin install paths)."""
     _index_cache.clear()
     _file_cache.clear()
+
+
+# ── skill listing / invocation ─────────────────────────────────────────
+# Only a one-line listing of skills sits in the system prompt; full SKILL.md
+# bodies enter the conversation when the model calls the `skill` tool (the
+# same progressive disclosure Claude Code uses for its Skill tool).
+SKILL_TOOL_NAME = "skill"
+SKILL_BASE_DIR_PREFIX = "Base directory for this skill: "
+# Cap for a skill tool result kept in context/session (latex-posters is ~60K).
+SKILL_RESULT_MAX_CHARS = 80_000
+MAX_LISTING_DESC_CHARS = 250
+MIN_LISTING_DESC_CHARS = 20
+DEFAULT_LISTING_CHAR_BUDGET = 8_000
+_ARGUMENTS_INDEXED = re.compile(r"\$ARGUMENTS\[(\d+)\]")
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: max(limit - 1, 0)] + "…"
+
+
+def substitute_arguments(body: str, args: str | None) -> str:
+    """Fill ``$ARGUMENTS`` / ``$ARGUMENTS[n]``; append the args when the body has no placeholder.
+
+    Bare ``$1``-style shorthands are deliberately not supported: skill bodies
+    are full of shell snippets (``awk '{print $1}'``) that must stay intact.
+    """
+    args = (args or "").strip()
+    if "$ARGUMENTS" not in body:
+        return f"{body}\n\nARGUMENTS: {args}" if args else body
+    try:
+        parts = shlex.split(args)
+    except ValueError:
+        parts = args.split()
+    body = _ARGUMENTS_INDEXED.sub(
+        lambda m: parts[int(m.group(1))] if int(m.group(1)) < len(parts) else "", body
+    )
+    return body.replace("$ARGUMENTS", args)
 
 
 class SkillsLoader:
@@ -282,46 +320,60 @@ class SkillsLoader:
 
         return "\n\n---\n\n".join(parts) if parts else ""
 
-    def build_skills_summary(self) -> str:
-        """
-        Build a summary of all skills (name, description, path, availability).
+    def is_model_invocable(self, name: str) -> bool:
+        """False when frontmatter sets ``disable-model-invocation: true``."""
+        meta = self.get_skill_metadata(name) or {}
+        return str(meta.get("disable-model-invocation", "")).strip().lower() != "true"
 
-        This is used for progressive loading - the agent can read the full
-        skill content using read_file when needed.
+    def build_skills_listing(self, char_budget: int = DEFAULT_LISTING_CHAR_BUDGET) -> str:
+        """One ``- name: description`` line per model-invocable skill, within ``char_budget``.
 
-        Returns:
-            XML-formatted skills summary.
+        Always-on skills are left out (their body is already in the prompt).
+        When the full descriptions do not fit, every description is cut to the
+        same length; below ``MIN_LISTING_DESC_CHARS`` only names are listed.
         """
-        all_skills = self.list_skills(filter_unavailable=False)
-        if not all_skills:
+        always = set(self.get_always_skills())
+        entries: list[tuple[str, str, str]] = []
+        for s in self.list_skills(filter_unavailable=False):
+            name = s["name"]
+            if name in always or not self.is_model_invocable(name):
+                continue
+            meta = self.get_skill_metadata(name) or {}
+            desc = self._get_skill_description(name)
+            when_to_use = str(meta.get("when_to_use") or "").strip()
+            if when_to_use:
+                desc = f"{desc} - {when_to_use}"
+            skill_meta = self._get_skill_meta(name)
+            suffix = ""
+            if not self._check_requirements(skill_meta):
+                missing = self._get_missing_requirements(skill_meta)
+                suffix = f" (unavailable: requires {missing})" if missing else " (unavailable)"
+            entries.append((name, _truncate(" ".join(desc.split()), MAX_LISTING_DESC_CHARS), suffix))
+        if not entries:
             return ""
 
-        def escape_xml(s: str) -> str:
-            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        full = "\n".join(f"- {name}: {desc}{suffix}" for name, desc, suffix in entries)
+        if len(full) <= char_budget:
+            return full
+        overhead = sum(len(f"- {name}: {suffix}\n") for name, _, suffix in entries)
+        max_desc = (char_budget - overhead) // len(entries)
+        if max_desc < MIN_LISTING_DESC_CHARS:
+            return "\n".join(f"- {name}{suffix}" for name, _, suffix in entries)
+        return "\n".join(f"- {name}: {_truncate(desc, max_desc)}{suffix}" for name, desc, suffix in entries)
 
-        lines = ["<skills>"]
-        for s in all_skills:
-            name = escape_xml(s["name"])
-            path = s["path"]
-            desc = escape_xml(self._get_skill_description(s["name"]))
-            skill_meta = self._get_skill_meta(s["name"])
-            available = self._check_requirements(skill_meta)
-
-            lines.append(f"  <skill available=\"{str(available).lower()}\">")
-            lines.append(f"    <name>{name}</name>")
-            lines.append(f"    <description>{desc}</description>")
-            lines.append(f"    <location>{path}</location>")
-
-            # Show missing requirements for unavailable skills
-            if not available:
-                missing = self._get_missing_requirements(skill_meta)
-                if missing:
-                    lines.append(f"    <requires>{escape_xml(missing)}</requires>")
-
-            lines.append("  </skill>")
-        lines.append("</skills>")
-
-        return "\n".join(lines)
+    def render_skill(self, name: str, args: str | None = None) -> str | None:
+        """Expanded skill body as the `skill` tool returns it, or None when unknown."""
+        path = self._skill_path(name)
+        if path is None:
+            return None
+        content = self._read_skill_file(path)
+        if content is None:
+            return None
+        skill_dir = str(path.parent)
+        body = self._strip_frontmatter(content)
+        for placeholder in ("${MIRA_SKILL_DIR}", "${CLAUDE_SKILL_DIR}"):
+            body = body.replace(placeholder, skill_dir)
+        return f"{SKILL_BASE_DIR_PREFIX}{skill_dir}\n\n{substitute_arguments(body, args)}"
 
     def _get_missing_requirements(self, skill_meta: dict) -> str:
         """Get a description of missing requirements."""
@@ -351,10 +403,15 @@ class SkillsLoader:
         return content
 
     def _parse_mira_metadata(self, raw: str) -> dict:
-        """Parse skill metadata JSON from frontmatter (supports mira and openclaw keys)."""
+        """Parse skill metadata JSON from frontmatter (supports mira, MIRA and openclaw keys)."""
         try:
             data = json.loads(raw)
-            return data.get("mira", data.get("openclaw", {})) if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
+            for key in ("mira", "MIRA", "openclaw"):
+                if isinstance(data.get(key), dict):
+                    return data[key]
+            return {}
         except (json.JSONDecodeError, TypeError):
             return {}
 

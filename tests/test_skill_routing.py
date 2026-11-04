@@ -68,13 +68,13 @@ class CapturingProvider(LLMProvider):
 
 
 @pytest.mark.parametrize('loop_class', [BaseAgentLoop, ResearchAgentLoop])
-@pytest.mark.parametrize('query,manual,expected', [
-    ('unrelatedquasar', False, []),
-    ('继续之前的任务', False, ['sheet-helper']),
-    ('unrelatedquasar', True, ['sheet-helper']),
-    ('CT', False, ['scan-helper']),
+@pytest.mark.parametrize('query,manual,hinted,expected', [
+    ('unrelatedquasar', False, [], []),
+    ('继续之前的任务', False, ['sheet-helper'], []),
+    ('unrelatedquasar', True, [], ['sheet-helper']),
+    ('CT', False, ['scan-helper'], []),
 ])
-async def test_actual_prompt_and_load_audit_do_not_reinsert_unrelated_history(tmp_path, monkeypatch, loop_class, query, manual, expected):
+async def test_routing_hints_and_manual_selection_loads_once(tmp_path, monkeypatch, loop_class, query, manual, hinted, expected):
     monkeypatch.setenv('MIRA_HOME', str(tmp_path / 'home'))
     loader = make_loader(tmp_path)
     provider = CapturingProvider()
@@ -91,15 +91,29 @@ async def test_actual_prompt_and_load_audit_do_not_reinsert_unrelated_history(tm
     await loop._process_message(InboundMessage(channel='ui', sender_id='u', chat_id='chat', content=query,
         metadata={'run_mode': 'manual', **({'selected_skill_ids': ['sheet-helper']} if manual else {})}), audit_hook=audit)
     assert loaded == expected
-    system = provider.messages[0][0]['content']
-    assert ('sheet-helper instructions' in system) == ('sheet-helper' in expected)
-    assert ('scan-helper instructions' in system) == ('scan-helper' in expected)
-    assert loop.sessions.get_or_create('ui:chat').metadata['_recent_skills'] == expected
-    # Follow-up reuses the immediately preceding task, never an older topic.
+    messages = provider.messages[0]
+    system = messages[0]['content']
+    # Skill bodies never ride in the system prompt; the listing names them.
+    assert 'sheet-helper instructions' not in system and 'scan-helper instructions' not in system
+    assert '- sheet-helper: spreadsheet table workbook formula' in system
+    user = next(m for m in messages if m['role'] == 'user')
+    assert ('Possibly Relevant Skills: ' + ', '.join(hinted) in user['content']) == bool(hinted)
+    tool_results = [m['content'] for m in messages if m['role'] == 'tool' and m.get('name') == 'skill']
+    assert [r for r in tool_results if 'sheet-helper instructions' in r] == (
+        [tool_results[0]] if expected else []
+    )
+    session = loop.sessions.get_or_create('ui:chat')
+    assert session.metadata['_recent_skills'] == expected
+    assert session.metadata.get('_invoked_skills', []) == expected
+    # The follow-up turn sees the earlier load in history instead of loading it again.
     loaded.clear()
     await loop._process_message(InboundMessage(channel='ui', sender_id='u', chat_id='chat', content='继续之前的任务',
-                                               metadata={'run_mode': 'manual'}), audit_hook=audit)
-    assert loaded == expected
+        metadata={'run_mode': 'manual', **({'selected_skill_ids': ['sheet-helper']} if manual else {})}), audit_hook=audit)
+    assert loaded == []
+    followup = provider.messages[1]
+    bodies = [m['content'] for m in followup if m['role'] == 'tool' and 'sheet-helper instructions' in str(m['content'])]
+    assert len(bodies) == (1 if expected else 0)
+    assert 'sheet-helper instructions' not in followup[0]['content']
 
 
 def test_real_catalog_no_unrelated_matches_and_relevant_skills_still_route(tmp_path):

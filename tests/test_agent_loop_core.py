@@ -817,9 +817,11 @@ async def test_skill_load_prompt_dedup_and_new_turn(monkeypatch, tmp_path: Path)
     path.write_text("# Follow these instructions")
     loop = _make_real_loop(tmp_path)
     events = []
+    runs = []
 
     async def fake_run(messages, audit_hook=None, **kwargs):
-        assert "Follow these instructions" in messages[0]["content"]
+        runs.append(messages)
+        assert "Follow these instructions" not in messages[0]["content"]
         await audit_hook(skill_loaded("manual-demo", "read_file"))
         await audit_hook(skill_loaded("manual-demo", "read_file"))
         return "done", [], messages + [{"role": "assistant", "content": "done"}]
@@ -833,9 +835,12 @@ async def test_skill_load_prompt_dedup_and_new_turn(monkeypatch, tmp_path: Path)
     await loop._process_message(message, audit_hook=audit)
     await loop._process_message(message, audit_hook=audit)
     loaded = [event for event in events if event.get("loaded") and event["skill_name"] == "manual-demo"]
-    assert len(loaded) == 2
-    assert all(event["source"] == "manual" for event in loaded)
+    # Turn 1 loads the selection through a synthetic skill call; turn 2 finds it in history.
+    assert [event["source"] for event in loaded] == ["manual", "read_file"]
     assert loaded[0]["event_id"] != loaded[1]["event_id"]
+    for messages in runs:
+        bodies = [m for m in messages if m["role"] == "tool" and "Follow these instructions" in m["content"]]
+        assert len(bodies) == 1 and bodies[0]["name"] == "skill"
 
 
 async def test_actual_skill_read_emits_only_after_success(tmp_path: Path) -> None:
@@ -864,14 +869,14 @@ async def test_actual_skill_read_emits_only_after_success(tmp_path: Path) -> Non
     assert events[1]["loaded"] is True
 
 
-async def test_process_message_injects_active_skills_into_context(monkeypatch, tmp_path: Path) -> None:
+async def test_process_message_hints_relevant_skills_in_context(monkeypatch, tmp_path: Path) -> None:
     loop = _make_real_loop(tmp_path)
     captured: dict[str, Any] = {}
 
     original_build_messages = loop.context.build_messages
 
     def _capture_build_messages(*args, **kwargs):
-        captured["skill_names"] = kwargs.get("skill_names")
+        captured["relevant_skills"] = kwargs.get("relevant_skills")
         return original_build_messages(*args, **kwargs)
 
     monkeypatch.setattr(loop.context, "build_messages", _capture_build_messages)
@@ -888,8 +893,7 @@ async def test_process_message_injects_active_skills_into_context(monkeypatch, t
     )
     out = await loop._process_message(msg)
     assert out.content == "done"
-    assert captured.get("skill_names")
-    assert "medical-image-analysis" in captured["skill_names"]
+    assert "medical-image-analysis" in (captured.get("relevant_skills") or [])
 
 
 async def test_process_message_new_failure_and_message_tool_short_circuit(monkeypatch, tmp_path: Path) -> None:

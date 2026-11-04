@@ -71,26 +71,46 @@ def test_load_skills_for_context_strips_frontmatter(tmp_path: Path) -> None:
     assert body in out
 
 
-def test_build_skills_summary_xml_escape_and_requires(tmp_path: Path) -> None:
+def test_skills_listing_lines_and_requirements(tmp_path: Path) -> None:
     ws = tmp_path / "ws"
     builtin = tmp_path / "builtin"
     bad_bin = "nonexistent_cli_skill_req_zzzzz"
-    meta = json.dumps({"mira": {"requires": {"bins": [bad_bin]}}})
-    _write_skill(
-        ws / "skills",
-        "esc&me",
-        f"---\ndescription: A & B < C\nmetadata: '{meta}'\n---\n\nx",
-    )
-    _write_skill(builtin, "ok_skill", "---\ndescription: Fine\n---\n")
+    meta = json.dumps({"MIRA": {"requires": {"bins": [bad_bin]}}})
+    _write_skill(ws / "skills", "needs_cli", f"---\ndescription: A & B\nmetadata: '{meta}'\n---\n\nx")
+    _write_skill(builtin, "ok_skill", "---\ndescription: Fine\nwhen_to_use: for tests\n---\n")
+    _write_skill(builtin, "user_only", "---\ndescription: Hidden\ndisable-model-invocation: true\n---\n")
+    _write_skill(builtin, "always_on", "---\ndescription: Always\nalways: true\n---\n")
     loader = SkillsLoader(ws, builtin_skills_dir=builtin)
-    xml = loader.build_skills_summary()
-    assert xml.startswith("<skills>")
-    assert xml.endswith("</skills>")
-    assert "esc&amp;me" in xml
-    assert "A &amp; B &lt; C" in xml
-    assert 'available="false"' in xml
-    assert "<requires>" in xml
-    assert f"CLI: {bad_bin}" in xml
+    listing = loader.build_skills_listing()
+    assert listing.splitlines() == [
+        f"- needs_cli: A & B (unavailable: requires CLI: {bad_bin})",
+        "- ok_skill: Fine - for tests",
+    ]
+
+
+def test_skills_listing_budget(tmp_path: Path) -> None:
+    builtin = tmp_path / "builtin"
+    for i in range(10):
+        _write_skill(builtin, f"s{i}", f"---\ndescription: {'word ' * 100}\n---\n")
+    loader = SkillsLoader(tmp_path / "ws", builtin_skills_dir=builtin)
+    full = loader.build_skills_listing(char_budget=100_000)
+    assert all(len(line.split(": ", 1)[1]) == 250 and line.endswith("…") for line in full.splitlines())
+    shrunk = loader.build_skills_listing(char_budget=1_000)
+    assert len(shrunk) <= 1_000 and len(shrunk.splitlines()) == 10
+    assert loader.build_skills_listing(char_budget=100).splitlines() == [f"- s{i}" for i in range(10)]
+
+
+def test_render_skill_base_dir_and_arguments(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    path = _write_skill(ws / "skills", "demo", "---\ndescription: D\n---\n\nRun ${MIRA_SKILL_DIR}/run.sh $ARGUMENTS[1] on $ARGUMENTS; awk '{print $1}'")
+    _write_skill(ws / "skills", "plain", "---\ndescription: P\n---\n\nBody")
+    loader = SkillsLoader(ws, builtin_skills_dir=None)
+    out = loader.render_skill("demo", "a 'b c'")
+    assert out.splitlines()[0] == f"Base directory for this skill: {path.parent}"
+    assert f"Run {path.parent}/run.sh b c on a 'b c'; awk '{{print $1}}'" in out
+    assert loader.render_skill("plain", "x y").endswith("Body\n\nARGUMENTS: x y")
+    assert loader.render_skill("plain").endswith("Body")
+    assert loader.render_skill("missing") is None
 
 
 def test_strip_frontmatter(tmp_path: Path) -> None:

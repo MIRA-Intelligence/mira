@@ -14,6 +14,7 @@ from mira_engine.agent.hook import AgentHook, CompositeHook
 from mira_engine.agent.routing import RoutedProviderManager
 from mira_engine.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from mira_engine.agent.skill_events import skill_loaded, skill_read_details
+from mira_engine.agent.skills import SKILL_TOOL_NAME
 from mira_engine.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
@@ -23,6 +24,7 @@ from mira_engine.agent.tools.filesystem import (
 from mira_engine.agent.tools.registry import ToolRegistry
 from mira_engine.agent.tools.search import GlobTool, GrepTool
 from mira_engine.agent.tools.shell import ExecTool
+from mira_engine.agent.tools.skill import SkillTool
 from mira_engine.agent.tools.web import WebFetchTool, WebSearchTool
 from mira_engine.bus.events import InboundMessage, OutboundMessage
 from mira_engine.bus.queue import MessageBus
@@ -43,7 +45,7 @@ ROLE_CONFIGS: dict[str, dict[str, Any]] = {
     "critic": {
         # Reviewer: read-only. No write/edit/exec — it only inspects and
         # returns a verdict, so it must not mutate the workspace.
-        "allowed_tools": {"read_file", "list_dir", "grep", "glob", "web_search", "web_fetch"},
+        "allowed_tools": {"read_file", "list_dir", "grep", "glob", "web_search", "web_fetch", "skill"},
         "temperature": 0.1,
     },
     "supervisor": {
@@ -257,6 +259,8 @@ class SubagentManager:
             tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         if _permitted("web_fetch"):
             tools.register(WebFetchTool(proxy=self.web_proxy))
+        if _permitted(SKILL_TOOL_NAME):
+            tools.register(SkillTool(workspace=run_workspace))
         return tools
 
     async def spawn(

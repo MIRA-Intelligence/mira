@@ -15,17 +15,67 @@ from mira_engine.agent.skills import SkillsLoader
 TAG = ContextBuilder._RUNTIME_CONTEXT_TAG
 
 
-def test_selected_skill_content_is_injected_into_system_prompt(tmp_path: Path) -> None:
+def _mrstation_builder(tmp_path: Path, body: str = "USE_MRSTATION_RECOMMENDED_FLOW") -> ContextBuilder:
     skill_dir = tmp_path / "skills" / "mrstation"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
-        "---\ndescription: MRStation workflow\n---\n\nUSE_MRSTATION_RECOMMENDED_FLOW",
+        f"---\ndescription: MRStation workflow\n---\n\n{body}",
         encoding="utf-8",
     )
     builder = ContextBuilder(tmp_path)
-    prompt = builder.build_system_prompt(skill_names=["mrstation"])
-    assert "USE_MRSTATION_RECOMMENDED_FLOW" in prompt
-    assert prompt.count("USE_MRSTATION_RECOMMENDED_FLOW") == 1
+    builder.skills = SkillsLoader(tmp_path, builtin_skills_dir=None)
+    return builder
+
+
+def _skill_exchange(name: str, content: str) -> list[dict]:
+    return [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call1", "type": "function",
+            "function": {"name": "skill", "arguments": json.dumps({"skill": name})},
+        }]},
+        {"role": "tool", "tool_call_id": "call1", "name": "skill", "content": content},
+    ]
+
+
+def test_skills_are_listed_not_inlined_and_prompt_is_stable(tmp_path: Path) -> None:
+    builder = _mrstation_builder(tmp_path)
+    prompt = builder.build_system_prompt()
+    assert "- mrstation: MRStation workflow" in prompt
+    assert "USE_MRSTATION_RECOMMENDED_FLOW" not in prompt
+    assert "<location>" not in prompt
+    assert builder.build_system_prompt() == prompt
+
+
+def test_invoked_skill_is_reattached_only_after_leaving_history(tmp_path: Path) -> None:
+    builder = _mrstation_builder(tmp_path)
+    rendered = builder.skills.render_skill("mrstation")
+
+    gone = builder.build_system_prompt(invoked_skills=["mrstation"], history=[])
+    assert "# Invoked Skills" in gone
+    assert gone.count("USE_MRSTATION_RECOMMENDED_FLOW") == 1
+    assert "Base directory for this skill: " in gone
+
+    present = builder.build_system_prompt(
+        invoked_skills=["mrstation"], history=_skill_exchange("mrstation", rendered),
+    )
+    assert "USE_MRSTATION_RECOMMENDED_FLOW" not in present
+
+
+def test_reattached_skill_is_truncated(tmp_path: Path) -> None:
+    builder = _mrstation_builder(tmp_path, body="x" * 30_000 + "TAIL_MARKER")
+    loaded: list[str] = []
+    prompt = builder.build_system_prompt(invoked_skills=["mrstation"], history=[], loaded_skills=loaded)
+    assert "skill content truncated" in prompt
+    assert "TAIL_MARKER" not in prompt
+    assert loaded == ["mrstation"]
+
+
+def test_relevant_skills_ride_in_runtime_context_not_system_prompt(tmp_path: Path) -> None:
+    builder = _mrstation_builder(tmp_path)
+    messages = builder.build_messages(history=[], current_message="hi", relevant_skills=["mrstation"])
+    assert "Possibly Relevant Skills: mrstation" in messages[-1]["content"]
+    assert "Possibly Relevant Skills" not in messages[0]["content"]
 
 
 def _tc(cid: str, name: str = "fn") -> dict:
@@ -516,7 +566,7 @@ def test_build_system_prompt_hides_disabled_plugin_skill(
     cb.skills = SkillsLoader(project_workspace, builtin_skills_dir=None, plugin_manager=manager)
 
     visible_prompt = cb.build_system_prompt()
-    assert "<name>hidden-skill</name>" in visible_prompt
+    assert "- hidden-skill:" in visible_prompt
     assert cb.skills.load_skill("hidden-skill") is not None
 
     manager.set_enabled(
@@ -527,5 +577,5 @@ def test_build_system_prompt_hides_disabled_plugin_skill(
         enabled=False,
     )
     hidden_prompt = cb.build_system_prompt()
-    assert "<name>hidden-skill</name>" not in hidden_prompt
+    assert "- hidden-skill:" not in hidden_prompt
     assert cb.skills.load_skill("hidden-skill") is None
