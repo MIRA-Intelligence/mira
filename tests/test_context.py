@@ -355,7 +355,6 @@ class TestLoadBootstrapFiles:
         project_workspace = tmp_path / "project"
         global_workspace.mkdir()
         project_workspace.mkdir()
-        (global_workspace / "SOUL.md").write_text("GLOBAL PERSONA", encoding="utf-8")
         (project_workspace / "SOUL.md").write_text("PROJECT OVERLAY", encoding="utf-8")
         monkeypatch.setattr(
             mira_engine.config.paths,
@@ -363,8 +362,13 @@ class TestLoadBootstrapFiles:
             lambda _value: global_workspace,
         )
         mock_builtin.return_value = ""
+        builder = ContextBuilder(project_workspace)
+        # The global persona is the mind's SOUL.md, not a workspace file.
+        (builder.memory.mind_dir / "SOUL.md").write_text("GLOBAL PERSONA", encoding="utf-8")
+        (global_workspace / "SOUL.md").write_text("STALE WORKSPACE COPY", encoding="utf-8")
 
-        out = ContextBuilder(project_workspace)._load_bootstrap_files()
+        out = builder._load_bootstrap_files()
+        assert "STALE WORKSPACE COPY" not in out
 
         assert "GLOBAL PERSONA" in out
         assert "PROJECT OVERLAY" in out

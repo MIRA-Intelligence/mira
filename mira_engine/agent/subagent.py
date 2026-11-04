@@ -490,7 +490,8 @@ without guessing.""",
         from mira_engine.agent.context import ContextBuilder
 
         run_workspace = workspace or self.workspace
-        context = ContextBuilder(run_workspace)
+        project = run_workspace.resolve(strict=False) != self.workspace.resolve(strict=False)
+        context = ContextBuilder(run_workspace, project=project)
         time_ctx = ContextBuilder._build_runtime_context(None, None)
         parts = [context.build_system_prompt(loaded_skills=loaded_skills), f"""# Subagent
 

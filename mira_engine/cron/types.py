@@ -3,6 +3,9 @@
 from dataclasses import dataclass, field
 from typing import Literal
 
+# System job the gateway registers to run Dream; it cannot be removed.
+DREAM_JOB_ID = "dream"
+
 
 @dataclass
 class CronRunRecord:

@@ -4,7 +4,9 @@ Output one line per finding:
 [FILE] atomic fact (not already in memory)
 [FILE-REMOVE] reason for removal
 
-Files: USER (identity, preferences), SOUL (bot behavior, tone), MEMORY (knowledge, project context)
+Files: USER (identity, preferences), SOUL (bot behavior, tone), MEMORY (long-term knowledge useful across projects)
+
+Entries tagged `[project NAME]` come from project work. That project keeps its own memory, so take from them only what holds beyond the project: the user's preferences, expertise, recurring workflows, and lessons that transfer. Do not copy project-specific paths, results, or status.
 
 Rules:
 - Atomic facts: "has a cat named Luna" not "discussed pet care"

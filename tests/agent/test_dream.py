@@ -10,7 +10,7 @@ from mira_engine.agent.runner import AgentRunResult
 
 @pytest.fixture
 def store(tmp_path):
-    s = MemoryStore(tmp_path)
+    s = MemoryStore(tmp_path, project=False)
     s.write_soul("# Soul\n- Helpful")
     s.write_user("# User\n- Developer")
     s.write_memory("# Memory\n- Project X active")

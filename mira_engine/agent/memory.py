@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import weakref
-from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -37,129 +35,234 @@ if TYPE_CHECKING:
     from mira_engine.session.manager import Session
 
 
-_SAVE_MEMORY_TOOL = [
-    {
+_HISTORY_ENTRY_PARAM = {
+    "type": "string",
+    "description": "A log of key events/decisions. Start with [YYYY-MM-DD HH:MM].",
+}
+_PROJECT_MEMORY_PARAM = {
+    "type": "string",
+    "description": (
+        "The full updated project MEMORY.md: decisions, experiment results, data and file locations, "
+        "pitfalls, current status. Return it unchanged if nothing new."
+    ),
+}
+
+
+def _save_memory_tool(project: bool) -> list[dict[str, Any]]:
+    properties: dict[str, Any] = {"history_entry": _HISTORY_ENTRY_PARAM}
+    if project:
+        properties["project_memory_update"] = _PROJECT_MEMORY_PARAM
+    return [{
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Save the memory consolidation result to appropriate storage. Actively classify knowledge into global rules vs project specifics.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "history_entry": {
-                        "type": "string",
-                        "description": "A log of key events/decisions. Start with [YYYY-MM-DD HH:MM].",
-                    },
-                    "project_memory_update": {
-                        "type": "string",
-                        "description": "Specific background for the CURRENT PROJECT ONLY (architecture, local bugs, specific API key paths, file names). Return unchanged if nothing new.",
-                    },
-                    "workspace_memory_update": {
-                        "type": "string",
-                        "description": "Global, reusable knowledge (Python tips, general DL concepts, cross-project configs). Return unchanged if nothing new.",
-                    },
-                },
-                "required": ["history_entry", "project_memory_update", "workspace_memory_update"],
-            },
+            "description": "Save the consolidation of the conversation.",
+            "parameters": {"type": "object", "properties": properties, "required": list(properties)},
         },
-    }
-]
+    }]
+
+
 _SAVE_MEMORY_TOOL_CHOICE = {"type": "function", "function": {"name": "save_memory"}}
 
 _MAX_SAVE_MEMORY_ATTEMPTS = 3
 
 
+_MIND_FILES = ("MEMORY.md", "USER.md", "SOUL.md")
+_MIND_MEMORY_SEED = "# Long-term Memory\n"
+
+
+def _builtin_template(name: str) -> str:
+    from importlib.resources import files as pkg_files
+
+    try:
+        return (pkg_files("mira_engine") / "templates" / name).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _is_memory_scaffold(text: str) -> bool:
+    """True for the shipped MEMORY.md template: headings and "(placeholder)" lines only."""
+    for line in text.splitlines():
+        s = line.strip()
+        if (
+            not s
+            or s.startswith("#")
+            or s == "---"
+            or (s.startswith("(") and s.endswith(")"))
+            or (s.startswith("*") and s.endswith("*"))
+            or s.startswith("This file stores")
+        ):
+            continue
+        return False
+    return True
+
+
+def _is_unedited(name: str, text: str) -> bool:
+    from mira_engine.agent.bootstrap_history import is_shipped_template
+
+    if name == "MEMORY.md":
+        return _is_memory_scaffold(text)
+    return not text.strip() or is_shipped_template(name, text)
+
+
+def migrate_to_mind_dir(*workspaces: Path) -> list[str]:
+    """Move the long-term memory a workspace used to hold into MIRA_HOME/mind.
+
+    Earlier layouts kept SOUL.md, USER.md, memory/MEMORY.md and the history
+    log in the default workspace, plus a hidden ``.mira/memory`` copy. A file
+    only moves when the mind does not already hold real content, so running
+    this on every start is safe. Returns the names that were moved.
+    """
+    from mira_engine.config.paths import get_mind_dir, get_workspace_path
+
+    mind = get_mind_dir()
+    sources = list(dict.fromkeys(
+        ws.expanduser().resolve(strict=False)
+        for ws in (get_workspace_path(None), *workspaces)
+        if isinstance(ws, Path)
+    ))
+    moved: list[str] = []
+
+    def _move(src: Path, target: Path) -> None:
+        if not src.is_file() or src.resolve(strict=False) == target.resolve(strict=False):
+            return
+        if not _is_unedited(target.name, _read_text(target)):
+            return
+        text = _read_text(src)
+        if not _is_unedited(target.name, text):
+            atomic_write_text(target, text)
+            moved.append(target.name)
+        src.unlink(missing_ok=True)
+
+    for ws in sources:
+        for name in ("SOUL.md", "USER.md"):
+            _move(ws / name, mind / name)
+        _move(ws / "memory" / "MEMORY.md", mind / "MEMORY.md")
+        # The default workspace's hidden copy held what plain chats consolidated.
+        hidden = ws / ".mira" / "memory"
+        leftover = _read_text(hidden / "MEMORY.md").strip()
+        if not _is_memory_scaffold(leftover) and leftover not in _read_text(mind / "MEMORY.md"):
+            current = _read_text(mind / "MEMORY.md").rstrip()
+            atomic_write_text(mind / "MEMORY.md", f"{current}\n\n{leftover}\n" if current else f"{leftover}\n")
+            moved.append(".mira/memory/MEMORY.md")
+        (hidden / "MEMORY.md").unlink(missing_ok=True)
+        history = ws / "memory" / "history.jsonl"
+        if history.is_file() and not (mind / "history.jsonl").exists():
+            history.replace(mind / "history.jsonl")
+            for name in ("HISTORY.md", "HISTORY.md.bak"):
+                if (ws / "memory" / name).is_file() and not (mind / name).exists():
+                    (ws / "memory" / name).replace(mind / name)
+            dream_cursor = hidden / ".dream_cursor"
+            if dream_cursor.is_file():
+                dream_cursor.replace(mind / ".dream_cursor")
+            moved.append("history.jsonl")
+        for name in (".cursor", ".dream_cursor"):
+            (hidden / name).unlink(missing_ok=True)
+        for empty in (hidden, ws / ".mira"):
+            try:
+                empty.rmdir()
+            except OSError:
+                pass
+    if moved:
+        logger.info("Moved long-term memory into {}: {}", mind, ", ".join(moved))
+    return moved
+
+
 class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+    """One memory layer: MEMORY.md (facts) + history.jsonl (grep-searchable log).
 
-    @staticmethod
-    def _safe_backup_folder_component(name: str) -> str:
-        """Normalize workspace labels for cross-platform backup directory names."""
-        # Windows forbids <>:"/\|?* and control chars, and disallows trailing dots/spaces.
-        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name)
-        cleaned = re.sub(r"\s+", "_", cleaned).strip(" ._")
-        return cleaned or "workspace"
+    The global layer is the assistant's mind in ``MIRA_HOME/mind``; only Dream
+    edits its MEMORY.md, USER.md and SOUL.md. A project layer lives in the
+    visible ``<project>/memory/`` folder and is maintained by the agent working
+    on the project (consolidation is the safety net). Project history entries
+    are mirrored into the mind's history so Dream learns from project work too.
+    """
 
-    def __init__(self, workspace: Path, max_history_entries: int = 1000):
-        from mira_engine.config.paths import get_workspace_path
+    def __init__(self, workspace: Path, max_history_entries: int = 1000, *, project: bool | None = None):
+        from mira_engine.config.paths import get_mind_dir, get_workspace_path
 
         self.workspace = workspace
-        self.project_workspace = workspace
         self.max_history_entries = max_history_entries
-        self.memory_dir = ensure_dir(workspace / ".mira" / "memory")
+        if project is None:
+            project = workspace.resolve(strict=False) != get_workspace_path(None).resolve(strict=False)
+        self.is_project = project
+        self.mind_dir = get_mind_dir()
+        if not project:
+            migrate_to_mind_dir(workspace)
+        self.memory_dir = ensure_dir(workspace / "memory") if project else self.mind_dir
         self.memory_file = self.memory_dir / "MEMORY.md"
-        self._legacy_project_memory_dir = ensure_dir(workspace / "memory")
-        self._legacy_project_memory_file = self._legacy_project_memory_dir / "MEMORY.md"
-        self.history_file = self._legacy_project_memory_dir / "HISTORY.md"
-        self.history_jsonl_file = self._legacy_project_memory_dir / "history.jsonl"
+        self.history_file = self.memory_dir / "HISTORY.md"
+        self.history_jsonl_file = self.memory_dir / "history.jsonl"
         self.legacy_history_file = self.history_file
-        self._legacy_history_backup_file = self._legacy_project_memory_dir / "HISTORY.md.bak"
-        self.soul_file = workspace / "SOUL.md"
-        self.user_file = workspace / "USER.md"
-        self._cursor_file = self.memory_dir / ".cursor"
+        self._legacy_history_backup_file = self.memory_dir / "HISTORY.md.bak"
+        # Entries up to this cursor are folded into MEMORY.md (by Dream for the
+        # mind, by consolidation for a project).
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
+        self.soul_file = self.mind_dir / "SOUL.md"
+        self.user_file = self.mind_dir / "USER.md"
+        self.global_memory_file = self.mind_dir / "MEMORY.md"
+        self._mind_history_file = self.mind_dir / "history.jsonl"
 
-        self.global_workspace = get_workspace_path(None)
-        self.global_memory_dir = ensure_dir(self.global_workspace / "memory")
-        self.global_memory_file = self.global_memory_dir / "MEMORY.md"
-        # Avoid leaking global memory into unrelated temporary workspaces.
-        self._allow_global_memory = workspace.resolve().is_relative_to(self.global_workspace.resolve())
-        self._explicit_global_write = False
+        self._git = GitStore(self.mind_dir, tracked_files=list(_MIND_FILES))
 
-        if workspace.resolve() != self.global_workspace.resolve():
-            workspace_hash = hashlib.md5(str(workspace.resolve()).encode()).hexdigest()[:8]
-            workspace_label = self._safe_backup_folder_component(str(getattr(workspace, "name", "workspace")))
-            backup_folder_name = f"{workspace_label}_{workspace_hash}"
-            self.backup_dir = ensure_dir(self.global_workspace / "project_backups" / backup_folder_name)
-            self.memory_backup_file = self.backup_dir / "MEMORY.md"
-            self.history_backup_file = self.backup_dir / "history.jsonl"
-        else:
-            self.backup_dir = None
-
-        self._git = GitStore(
-            self.workspace,
-            tracked_files=["SOUL.md", "USER.md", "memory/MEMORY.md"],
-        )
-
+        if project:
+            self._migrate_hidden_project_memory()
         self._migrate_legacy_history_if_needed()
 
     @property
     def git(self) -> GitStore:
         return self._git
 
+    def _migrate_hidden_project_memory(self) -> None:
+        """Fold the old hidden ``<project>/.mira/memory`` copy into ``memory/``."""
+        hidden = self.workspace / ".mira" / "memory"
+        if not hidden.is_dir():
+            return
+        old = hidden / "MEMORY.md"
+        # Older builds read the hidden copy first, so it is what the agent saw.
+        if old.is_file():
+            text = _read_text(old)
+            if text.strip() and text != _read_text(self.memory_file):
+                atomic_write_text(self.memory_file, text)
+            old.unlink(missing_ok=True)
+        cursor = hidden / ".dream_cursor"
+        if cursor.is_file() and not self._dream_cursor_file.exists():
+            cursor.replace(self._dream_cursor_file)
+        (hidden / ".cursor").unlink(missing_ok=True)
+        cursor.unlink(missing_ok=True)
+        try:
+            hidden.rmdir()
+        except OSError:
+            pass
+
     def read_long_term(self) -> str:
-        if self.memory_file.exists():
-            return self.memory_file.read_text(encoding="utf-8")
-        if self._legacy_project_memory_file.exists():
-            return self._legacy_project_memory_file.read_text(encoding="utf-8")
-        # Fallback to backup if local was accidentally deleted
-        if self.backup_dir and self.memory_backup_file.exists():
-            return self.memory_backup_file.read_text(encoding="utf-8")
-        return ""
+        return _read_text(self.memory_file)
 
     def read_global_term(self) -> str:
-        # Global long-term memory is SHARED across all projects/instances (per
-        # user). Always overlay it on top of per-project memory so knowledge
-        # learned in one project is available everywhere, matching the
-        # "global shared + per-project overlay" model. Writes to the global
-        # store remain gated (see ``write_global_term``); only reads are open.
-        if (
-            self.memory_file.resolve() != self.global_memory_file.resolve()
-            and self.global_memory_file.exists()
-        ):
-            return self.global_memory_file.read_text(encoding="utf-8")
-        return ""
+        """The mind's MEMORY.md as seen from a project; empty for the mind itself."""
+        return _read_text(self.global_memory_file) if self.is_project else ""
 
     def write_long_term(self, content: str) -> None:
         locked_write_text(self.memory_file, content)
-        self._legacy_project_memory_file.parent.mkdir(parents=True, exist_ok=True)
-        if (
-            self._legacy_project_memory_file.resolve(strict=False)
-            != self.global_memory_file.resolve(strict=False)
-        ):
-            locked_write_text(self._legacy_project_memory_file, content)
-        if self.backup_dir:
-            locked_write_text(self.memory_backup_file, content)
+
+    def ensure_mind_files(self) -> None:
+        """Seed empty mind files so Dream's surgical edits have text to anchor on."""
+        seeds = {
+            "SOUL.md": _builtin_template("SOUL.md"),
+            "USER.md": _builtin_template("USER.md"),
+            "MEMORY.md": _MIND_MEMORY_SEED,
+        }
+        for name, seed in seeds.items():
+            path = self.mind_dir / name
+            if not _read_text(path).strip():
+                atomic_write_text(path, seed)
 
     @staticmethod
     def read_file(path: Path) -> str:
@@ -198,53 +301,65 @@ class MemoryStore:
     def append_history(self, entry: str) -> int:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         cleaned = strip_think(entry.rstrip()) or entry.rstrip()
-        # The cursor read-modify-write plus the appends must be atomic across
-        # processes: concurrent instances sharing this workspace would otherwise
-        # mint duplicate cursors and interleave partial lines.
-        with interprocess_lock(self.history_jsonl_file):
-            cursor = self._next_cursor()
-            with open(self.history_jsonl_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"cursor": cursor, "timestamp": ts, "content": cleaned}, ensure_ascii=False) + "\n")
-            with open(self.history_file, "a", encoding="utf-8") as f:
-                f.write(f"{cleaned}\n\n")
-            self._cursor_file.write_text(str(cursor), encoding="utf-8")
-            if self.backup_dir:
-                with open(self.history_backup_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"cursor": cursor, "timestamp": ts, "content": cleaned}, ensure_ascii=False) + "\n")
+        cursor = self._append_entry(self.history_jsonl_file, self._dream_cursor_file, ts, cleaned)
+        if self.is_project and not cleaned.startswith("[RAW]"):
+            # Dream reads only the mind's history; give it the project's story too.
+            self._append_entry(
+                self._mind_history_file, self.mind_dir / ".dream_cursor", ts, f"[project {self.workspace.name}] {cleaned}",
+            )
         return cursor
 
-    def _next_cursor(self) -> int:
-        if self._cursor_file.exists():
-            try:
-                return int(self._cursor_file.read_text(encoding="utf-8").strip()) + 1
-            except (ValueError, OSError):
-                pass
-        last = self._read_last_jsonl_entry()
-        return (last.get("cursor", 0) + 1) if last else 1
+    @classmethod
+    def _append_entry(cls, history: Path, dream_cursor: Path, ts: str, content: str) -> int:
+        # The cursor read plus the append must be atomic across processes:
+        # concurrent instances sharing this file would otherwise mint duplicate
+        # cursors and interleave partial lines.
+        history.parent.mkdir(parents=True, exist_ok=True)
+        with interprocess_lock(history):
+            # Never reuse a cursor Dream already passed, even if the log was trimmed by hand.
+            cursor = max(cls._last_cursor(history), cls._read_cursor(dream_cursor)) + 1
+            with open(history, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"cursor": cursor, "timestamp": ts, "content": content}, ensure_ascii=False) + "\n")
+        return cursor
 
-    def _read_last_jsonl_entry(self) -> dict[str, Any] | None:
+    @staticmethod
+    def _read_cursor(path: Path) -> int:
         try:
-            with open(self.history_jsonl_file, "rb") as f:
+            return int(path.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, ValueError, OSError):
+            return 0
+
+    @staticmethod
+    def _row_cursor(row: Any) -> int | None:
+        """A row's cursor, or None for rows not written by append_history (e.g. by hand)."""
+        cursor = row.get("cursor") if isinstance(row, dict) else None
+        return cursor if isinstance(cursor, int) and not isinstance(cursor, bool) else None
+
+    @classmethod
+    def _last_cursor(cls, history: Path) -> int:
+        try:
+            with open(history, "rb") as f:
                 f.seek(0, 2)
                 size = f.tell()
-                if size == 0:
-                    return None
-                read_size = min(size, 4096)
-                f.seek(size - read_size)
-                data = f.read().decode("utf-8")
-                lines = [line for line in data.split("\n") if line.strip()]
-                if not lines:
-                    return None
-                return json.loads(lines[-1])
-        except (FileNotFoundError, json.JSONDecodeError):
-            return None
+                f.seek(max(0, size - 4096))
+                tail = f.read().decode("utf-8", errors="replace").splitlines()
+                if size > 4096:
+                    tail = tail[1:]  # the first line may be cut mid-way
+        except FileNotFoundError:
+            return 0
+        for line in reversed(tail):
+            try:
+                cursor = cls._row_cursor(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+            if cursor is not None:
+                return cursor
+        # The tail held no valid cursor (e.g. rows appended by hand): scan it all.
+        return max((r["cursor"] for r in cls._read_rows(history)), default=0)
 
-    def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
-        self._migrate_legacy_history_if_needed()
-        entries: list[dict[str, Any]] = []
-        source = self.history_jsonl_file
-        if not source.exists() and self.history_file.exists():
-            source = self.history_file
+    @classmethod
+    def _read_rows(cls, source: Path) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
         try:
             with open(source, encoding="utf-8") as f:
                 for line in f:
@@ -255,11 +370,18 @@ class MemoryStore:
                         row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if row.get("cursor", 0) > since_cursor:
-                        entries.append(row)
+                    if cls._row_cursor(row) is not None:
+                        rows.append(row)
         except FileNotFoundError:
             pass
-        return entries
+        return rows
+
+    def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
+        self._migrate_legacy_history_if_needed()
+        source = self.history_jsonl_file
+        if not source.exists() and self.history_file.exists():
+            source = self.history_file
+        return [row for row in self._read_rows(source) if row["cursor"] > since_cursor]
 
     def compact_history(self) -> None:
         entries = self.read_unprocessed_history(since_cursor=0)
@@ -365,18 +487,12 @@ class MemoryStore:
                 for entry in entries:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             last_cursor = entries[-1]["cursor"]
-            self._cursor_file.write_text(str(last_cursor), encoding="utf-8")
             self._dream_cursor_file.write_text(str(last_cursor), encoding="utf-8")
 
         self.legacy_history_file.unlink(missing_ok=True)
 
     def get_last_dream_cursor(self) -> int:
-        if self._dream_cursor_file.exists():
-            try:
-                return int(self._dream_cursor_file.read_text(encoding="utf-8").strip())
-            except (ValueError, OSError):
-                pass
-        return 0
+        return self._read_cursor(self._dream_cursor_file)
 
     def set_last_dream_cursor(self, cursor: int) -> None:
         self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
@@ -401,82 +517,32 @@ class MemoryStore:
     def raw_archive(self, messages: list[dict]) -> None:
         self.append_history(f"[RAW] {len(messages)} messages\n{self._format_messages(messages)}")
 
-    def write_global_term(self, content: str) -> None:
-        self._explicit_global_write = True
-        if self.memory_file.resolve() != self.global_memory_file.resolve():
-            ensure_dir(self.global_memory_file.parent)
-            # Global memory is shared across all projects/instances; guard the
-            # write with a cross-process lock + atomic replace.
-            locked_write_text(self.global_memory_file, content)
-        else:
-            # If they are exactly the same, writing to long_term is enough
-            pass
-
-    def commit_consolidated_memories(
-        self,
-        *,
-        expected_local: str,
-        local_update: str | None,
-        expected_global: str,
-        global_update: str | None,
-    ) -> bool:
-        """Commit memory snapshots only if neither source changed concurrently."""
-        local_changed = local_update is not None and local_update != expected_local
-        global_changed = global_update is not None and global_update != expected_global
-        if not local_changed and not global_changed:
+    def commit_consolidated_memory(self, *, expected: str, update: str | None) -> bool:
+        """Write the project MEMORY.md only if nobody changed it since ``expected`` was read."""
+        if update is None or update == expected:
             return True
-
-        local_targets: list[Path] = []
-        if local_changed:
-            local_targets.append(self.memory_file)
-            if (
-                self._legacy_project_memory_file.resolve(strict=False)
-                != self.global_memory_file.resolve(strict=False)
-            ):
-                local_targets.append(self._legacy_project_memory_file)
-            if self.backup_dir:
-                local_targets.append(self.memory_backup_file)
-
-        global_targets = [self.global_memory_file] if global_changed else []
-        lock_targets = sorted(
-            {
-                target.resolve(strict=False)
-                for target in local_targets + global_targets + [self.global_memory_file]
-            },
-            key=str,
-        )
-
-        with ExitStack() as stack:
-            for target in lock_targets:
-                stack.enter_context(interprocess_lock(target))
-            if self.read_long_term() != expected_local or self.read_global_term() != expected_global:
-                logger.warning(
-                    "Memory consolidation skipped because another instance updated memory"
-                )
+        with interprocess_lock(self.memory_file):
+            if self.read_long_term() != expected:
+                logger.warning("Memory consolidation skipped because MEMORY.md changed meanwhile")
                 return False
-            if local_changed and local_update is not None:
-                for target in local_targets:
-                    atomic_write_text(target, local_update)
-            if global_changed and global_update is not None:
-                atomic_write_text(self.global_memory_file, global_update)
-                self._explicit_global_write = True
+            atomic_write_text(self.memory_file, update)
         return True
 
     def get_memory_context(self) -> str:
-        global_term = self.read_global_term()
-        local_term = self.read_long_term()
-
-        # Backward compatibility for existing prompts/tests.
-        if local_term and not global_term:
-            return f"## Long-term Memory\n{local_term}"
-
+        global_term = self.read_global_term().strip()
+        local_term = self.read_long_term().strip()
+        if _is_memory_scaffold(global_term):
+            global_term = ""
+        if _is_memory_scaffold(local_term):
+            local_term = ""
+        if not self.is_project:
+            return f"## Long-term Memory\n{local_term}" if local_term else ""
         parts = []
         if global_term:
-            parts.append(f"## Global System Memory (Rules & Guidelines)\n{global_term}")
+            parts.append(f"## Long-term Memory\n{global_term}")
         if local_term:
-            parts.append(f"## Local Project Memory (Current Case/Context)\n{local_term}")
-
-        return "\n\n".join(parts) if parts else ""
+            parts.append(f"## Project Memory\n{local_term}")
+        return "\n\n".join(parts)
 
     @staticmethod
     def _align_boundary_to_user(messages: list[dict], boundary: int) -> int:
@@ -561,9 +627,7 @@ class MemoryStore:
         if "memory_update" in args and "project_memory_update" not in args:
             args["project_memory_update"] = args["memory_update"]
 
-        if not any(
-            k in args for k in ("history_entry", "project_memory_update", "workspace_memory_update")
-        ):
+        if not any(k in args for k in ("history_entry", "project_memory_update")):
             return None
         return args
 
@@ -594,7 +658,12 @@ class MemoryStore:
         archive_all: bool = False,
         memory_window: int = 50,
     ) -> bool:
-        """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
+        """Fold old messages into history (and, for a project, its MEMORY.md) via an LLM tool call.
+
+        The mind's MEMORY.md is never written here: Dream owns it and learns
+        from the history entry. A project's consolidation also folds the
+        project history entries archived since the last run, then marks them
+        as folded so they leave the Recent History section.
 
         Returns True on success (including no-op), False on failure.
         """
@@ -613,28 +682,32 @@ class MemoryStore:
                 return True
             logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
 
-        lines = []
-        for m in old_messages:
-            if not m.get("content"):
-                continue
-            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
-
+        conversation = self._format_messages(old_messages)
         current_local = self.read_long_term()
-        current_global = self.read_global_term()
-        prompt = f"""Process this conversation and partition the memory using the save_memory tool.
-You MUST analyze the knowledge and separate it:
-- workspace_memory_update: Global, deep learning facts, Python rules, Mira workflows.
-- project_memory_update: Specific bugs, local paths, architecture of the current project.
+        if self.is_project:
+            pending = self.read_unprocessed_history(since_cursor=self.get_last_dream_cursor())
+            pending_text = "\n".join(f"[{e.get('timestamp', '?')}] {e.get('content', '')}" for e in pending)
+            prompt = f"""Consolidate this project conversation with the save_memory tool.
+- history_entry: a short log entry of what happened.
+- project_memory_update: the full updated project MEMORY.md. Keep what the project needs to move on
+  (decisions, experiment results, data/file locations, pitfalls, current status); drop what is stale.
+  Facts about the user in general are not project memory; they reach long-term memory through the history.
 
-## Current Workspace/Global Memory
-{current_global or "(empty)"}
-
-## Current Local Project Memory
+## Current Project Memory
 {current_local or "(empty)"}
 
+## Archived History Not Yet In Project Memory
+{pending_text or "(none)"}
+
 ## Conversation to Process
-{chr(10).join(lines)}"""
+{conversation}"""
+        else:
+            pending = []
+            prompt = f"""Summarize this conversation for the history log with the save_memory tool.
+history_entry: the key events, decisions, and facts learned about the user. Start with [YYYY-MM-DD HH:MM].
+
+## Conversation to Process
+{conversation}"""
 
         try:
             args: dict[str, Any] | None = None
@@ -644,7 +717,7 @@ You MUST analyze the knowledge and separate it:
                         {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
                         {"role": "user", "content": prompt},
                     ],
-                    tools=_SAVE_MEMORY_TOOL,
+                    tools=_save_memory_tool(self.is_project),
                     tool_choice=_SAVE_MEMORY_TOOL_CHOICE,
                     model=model,
                 )
@@ -665,29 +738,24 @@ You MUST analyze the knowledge and separate it:
                 )
                 return False
 
-            project_update = args.get("project_memory_update")
+            project_update = args.get("project_memory_update") if self.is_project else None
             if project_update is not None and not isinstance(project_update, str):
                 project_update = json.dumps(project_update, ensure_ascii=False)
-            workspace_update = args.get("workspace_memory_update")
-            if workspace_update is not None and not isinstance(workspace_update, str):
-                workspace_update = json.dumps(workspace_update, ensure_ascii=False)
-
-            if not self.commit_consolidated_memories(
-                expected_local=current_local,
-                local_update=project_update,
-                expected_global=current_global,
-                global_update=workspace_update,
-            ):
+            if not self.commit_consolidated_memory(expected=current_local, update=project_update):
                 return False
 
             wrote_project = project_update is not None and project_update != current_local
-            wrote_workspace = workspace_update is not None and workspace_update != current_global
             wrote_history = False
             if entry := args.get("history_entry"):
                 if not isinstance(entry, str):
                     entry = json.dumps(entry, ensure_ascii=False)
-                self.append_history(entry)
+                cursor = self.append_history(entry)
                 wrote_history = True
+                if self.is_project:
+                    # This entry and the pending ones were just folded into MEMORY.md.
+                    self.set_last_dream_cursor(cursor)
+            elif pending and self.is_project:
+                self.set_last_dream_cursor(pending[-1]["cursor"])
 
             if archive_all:
                 session.last_consolidated = 0
@@ -697,12 +765,7 @@ You MUST analyze the knowledge and separate it:
                 # window never starts mid-tool-call-sequence.
                 boundary = self._align_boundary_to_user(session.messages, boundary)
                 session.last_consolidated = boundary
-            logger.info(
-                "Memory consolidation writes: history={}, project={}, workspace={}",
-                wrote_history,
-                wrote_project,
-                wrote_workspace,
-            )
+            logger.info("Memory consolidation writes: history={}, project={}", wrote_history, wrote_project)
             logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
             return True
         except Exception:
@@ -891,7 +954,7 @@ class Consolidator:
 
 
 class Dream:
-    """Two-phase memory processor for unprocessed history entries."""
+    """Two-phase processor that folds the mind's unprocessed history into MEMORY.md, USER.md and SOUL.md."""
 
     def __init__(
         self,
@@ -902,6 +965,8 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
     ):
+        if store.is_project:
+            raise ValueError("Dream edits the mind in MIRA_HOME, not a project's memory")
         self.store = store
         self.provider = provider
         self.model = model
@@ -915,9 +980,9 @@ class Dream:
         from mira_engine.agent.tools.filesystem import EditFileTool, ReadFileTool
 
         tools = ToolRegistry()
-        workspace = self.store.project_workspace
-        tools.register(ReadFileTool(workspace=workspace, allowed_dir=workspace))
-        tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace))
+        mind = self.store.mind_dir
+        tools.register(ReadFileTool(workspace=mind, allowed_dir=mind))
+        tools.register(EditFileTool(workspace=mind, allowed_dir=mind, protect_mind=False))
         return tools
 
     async def run(self) -> bool:
@@ -925,6 +990,9 @@ class Dream:
         entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
         if not entries:
             return False
+
+        self.store.ensure_mind_files()
+        self.store.git.init()
 
         batch = entries[: self.max_batch_size]
         history_text = "\n".join(f"[{e['timestamp']}] {e['content']}" for e in batch)
@@ -981,4 +1049,5 @@ class Dream:
         new_cursor = batch[-1]["cursor"]
         self.store.set_last_dream_cursor(new_cursor)
         self.store.compact_history()
+        self.store.git.auto_commit(f"dream: {current_date}, history up to #{new_cursor}")
         return bool(result and result.stop_reason == "completed")

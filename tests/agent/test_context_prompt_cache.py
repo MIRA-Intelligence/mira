@@ -50,15 +50,18 @@ def test_system_prompt_stays_stable_when_clock_changes(tmp_path, monkeypatch) ->
 
 def test_system_prompt_reflects_current_dream_memory_contract(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
+    builder = ContextBuilder(workspace, project=False)
     prompt = builder.build_system_prompt()
 
-    assert "memory/history.jsonl" in prompt
-    assert "automatically managed by Dream" in prompt
-    assert "do not edit directly" in prompt
+    assert f"History log: {builder.memory.mind_dir / 'history.jsonl'}" in prompt
+    assert "maintained by Dream" in prompt and "Never write anything in that folder" in prompt
+    assert "Project memory:" not in prompt
     assert "memory/HISTORY.md" not in prompt
     assert "write important facts here" not in prompt
+
+    project_prompt = ContextBuilder(workspace, project=True).build_system_prompt()
+    assert f"Project memory: {workspace / 'memory' / 'MEMORY.md'} is yours to maintain" in project_prompt
+    assert f"History log: {workspace / 'memory' / 'history.jsonl'}" in project_prompt
 
 
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:

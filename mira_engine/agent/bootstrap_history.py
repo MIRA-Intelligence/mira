@@ -41,8 +41,10 @@ SHIPPED_TEMPLATE_DIGESTS: dict[str, frozenset[str]] = {
         "1fdf27cad43e6149",
         "4af3052956b53b77",
         "86305b7307fd1e31",
+        "935b1b70f8b9ecc8",
     }),
     "AGENTS_RS.md": frozenset({
+        "00cdf889bf79d74f",
         "21060c8b4bfe18c8",
         "476e0a6eca8a3c44",
         "5022805b9d727654",
@@ -52,6 +54,7 @@ SHIPPED_TEMPLATE_DIGESTS: dict[str, frozenset[str]] = {
     }),
     "AGENTS_TM.md": frozenset({
         "3cc5b72b1fa89a7e",
+        "81c83707aa9a0ebb",
         "a4c1d12a4d66f585",
     }),
     "SOUL.md": frozenset({

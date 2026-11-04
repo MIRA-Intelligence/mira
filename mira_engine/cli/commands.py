@@ -758,23 +758,20 @@ def _load_workspace_template(name: str) -> str:
 
 
 def _ensure_workspace_bootstrap(workspace: Path) -> list[str]:
+    from mira_engine.agent.memory import migrate_to_mind_dir
+    from mira_engine.config.paths import get_mind_dir
+
+    migrate_to_mind_dir(workspace)
     created: list[str] = []
-    bootstrap = ("AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "HEARTBEAT.md")
-    for name in bootstrap:
-        target = workspace / name
+    # SOUL.md and USER.md belong to the mind in MIRA_HOME, next to MEMORY.md.
+    mind = get_mind_dir()
+    targets = [workspace / name for name in ("AGENTS.md", "TOOLS.md", "HEARTBEAT.md")]
+    targets += [mind / name for name in ("SOUL.md", "USER.md")]
+    for target in targets:
         if not target.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(_load_workspace_template(name), encoding="utf-8")
-            created.append(name)
-    memory_dir = workspace / "memory"
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("MEMORY.md", "HISTORY.md", "history.jsonl"):
-        target = memory_dir / name
-        if target.exists():
-            continue
-        text = _load_workspace_template(f"memory/{name}") if name == "MEMORY.md" else ""
-        target.write_text(text, encoding="utf-8")
-        created.append(f"memory/{name}")
+            target.write_text(_load_workspace_template(target.name), encoding="utf-8")
+            created.append(target.name if target.parent == workspace else str(target))
     return created
 
 
@@ -1406,7 +1403,7 @@ def gateway(
     from mira_engine.bus.queue import MessageBus
     from mira_engine.channels.manager import ChannelManager
     from mira_engine.cron.service import CronService
-    from mira_engine.cron.types import CronJob
+    from mira_engine.cron.types import DREAM_JOB_ID, CronJob, CronPayload
     from mira_engine.heartbeat.service import HeartbeatService
     from mira_engine.session.manager import SessionManager
 
@@ -1473,11 +1470,19 @@ def gateway(
         auto_max_rounds=config.agents.defaults.auto_max_rounds,
     )
 
+    # Dream folds the history into long-term memory on a fixed schedule.
+    dream_config = config.agents.defaults.dream
+    agent.configure_dream(dream_config)
+
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
         from mira_engine.agent.tools.cron import CronTool
         from mira_engine.agent.tools.message import MessageTool
+
+        if job.id == DREAM_JOB_ID:
+            await agent.dream.run()
+            return None
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
@@ -1536,6 +1541,12 @@ def gateway(
             ))
         return response
     cron.on_job = on_cron_job
+    cron.register_system_job(CronJob(
+        id=DREAM_JOB_ID,
+        name="dream",
+        schedule=dream_config.build_schedule(default_tz),
+        payload=CronPayload(kind="system_event", message="Dream memory consolidation"),
+    ))
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
