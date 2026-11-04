@@ -8,8 +8,10 @@ from typing import Any
 import pytest
 
 from mira_engine.agent.research_loop import ResearchAgentLoop
+from mira_engine.agent.runner import AgentRunResult
 from mira_engine.agent.subagent import ROLE_CONFIGS, SubagentManager
 from mira_engine.agent.tools.consult import ConsultRoleTool
+from mira_engine.agent.tools.spawn import SpawnTool
 from mira_engine.bus.queue import MessageBus
 from mira_engine.config.schema import AgentDefaults, Config, ExecToolConfig
 from mira_engine.providers.base import LLMProvider, LLMResponse
@@ -75,14 +77,57 @@ def test_build_tools_critic_is_read_only(tmp_path: Path) -> None:
 def test_build_subagent_prompt_includes_role_block(tmp_path: Path) -> None:
     mgr = _manager(tmp_path)
     critic_prompt = mgr._build_subagent_prompt(tmp_path, "critic")
-    assert "[OKAY]" in critic_prompt and "[REJECT]" in critic_prompt
+    # The critic reviews the design before a run and the evidence after it.
+    for verdict in ("[DESIGN: OKAY]", "[DESIGN: REVISE]", "[SUPPORTED]", "[PARTIAL]", "[NOT SUPPORTED]"):
+        assert verdict in critic_prompt
+    assert "[BLOCKING]" in critic_prompt and "Alternative explanations" in critic_prompt
     student_prompt = mgr._build_subagent_prompt(tmp_path, "student")
-    assert "Implementer" in student_prompt
+    assert "Role: Student (Executor)" in student_prompt
+    assert "## What was obtained" in student_prompt and "IDs per split" in student_prompt
+
+
+def test_the_supervisor_is_never_a_delegate() -> None:
+    # The main loop plays the supervisor; only the student and critic are delegates.
+    assert set(ROLE_CONFIGS) == set(SubagentManager._ROLE_PROMPTS) == {"student", "critic"}
+
+
+async def test_delegates_get_the_main_loop_step_budget(tmp_path: Path) -> None:
+    mgr = _manager(tmp_path)
+    mgr.max_iterations = 321
+    specs = []
+
+    async def _capture(runner, spec):
+        specs.append(spec)
+        return AgentRunResult(final_content="ok", messages=spec.initial_messages)
+
+    mgr._run_delegate = _capture
+    await mgr.consult("student", "run the sweep")
+    await mgr._run_subagent("t1", "long run", "long", {"channel": "cli", "chat_id": "direct"}, role="student")
+
+    assert [s.max_iterations for s in specs] == [321, 321]
+    assert "321 steps" in specs[0].max_iterations_message.format(max_iterations=321)
+
+
+async def test_spawn_tool_passes_the_team_role(tmp_path: Path) -> None:
+    mgr = _manager(tmp_path)
+    seen = {}
+
+    async def _spawn(**kwargs):
+        seen.update(kwargs)
+        return "started"
+
+    mgr.spawn = _spawn
+    tool = SpawnTool(manager=mgr)
+    assert tool.parameters["properties"]["role"]["enum"] == ["student", "critic"]
+
+    assert await tool.execute(task="train", role="Student") == "started"
+    assert seen["role"] == "student"
+    assert (await tool.execute(task="x", role="supervisor")).startswith("Error: unknown role")
 
 
 async def test_consult_uses_role_provider_and_continues_session(tmp_path: Path) -> None:
     providers = {
-        "critic": _RecordingProvider("Looks rigorous. **[OKAY]**", "anthropic/claude-opus-4-5"),
+        "critic": _RecordingProvider("Looks rigorous. **[DESIGN: OKAY]**", "anthropic/claude-opus-4-5"),
         "student": _RecordingProvider("done", "deepseek/deepseek-chat"),
     }
 
@@ -93,7 +138,7 @@ async def test_consult_uses_role_provider_and_continues_session(tmp_path: Path) 
     mgr = _manager(tmp_path, role_factory=role_factory)
 
     result, session_id = await mgr.consult("critic", "review this plan")
-    assert "[OKAY]" in result
+    assert "[DESIGN: OKAY]" in result
     assert providers["critic"].models_seen == ["anthropic/claude-opus-4-5"]
     assert session_id in mgr._consult_sessions
 
@@ -105,7 +150,7 @@ async def test_consult_uses_role_provider_and_continues_session(tmp_path: Path) 
 
 
 async def test_consult_tool_formats_output_and_returns_session(tmp_path: Path) -> None:
-    provider = _RecordingProvider("**[REJECT]** add a control", "anthropic/claude-opus-4-5")
+    provider = _RecordingProvider("**[NOT SUPPORTED]** add a control", "anthropic/claude-opus-4-5")
 
     def role_factory(role: str):
         return provider, provider.get_default_model(), (provider.get_default_model(),)
@@ -115,10 +160,11 @@ async def test_consult_tool_formats_output_and_returns_session(tmp_path: Path) -
 
     out = await tool.execute(role="critic", task="my plan")
     assert "[consult:critic session_id=" in out
-    assert "[REJECT]" in out
+    assert "[NOT SUPPORTED]" in out
 
-    bad = await tool.execute(role="nope", task="x")
-    assert bad.startswith("Error: unknown role")
+    for bad_role in ("nope", "supervisor"):
+        bad = await tool.execute(role=bad_role, task="x")
+        assert bad.startswith("Error: unknown role")
 
 
 def test_team_profile_registration() -> None:

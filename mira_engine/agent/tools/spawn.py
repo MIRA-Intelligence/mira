@@ -4,6 +4,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from mira_engine.agent.subagent import DELEGATE_ROLES
 from mira_engine.agent.tools.base import UNSET, Tool, turn_value
 
 if TYPE_CHECKING:
@@ -81,7 +82,9 @@ class SpawnTool(Tool):
         return (
             "Spawn a subagent to handle a task in the background. "
             "Use this for complex or time-consuming tasks that can run independently. "
-            "The subagent will complete the task and report back when done."
+            "The subagent will complete the task and report back when done. "
+            "In team mode, pass role='student' for long experiments so it works as "
+            "the team's executor."
         )
 
     @property
@@ -97,15 +100,26 @@ class SpawnTool(Tool):
                     "type": "string",
                     "description": "Optional short label for the task (for display)",
                 },
+                "role": {
+                    "type": "string",
+                    "enum": list(DELEGATE_ROLES),
+                    "description": "Optional team role whose rules and tools the subagent follows.",
+                },
             },
             "required": ["task"],
         }
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self, task: str, label: str | None = None, role: str | None = None, **kwargs: Any
+    ) -> str:
         """Spawn a subagent to execute the given task."""
+        role = (role or "").strip().lower() or None
+        if role is not None and role not in DELEGATE_ROLES:
+            return f"Error: unknown role '{role}'. Valid roles: {', '.join(DELEGATE_ROLES)}."
         return await self._manager.spawn(
             task=task,
             label=label,
+            role=role,
             origin_channel=turn_value(self._runtime_origin_channel, self._origin_channel),
             origin_chat_id=turn_value(self._runtime_origin_chat_id, self._origin_chat_id),
             session_key=turn_value(self._runtime_session_key, self._session_key),

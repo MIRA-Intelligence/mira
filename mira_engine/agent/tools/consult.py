@@ -11,12 +11,11 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from mira_engine.agent.subagent import DELEGATE_ROLES as _VALID_ROLES
 from mira_engine.agent.tools.base import UNSET, Tool, turn_value
 
 if TYPE_CHECKING:
     from mira_engine.agent.subagent import SubagentManager
-
-_VALID_ROLES = ("critic", "student", "supervisor")
 
 
 class ConsultRoleTool(Tool):
@@ -46,12 +45,14 @@ class ConsultRoleTool(Tool):
     def description(self) -> str:
         return (
             "Synchronously consult a teammate and get their reply in this turn. "
-            "Roles: 'critic' (read-only reviewer; returns a [OKAY]/[REJECT] verdict "
-            "on your plan's rigor), 'student' (implementer; executes a concrete, "
-            "already-decided task and reports results). Use 'critic' to debate a plan "
-            "to consensus before execution, then delegate the agreed work to 'student'. "
-            "To continue an existing debate or task thread, pass back the 'session_id' "
-            "returned by a previous consult so the teammate keeps full context."
+            "Roles: 'student' (executor; searches literature, designs and runs "
+            "experiments, and reports what was done and obtained with an evidence "
+            "package), 'critic' (read-only reviewer; reviews a design before it runs "
+            "and the evidence after, checking for leakage, overfitting, missing "
+            "controls, statistical problems and alternative explanations). "
+            "To continue an existing thread (a revision, the next review round), pass "
+            "back the 'session_id' returned by a previous consult so the teammate "
+            "keeps full context."
         )
 
     @property
@@ -67,8 +68,8 @@ class ConsultRoleTool(Tool):
                 "task": {
                     "type": "string",
                     "description": (
-                        "The plan to review (for critic) or the concrete task to "
-                        "implement (for student). Be specific and self-contained."
+                        "The work for the student, or the design / claim and evidence "
+                        "paths for the critic to review. Be specific and self-contained."
                     ),
                 },
                 "session_id": {

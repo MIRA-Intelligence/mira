@@ -87,3 +87,14 @@ def test_migrate_config_only_moves_when_target_missing() -> None:
     untouched = loader._migrate_config(already_new)
     assert untouched["tools"]["restrictToWorkspace"] is False
     assert untouched["tools"]["exec"]["restrictToWorkspace"] is True
+
+
+def test_saved_old_step_cap_is_raised_but_a_chosen_one_is_kept() -> None:
+    new_default = Config().agents.defaults.max_tool_iterations
+    assert new_default > 200
+
+    old = loader._migrate_config({"agents": {"defaults": {"maxToolIterations": 200}}})
+    assert old["agents"]["defaults"]["maxToolIterations"] == new_default
+
+    chosen = loader._migrate_config({"agents": {"defaults": {"maxToolIterations": 100}}})
+    assert chosen["agents"]["defaults"]["maxToolIterations"] == 100
