@@ -83,44 +83,6 @@ Draft → consult critic → [REJECT]? revise → consult critic (same session) 
 
 ---
 
-## Interactive Plan Mode — Mandatory Before Experiments (project sessions)
-
-In a project session you MUST run an interactive planning stage **after the
-literature review and before designing or running any experiments**, using the
-`set_plan` tool. The team debate above happens *inside* this stage.
-
-1. **Ask clarifying questions.** After surveying the literature, call `set_plan`
-   with `phase="questions"` and 3-6 concise, high-value clarifying questions.
-   Prefer structured questions (`kind="single"`/`"multi"` with `options`, or
-   `kind="text"`). Give each a stable `id` and a short `rationale`. Then **stop
-   and wait** — do not create experiments.
-
-2. **Propose a draft plan — after critic consensus.** When the user's answers
-   arrive (in `task_plan.json` under `plan.answers`), draft your plan, run the
-   **bounded debate** with the critic until `[OKAY]`, then call `set_plan` with
-   `phase="draft"`: a short `summary` plus a list of `experiments`, each with
-   `title`, `hypothesis`, and `method`. Then **stop and wait** for the user to
-   approve. If the user requests changes (in `plan.feedback`), revise (consult
-   the critic again if the change is substantive) and re-issue the draft.
-
-3. **Execute after approval — via the student.** Once the user approves, call
-   `set_plan` with `phase="approved"`, materialize the experiments as `pending`
-   entries (stable ids such as `Exp001`), and delegate each concrete
-   implementation task to the student with
-   `consult(role="student", task=<precise task with acceptance criteria>)`.
-   Review the student's report, verify it, and only then mark the experiment
-   complete.
-
-Notes:
-- The `set_plan` tool writes the `plan` block of `task_plan.json`; never
-  overwrite that block with raw file writes.
-- In auto mode the loop will NOT advance into experiments while the plan is
-  awaiting questions or draft approval — always finish each plan step by
-  stopping and waiting.
-- If the user runs `/plan`, restart from step 1 with a fresh set of questions.
-
----
-
 ## Delegation Discipline
 
 - **Decide before delegating.** Never hand the student an open-ended "figure out
@@ -177,13 +139,3 @@ ExpNNN: <Title> (commit: <hash>)
 - **Anomalies**: Unexpected behaviors during the test.
 - **Conclusion**: Is the mechanism supported or falsified? Real root cause?
 ```
-
----
-
-## Scheduled Reminders & Heartbeat Tasks
-
-Before scheduling reminders, check available skills and follow skill guidance.
-Use the built-in `cron` tool to create/list/remove jobs. Get USER_ID and CHANNEL
-from the current session. Do NOT just write reminders to MEMORY.md — that won't
-trigger notifications. `HEARTBEAT.md` is checked on the configured heartbeat
-interval; manage periodic analytical tasks there with file tools.

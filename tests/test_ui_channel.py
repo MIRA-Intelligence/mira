@@ -24,7 +24,6 @@ from mira_engine.channels.ui import (
     _detect_guard_id_reassignments,
     _extract_plan_experiment_ids,
     _format_tool_call,
-    _load_ui_instructions,
     _normalize_agent_profile,
     _normalize_contract_version,
     _normalize_loop_mode,
@@ -98,16 +97,8 @@ def ui_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> UiChannel:
         lambda name: (runtime_root / name).mkdir(parents=True, exist_ok=True) or (runtime_root / name),
     )
     with patch.object(BaseChannel, "__init__", _minimal_base_init):
-        with patch.object(ui_channel_mod, "_load_ui_instructions", return_value=""):
-            ch = UiChannel(config, bus, workspace=tmp_path)
-            return ch
-
-
-def test_load_ui_instructions_joins_present_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(ui_channel_mod, "_ASSETS_DIR", tmp_path)
-    (tmp_path / "AGENTS_UI.md").write_text("alpha", encoding="utf-8")
-    (tmp_path / "SKILL_UI.md").write_text("beta", encoding="utf-8")
-    assert _load_ui_instructions() == "alpha\n\n---\n\nbeta"
+        ch = UiChannel(config, bus, workspace=tmp_path)
+        return ch
 
 
 @pytest.mark.asyncio
@@ -214,12 +205,6 @@ async def test_token_usage_snapshot_and_side_effect_free_push(ui_channel):
     assert json.loads(response.text) == snapshot
     response = await ui_channel._handle_token_usage(SimpleNamespace(match_info={"session_id": "other"}))
     assert json.loads(response.text)["total_tokens"] == 0
-
-
-def test_load_ui_instructions_skips_missing_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(ui_channel_mod, "_ASSETS_DIR", tmp_path)
-    (tmp_path / "AGENTS_UI.md").write_text("only", encoding="utf-8")
-    assert _load_ui_instructions() == "only"
 
 
 def test_normalize_agent_profile_accepts_known_values() -> None:
@@ -1002,12 +987,11 @@ async def test_project_dir_index_survives_channel_restart_after_root_change(
     assert config_resp.status == 200
 
     with patch.object(BaseChannel, "__init__", _minimal_base_init):
-        with patch.object(ui_channel_mod, "_load_ui_instructions", return_value=""):
-            restarted = UiChannel(
-                MagicMock(spec=UiChannelConfig),
-                MagicMock(spec=MessageBus),
-                workspace=new_root,
-            )
+        restarted = UiChannel(
+            MagicMock(spec=UiChannelConfig),
+            MagicMock(spec=MessageBus),
+            workspace=new_root,
+        )
 
     artifact_req = MagicMock(spec=web.Request)
     artifact_req.match_info = {"session_id": session_id}
@@ -1802,8 +1786,7 @@ async def test_handle_create_project_managed_mode_ignores_client_path(
         lambda name: (runtime_root / name).mkdir(parents=True, exist_ok=True) or (runtime_root / name),
     )
     with patch.object(BaseChannel, "__init__", _minimal_base_init):
-        with patch.object(ui_channel_mod, "_load_ui_instructions", return_value=""):
-            ch = UiChannel(config, bus, workspace=tmp_path / "local")
+        ch = UiChannel(config, bus, workspace=tmp_path / "local")
 
     req = MagicMock(spec=web.Request)
     req.json = AsyncMock(return_value={
@@ -2842,7 +2825,6 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     ]
     ws = _FakeWs(messages)
     monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
-    ui_channel._ui_instructions = "UI instruction"
     handled = []
 
     async def _handle_message(**kwargs):
@@ -2860,7 +2842,8 @@ async def test_ws_handler_message_and_set_mode_dispatch(
     assert handled[0]["metadata"]["turn_id"] == "turn-1"
     assert handled[0]["metadata"]["selected_skill_ids"] == ["mrstation"]
     assert handled[0]["metadata"]["automation_policy"]["maxExperiments"] == 8
-    assert "_ui_system_instructions" in handled[0]["metadata"]
+    # Project chats outside a Run no longer get the legacy task_plan instructions.
+    assert "_ui_system_instructions" not in handled[0]["metadata"]
     assert handled[1]["metadata"]["_control"] == "set_mode"
 
     meta_file = ui_channel.project_registry.default_project_parent / "PRJ-4001" / ".mira" / "project.json"
@@ -2922,7 +2905,6 @@ async def test_ws_handler_normal_message_skips_project_runtime_state(
         ),
     ])
     monkeypatch.setattr(ui_channel_mod.web, "WebSocketResponse", lambda: ws)
-    ui_channel._ui_instructions = "UI instruction"
     captured: dict[str, Any] = {}
 
     async def _handle_message(**kwargs):

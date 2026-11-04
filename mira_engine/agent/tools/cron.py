@@ -62,7 +62,12 @@ class CronTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Schedule reminders and recurring tasks. Actions: add, list, remove."
+        return (
+            "Schedule reminders and recurring tasks. Actions: add, list, remove. "
+            "Use this tool for reminders, not `mira cron` via exec; a note in memory never fires. "
+            "For open-ended periodic checks, edit HEARTBEAT.md in the workspace instead "
+            "(it is read on every heartbeat): edit_file to add or remove a task."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:

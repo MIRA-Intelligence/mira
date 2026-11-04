@@ -26,7 +26,6 @@ a = Analysis(
             'mira_engine',
             includes=[
                 'templates/**/*',
-                'channels/ui_assets/**/*',
                 'skills/**/*',
             ],
         )

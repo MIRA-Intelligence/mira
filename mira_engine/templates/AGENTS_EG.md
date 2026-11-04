@@ -28,32 +28,11 @@ Before writing code, verify if the task is well-defined from an engineering pers
 3. **Fallback for Ambiguity**
    - If the user isn't sure about the best method, provide a comparison of 2-3 standard approaches detailing their Trade-offs (Speed vs. Accuracy vs. Implementation Complexity) and recommend one.
 
-## Interactive Plan Mode — Mandatory Before Experiments (project sessions)
-
-In a project session you MUST run an interactive planning stage before creating
-or running experiments. If literature review is enabled, do this after the
-research survey; otherwise do it immediately after creating `task_plan.json`.
-Drive the stage with the `set_plan` tool:
-
-1. Call `set_plan` with `phase="questions"` and 3-6 concise questions needed to
-   choose the engineering direction, target metric, constraints, or experiment
-   scope. After the tool call, stop and wait for the user's answers.
-2. When answers arrive in `task_plan.json` under `plan.answers`, call `set_plan`
-   with `phase="draft"` containing a short summary and proposed experiments.
-   Stop and wait for approval or revision feedback.
-3. Only after approval, call `set_plan` with `phase="approved"`, then create
-   `pending` experiment entries in `task_plan.json` and execute them according
-   to the current run mode.
-
-Do not ask these questions only in prose. The UI plan stage only renders content
-written through `set_plan`.
-
 ### The Cycle
 
 ```
 Requirement Analysis → Constraint Check → Solution Design → Implementation → Benchmarking → Optimization
 ```
-
 
 ### Step-by-Step Requirements
 
@@ -89,7 +68,6 @@ Requirement Analysis → Constraint Check → Solution Design → Implementation
 
 Every engineering attempt recorded in MEMORY.md must include:
 
-
 ```
 ExpNNN: <Title> (commit: <hash>)
 - **Goal**: What specific metric/bug are we targeting?
@@ -100,21 +78,3 @@ ExpNNN: <Title> (commit: <hash>)
 - **Trade-offs**: What did we sacrifice for this gain? (e.g., +2% Dice but 1.5x slower inference).
 - **Next Steps**: Is further optimization needed, or is it ready to merge?
 ```
-
----
-
-## Scheduled Reminders & Heartbeat Tasks
-
-Before scheduling reminders, check available skills and follow skill guidance first.
-Use the built-in `cron` tool to create/list/remove jobs.
-Get USER_ID and CHANNEL from the current session.
-
-**Do NOT just write reminders to MEMORY.md** — that won't trigger actual notifications.
-
-`HEARTBEAT.md` is checked on the configured heartbeat interval. Use file tools to manage periodic tasks:
-
-- **Add**: `edit_file` to append new tasks
-- **Remove**: `edit_file` to delete completed tasks
-- **Rewrite**: `write_file` to replace all tasks
-
-When the user asks for a recurring/periodic task, update `HEARTBEAT.md` instead of creating a one-time cron reminder.

@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from mira_engine.agent.bootstrap_history import is_shipped_template
 from mira_engine.agent.memory import MemoryStore
 from mira_engine.agent.skill_turn import invoked_skill_names
 from mira_engine.agent.skills import SkillsLoader
@@ -19,6 +20,8 @@ class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    # Scaffolds that say nothing until someone fills them in.
+    _SKIP_UNEDITED_BOOTSTRAP = frozenset({"USER.md"})
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _MAX_RECENT_HISTORY = 50
     # Skills re-attached after their tool result left the conversation
@@ -207,7 +210,9 @@ class ContextBuilder:
         """Load shared persona followed by project-specific overlays.
 
         Per file (e.g. AGENTS.md):
-          1. global workspace file, or built-in template as fallback
+          1. global workspace file, or built-in template as fallback (also for
+             an unedited copy of an older template; skipped entirely for an
+             unedited ``USER.md``)
           2. global ``*.local.md``
           3. project file when this is a project workspace
           4. project ``*.local.md``
@@ -228,10 +233,11 @@ class ContextBuilder:
             layers: list[str] = []
 
             global_file = global_workspace / effective_name
-            if global_file.exists():
-                layers.append(global_file.read_text(encoding="utf-8"))
-            else:
-                layers.append(self._load_builtin_template(effective_name) or "")
+            builtin = self._load_builtin_template(effective_name) or ""
+            text = global_file.read_text(encoding="utf-8") if global_file.exists() else builtin
+            if is_shipped_template(effective_name, text):
+                text = "" if effective_name in self._SKIP_UNEDITED_BOOTSTRAP else builtin
+            layers.append(text)
 
             global_local = global_workspace / f"{stem}.local.md"
             if global_local.exists():

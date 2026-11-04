@@ -127,7 +127,9 @@ def test_real_catalog_no_unrelated_matches_and_relevant_skills_still_route(tmp_p
                             ('Run ANOVA', 'statistical-analysis'), ('MRI MONAI', 'medical-image-analysis')]:
         assert expected in loader.suggest_skills(query)
     assert loader.suggest_skills('Create a spreadsheet') == ['xlsx']
-    assert 'memory' in loader.get_always_skills()
+    # Nothing builtin rides in every prompt; memory guidance loads on demand.
+    assert loader.get_always_skills() == []
+    assert '- memory: ' in loader.build_skills_listing()
 
 
 def test_grammatical_words_alone_are_not_task_evidence(tmp_path):

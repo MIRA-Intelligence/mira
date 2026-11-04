@@ -52,8 +52,7 @@ def _make_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kwargs) -> 
         lambda name: (runtime_root / name).mkdir(parents=True, exist_ok=True) or (runtime_root / name),
     )
     with patch.object(BaseChannel, "__init__", _minimal_base_init):
-        with patch.object(ui_channel_mod, "_load_ui_instructions", return_value=""):
-            return UiChannel(UiChannelConfig(), MagicMock(spec=MessageBus), workspace=tmp_path, **kwargs)
+        return UiChannel(UiChannelConfig(), MagicMock(spec=MessageBus), workspace=tmp_path, **kwargs)
 
 
 @pytest.fixture
