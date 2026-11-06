@@ -40,6 +40,7 @@ class EngineLog:
     ws_sockets: list[web.WebSocketResponse] = field(default_factory=list)
     ws_paths: list[str] = field(default_factory=list)
     team_layers: list[Any] = field(default_factory=list)
+    plan_usage: dict[str, Any] | None = None  # what /api/subscription/usage answers (None: 404)
 
 
 def make_engine_app(token: str, log: EngineLog) -> web.Application:
@@ -93,6 +94,11 @@ def make_engine_app(token: str, log: EngineLog) -> web.Application:
         log.team_layers.append(body["layer"])
         return web.json_response({"ok": True, "revision": (body["layer"] or {}).get("revision", "")})
 
+    async def plan_usage(_: web.Request) -> web.Response:
+        if log.plan_usage is None:
+            raise web.HTTPNotFound()
+        return web.json_response(log.plan_usage)
+
     async def ws(request: web.Request) -> web.WebSocketResponse:
         sock = web.WebSocketResponse()
         await sock.prepare(request)
@@ -114,6 +120,7 @@ def make_engine_app(token: str, log: EngineLog) -> web.Application:
     app.router.add_post("/api/upload", upload)
     app.router.add_get("/api/stream", stream)
     app.router.add_put("/api/team/layer", team_layer)
+    app.router.add_get("/api/subscription/usage", plan_usage)
     app.router.add_get("/ws", ws)
     app.router.add_get("/ws/workflow/v1", ws)
     return app

@@ -10,6 +10,13 @@ Quotas are in tokens: a team default per user, daily and monthly, with
 per-user overrides. They are checked before a request is forwarded, so a
 request in flight can exceed a limit by at most its own size. Days and months
 follow the server's local time. Users' own keys are not metered or limited.
+
+Subscription plans (ChatGPT, which each user signs in to for OpenAI Codex) are
+not metered in tokens and never pass through the proxy. Their quota, kept
+alongside the token quotas, caps how much of the plan's usage windows (5-hour
+and weekly) Mira may use, in percent; Mira Server pushes each user's caps to
+their engine in the team layer, and the engine checks them against the usage
+the plan reports (``mira_engine/providers/subscription_quota.py``).
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ _MAX_JSON_RESPONSE = 16 * 1024 * 1024
 _MAX_SSE_LINE = 4 * 1024 * 1024
 DEFAULT_WARN_PERCENT = 80
 PERIODS = ("daily", "monthly")
+PLAN_WINDOWS = ("five_hour", "weekly")
 _GEMINI_MODEL = re.compile(r"/models/([^/:?]+)")
 
 
@@ -195,10 +203,26 @@ class Limits:
 
 
 @dataclass(frozen=True)
+class PlanCaps:
+    """How much of a subscription plan's windows Mira may use, in percent.
+
+    ``None`` means no cap (or, in an override, the team default).
+    """
+
+    five_hour: int | None = None
+    weekly: int | None = None
+
+    def as_json(self) -> dict[str, int | None]:
+        return {"five_hour": self.five_hour, "weekly": self.weekly}
+
+
+@dataclass(frozen=True)
 class Quotas:
     default: Limits = Limits()
     users: dict[str, Limits] | None = None
     warn_percent: int = DEFAULT_WARN_PERCENT
+    plan_default: PlanCaps = PlanCaps()
+    plan_users: dict[str, PlanCaps] | None = None
 
     def for_user(self, username: str) -> Limits:
         """The user's limits: the override where set, else the team default (0 = unlimited)."""
@@ -207,11 +231,25 @@ class Quotas:
         monthly = override.monthly if override.monthly is not None else self.default.monthly
         return Limits(daily or None, monthly or None)
 
+    def plan_caps_for(self, username: str) -> PlanCaps:
+        """The user's subscription caps: the override where set, else the team default (0 = no cap)."""
+        override = (self.plan_users or {}).get(username, PlanCaps())
+        caps = {window: getattr(override, window) if getattr(override, window) is not None
+                else getattr(self.plan_default, window) for window in PLAN_WINDOWS}
+        return PlanCaps(**{window: cap or None for window, cap in caps.items()})
+
+    def plan_json(self) -> dict[str, Any]:
+        return {
+            "default": self.plan_default.as_json(),
+            "users": {name: caps.as_json() for name, caps in sorted((self.plan_users or {}).items())},
+        }
+
     def as_json(self) -> dict[str, Any]:
         return {
             "default": self.default.as_json(),
             "users": {name: limits.as_json() for name, limits in sorted((self.users or {}).items())},
             "warn_percent": self.warn_percent,
+            "subscription": self.plan_json(),
         }
 
 
@@ -237,11 +275,55 @@ def _limits(value: Any, where: str, *, override: bool) -> Limits:
     return Limits(daily or None, monthly or None)  # null or 0: unlimited
 
 
+def _cap(value: Any, where: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or not 0 <= value <= 100:
+        raise QuotaError(f"{where} must be a percentage from 1 to 100 (0: no cap), or null")
+    return value
+
+
+def _plan_caps(value: Any, where: str, *, override: bool) -> PlanCaps:
+    if value is None:
+        return PlanCaps()
+    if not isinstance(value, dict):
+        raise QuotaError(f"{where} must be an object with five_hour and weekly")
+    unknown = sorted(set(value) - set(PLAN_WINDOWS))
+    if unknown:
+        raise QuotaError(f"{where}: unknown key(s) {', '.join(unknown)}")
+    five_hour, weekly = (_cap(value.get(window), f"{where}.{window}") for window in PLAN_WINDOWS)
+    if override:
+        return PlanCaps(five_hour, weekly)  # null follows the team default; 0 is no cap for this user
+    return PlanCaps(five_hour or None, weekly or None)
+
+
+def _parse_plan(data: Any, valid_user) -> tuple[PlanCaps, dict[str, PlanCaps]]:
+    if data is None:
+        return PlanCaps(), {}
+    if not isinstance(data, dict):
+        raise QuotaError("subscription must be an object with default and users")
+    unknown = sorted(set(data) - {"default", "users"})
+    if unknown:
+        raise QuotaError(f"subscription: unknown key(s) {', '.join(unknown)}")
+    default = _plan_caps(data.get("default"), "subscription.default", override=False)
+    users_raw = data.get("users") or {}
+    if not isinstance(users_raw, dict):
+        raise QuotaError("subscription.users must be an object of username: {five_hour, weekly}")
+    users: dict[str, PlanCaps] = {}
+    for name, value in users_raw.items():
+        if not isinstance(name, str) or (valid_user is not None and not valid_user(name)):
+            raise QuotaError(f"subscription.users: {name!r} is not a valid username")
+        caps = _plan_caps(value, f"subscription.users.{name}", override=True)
+        if caps != PlanCaps():
+            users[name] = caps
+    return default, users
+
+
 def parse_quotas(data: Any, *, valid_user=None) -> Quotas:
     """Validate quota settings (the ``/server/admin/quotas`` body)."""
     if not isinstance(data, dict):
         raise QuotaError("quotas must be an object")
-    unknown = sorted(set(data) - {"default", "users", "warn_percent"})
+    unknown = sorted(set(data) - {"default", "users", "warn_percent", "subscription"})
     if unknown:
         raise QuotaError(f"unknown key(s) {', '.join(unknown)}")
     default = _limits(data.get("default"), "default", override=False)
@@ -258,7 +340,8 @@ def parse_quotas(data: Any, *, valid_user=None) -> Quotas:
     warn = data.get("warn_percent", DEFAULT_WARN_PERCENT)
     if type(warn) is not int or not 1 <= warn <= 100:
         raise QuotaError("warn_percent must be a whole number from 1 to 100")
-    return Quotas(default, users, warn)
+    plan_default, plan_users = _parse_plan(data.get("subscription"), valid_user)
+    return Quotas(default, users, warn, plan_default, plan_users)
 
 
 # ── periods (server local time) ──────────────────────────────────────
@@ -298,3 +381,18 @@ def quota_status(limits: Limits, used: dict[str, int], warn_percent: int, day: s
             "resets_at": period_reset(period, day),
         }
     return status
+
+
+def plan_status(engine_status: dict[str, Any] | None, warn_percent: int) -> dict[str, Any] | None:
+    """An engine's ``/api/subscription/usage`` with ``warn`` added to each window."""
+    if not isinstance(engine_status, dict) or not isinstance(engine_status.get("providers"), dict):
+        return None
+    for provider in engine_status["providers"].values():
+        windows = provider.get("windows") if isinstance(provider, dict) else None
+        for window in (windows or {}).values():
+            if not isinstance(window, dict):
+                continue
+            used, cap = window.get("used_percent"), window.get("limit_percent")
+            window["warn"] = bool(window.get("current") and isinstance(used, (int, float))
+                                  and isinstance(cap, int) and used * 100 >= cap * warn_percent)
+    return engine_status

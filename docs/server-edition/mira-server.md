@@ -578,6 +578,34 @@ sudo -u mira-server /opt/mira/bin/mira-server usage --by user,model             
 
 Changes apply to the next call; Mira Server does not need a restart.
 
+### ChatGPT plans (OpenAI Codex)
+
+Users sign in to OpenAI Codex with their own ChatGPT account, and their engine
+talks to ChatGPT directly, so those calls are not metered in tokens. A ChatGPT
+plan meters use in its own windows instead: a 5-hour one on most plans and a
+weekly one. Every Codex response reports how much of each window is used, in
+percent, and the engine keeps the latest figures.
+
+The **subscription quota** sits alongside the token quotas and caps how much of
+each window Mira may use, in percent (1–100): a team default and per-user
+overrides, with the same `null`/`0` rules as the token quotas (`0`: no cap).
+The percentage is the whole account's, so use outside Mira counts too: a weekly
+cap of 80 keeps the last 20% of the week for the user's own use. Mira Server
+gives each engine its user's caps in the team layer (`subscription_quota`), and
+the engine checks them before every Codex call against the last reported usage.
+Once a window is at its cap, Codex calls fail at once (no retry) with a message
+saying when the window resets; other providers keep working. A plan without a
+5-hour window is held to its weekly cap only. Engines older than this feature
+ignore the caps.
+
+```sh
+sudo -u mira-server /opt/mira/bin/mira-server quota set --five-hour 80 --weekly 90
+sudo -u mira-server /opt/mira/bin/mira-server quota set --user alice --weekly none   # or a percentage, default
+```
+
+Running engines get changes made through the API at once, and changes made
+with `quota set` at the next sweep (within 30 seconds).
+
 ## Dev mode (UI development only)
 
 For working on the desktop client without a Linux host or real accounts:
@@ -626,9 +654,10 @@ response carries `X-Mira-Request-Id`.
 | `POST /server/engine/stop` | bearer | Stops the engine; returns the `engine` object |
 | `/api/*` | bearer (or `?access_token=` on GET/HEAD) | Proxied to the caller's engine; for administrators the settings endpoints answer from the [team settings](#team-settings) (`"scope": "team"`) |
 | `/llm/<provider>/*` | an engine's token (loopback only) | The [LLM proxy](#team-settings) for team providers |
-| `GET /server/usage` | bearer | The caller's team-provider usage: `today`, `month`, `by_model` (this month) and `quota` (per period: `limit`, `used`, `remaining`, `warn`, `exceeded`, `resets_at`) |
+| `GET /server/usage` | bearer | The caller's team-provider usage: `today`, `month`, `by_model` (this month) and `quota` (per period: `limit`, `used`, `remaining`, `warn`, `exceeded`, `resets_at`); `subscription_quota` (`five_hour`, `weekly` caps) and `subscription`, the ChatGPT plan's windows as the engine last saw them (per window: `used_percent`, `window_minutes`, `resets_at`, `limit_percent`, `warn`, `exceeded`; `null` before the engine has reported) |
 | `GET /server/admin/usage` | bearer, administrator | Everyone's usage: `?from=&to=` (dates, default this month), `?group_by=` (`user`, `day`, `month`, `provider`, `model`; default `user`, which adds each user's `quota`), `?format=csv` |
-| `GET`, `PUT /server/admin/quotas` | bearer, administrator | `{"default": {"daily", "monthly"}, "users": {"alice": {"daily", "monthly"}}, "warn_percent"}`; `PUT` replaces all of it |
+| `GET`, `PUT /server/admin/quotas` | bearer, administrator | `{"default": {"daily", "monthly"}, "users": {"alice": {"daily", "monthly"}}, "warn_percent", "subscription": {"default": {"five_hour", "weekly"}, "users": {"alice": {"five_hour", "weekly"}}}}`; `PUT` replaces all of it |
+| `GET /server/admin/subscription-usage` | bearer, administrator | Every user's ChatGPT plan usage and caps (`users`: `user`, `engine_running`, `subscription`, `subscription_quota`): fresh from running engines, the last report for stopped ones (kept until Mira Server restarts) |
 | `GET /ws`, `GET /ws/*` | bearer or `?access_token=` | WebSocket proxy to the same path on the engine (`/ws`, `/ws/workflow/v1`) |
 
 Token response:

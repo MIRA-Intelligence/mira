@@ -11,6 +11,7 @@ import httpx
 from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
+from mira_engine.providers import subscription_quota
 from mira_engine.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from mira_engine.providers.oauth_state import ensure_oauth_state_dirs_for_runtime
 from mira_engine.providers.usage import extract_usage
@@ -66,6 +67,10 @@ class OpenAICodexProvider(LLMProvider):
                 raise RuntimeError(
                     "Codex OAuth account id is missing. Run `mira onboard --wizard` and log in again."
                 )
+            if refused := subscription_quota.refusal(subscription_quota.CODEX, token.account_id):
+                logger.info("Codex request refused: the team's subscription quota is used up")
+                return LLMResponse(content=refused, finish_reason="error", error_status_code=429,
+                                   error_should_retry=False)
 
             headers = _build_headers(token.account_id, token.access)
             body: dict[str, Any] = {
@@ -187,11 +192,17 @@ async def _request_codex_once(
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
+            plan = subscription_quota.parse_codex_headers(
+                response.headers, account_id=headers.get("chatgpt-account-id", ""))
+            subscription_quota.record(subscription_quota.CODEX, plan)
             if response.status_code != 200:
                 text = await response.aread()
+                message = _friendly_error(response.status_code, text.decode("utf-8", "ignore"))
+                if response.status_code == 429 and (detail := subscription_quota.plan_limit_message(plan)):
+                    message = f"{message} {detail}"
                 raise CodexAPIError(
                     response.status_code,
-                    _friendly_error(response.status_code, text.decode("utf-8", "ignore")),
+                    message,
                     retry_after=LLMProvider._extract_retry_after_from_headers(response.headers),
                 )
             return await _consume_sse(response)

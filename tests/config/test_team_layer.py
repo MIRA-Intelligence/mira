@@ -193,7 +193,7 @@ def test_payload_marks_team_providers_and_hides_the_engine_token(config_path: Pa
     assert openai["api_key_preview"] is None
     assert "managed_by" not in payload["providers"]["deepseek"]
     assert payload["team"] == {"revision": "r1", "providers": ["openai"], "model_params": False,
-                               "defaults": ["model", "provider", "temperature"]}
+                               "defaults": ["model", "provider", "temperature"], "subscription_quota": {}}
     assert TOKEN not in json.dumps(payload)
 
 
@@ -351,3 +351,13 @@ async def test_endpoint_rejects_bad_bodies(body) -> None:
     response = await channel._handle_team_layer(_request(body))
     assert response.status == 400
     assert team_layer.get_team_layer().empty
+
+
+async def test_endpoint_takes_subscription_caps_and_reports_them(config_path: Path) -> None:
+    channel = _channel(AsyncMock())
+    layer = {"revision": "r3", "subscription_quota": {"openai_codex": {"five_hour": 80, "weekly": 90}}}
+    response = await channel._handle_team_layer(_request({"layer": layer}))
+    assert response.status == 200
+    assert team_layer.get_team_layer().subscription_quota == {"openai_codex": {"five_hour": 80, "weekly": 90}}
+    response = await channel._handle_subscription_usage(_request(None))
+    assert json.loads(response.text)["providers"]["openai_codex"]["limits"] == {"five_hour": 80, "weekly": 90}
