@@ -15,6 +15,10 @@ keeps it in memory only and applies it to the user's raw ``config.json`` in
   turning one off on their own Providers page does not affect users, who may
   still use it with their own key.
 - **model_params**, when the team sets them, replace the user's rules (locked).
+- **subscription_quota** caps how much of a subscription plan's usage windows
+  Mira may use, per provider (``{"openai_codex": {"five_hour": 80, "weekly":
+  90}}``, percent). It is not config: the provider checks it before each request
+  (:mod:`mira_engine.providers.subscription_quota`).
 - **Defaults** (provider and model, reasoning effort, ...) apply only where the
   user has not chosen a value: the key is missing from config.json or still
   holds the built-in default (engines write every default into config.json the
@@ -86,10 +90,12 @@ class TeamLayer:
     providers: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_params: list[dict[str, Any]] | None = None
     defaults: dict[str, Any] = field(default_factory=dict)
+    subscription_quota: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
     def empty(self) -> bool:
-        return not self.providers and self.model_params is None and not self.defaults
+        return (not self.providers and self.model_params is None and not self.defaults
+                and not self.subscription_quota)
 
     def manages(self, provider_name: str) -> bool:
         return provider_name in self.providers
@@ -101,6 +107,7 @@ class TeamLayer:
             "providers": sorted(self.providers),
             "model_params": self.model_params is not None,
             "defaults": sorted(self.defaults),
+            "subscription_quota": {name: dict(caps) for name, caps in sorted(self.subscription_quota.items())},
         }
 
 
@@ -116,7 +123,7 @@ def parse_layer(data: Any) -> TeamLayer:
         return TeamLayer()
     if not isinstance(data, dict):
         raise TeamLayerError("layer must be an object or null")
-    unknown = sorted(set(data) - {"revision", "providers", "model_params", "defaults"})
+    unknown = sorted(set(data) - {"revision", "providers", "model_params", "defaults", "subscription_quota"})
     if unknown:
         logger.warning("Team layer: ignoring unknown key(s) {} (a newer Mira Server)", ", ".join(unknown))
     revision = data.get("revision", "")
@@ -172,7 +179,35 @@ def parse_layer(data: Any) -> TeamLayer:
     unknown = sorted(set(defaults) - set(DEFAULT_FIELDS))
     if unknown:
         raise TeamLayerError(f"unknown default(s): {', '.join(unknown)}")
-    return TeamLayer(revision=revision, providers=providers, model_params=model_params, defaults=dict(defaults))
+    return TeamLayer(revision=revision, providers=providers, model_params=model_params, defaults=dict(defaults),
+                     subscription_quota=_parse_subscription_quota(data.get("subscription_quota")))
+
+
+def _parse_subscription_quota(data: Any) -> dict[str, dict[str, int]]:
+    """``{provider: {window: percent}}``; a cap of null or 0 is no cap."""
+    from mira_engine.providers.subscription_quota import WINDOWS
+
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise TeamLayerError("subscription_quota must be an object")
+    quota: dict[str, dict[str, int]] = {}
+    for provider, caps in data.items():
+        if not isinstance(caps, dict):
+            raise TeamLayerError(f"subscription_quota.{provider} must be an object")
+        kept: dict[str, int] = {}
+        for window, cap in caps.items():
+            if window not in WINDOWS:
+                logger.warning("Team layer: ignoring subscription window {} that this engine does not know", window)
+                continue
+            if cap is None or cap == 0:
+                continue
+            if type(cap) is not int or not 1 <= cap <= 100:
+                raise TeamLayerError(f"subscription_quota.{provider}.{window} must be a percentage from 1 to 100")
+            kept[window] = cap
+        if kept:
+            quota[provider] = kept
+    return quota
 
 
 def set_team_layer(layer: TeamLayer) -> bool:

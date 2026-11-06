@@ -353,7 +353,7 @@ def deploy_dir_command() -> None:
 
 # ── token usage and quotas ───────────────────────────────────────────
 
-quota_app = typer.Typer(help="Token quotas for team providers (run as the mira-server account).",
+quota_app = typer.Typer(help="Token quotas for team providers and caps on ChatGPT plans (run as the mira-server account).",
                         no_args_is_help=True, add_completion=False, rich_markup_mode=None)
 app.add_typer(quota_app, name="quota")
 
@@ -398,6 +398,24 @@ def _tokens(value: str, *, override: bool) -> int | None:
 
 def _fmt(limit: int | None) -> str:
     return "unlimited" if not limit else f"{limit:,}"
+
+
+def _percent(value: str, *, override: bool) -> int | None:
+    """``80`` or ``80%``; ``none`` (0, no cap); ``default`` (an override follows the team default)."""
+    text = value.strip().lower().rstrip("%")
+    if text in {"none", "unlimited", "0"}:
+        return 0
+    if text == "default":
+        if not override:
+            raise typer.BadParameter("'default' only applies to --user")
+        return None
+    if not text.isdigit() or not 1 <= int(text) <= 100:
+        raise typer.BadParameter(f"{value!r} is not a percentage from 1 to 100 (or none)")
+    return int(text)
+
+
+def _fmt_cap(cap: int | None) -> str:
+    return "no cap" if not cap else f"{cap}%"
 
 
 @app.command()
@@ -447,7 +465,7 @@ def usage(
 
 @quota_app.command("show")
 def quota_show(config: Path | None = ConfigOption) -> None:
-    """Show the token quotas."""
+    """Show the token quotas and the caps on ChatGPT plans."""
     from mira_server.usage import parse_quotas
 
     quotas = parse_quotas(_open_store(config).get_setting("quotas") or {})
@@ -457,6 +475,12 @@ def quota_show(config: Path | None = ConfigOption) -> None:
         daily = "default" if limits.daily is None else _fmt(limits.daily)
         monthly = "default" if limits.monthly is None else _fmt(limits.monthly)
         typer.echo(f"  {name}: daily {daily}, monthly {monthly}")
+    plan = quotas.plan_default
+    typer.echo(f"ChatGPT plan (Codex) per user: 5-hour {_fmt_cap(plan.five_hour)}, weekly {_fmt_cap(plan.weekly)}")
+    for name, caps in sorted((quotas.plan_users or {}).items()):
+        five_hour = "default" if caps.five_hour is None else _fmt_cap(caps.five_hour)
+        weekly = "default" if caps.weekly is None else _fmt_cap(caps.weekly)
+        typer.echo(f"  {name}: 5-hour {five_hour}, weekly {weekly}")
 
 
 @quota_app.command("set")
@@ -465,23 +489,34 @@ def quota_set(
     daily: str = typer.Option("", "--daily", help="Daily tokens: 2M, 500k, unlimited; with --user also default"),
     monthly: str = typer.Option("", "--monthly", help="Monthly tokens, as --daily"),
     warn: int = typer.Option(0, "--warn", help="Warn users at this percentage of a quota (1-100)"),
+    five_hour: str = typer.Option("", "--five-hour",
+                                  help="Cap on a ChatGPT plan's 5-hour window: 80 (%), none; with --user also default"),
+    weekly: str = typer.Option("", "--weekly", help="Cap on a ChatGPT plan's weekly window, as --five-hour"),
     config: Path | None = ConfigOption,
 ) -> None:
-    """Change the team default, a user's override, or the warning threshold. Applies at once."""
+    """Change the team default, a user's override, or the warning threshold.
+
+    Token quotas apply at once; running engines get new plan caps within 30 seconds.
+    """
     from mira_server.config import valid_username
     from mira_server.usage import QuotaError, parse_quotas
 
-    if not (daily or monthly or warn):
-        raise typer.BadParameter("give --daily, --monthly and/or --warn")
+    if not (daily or monthly or warn or five_hour or weekly):
+        raise typer.BadParameter("give --daily, --monthly, --five-hour, --weekly and/or --warn")
     store = _open_store(config)
     data = parse_quotas(store.get_setting("quotas") or {}).as_json()
+    plan = data["subscription"]
     if user:
         entry = data["users"].setdefault(user, {"daily": None, "monthly": None})
+        plan_entry = plan["users"].setdefault(user, {"five_hour": None, "weekly": None})
     else:
-        entry = data["default"]
+        entry, plan_entry = data["default"], plan["default"]
     for period, value in (("daily", daily), ("monthly", monthly)):
         if value:
             entry[period] = _tokens(value, override=bool(user))
+    for window, value in (("five_hour", five_hour), ("weekly", weekly)):
+        if value:
+            plan_entry[window] = _percent(value, override=bool(user))
     if warn:
         data["warn_percent"] = warn
     try:
@@ -491,7 +526,9 @@ def quota_set(
         raise typer.Exit(2) from None
     store.put_setting("quotas", quotas.as_json())
     store.audit("team.quotas_changed", username=f"cli:{getpass.getuser()}", default=quotas.default.as_json(),
-                users=[user] if user else [], warn_percent=quotas.warn_percent)
+                users=[user] if user else [], warn_percent=quotas.warn_percent,
+                subscription_default=quotas.plan_default.as_json(),
+                subscription_users=[user] if user and (five_hour or weekly) else [])
     quota_show(config)
 
 

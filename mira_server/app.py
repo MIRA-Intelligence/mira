@@ -8,6 +8,7 @@ and ``docs/server-edition/mira-server.md``. All errors are
 from __future__ import annotations
 
 import asyncio
+import copy
 import csv
 import hmac
 import io
@@ -27,6 +28,7 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 
+from mira_engine.providers.subscription_quota import CODEX
 from mira_server import PRODUCT, PROTOCOL, server_version
 from mira_server.auth.backends import PasswordBackend
 from mira_server.auth.identity import (
@@ -67,6 +69,7 @@ from mira_server.usage import (
     local_day,
     parse_quotas,
     period_start,
+    plan_status,
     quota_status,
     request_model,
 )
@@ -85,6 +88,7 @@ _MAX_CONFIG_BODY = 1024 * 1024
 _FORWARDING_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "X-Real-IP")
 _MAX_LLM_BODY = 64 * 1024 * 1024
 TEAM_PUSH_TIMEOUT_S = 10.0
+PLAN_USAGE_TIMEOUT_S = 5.0
 # Engine API paths Mira Server answers itself for administrators (the team layer).
 _TEAM_CONFIG_PATH = "/api/config"
 _TEAM_PROVIDER_PREFIX = "/api/providers/"
@@ -168,6 +172,10 @@ class MiraServer:
         self._nss = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mira-nss")
         self._background: list[asyncio.Task] = []
         self.http: aiohttp.ClientSession | None = None
+        # Subscription caps engines last got (to push changes `mira-server quota set` makes),
+        # and each user's last reported subscription usage (kept while their engine is stopped).
+        self._plan_caps_pushed = self._load_quotas().plan_json()
+        self._plan_usage: dict[str, dict[str, Any]] = {}
 
     # ── identity and groups ──────────────────────────────────────────
 
@@ -557,13 +565,17 @@ class MiraServer:
         if self.http is None:
             return
         layer = self.team.layer_for(handle.token, self.llm_proxy_base)
+        caps = self.quotas.plan_caps_for(name)
+        if caps.five_hour is not None or caps.weekly is not None:
+            layer["subscription_quota"] = {CODEX: caps.as_json()}
         url = f"http://127.0.0.1:{handle.port}{_ENGINE_TEAM_PREFIX}/layer"
         try:
             async with self.http.put(url, json={"layer": layer},
                                      headers={"Authorization": f"Bearer {handle.token}"},
                                      timeout=aiohttp.ClientTimeout(total=TEAM_PUSH_TIMEOUT_S)) as resp:
                 if resp.status == 404:
-                    if layer["providers"] or layer.get("defaults") or "model_params" in layer:
+                    if (layer["providers"] or layer.get("defaults") or "model_params" in layer
+                            or "subscription_quota" in layer):
                         log.warning("the engine of %s is too old for team settings; upgrade mira-engine", name)
                         self.store.audit("team.push_unsupported", username=name)
                     return
@@ -771,7 +783,51 @@ class MiraServer:
                                                  username=name),
             "quota": quota_status(quotas.for_user(name), self._period_usage(name, day), quotas.warn_percent, day),
             "warn_percent": quotas.warn_percent,
+            "subscription": await self._user_plan_usage(name),
+            "subscription_quota": quotas.plan_caps_for(name).as_json(),
         })
+
+    async def _fetch_plan_usage(self, engine: UserEngine) -> None:
+        """Ask a running engine for its subscription usage and remember the answer."""
+        handle = engine.handle
+        if handle is None or self.http is None:
+            return
+        url = f"http://127.0.0.1:{handle.port}/api/subscription/usage"
+        try:
+            async with self.http.get(url, headers={"Authorization": f"Bearer {handle.token}"},
+                                     timeout=aiohttp.ClientTimeout(total=PLAN_USAGE_TIMEOUT_S)) as resp:
+                if resp.status != 200:
+                    return  # 404: an engine that predates subscription quotas
+                data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            log.debug("cannot read the subscription usage of %s: %s", engine.name, type(exc).__name__)
+            return
+        if isinstance(data, dict):
+            self._plan_usage[engine.name] = {**data, "fetched_at": self._wall_clock()}
+
+    def _plan_report(self, name: str, warn_percent: int) -> dict[str, Any] | None:
+        seen = self._plan_usage.get(name)
+        return plan_status(copy.deepcopy(seen), warn_percent) if seen else None
+
+    async def _user_plan_usage(self, name: str) -> dict[str, Any] | None:
+        engine = next((e for e in self.engines.running() if e.name == name), None)
+        if engine is not None:
+            await self._fetch_plan_usage(engine)
+        return self._plan_report(name, self.quotas.warn_percent)
+
+    async def handle_admin_subscription_usage(self, request: web.Request) -> web.Response:
+        """Every user's subscription usage: fresh from running engines, last known for the others."""
+        ctx = await self.authenticate(request)
+        self._require_admin(ctx.identity)
+        await asyncio.gather(*(self._fetch_plan_usage(engine) for engine in self.engines.running()))
+        quotas = self.quotas
+        running = {engine.name for engine in self.engines.running()}
+        users = sorted({*self._plan_usage, *(quotas.plan_users or {})})
+        return web.json_response({"warn_percent": quotas.warn_percent, "users": [
+            {"user": name, "engine_running": name in running,
+             "subscription": self._plan_report(name, quotas.warn_percent),
+             "subscription_quota": quotas.plan_caps_for(name).as_json()}
+            for name in users]})
 
     async def handle_admin_usage(self, request: web.Request) -> web.StreamResponse:
         """Everyone's usage over ``from``..``to``, grouped by ``group_by`` (JSON or ``format=csv``)."""
@@ -820,12 +876,18 @@ class MiraServer:
             raise ApiError(400, "bad_request", str(exc)) from None
         before, after = self.quotas.as_json(), quotas.as_json()
         self.store.put_setting("quotas", after)
+        if after["subscription"] != before["subscription"]:
+            self._plan_caps_pushed = quotas.plan_json()
+            self.engines.background(self.push_team_layer_all())
         if after != before:
             users = sorted(name for name in {*before["users"], *after["users"]}
                            if before["users"].get(name) != after["users"].get(name))
+            plan_users = sorted(name for name in {*before["subscription"]["users"], *after["subscription"]["users"]}
+                                if before["subscription"]["users"].get(name) != after["subscription"]["users"].get(name))
             self.store.audit("team.quotas_changed", username=ctx.identity.name, client_ip=self.client_ip(request),
-                             default=after["default"], users=users, warn_percent=quotas.warn_percent)
-            log.info("token quotas changed by %s", ctx.identity.name)
+                             default=after["default"], users=users, warn_percent=quotas.warn_percent,
+                             subscription_default=after["subscription"]["default"], subscription_users=plan_users)
+            log.info("quotas changed by %s", ctx.identity.name)
         return web.json_response(quotas.as_json())
 
     # ── /ws ──────────────────────────────────────────────────────────
@@ -967,6 +1029,10 @@ class MiraServer:
             response.headers["Vary"] = f"{vary}, Origin" if vary else "Origin"
 
     async def sweep_once(self) -> None:
+        plan_caps = self.quotas.plan_json()
+        if plan_caps != self._plan_caps_pushed:  # changed with `mira-server quota set`
+            self._plan_caps_pushed = plan_caps
+            await self.push_team_layer_all()
         for engine in list(self.engines.running()):
             try:
                 await self.current_identity(engine.name)
@@ -1022,6 +1088,7 @@ class MiraServer:
         app.router.add_get("/server/admin/usage", self.handle_admin_usage)
         app.router.add_get("/server/admin/quotas", self.handle_get_quotas)
         app.router.add_put("/server/admin/quotas", self.handle_put_quotas)
+        app.router.add_get("/server/admin/subscription-usage", self.handle_admin_subscription_usage)
         app.router.add_get("/ws", self.handle_ws)
         app.router.add_get("/ws/{tail:.+}", self.handle_ws)
         app.router.add_route("*", "/api", self.handle_api)

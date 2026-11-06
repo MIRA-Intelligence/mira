@@ -69,6 +69,7 @@ from mira_engine.projects import (
     slugify_project_id,
     validate_project_id,
 )
+from mira_engine.providers import subscription_quota
 from mira_engine.providers.model_fetch import (
     ModelCache,
     ModelFetchError,
@@ -1451,6 +1452,7 @@ class UiChannel(BaseChannel):
         self._app.router.add_get("/api/providers/{name}/models", self._handle_provider_models)
         self._app.router.add_post("/api/providers/{name}/test", self._handle_provider_test)
         self._app.router.add_put("/api/team/layer", self._handle_team_layer)
+        self._app.router.add_get("/api/subscription/usage", self._handle_subscription_usage)
         self._app.router.add_get("/api/feedback/config", self._handle_feedback_config)
         self._app.router.add_post("/api/feedback", self._handle_feedback)
         self._app.router.add_get("/api/projects", self._handle_list_projects)
@@ -3291,6 +3293,10 @@ class UiChannel(BaseChannel):
                     logger.exception("Failed to apply the team layer")
                     return web.json_response({"error": f"failed to apply the team layer: {exc}"}, status=500)
         return web.json_response({"ok": True, "revision": layer.revision})
+
+    async def _handle_subscription_usage(self, _request: web.Request) -> web.Response:
+        """Subscription plans' reported usage windows and the team caps on them."""
+        return web.json_response(subscription_quota.status())
 
     @staticmethod
     def _provider_models_response(cache: ModelCache) -> dict[str, Any]:

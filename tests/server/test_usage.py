@@ -15,6 +15,7 @@ from mira_server.cli import app
 from mira_server.store import Store
 from mira_server.usage import (
     Limits,
+    PlanCaps,
     QuotaError,
     TokenCounts,
     UsageMeter,
@@ -110,6 +111,33 @@ def test_user_limits_follow_the_default_unless_overridden() -> None:
     ({"limits": {}}, "unknown key"),
 ])
 def test_invalid_quota_settings(data: Any, message: str) -> None:
+    with pytest.raises(QuotaError, match=message):
+        parse_quotas(data, valid_user=lambda name: name.isalnum())
+
+
+def test_plan_caps_follow_the_default_unless_overridden() -> None:
+    quotas = parse_quotas({"default": {"daily": 1000},
+                           "subscription": {"default": {"five_hour": 80, "weekly": 90},
+                                            "users": {"alice": {"weekly": 0}, "bob": {"five_hour": 50},
+                                                      "carol": {}}}})
+    assert quotas.plan_caps_for("dave") == PlanCaps(80, 90)
+    assert quotas.plan_caps_for("alice") == PlanCaps(80, None)  # weekly 0 for alice: no cap
+    assert quotas.plan_caps_for("bob") == PlanCaps(50, 90)
+    assert quotas.for_user("bob") == Limits(1000, None)  # token quotas are separate
+    assert "carol" not in quotas.as_json()["subscription"]["users"]
+    assert parse_quotas(quotas.as_json()) == quotas
+    assert parse_quotas({}).plan_caps_for("dave") == PlanCaps()
+
+
+@pytest.mark.parametrize("data, message", [
+    ({"subscription": []}, "subscription must be an object"),
+    ({"subscription": {"default": {"weekly": 101}}}, "subscription.default.weekly"),
+    ({"subscription": {"default": {"weekly": 50.5}}}, "subscription.default.weekly"),
+    ({"subscription": {"default": {"daily": 5}}}, "unknown key"),
+    ({"subscription": {"users": {"../x": {"weekly": 1}}}}, "not a valid username"),
+    ({"subscription": {"limits": {}}}, "unknown key"),
+])
+def test_invalid_plan_caps(data: Any, message: str) -> None:
     with pytest.raises(QuotaError, match=message):
         parse_quotas(data, valid_user=lambda name: name.isalnum())
 
@@ -283,7 +311,7 @@ async def test_quotas_are_kept_and_invalid_ones_refused(harness: Harness) -> Non
     assert status == 200
     assert harness.server._load_quotas().as_json() == {
         "default": {"daily": 2_000_000, "monthly": 30_000_000}, "users": {"alice": {"daily": None, "monthly": 0}},
-        "warn_percent": 90}
+        "warn_percent": 90, "subscription": {"default": {"five_hour": None, "weekly": None}, "users": {}}}
     status, data = await _get(harness, admin, "/server/admin/quotas")
     assert data["warn_percent"] == 90
 
@@ -296,6 +324,84 @@ async def test_a_call_without_usage_counts_as_unreported(harness: Harness, upstr
     status, mine = await _get(harness, await harness.login("alice"), "/server/usage")
     assert mine["today"]["calls"] == 1 and mine["today"]["unreported_calls"] == 1
     assert mine["today"]["total_tokens"] == 0
+
+
+# ── subscription plans (ChatGPT) ─────────────────────────────────────
+
+
+def _engine_plan_usage(used: float, cap: int | None) -> dict[str, Any]:
+    return {"providers": {"openai_codex": {
+        "updated_at": 1.0, "limit_reached": None,
+        "windows": {"weekly": {"used_percent": used, "window_minutes": 10080, "resets_at": 2e9,
+                               "current": True, "limit_percent": cap,
+                               "exceeded": cap is not None and used >= cap}},
+        "limits": {"five_hour": None, "weekly": cap}}}}
+
+
+async def test_plan_caps_reach_engines_in_the_team_layer(harness: Harness) -> None:
+    alice, admin = await harness.login("alice"), await harness.login("bob")
+    await harness.wait_running(alice)
+    await harness.wait_running(admin)
+    assert "subscription_quota" not in harness.spawner.logs["alice"].team_layers[-1]  # no caps: not sent
+
+    status, saved = await _put_quotas(harness, admin, {
+        "default": {"daily": 1000},
+        "subscription": {"default": {"five_hour": 80, "weekly": 90}, "users": {"bob": {"five_hour": 0}}}})
+    assert status == 200 and saved["subscription"]["users"] == {"bob": {"five_hour": 0, "weekly": None}}
+    await harness.server.engines.drain()
+    assert harness.spawner.logs["alice"].team_layers[-1]["subscription_quota"] == {
+        "openai_codex": {"five_hour": 80, "weekly": 90}}
+    assert harness.spawner.logs["bob"].team_layers[-1]["subscription_quota"] == {
+        "openai_codex": {"five_hour": None, "weekly": 90}}
+    event = harness.store.audit_events("team.quotas_changed")[-1]["detail"]
+    assert event["subscription_users"] == ["bob"] and event["subscription_default"]["weekly"] == 90
+
+    # A token-only change does not push the layer again.
+    pushes = len(harness.spawner.logs["alice"].team_layers)
+    await _put_quotas(harness, admin, {**saved, "default": {"daily": 2000}})
+    await harness.server.engines.drain()
+    assert len(harness.spawner.logs["alice"].team_layers) == pushes
+
+
+async def test_plan_caps_set_from_the_command_line_reach_engines_on_the_next_sweep(harness: Harness) -> None:
+    alice = await harness.login("alice")
+    await harness.wait_running(alice)
+    harness.store.put_setting("quotas", {"subscription": {"default": {"weekly": 75}}})  # as `quota set` does
+    await harness.server.sweep_once()
+    assert harness.spawner.logs["alice"].team_layers[-1]["subscription_quota"] == {
+        "openai_codex": {"five_hour": None, "weekly": 75}}
+    pushes = len(harness.spawner.logs["alice"].team_layers)
+    await harness.server.sweep_once()  # unchanged: no push
+    assert len(harness.spawner.logs["alice"].team_layers) == pushes
+
+
+async def test_users_and_administrators_see_plan_usage(harness: Harness) -> None:
+    alice, admin = await harness.login("alice"), await harness.login("bob")
+    await harness.wait_running(alice)
+    await _put_quotas(harness, admin, {"warn_percent": 80, "subscription": {"default": {"weekly": 90}}})
+    harness.spawner.logs["alice"].plan_usage = _engine_plan_usage(75.0, 90)
+
+    status, mine = await _get(harness, alice, "/server/usage")
+    assert status == 200 and mine["subscription_quota"] == {"five_hour": None, "weekly": 90}
+    weekly = mine["subscription"]["providers"]["openai_codex"]["windows"]["weekly"]
+    assert weekly["used_percent"] == 75.0 and weekly["warn"] is True and weekly["exceeded"] is False
+    status, theirs = await _get(harness, admin, "/server/usage")
+    assert theirs["subscription"] is None  # bob's engine (old or no plan) answers 404
+
+    status, _ = await _get(harness, alice, "/server/admin/subscription-usage")
+    assert status == 403
+    status, report = await _get(harness, admin, "/server/admin/subscription-usage")
+    assert status == 200
+    rows = {row["user"]: row for row in report["users"]}
+    assert rows["alice"]["engine_running"] is True and rows["alice"]["subscription_quota"]["weekly"] == 90
+    assert rows["alice"]["subscription"]["providers"]["openai_codex"]["windows"]["weekly"]["warn"] is True
+
+    # Kept while the engine is stopped.
+    await harness.client.post("/server/engine/stop", headers=harness.bearer(alice))
+    status, report = await _get(harness, admin, "/server/admin/subscription-usage")
+    row = next(row for row in report["users"] if row["user"] == "alice")
+    assert row["engine_running"] is False
+    assert row["subscription"]["providers"]["openai_codex"]["windows"]["weekly"]["used_percent"] == 75.0
 
 
 # ── command line ─────────────────────────────────────────────────────
@@ -320,6 +426,16 @@ def test_cli_quota_and_usage(tmp_path) -> None:
     result = runner.invoke(app, ["quota", "set", "--daily", "default", "-c", str(config)])
     assert result.exit_code != 0  # 'default' is for overrides
     assert store.audit_events("team.quotas_changed")[-1]["detail"]["users"] == ["alice"]
+
+    result = runner.invoke(app, ["quota", "set", "--five-hour", "80%", "--weekly", "90", "-c", str(config)])
+    assert result.exit_code == 0, result.output
+    assert "ChatGPT plan (Codex) per user: 5-hour 80%, weekly 90%" in result.output
+    result = runner.invoke(app, ["quota", "set", "-u", "bob", "--weekly", "none", "-c", str(config)])
+    assert result.exit_code == 0 and "bob: 5-hour default, weekly no cap" in result.output
+    quotas = parse_quotas(store.get_setting("quotas"))
+    assert quotas.plan_caps_for("bob") == PlanCaps(80, None)
+    assert quotas.for_user("alice") == Limits(500_000, None)  # token quotas untouched
+    assert runner.invoke(app, ["quota", "set", "--weekly", "120", "-c", str(config)]).exit_code != 0
 
     result = runner.invoke(app, ["usage", "--by", "user,model", "-c", str(config)])
     assert result.exit_code == 0, result.output
