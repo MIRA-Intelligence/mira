@@ -78,6 +78,22 @@ class TestBwrapArgv:
         masks = [i for i, token in enumerate(args) if token == "--tmpfs" and args[i + 1] == str(mira_home.resolve())]
         assert len(masks) == 2 and masks[-1] > workspace_bind
 
+    def test_the_mind_is_never_mounted(self, workspace: Path, tmp_path: Path) -> None:
+        mind = _mira_home() / "mind"
+        skills = tmp_path / "skills"
+        skills.mkdir()
+        spec = SandboxSpec.build(workspace, extra_read_only=[skills, mind])
+        assert spec.extra_read_only == (skills.resolve(),)
+        args = bwrap_argv(spec)
+        assert str(mind.resolve()) not in args
+        assert (str(skills.resolve()), str(skills.resolve())) in _pairs(args, "--ro-bind")
+
+    def test_paths_inside_the_mind_are_refused(self, workspace: Path) -> None:
+        with pytest.raises(ValueError, match="private"):
+            SandboxSpec.build(workspace, read_only_paths=[str(_mira_home() / "mind")])
+        with pytest.raises(ValueError, match="private"):
+            SandboxSpec.build(workspace, read_write_paths=[str(_mira_home() / "mind" / "history.jsonl")])
+
     def test_cwd_outside_workspace_falls_back(self, workspace: Path, tmp_path: Path) -> None:
         args = bwrap_argv(SandboxSpec.build(workspace), tmp_path)
         assert args[args.index("--chdir") + 1] == str(workspace)
@@ -129,6 +145,14 @@ class TestRealSandbox:
         assert (workspace / "out.txt").read_text() == "hi\n"
         assert "sk-test" not in result.stdout and "tok-test" not in result.stdout
         assert result.stdout.strip().endswith("done")
+
+    def test_mind_is_hidden_even_when_passed_as_an_extra_dir(self, workspace: Path) -> None:
+        mind = _mira_home() / "mind"
+        mind.mkdir(parents=True, exist_ok=True)
+        (mind / "USER.md").write_text("# User\n- Name: Ada")
+        result = _run(SandboxSpec.build(workspace, extra_read_only=[mind]), f"cat {mind}/USER.md")
+        assert result.returncode != 0
+        assert "Ada" not in result.stdout
 
     def test_other_directories_are_invisible(self, workspace: Path, tmp_path: Path) -> None:
         private = tmp_path / "private"

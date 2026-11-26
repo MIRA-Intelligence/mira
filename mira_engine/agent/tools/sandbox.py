@@ -60,6 +60,23 @@ def _inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def private_dirs() -> tuple[Path, ...]:
+    """Private data a sandboxed command must never see; the host-side file tools read it.
+
+    A sandbox may reach the network, so anything it can read can leave the
+    machine (``curl -F @...``). The long-term mind (USER.md, MEMORY.md, the
+    history) therefore stays out of every sandbox.
+    """
+    from mira_engine.config.paths import get_mind_dir
+
+    return (get_mind_dir().resolve(),)
+
+
+def _exposes(path: Path, private: tuple[Path, ...]) -> bool:
+    """Whether mounting ``path`` would show any of ``private``."""
+    return any(_inside(path, p) or _inside(p, path) for p in private)
+
+
 def _uv_dirs(home: Path) -> list[Path]:
     """The uv cache and interpreter dirs, shared with venvs created outside the sandbox."""
     cache = os.environ.get("UV_CACHE_DIR") or os.path.join(
@@ -93,12 +110,20 @@ class SandboxSpec:
             resolved = (_resolve(value) for value in values if str(value).strip())
             return tuple(dict.fromkeys(path for path in resolved if path is not None))
 
+        private = private_dirs()
+        read_only, read_write = paths(read_only_paths), paths(read_write_paths)
+        # Admin and user paths are mounted before the Mira home is masked, so
+        # only one inside private data could show it: refuse rather than hide it.
+        for path in (*read_only, *read_write):
+            if any(_inside(path, p) for p in private):
+                raise ValueError(f"{path} is private (the long-term mind) and cannot be mounted in the sandbox")
         return cls(
             workspace=Path(workspace).expanduser().resolve(),
             network=network != "none",
-            read_only=paths(read_only_paths),
-            read_write=paths(read_write_paths),
-            extra_read_only=paths(extra_read_only),
+            read_only=read_only,
+            read_write=read_write,
+            # The engine passes the mind with the skill dirs for its own file tools.
+            extra_read_only=tuple(p for p in paths(extra_read_only) if not _exposes(p, private)),
         )
 
 
@@ -135,7 +160,9 @@ def bwrap_argv(spec: SandboxSpec, cwd: str | Path | None = None) -> list[str]:
         args += ["--bind-try", str(path), str(path)]
     shared = [home / ".local" / "bin", Path(sys.prefix), Path(sys.base_prefix)]
     media = _resolve(get_media_dir())
-    read_only = [path for path in [*shared, *([media] if media else []), *spec.extra_read_only] if path.exists()]
+    private = private_dirs()
+    read_only = [path for path in [*shared, *([media] if media else []), *spec.extra_read_only]
+                 if path.exists() and not _exposes(path, private)]
 
     def mask_mira_home(only_inside: bool) -> list[str]:
         # Nothing before this may expose the Mira home (config.json, keys, the
