@@ -532,7 +532,8 @@ class BaseAgentLoop:
         from mira_engine.agent.skills import skill_access_dirs
         from mira_engine.config.paths import get_mind_dir
 
-        # The mind is readable (history grep, MEMORY.md); file tools refuse writes.
+        # The host-side file tools may read the mind (history grep, MEMORY.md) but
+        # refuse writes; the sandbox drops it (see sandbox.private_dirs).
         return [*skill_access_dirs(workspace), get_mind_dir().resolve()]
 
         from mira_engine.agent.skills import SkillsLoader

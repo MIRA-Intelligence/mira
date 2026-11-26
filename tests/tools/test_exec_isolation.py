@@ -10,6 +10,7 @@ import pytest
 
 from mira_engine.agent.tools.bg import BackgroundJobRegistry
 from mira_engine.agent.tools.shell import ExecTool
+from mira_engine.config.paths import get_mind_dir
 from mira_engine.config.schema import PythonRuntimeConfig
 from mira_engine.runtime import python_env
 
@@ -81,7 +82,8 @@ async def test_sandbox_spec_includes_runtime_skill_dirs_and_policy_paths(workspa
     skills = tmp_path / "skills"
     skills.mkdir()
     tool = ExecTool(working_dir=str(workspace), sandbox="bwrap", sandbox_read_only_paths=["/opt/conda"])
-    tool.set_runtime_context(workspace=workspace, extra_allowed_dirs=[skills])
+    # The engine hands the mind to every tool; only the host-side file tools keep it.
+    tool.set_runtime_context(workspace=workspace, extra_allowed_dirs=[skills, get_mind_dir()])
     spec = tool._sandbox_spec()
     assert spec.workspace == workspace
     assert spec.network is False

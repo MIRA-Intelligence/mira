@@ -420,3 +420,51 @@ class TestWorkspaceRestriction:
         assert "Error" in result
         assert "outside" in result.lower()
         assert skill_file.read_text() == "# Weather\nOriginal content."
+
+
+# ---------------------------------------------------------------------------
+# Mira's own config and runtime state
+# ---------------------------------------------------------------------------
+
+class TestEngineOwnedFiles:
+    """Unrestricted tools still may not rewrite Mira's config, keys or tokens."""
+
+    @pytest.fixture()
+    def mira_home(self):
+        from mira_engine.config.loader import get_home_dir
+
+        home = get_home_dir().resolve()
+        (home / "runtime").mkdir(parents=True, exist_ok=True)
+        (home / "config.json").write_text('{"tools": {"exec": {"sandbox": "bwrap"}}}', encoding="utf-8")
+        (home / "runtime" / "gateway-token").write_text("tok", encoding="utf-8")
+        return home
+
+    @pytest.mark.asyncio
+    async def test_write_and_edit_of_config_are_refused(self, tmp_path, mira_home):
+        from mira_engine.agent.tools.filesystem import WriteFileTool
+
+        config = mira_home / "config.json"
+        out = await WriteFileTool(workspace=tmp_path).execute(path=str(config), content="{}")
+        assert out.startswith("Error") and "configuration" in out
+        out = await EditFileTool(workspace=tmp_path).execute(path=str(config), old_text='"bwrap"', new_text='""')
+        assert out.startswith("Error")
+        assert '"bwrap"' in config.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_new_top_level_files_and_runtime_state_are_refused(self, tmp_path, mira_home):
+        from mira_engine.agent.tools.filesystem import WriteFileTool
+
+        tool = WriteFileTool(workspace=tmp_path)
+        assert (await tool.execute(path=str(mira_home / "config.json.bak"), content="x")).startswith("Error")
+        assert (await tool.execute(path=str(mira_home / "runtime" / "gateway-token"), content="x")).startswith("Error")
+        assert (mira_home / "runtime" / "gateway-token").read_text(encoding="utf-8") == "tok"
+
+    @pytest.mark.asyncio
+    async def test_workspace_inside_mira_home_stays_writable(self, mira_home):
+        from mira_engine.agent.tools.filesystem import WriteFileTool
+
+        workspace = mira_home / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        out = await WriteFileTool(workspace=workspace).execute(path="notes.md", content="ok")
+        assert not out.startswith("Error")
+        assert (workspace / "notes.md").read_text(encoding="utf-8") == "ok"

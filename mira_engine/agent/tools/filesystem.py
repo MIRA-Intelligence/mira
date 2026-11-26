@@ -16,7 +16,8 @@ from mira_engine.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
-from mira_engine.config.paths import get_media_dir, get_mind_dir
+from mira_engine.config.loader import get_config_path, get_home_dir
+from mira_engine.config.paths import get_media_dir, get_mind_dir, get_runtime_dir
 from mira_engine.utils.helpers import build_image_content_blocks, detect_image_mime
 
 
@@ -26,6 +27,20 @@ def _is_under(path: Path, directory: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_engine_owned(path: Path) -> bool:
+    """Mira's own config, keys and runtime state, which no agent may write.
+
+    Writing them would let a prompt-injected agent switch protections off
+    (sandbox, policy-free providers) before exfiltrating. This holds even when
+    the tools are not restricted to the workspace.
+    """
+    home = get_home_dir().expanduser().resolve()
+    if path.parent == home or path == get_config_path().expanduser().resolve():
+        return True  # config.json, its backups, organization/workspace state, approval ledgers
+    owned = (home / "runtime", get_runtime_dir(), home / "config", home / ".config")
+    return any(_is_under(path, directory) for directory in owned)
 
 
 def _resolve_path(
@@ -146,6 +161,11 @@ class _FsTool(Tool):
             raise PermissionError(
                 f"{fp} is long-term memory maintained by Dream; do not edit it. "
                 "Project facts belong in the project's memory/MEMORY.md."
+            )
+        if _is_engine_owned(fp):
+            raise PermissionError(
+                f"{fp} is Mira's own configuration or runtime state; agents may not change it. "
+                "Ask the user to change settings in Mira."
             )
         return fp
 
